@@ -241,6 +241,7 @@ class NvencEncoder final : public VideoEncoder {
     }
 
     bool Encode(ID3D11Texture2D* input, bool forceKeyframe, EncodedFrame& out) override {
+        TrackFrameInterval();
         auto& api = NvencLib::Get().api;
         NV_ENC_REGISTERED_PTR reg = Register(input);
         if (!reg) return false;
@@ -353,11 +354,46 @@ class NvencEncoder final : public VideoEncoder {
         auto& rc = m_encodeConfig.rcParams;
         rc.averageBitRate = kbps * 1000;
         rc.maxBitRate = kbps * 1000;
-        // One frame worth of VBV keeps frame sizes even: low latency over quality spikes.
-        const uint32_t perFrame = uint32_t(double(kbps) * 1000.0 / m_config.fps);
-        // Desktop gets two frames of headroom for sudden full-screen changes; VR stays at one.
-        rc.vbvBufferSize = m_config.desktop ? perFrame * 2 : perFrame;
+        // A frame's worth of VBV keeps frame sizes even: low latency over quality spikes. But a
+        // fixed share of the nominal frame rate also caps what a slow game can carry - at 30 fps
+        // one frame's worth is a third of the bitrate - so VR's buffer follows the frames that
+        // actually arrive (two of them, bounded to one to four nominal frames so a stall can't
+        // ask for a huge burst). Desktop keeps two nominal frames for full-screen changes.
+        const uint32_t nominal = uint32_t(double(kbps) * 1000.0 / m_config.fps);
+        if (m_config.desktop || m_intervalNsSmooth <= 0) {
+            rc.vbvBufferSize = nominal * 2;
+        } else {
+            const uint32_t perFrame = uint32_t(double(kbps) * 1000.0 * (m_intervalNsSmooth / 1e9));
+            rc.vbvBufferSize = std::clamp(perFrame * 2, nominal, nominal * 4);
+        }
         rc.vbvInitialDelay = rc.vbvBufferSize;
+    }
+
+    // How far apart encoded frames actually are, and a buffer sized for that. Resizing is a
+    // reconfiguration, so only when the frame rate has moved and at most every couple of seconds.
+    void TrackFrameInterval() {
+        const int64_t now = rc::NowNs();
+        if (m_lastEncodeNs) {
+            const double interval = double(now - m_lastEncodeNs);
+            m_intervalNsSmooth = m_intervalNsSmooth > 0 ? m_intervalNsSmooth * 0.85 + interval * 0.15 : interval;
+        }
+        m_lastEncodeNs = now;
+        if (m_config.desktop || m_intervalNsSmooth <= 0 || !m_encoder) return;
+        if (m_lastVbvNs && now - m_lastVbvNs < 2'000'000'000LL) return;
+        const uint32_t nominal = uint32_t(double(m_config.bitrateKbps) * 1000.0 / m_config.fps);
+        const uint32_t perFrame = uint32_t(double(m_config.bitrateKbps) * 1000.0 * (m_intervalNsSmooth / 1e9));
+        const uint32_t want = std::clamp(perFrame * 2, nominal, nominal * 4);
+        if (m_encodeConfig.rcParams.vbvBufferSize == want) return;
+        m_encodeConfig.rcParams.vbvBufferSize = want;
+        m_encodeConfig.rcParams.vbvInitialDelay = want;
+        NV_ENC_RECONFIGURE_PARAMS re{};
+        re.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+        re.reInitEncodeParams = m_init;
+        re.reInitEncodeParams.encodeConfig = &m_encodeConfig;
+        if (NvencLib::Get().api.nvEncReconfigureEncoder(m_encoder, &re) == NV_ENC_SUCCESS) {
+            m_lastVbvNs = now;
+            RC_LOGI("NVENC: %.0f fps measured, VBV %.2f Mbit", 1e9 / m_intervalNsSmooth, double(want) / 1e6);
+        }
     }
 
     NV_ENC_REGISTERED_PTR Register(ID3D11Texture2D* tex) {
@@ -413,6 +449,10 @@ class NvencEncoder final : public VideoEncoder {
     NV_ENC_INITIALIZE_PARAMS m_init{};
     std::map<ID3D11Texture2D*, NV_ENC_REGISTERED_PTR> m_registered;
     uint64_t m_frameCount = 0;
+    // The interval between encoded frames, smoothed, and when the VBV was last sized for it.
+    int64_t m_lastEncodeNs = 0;
+    double m_intervalNsSmooth = 0;
+    int64_t m_lastVbvNs = 0;
     uint64_t m_lastIntraTs = 0;
     bool m_canInvalidate = false;
     bool m_split = false;
