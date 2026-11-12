@@ -56,6 +56,11 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
         m_stats.mbps = double(m_windowBytes) * 8 / 1e6 / elapsed;
         m_stats.encodeMs = m_windowFrames ? m_windowEncodeMs / m_windowFrames : 0;
         m_stats.bitrateKbps = m_targetKbps;
+        if (now - m_lastStatsLogNs > 3'000'000'000LL) {
+            m_lastStatsLogNs = now;
+            RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps", m_streamId, m_stats.mbps,
+                    m_stats.fps, m_targetKbps.load());
+        }
         m_windowFrames = 0;
         m_windowBytes = 0;
         m_windowEncodeMs = 0;

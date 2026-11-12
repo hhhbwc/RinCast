@@ -88,6 +88,7 @@ class VideoSender {
     uint64_t m_windowBytes = 0;
     double m_windowEncodeMs = 0;
     VideoSenderStats m_stats;
+    int64_t m_lastStatsLogNs = 0;
     int64_t m_lastIncreaseNs = 0;
     int64_t m_lastDecreaseNs = 0;
     double m_baselineNetworkMs = -1;
