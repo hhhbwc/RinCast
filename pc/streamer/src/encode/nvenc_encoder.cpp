@@ -354,29 +354,33 @@ class NvencEncoder final : public VideoEncoder {
         auto& rc = m_encodeConfig.rcParams;
         rc.averageBitRate = kbps * 1000;
         rc.maxBitRate = kbps * 1000;
-        // Two frames' worth of VBV at the rate the stream actually runs (VR tracks it; desktop
-        // keeps the nominal rate) keeps frame sizes even without capping a slow game's throughput.
+        // About one and a half frames' worth of VBV at the rate the stream actually runs (VR tracks
+        // it; desktop keeps the nominal rate). Enough to carry the set bitrate at any frame rate,
+        // but small enough that a burst of frames can't push the stream far past the setting.
         const uint32_t fps = (!m_config.desktop && m_effectiveFps) ? m_effectiveFps : m_config.fps;
-        rc.vbvBufferSize = uint32_t(double(kbps) * 1000.0 / fps) * 2;
+        rc.vbvBufferSize = uint32_t(double(kbps) * 1000.0 / fps) * 3 / 2;
         rc.vbvInitialDelay = rc.vbvBufferSize;
     }
 
     // How far apart encoded frames actually are. NVENC's CBR budgets each frame as bitrate / the
     // frame rate it was told, so telling it 90 while the game runs at 30 caps the stream at a third
     // of the setting no matter how big the VBV is. Tell it the rate frames really arrive at and size
-    // the VBV for two of those frames, so the stream carries the set bitrate at any frame rate.
-    // Resizing is a reconfiguration, so only when the rate has moved and at most every couple of seconds.
+    // the VBV for about one and a half of those frames, so the stream carries the set bitrate at any
+    // frame rate.
+    // The rate has to track quickly: if it lags while a burst of frames arrives, each frame still
+    // gets the slow rate's big budget and the stream overshoots the setting (a 15 fps budget fed
+    // 26 frames in a second sends ~170 Mbps against a 100 Mbps setting), which saturates the link.
     void TrackFrameInterval() {
         const int64_t now = rc::NowNs();
         if (m_lastEncodeNs) {
             const double interval = double(now - m_lastEncodeNs);
-            m_intervalNsSmooth = m_intervalNsSmooth > 0 ? m_intervalNsSmooth * 0.85 + interval * 0.15 : interval;
+            m_intervalNsSmooth = m_intervalNsSmooth > 0 ? m_intervalNsSmooth * 0.6 + interval * 0.4 : interval;
         }
         m_lastEncodeNs = now;
         if (m_config.desktop || m_intervalNsSmooth <= 0 || !m_encoder) return;
-        if (m_lastVbvNs && now - m_lastVbvNs < 2'000'000'000LL) return;
+        if (m_lastVbvNs && now - m_lastVbvNs < 500'000'000LL) return;
         const uint32_t fps = uint32_t(std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 6.0, double(m_config.fps)));
-        const uint32_t want = uint32_t(double(m_config.bitrateKbps) * 1000.0 / fps) * 2;
+        const uint32_t want = uint32_t(double(m_config.bitrateKbps) * 1000.0 / fps) * 3 / 2;
         const uint32_t rateNum = fps * 1000;
         if (m_init.frameRateNum == rateNum && m_encodeConfig.rcParams.vbvBufferSize == want) return;
         m_effectiveFps = fps;
