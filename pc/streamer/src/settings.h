@@ -38,7 +38,7 @@ struct Settings {
     int desktopBitrateMbps = 40;
     bool adaptiveBitrate = true;
     int fecPercent = 5;
-    bool foveatedEncoding = true;  // VR: fewer bits towards the lens edges
+    bool foveatedEncoding = false;  // VR: fewer bits towards the lens edges
     bool adaptiveQuantization = true;
     bool twoPassEncoding = false;  // VR only; desktop streams always use two passes
     int desktopMaxHeight = 0;      // 0 = native
