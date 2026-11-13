@@ -115,6 +115,21 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
     std::vector<uint8_t> parity;
     if (group) parity.assign(fragPayload, 0);
     size_t sent = 0;
+    // A datagram the socket refuses (send buffer full, SO_SNDTIMEO expired) never reaches
+    // the path at all: the headset counts it as loss, while the sender's stats and the
+    // congestion guard see nothing - the one loss source neither of them can explain.
+    // Count it and say so now and then, so a local stall leaves a trace.
+    const auto send = [this, streamId](PacketType type, const void* header, size_t headerSize, const uint8_t* data,
+                                       size_t len) {
+        if (m_connection->Send2(type, header, headerSize, data, len)) return;
+        m_sendFailures.fetch_add(1, std::memory_order_relaxed);
+        const int64_t now = NowNs();
+        if (now - m_lastSendFailLogNs > 5'000'000'000LL) {
+            m_lastSendFailLogNs = now;
+            RC_LOGW("Stream %u: %u datagrams refused by the socket so far (the path never saw them)", streamId,
+                    m_sendFailures.load());
+        }
+    };
     const size_t lastSize = total - (count - 1) * fragPayload;
     const uint32_t kbps = m_pacingKbps.load(std::memory_order_relaxed);
     const bool paced = kbps != 0;
@@ -139,7 +154,7 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
             const int64_t now = NowNs();
             if (m_nextSendNs < now - kPaceMaxDebtNs) m_nextSendNs = now - kPaceMaxDebtNs;
         }
-        m_connection->Send2(PacketType::Video, &h, sizeof(h), m_frame.data() + offset, len);
+        send(PacketType::Video, &h, sizeof(h), m_frame.data() + offset, len);
         sent++;
         if (paced) m_nextSendNs += int64_t(double(sizeof(h) + len) * nsPerByte);
         if (group) {
@@ -166,7 +181,7 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
                         const int64_t now = NowNs();
                         if (m_nextSendNs < now - kPaceMaxDebtNs) m_nextSendNs = now - kPaceMaxDebtNs;
                     }
-                    m_connection->Send2(PacketType::VideoParity, &ph, sizeof(ph), parity.data(), fragPayload);
+                    send(PacketType::VideoParity, &ph, sizeof(ph), parity.data(), fragPayload);
                     sent++;
                     if (paced) m_nextSendNs += int64_t(double(sizeof(ph) + fragPayload) * nsPerByte);
                 }

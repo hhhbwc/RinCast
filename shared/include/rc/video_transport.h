@@ -44,6 +44,11 @@ class VideoPacketizer {
     // Makes a SendFrame waiting in the pacer return at once (used by shutdown).
     void RequestStop();
 
+    // Datagrams the socket refused (a full send buffer after SO_SNDTIMEO). They never
+    // reach the path, so the headset counts them as loss while the sender's own stats and
+    // the congestion guard see nothing - the one loss source neither can explain.
+    uint32_t SendFailures() const { return m_sendFailures.load(std::memory_order_relaxed); }
+
    private:
     // Waits until dueNs; false means a stop was requested: wrap up at once.
     bool WaitDue(int64_t dueNs);
@@ -59,6 +64,8 @@ class VideoPacketizer {
     void* m_paceTimer = nullptr;
     void* m_stopEvent = nullptr;
     std::vector<uint8_t> m_frame;
+    std::atomic<uint32_t> m_sendFailures{0};
+    int64_t m_lastSendFailLogNs = 0;
 };
 
 struct ReceivedFrame {

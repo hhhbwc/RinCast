@@ -125,8 +125,16 @@ bool VideoSender::Submit(EncodedFrame&& frame, const void* metadata, uint16_t me
         m_stats.bitrateKbps = m_targetKbps;
         if (now - m_lastStatsLogNs > 3'000'000'000LL) {
             m_lastStatsLogNs = now;
-            RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps", m_streamId, m_stats.mbps,
-                    m_stats.fps, m_targetKbps.load());
+            // Datagrams the socket refused never reached the path: they look like loss on
+            // the headset and like nothing at all here. Worth showing in the regular line.
+            const uint32_t refused = m_packetizer.SendFailures();
+            if (refused) {
+                RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps, %u datagrams refused",
+                        m_streamId, m_stats.mbps, m_stats.fps, m_targetKbps.load(), refused);
+            } else {
+                RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps", m_streamId, m_stats.mbps,
+                        m_stats.fps, m_targetKbps.load());
+            }
         }
         m_windowFrames = 0;
         m_windowBytes = 0;
