@@ -628,7 +628,9 @@ void ClientSession::StartDesktop(const json& m) {
         cfg.bitrateKbps = std::max<uint32_t>(cfg.bitrateKbps, 5000);
         // Internet paths lose packets and have no retransmissions: recover more of them locally.
         cfg.fecPercent = m_slowPath ? std::max(pc.fecPercent, 12) : pc.fecPercent;
-        cfg.pace = m_slowPath;
+        // 局域网也铺开发：整帧突发会打爆 Wi-Fi 的浅队列。pacing 只改变发送节奏，
+        // 不增加端到端延迟（编码和上一帧的发送重叠）。
+        cfg.pace = true;
         cfg.adaptiveQuant = pc.adaptiveQuantization;
         // Over the internet a fixed bitrate only fills queues or loses frames: always adapt.
         cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate);
@@ -744,7 +746,7 @@ void ClientSession::StartVr() {
     cfg.bitrateKbps = uint32_t((st.vrBitrateMbps > 0 ? st.vrBitrateMbps : pc.vrBitrateMbps) * 1000);
     if (m_slowPath) cfg.bitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 60000);
     cfg.fecPercent = m_slowPath ? std::max(pc.fecPercent, 12) : pc.fecPercent;
-    cfg.pace = m_slowPath;
+    cfg.pace = true;  // 局域网也一样，见桌面流处说明
     cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate);  // see above
     if (m_slowPath) cfg.startBitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 12000);
     cfg.foveated = pc.foveatedEncoding;
