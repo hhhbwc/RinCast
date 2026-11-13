@@ -216,35 +216,32 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
                            (!measured && (fb.framesLost > 0 || fb.networkMs > m_baselineNetworkMs + 8.0));
 
     if (!m_adaptive) {
-        // Fixed bitrate: the user asked for a constant rate, but a saturated link must
-        // not keep asking for keyframes either (every unrecoverable burst is a freeze),
-        // and the queue must not pile into an 800 ms delay. The same signals as the
-        // adaptive AIMD, but the dip rides on m_congestionKbps and climbs back - the
-        // target itself is never changed.
-        if (congested) {
-            m_lastLossNs = now;
+        // Fixed bitrate: the user asked for a constant rate. Chronic small losses are
+        // FINE here - the recovery frames cover them - so they must not ratchet the
+        // rate down. Only real HARM backs the rate off: the headset asking for a
+        // keyframe (the freeze precursor), or the queue piling well past the device's
+        // own floor. Each harmful event dips 20%; without harm for 1.5 s the rate
+        // climbs back in steps - probing the ceiling, hovering at the true edge.
+        const bool harmful = fb.requestKeyframe || q > queueFloor + 25;
+        if (harmful) {
+            m_lastDipNs = now;
             const uint32_t base = m_congestionKbps.load() ? m_congestionKbps.load() : m_targetKbps.load();
-            uint32_t cap = base * 3 / 4;
+            uint32_t cap = base * 4 / 5;
             if (queueHigh && m_receivedKbps > 0) cap = std::min(cap, uint32_t(m_receivedKbps * 0.8));
-            m_congestionKbps.store(std::max(cap, m_targetKbps.load() / 4));
-            if (m_congestedUntilNs == 0) RC_LOGI("Stream %u: congestion guard dip to %u kbps (queue %.0f ms, loss %.1f %%)",
-                                                 m_streamId, m_congestionKbps.load(), q, lossRate * 100);
-            m_congestedUntilNs = now + 1'500'000'000LL;
+            m_congestionKbps.store(std::max(cap, m_targetKbps.load() / 8));
+            RC_LOGI("Stream %u: congestion guard dip to %u kbps (queue %.0f ms, floor %.0f, loss %.1f %%)",
+                    m_streamId, m_congestionKbps.load(), q, queueFloor, lossRate * 100);
         } else if (m_congestionKbps.load() && now > m_congestedUntilNs &&
                    now - m_lastDipNs > 1'500'000'000LL) {
-            // The queue drained and the losses stopped: climb back in steps.
-            if (now - m_lastClimbNs > 300'000'000LL) {
+            // No harm for 1.5 s: climb in steps. Small losses on the way are tolerated
+            // (recovery frames) and do not reset this - only harm does.
+            if (now - m_lastClimbNs > 500'000'000LL) {
                 m_lastClimbNs = now;
                 const uint32_t target = m_targetKbps.load();
-                uint32_t up = std::min(m_congestionKbps.load() * 5 / 4, target);
-                // The climb is safe to approach the target: the queue gate above (q <
-                // floor + 5) stops it the moment the path starts buffering - well before
-                // loss. (An earlier attempt capped the climb at the arrival rate, but the
-                // arrival rate follows what we send: on static scenes it sank to ~10 Mbps
-                // and locked the encoder there, which tripped the half-rate path and cut
-                // the fps in half.)
-                if (m_congestionKbps.load() == 0) RC_LOGI("Stream %u: congestion guard released, back to %u kbps",
-                                                          m_streamId, target);
+                const uint32_t up = std::min(m_congestionKbps.load() * 5 / 4, target);
+                m_congestionKbps.store(up);
+                if (m_congestionKbps.load() >= target) RC_LOGI("Stream %u: congestion guard released, back to %u kbps",
+                                                               m_streamId, target);
             }
         }
         return;
