@@ -237,12 +237,12 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
                 m_lastClimbNs = now;
                 const uint32_t target = m_targetKbps.load();
                 uint32_t up = std::min(m_congestionKbps.load() * 5 / 4, target);
-                // Hold just below what the path actually carries: climbing to the target
-                // re-saturates it, the queue builds, and the guard dips right back - a
-                // sawtooth the tester feels as quality flapping. The cap follows the
-                // arrival rate up and down, so the ride settles at the path's edge.
-                if (m_receivedKbps > 0) up = std::min(up, uint32_t(m_receivedKbps * 0.95));
-                m_congestionKbps.store(up);
+                // The climb is safe to approach the target: the queue gate above (q <
+                // floor + 5) stops it the moment the path starts buffering - well before
+                // loss. (An earlier attempt capped the climb at the arrival rate, but the
+                // arrival rate follows what we send: on static scenes it sank to ~10 Mbps
+                // and locked the encoder there, which tripped the half-rate path and cut
+                // the fps in half.)
                 if (m_congestionKbps.load() == 0) RC_LOGI("Stream %u: congestion guard released, back to %u kbps",
                                                           m_streamId, target);
             }

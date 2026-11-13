@@ -388,7 +388,7 @@ class NvencEncoder final : public VideoEncoder {
         }
         m_lastEncodeNs = now;
         if (m_config.desktop || m_intervalNsSmooth <= 0 || !m_encoder) return;
-        const uint32_t fps = uint32_t(std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 6.0, double(m_config.fps)));
+        const uint32_t fps = uint32_t(std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 2.0, double(m_config.fps)));
         // 门控从 500ms 缩到 100ms：预算陈旧是超调/欠速的主因，帧率一变就尽快重配。
         if (m_lastVbvNs && now - m_lastVbvNs < 100'000'000LL) return;
         // 稳态 fps 在 87-92 间抖，每个整数变化都重配 → 每秒约十次（无害但刷日志、扰动编码）。
