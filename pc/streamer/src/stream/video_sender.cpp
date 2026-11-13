@@ -55,7 +55,14 @@ void VideoSender::WorkerLoop() {
         // 这是端到端延迟不增反降的来源。
         m_slotCv.notify_all();
         if (m_pace.load(std::memory_order_relaxed))
-            m_packetizer.SetPacingKbps(uint32_t(TargetBitrateKbps() * 1.5));
+            // Pace at the rate we actually allow, not 1.5x it: at 140 Mb/s a frame is
+            // ~190 KB and lands every 11 ms, so a 1.5x pacer (210 Mb/s) shipped it in
+            // 7.4 ms and sat idle for the rest - the pacer shaped nothing, and every frame
+            // went out as one 140-datagram burst. A Wi-Fi queue that overflows mid-burst
+            // then loses a contiguous run of exactly one frame, which no FEC group this
+            // size can repair. 8% of headroom absorbs the per-frame variance and the
+            // timer's ~1 ms wake error without turning the stream back into bursts.
+            m_packetizer.SetPacingKbps(uint32_t(TargetBitrateKbps() * 1.08));
         m_packetizer.SendFrame(m_streamId, m_codec, local.flags, local.index, local.metadata.data(),
                                uint16_t(local.metadata.size()), local.frame.data.data(),
                                local.frame.data.size());
@@ -234,7 +241,12 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
         const bool dipGate = now - m_lastDipNs > 500'000'000LL;
         uint32_t rate = m_congestionKbps.load();
         const uint32_t target = m_targetKbps.load();
-        if (keyframeDip || (queueDip && dipGate)) {
+        // The dip gate covers keyframe requests too. The headset flags one on every feedback
+        // while frames keep expiring (lost || pending), so a single burst used to arrive as
+        // four requests in 400 ms and take the rate to the floor in three steps - the one
+        // path left that could still fall in three frames (the older tests call it out).
+        // The first request is answered at once: only repeats inside 500 ms are held.
+        if ((keyframeDip || queueDip) && dipGate) {
             m_lastDipNs = now;
             const uint32_t base = rate ? rate : target;
             // The depth follows the severity, never the arrival rate. A step sized by

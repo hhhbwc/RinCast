@@ -338,8 +338,15 @@ void VrStream::Run() {
             continue;
         }
 
-        // The encoder budgets bitrate / fps per frame, so half the frames need twice the rate.
-        const uint32_t encoderKbps = halfRate ? target * 2 : target;
+        // Half rate sends half the frames, and the encoder's budget is bitrate / fps per
+        // frame - so it needs no help here: the rate tracking below already reconfigures
+        // frameRateNum to the frame rate that actually arrives, which doubles the per-frame
+        // budget by itself. Doubling the bitrate *as well* paid it twice: whenever the
+        // guard cut the rate low enough to trip half rate, the encoder produced twice what
+        // the pacer was allowed to send (17.5 -> 35 Mb/s against a 26 Mb/s pacer), the
+        // worker blocked on the wire time and the frame rate fell to 29-33 fps - the
+        // tester's 35 s in exactly that state.
+        const uint32_t encoderKbps = target;
         if (encoderKbps != appliedKbps) {
             encoder->SetBitrate(encoderKbps);
             appliedKbps = encoderKbps;
