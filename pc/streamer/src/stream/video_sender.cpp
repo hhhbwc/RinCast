@@ -180,41 +180,10 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
         m_stats.clientDecodeMs = fb.decodeMs;
         m_stats.clientLatencyMs = fb.totalLatencyMs;
     }
-    if (!m_adaptive) {
-        // Fixed bitrate: the user asked for a constant rate, but a saturated link must
-        // not keep asking for keyframes either (every unrecoverable burst is a freeze).
-        // On loss, dip the send rate below the path's capacity for a moment - the
-        // picture softens for a beat instead of freezing - and climb back once the
-        // losses stop. The target itself is never changed.
-        const int64_t now = rc::NowNs();
-        const uint32_t total = fb.fragmentsReceived + fb.fragmentsLost;
-        const double lossRate = total ? double(fb.fragmentsLost) / total : 0;
-        const bool congested = fb.requestKeyframe || lossRate > 0.02;
-        if (congested) {
-            m_lastLossNs = now;
-            // First loss dips to 60% of the target; losses while already dipped deepen
-            // by a quarter, floored at a quarter of the target.
-            const uint32_t base = m_congestionKbps.load() ? m_congestionKbps.load() : m_targetKbps.load();
-            m_congestionKbps.store(std::max(base * 3 / 4, m_targetKbps.load() / 4));
-            m_congestedUntilNs = now + 1'500'000'000LL;
-        } else if (m_congestionKbps.load() && now > m_congestedUntilNs && now - m_lastLossNs > 1'500'000'000LL) {
-            // No losses recently: climb a quarter of the dip back toward the target,
-            // time-gated so a fast feedback stream does not snap straight back.
-            if (now - m_lastClimbNs > 300'000'000LL) {
-                m_lastClimbNs = now;
-                const uint32_t target = m_targetKbps.load();
-                const uint32_t up = std::min(m_congestionKbps.load() * 5 / 4, target);
-                m_congestionKbps.store(up >= target ? 0 : up);
-            }
-        }
-        return;
-    }
-
-    // Congestion control. When the stream is faster than the path (an internet upload,
-    // weak Wi-Fi), the excess doesn't get lost right away: it waits in some buffer on
-    // the way (router, modem, access point) and every frame arrives later than the one
-    // before, up to hundreds of ms. So the main signal is the queueing delay the headset
-    // measures; loss and arrival spread (for headsets that don't measure it) back it up.
+    // Signals for both modes: the queueing delay the headset measures is the main one
+    // (a busy AP or an internet hop queues packets; the delay grows to hundreds of ms
+    // before anything drops - loss alone is a late signal). Loss and the arrival rate
+    // back it up (headsets that don't measure the delay have only lost frames).
     const int64_t now = rc::NowNs();
     const uint32_t total = fb.fragmentsReceived + fb.fragmentsLost;
     const double lossRate = total ? double(fb.fragmentsLost) / total : 0;
@@ -229,13 +198,46 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     }
     // Without frames in this report (a still desktop) there is nothing to judge by.
     const double q = measured ? m_queueMs : -1;
-
     const bool queueHigh = q > 40;  // well past what the path carries
     // Wi-Fi and mobile links lose the odd packet without being full: only sustained or
     // heavy loss counts. (Headsets that measure no delay have nothing better than lost frames.)
     m_lossAvg = m_lossAvg * 0.8 + lossRate * 0.2;
     const bool lossy = m_lossAvg > 0.02 || lossRate > 0.2;
     const bool congested = q > 10 || lossy || (!measured && (fb.framesLost > 0 || fb.networkMs > m_baselineNetworkMs + 8.0));
+
+    if (!m_adaptive) {
+        // Fixed bitrate: the user asked for a constant rate, but a saturated link must
+        // not keep asking for keyframes either (every unrecoverable burst is a freeze),
+        // and the queue must not pile into an 800 ms delay. The same signals as the
+        // adaptive AIMD, but the dip rides on m_congestionKbps and climbs back - the
+        // target itself is never changed.
+        if (congested) {
+            m_lastLossNs = now;
+            const uint32_t base = m_congestionKbps.load() ? m_congestionKbps.load() : m_targetKbps.load();
+            uint32_t cap = base * 3 / 4;
+            if (queueHigh && m_receivedKbps > 0) cap = std::min(cap, uint32_t(m_receivedKbps * 0.8));
+            m_congestionKbps.store(std::max(cap, m_targetKbps.load() / 4));
+            if (m_congestedUntilNs == 0) RC_LOGI("Stream %u: congestion guard dip to %u kbps (queue %.0f ms, loss %.1f %%)",
+                                                 m_streamId, m_congestionKbps.load(), q, lossRate * 100);
+            m_congestedUntilNs = now + 1'500'000'000LL;
+        } else if (m_congestionKbps.load() && q < 5 && now > m_congestedUntilNs &&
+                   now - m_lastLossNs > 1'500'000'000LL) {
+            // The queue drained and the losses stopped: climb back in steps.
+            if (now - m_lastClimbNs > 300'000'000LL) {
+                m_lastClimbNs = now;
+                const uint32_t target = m_targetKbps.load();
+                const uint32_t up = std::min(m_congestionKbps.load() * 5 / 4, target);
+                m_congestionKbps.store(up >= target ? 0 : up);
+                if (m_congestionKbps.load() == 0) RC_LOGI("Stream %u: congestion guard released, back to %u kbps",
+                                                          m_streamId, target);
+            }
+        }
+        return;
+    }
+
+    // Congestion control. When the stream is faster than the path (an internet upload,
+    // weak Wi-Fi), the excess waits in some buffer on the way and every frame arrives
+    // later than the one before - that queueing delay above is the AIMD's main signal.
     const uint32_t minKbps = std::max<uint32_t>(m_maxKbps / 20, 2000);
     uint32_t target = m_targetKbps;
     // A queue takes a moment to drain after a cut: only cut again once that had time,
