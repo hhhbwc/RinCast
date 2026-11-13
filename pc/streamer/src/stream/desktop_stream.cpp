@@ -2,6 +2,8 @@
 
 #include <avrt.h>
 
+#include <utility>
+
 #include "../gpu.h"
 #include "../input/input_injector.h"
 #include "rc/platform.h"
@@ -42,6 +44,8 @@ bool DesktopStream::Start() {
 
 void DesktopStream::Stop() {
     m_running = false;
+    // 和 VR 流一样：先停发送线程（释放阻塞的 Submit、打断 pacing），再等编码线程退出。
+    m_sender.Stop();
     if (m_thread.joinable()) m_thread.join();
 }
 
@@ -156,7 +160,8 @@ void DesktopStream::Run() {
         const POINT cursor = capture.CursorPosition();
         meta.cursorX = cursor.x;
         meta.cursorY = cursor.y;
-        m_sender.Send(out, &meta, sizeof(meta), 0, rc::NsToMs(encEnd - encStart));
+        if (!m_sender.Submit(std::move(out), &meta, sizeof(meta), 0, rc::NsToMs(encEnd - encStart)))
+            break;  // 发送端已停止：流正在结束
         lastSent = t;
     }
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
