@@ -218,33 +218,65 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     if (!m_adaptive) {
         // Fixed bitrate: the user asked for a constant rate. Chronic small losses are
         // FINE here - the recovery frames cover them - so they must not ratchet the
-        // rate down. Only real HARM backs the rate off: the headset asking for a
-        // keyframe (the freeze precursor), or the queue piling past the device's own
-        // floor. Gentle steps - a harsh step per 300 ms swung the rate from 140 to 71
-        // and back every couple of seconds. The ride hovers at the path's edge.
+        // rate down. Only real HARM backs the rate off: the headset asking for a keyframe
+        // (the freeze precursor), or the queue standing well above the link's idle queue.
+        //
+        // The threshold is absolute, floored by the device's own baseline. A relative
+        // "+25 ms over the lowest queue ever seen" landed exactly on the queue this link
+        // runs at while it carries the stream (27-30 ms against a 1-3 ms floor): it fired
+        // on every report - a 15% sawtooth - and once the queue was a second deep it fired
+        // forever, so a climb gated on "no harm for 1.5 s" never started and the guard sat
+        // at the floor for the rest of the session.
+        const double dipAtMs = std::max(queueFloor + 45.0, 60.0);
+        const double severeMs = std::max(dipAtMs * 4.0, 250.0);
         const bool keyframeDip = fb.requestKeyframe;
-        const bool queueDip = q > queueFloor + 25;
+        const bool queueDip = q > dipAtMs;
         const bool dipGate = now - m_lastDipNs > 500'000'000LL;
+        uint32_t rate = m_congestionKbps.load();
+        const uint32_t target = m_targetKbps.load();
         if (keyframeDip || (queueDip && dipGate)) {
             m_lastDipNs = now;
-            const uint32_t base = m_congestionKbps.load() ? m_congestionKbps.load() : m_targetKbps.load();
-            uint32_t cap = keyframeDip ? base * 4 / 5 : base * 85 / 100;
-            if (queueHigh && m_receivedKbps > 0) cap = std::min(cap, uint32_t(m_receivedKbps * 0.8));
-            m_congestionKbps.store(std::max(cap, m_targetKbps.load() / 8));
-            RC_LOGI("Stream %u: congestion guard dip to %u kbps (queue %.0f ms, floor %.0f, loss %.1f %%)",
-                    m_streamId, m_congestionKbps.load(), q, queueFloor, lossRate * 100);
-        } else if (m_congestionKbps.load() && now > m_congestedUntilNs &&
-                   now - m_lastDipNs > 1'500'000'000LL) {
-            // No harm for 1.5 s: climb gently. Small losses on the way are tolerated
-            // (recovery frames) and do not reset this - only harm does.
-            if (now - m_lastClimbNs > 500'000'000LL) {
-                m_lastClimbNs = now;
-                const uint32_t target = m_targetKbps.load();
-                const uint32_t up = std::min(m_congestionKbps.load() * 21 / 20, target);
-                m_congestionKbps.store(up);
-                if (m_congestionKbps.load() >= target) RC_LOGI("Stream %u: congestion guard released, back to %u kbps",
-                                                               m_streamId, target);
+            const uint32_t base = rate ? rate : target;
+            // The depth follows the severity, never the arrival rate. A step sized by
+            // "what arrives x 0.8" feeds itself - the cut lowers what arrives, the next
+            // step reads that lower rate - and walked 119 Mb/s to the floor in four
+            // 300 ms steps; the tester's stream then ran 35 s at 17.5 Mb/s.
+            const bool severe = keyframeDip || q >= severeMs;
+            const uint32_t cap = uint32_t(uint64_t(base) * (severe ? 65 : 88) / 100);
+            const uint32_t next = std::max(cap, std::max(target / 8, 1000u));
+            if (next < (rate ? rate : target)) {
+                rate = next;
+                m_congestionKbps.store(rate);
+                RC_LOGI("Stream %u: congestion guard dip to %u kbps (queue %.0f ms, floor %.0f, loss %.1f %%)",
+                        m_streamId, rate, q, queueFloor, lossRate * 100);
             }
+        } else if (rate && rate < target) {
+            // Climb when the path looks calm now, not once it has been silent for a while:
+            // "no harm for 1.5 s" is a deadlock as soon as the queue rests above the
+            // threshold (it did - 130 ms for 30 s at the floor). A climb is a probe; the
+            // next dip answers it, and losses stay covered by the recovery frames.
+            const bool calm = q >= 0 && q < dipAtMs * 1.4;
+            // Pinned at the floor with the queue down again: the path carries more, get
+            // back on air. This is what left the tester 35 s at 17.5 Mb/s after a burst.
+            const bool pinned = rate <= target / 8 && now - m_lastDipNs > 4'000'000'000LL && q < severeMs;
+            if (now - m_lastDipNs > 1'200'000'000LL && now - m_lastClimbNs > 500'000'000LL && (calm || pinned)) {
+                m_lastClimbNs = now;
+                // 5% a step on a line that is carrying, a quarter when the guard fell to the
+                // floor - a dip that reached it usually answered a burst, not a dead path.
+                const uint32_t up = pinned ? rate + rate / 4 : rate + rate / 20;
+                rate = std::min(std::max(up, rate + 1), target);
+                m_congestionKbps.store(rate);
+                if (rate >= target) RC_LOGI("Stream %u: congestion guard released, back to %u kbps",
+                                            m_streamId, target);
+            }
+        }
+        // A guard that sits at the floor otherwise leaves nothing behind. The queue alone
+        // cannot say whether the path is full or the estimate is stale - the arrival rate
+        // can, so log both and let the next test answer it.
+        if (rate && rate <= target / 8 && now - m_floorLogNs > 5'000'000'000LL) {
+            m_floorLogNs = now;
+            RC_LOGI("Stream %u: guard at the floor, queue %.0f ms, sending %u of %u kbps, arriving %.0f kbps",
+                    m_streamId, q, rate, target, m_receivedKbps);
         }
         return;
     }

@@ -81,12 +81,12 @@ class VideoSender {
     std::atomic<bool> m_keyframeRequested{true};
     std::atomic<uint32_t> m_targetKbps;
     // Fixed-bitrate congestion guard (OnFeedback): dips below the target while the link
-    // saturates, climbs back when the losses stop. 0 = no dip active. Quality-adaptive
+    // saturates, climbs back when the path looks calm. 0 = no dip active. Quality-adaptive
     // mode leaves this alone - its AIMD owns m_targetKbps.
     std::atomic<uint32_t> m_congestionKbps{0};
-    int64_t m_congestedUntilNs = 0;  // network thread only
     int64_t m_lastDipNs = 0;         // network thread only
     int64_t m_lastClimbNs = 0;       // network thread only
+    int64_t m_floorLogNs = 0;        // network thread only
     double m_queueBaselineMs = -1;   // the device's own queue floor; network thread only
     uint32_t m_maxKbps;
     bool m_adaptive;
