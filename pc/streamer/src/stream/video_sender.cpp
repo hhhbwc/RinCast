@@ -312,6 +312,27 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
             RC_LOGI("Stream %u: guard at the floor, queue %.0f ms, sending %u of %u kbps, arriving %.0f kbps",
                     m_streamId, q, rate, target, m_receivedKbps);
         }
+        // Ceiling probe: after a long clean stretch at the target, briefly push above
+        // it to learn whether the path has more headroom. Any queue or loss ends the
+        // probe at once; half a minute passes before the next one.
+        if (m_congestionKbps.load() == 0) {
+            const bool cleanLong = !congested && q >= 0 && q < queueFloor + 8 &&
+                                   now - m_lastDipNs > 10'000'000'000LL &&
+                                   now - m_lastProbeEndNs > 30'000'000'000LL;
+            if (!m_probing.load() && cleanLong) {
+                m_probing.store(true);
+                m_probeUntilNs = now + 15'000'000'000LL;
+                RC_LOGI("Stream %u: probing above the target (%u kbps) for 15 s", m_streamId,
+                        uint32_t(m_targetKbps.load() * 115 / 100));
+            }
+        }
+        if (m_probing.load()) {
+            if (congested || q > queueFloor + 25 || now > m_probeUntilNs) {
+                m_probing.store(false);
+                m_lastProbeEndNs = now;
+                RC_LOGI("Stream %u: probe ended after a queue or a loss", m_streamId);
+            }
+        }
         return;
     }
 

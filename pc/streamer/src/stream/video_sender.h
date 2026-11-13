@@ -58,7 +58,10 @@ class VideoSender {
     // Bitrate the encoder should use now (changes when adaptive).
     uint32_t TargetBitrateKbps() const {
         const uint32_t cap = m_congestionKbps.load();
-        const uint32_t t = m_targetKbps.load();
+        uint32_t t = m_targetKbps.load();
+        // A clean stretch above the target buys a short probe past it: the only way to
+        // learn whether the path has more headroom. Any queue or loss ends the probe.
+        if (m_probing.load()) t = std::max(t, m_probeKbps.load());
         return cap ? std::min(cap, t) : t;
     }
     void SetMaxBitrate(uint32_t kbps);
@@ -85,6 +88,10 @@ class VideoSender {
     // mode leaves this alone - its AIMD owns m_targetKbps.
     std::atomic<uint32_t> m_congestionKbps{0};
     int64_t m_lastDipNs = 0;         // network thread only
+    std::atomic<bool> m_probing{false};
+    int64_t m_probeUntilNs = 0;      // network thread only
+    int64_t m_lastProbeEndNs = 0;    // network thread only
+    std::atomic<uint32_t> m_probeKbps{0};
     int m_baseFecPercent = -1;       // the setting's FEC; network thread only
     std::atomic<int> m_dynamicFec{-1};  // what the packetizer currently runs; network thread only
     int64_t m_lastClimbNs = 0;       // network thread only
