@@ -349,6 +349,8 @@ class NvencEncoder final : public VideoEncoder {
 
    private:
     static constexpr uint32_t kDpbFrames = 8;
+    // 流启动后 fps 估计震荡约 3s（实测重启 0→15→96 后趋稳）；这段时间钳紧 VBV 抑制超调。
+    static constexpr int64_t kStartupVbvClampNs = 3'000'000'000LL;
 
     void ApplyBitrate(uint32_t kbps) {
         auto& rc = m_encodeConfig.rcParams;
@@ -372,15 +374,34 @@ class NvencEncoder final : public VideoEncoder {
     // 26 frames in a second sends ~170 Mbps against a 100 Mbps setting), which saturates the link.
     void TrackFrameInterval() {
         const int64_t now = rc::NowNs();
+        if (!m_streamStartNs) m_streamStartNs = now;
         if (m_lastEncodeNs) {
             const double interval = double(now - m_lastEncodeNs);
-            m_intervalNsSmooth = m_intervalNsSmooth > 0 ? m_intervalNsSmooth * 0.6 + interval * 0.4 : interval;
+            // 双向都快跟踪：预算必须贴合当前帧率。升得慢→突发帧沿用慢速大预算→超调；
+            // 降得慢→低帧率阶段沿用小预算→跑不满。0.4/0.6 比原来的 0.6/0.4 收敛更快。
+            m_intervalNsSmooth = m_intervalNsSmooth > 0 ? m_intervalNsSmooth * 0.4 + interval * 0.6 : interval;
         }
         m_lastEncodeNs = now;
         if (m_config.desktop || m_intervalNsSmooth <= 0 || !m_encoder) return;
-        if (m_lastVbvNs && now - m_lastVbvNs < 500'000'000LL) return;
         const uint32_t fps = uint32_t(std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 6.0, double(m_config.fps)));
-        const uint32_t want = uint32_t(double(m_config.bitrateKbps) * 1000.0 / fps) * 3 / 2;
+        // 门控从 500ms 缩到 100ms：预算陈旧是超调/欠速的主因，帧率一变就尽快重配。
+        if (m_lastVbvNs && now - m_lastVbvNs < 100'000'000LL) return;
+        // 稳态 fps 在 87-92 间抖，每个整数变化都重配 → 每秒约十次（无害但刷日志、扰动编码）。
+        // 只有偏离上次实际下发的 fps 超过一个相对死区（±1/12，至少 3fps）才重配；真实帧率
+        // 变化和累积漂移仍会触发。锚在 m_effectiveFps 上，所以缓慢漂移攒够一档照样会重配。
+        if (m_effectiveFps) {
+            const uint32_t band = std::max(3u, m_effectiveFps / 12);
+            const uint32_t lo = m_effectiveFps > band ? m_effectiveFps - band : 0;
+            if (fps >= lo && fps <= m_effectiveFps + band) return;
+        }
+        uint32_t want = uint32_t(double(m_config.bitrateKbps) * 1000.0 / fps) * 3 / 2;
+        // 启动宽限期内把 VBV 钳到标称帧率的大小。重启瞬间 fps 估计剧烈震荡（实测 0→15→96），
+        // 低 fps 会把 VBV 撑到 8Mbit 且起始即满，帧率一跳高就整桶倾泻 → 启动超调（实测 101.7Mbps
+        // 顶爆链路）。桶钳小后瞬态随之变小；宽限期过后恢复跟踪，真实低帧率仍能拿大 VBV 跑满码率。
+        if (now - m_streamStartNs < kStartupVbvClampNs) {
+            const uint32_t nominal = uint32_t(double(m_config.bitrateKbps) * 1000.0 / m_config.fps) * 3 / 2;
+            want = std::min(want, nominal);
+        }
         const uint32_t rateNum = fps * 1000;
         if (m_init.frameRateNum == rateNum && m_encodeConfig.rcParams.vbvBufferSize == want) return;
         m_effectiveFps = fps;
@@ -454,6 +475,7 @@ class NvencEncoder final : public VideoEncoder {
     // The interval between encoded frames, smoothed, the rate last told to the encoder, and when
     // the VBV was last sized for it.
     int64_t m_lastEncodeNs = 0;
+    int64_t m_streamStartNs = 0;
     double m_intervalNsSmooth = 0;
     uint32_t m_effectiveFps = 0;
     int64_t m_lastVbvNs = 0;

@@ -5,11 +5,84 @@
 
 #include "rc/platform.h"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+// CREATE_WAITABLE_TIMER_HIGH_RESOLUTION is Win10 1803+; older SDKs lack it.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#endif
+
 namespace rc {
 
 namespace {
 inline bool FrameNewer(uint32_t a, uint32_t b) { return int32_t(a - b) > 0; }
+
+// Inside this window to the due time, send right away instead of waiting.
+// The high-resolution cancelable wait wakes with ~1.0 ms accuracy on this machine
+// (measured: a 0.5 ms period timer ticks at 1.0 ms), so the threshold stays small:
+// a batch emits ~(wake error + threshold) x pacing rate, ~22 KB at 0.2 ms.
+constexpr int64_t kPaceWaitThresholdNs = 200'000;
+// At most this much of a late send clock is repaid; beyond it the debt is dropped
+constexpr int64_t kPaceMaxDebtNs = 600'000;
+// (better to send less than to repay a stall as one burst).
+constexpr int64_t kPaceIdleResetNs = 50'000'000;
 }  // namespace
+
+VideoPacketizer::VideoPacketizer(Connection* connection) : m_connection(connection) {
+#ifdef _WIN32
+    // High-resolution cancelable wait: a high-resolution timer (~0.5 ms real accuracy)
+    // plus the stop event, waited on together, so shutdown need not wait out a packet.
+    m_paceTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!m_paceTimer) m_paceTimer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+    m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+#endif
+}
+
+VideoPacketizer::~VideoPacketizer() {
+#ifdef _WIN32
+    if (m_paceTimer) CloseHandle(static_cast<HANDLE>(m_paceTimer));
+    if (m_stopEvent) CloseHandle(static_cast<HANDLE>(m_stopEvent));
+    m_paceTimer = nullptr;
+    m_stopEvent = nullptr;
+#endif
+}
+
+void VideoPacketizer::RequestStop() {
+    m_stopRequested.store(true, std::memory_order_relaxed);
+#ifdef _WIN32
+    if (m_stopEvent) SetEvent(static_cast<HANDLE>(m_stopEvent));
+#endif
+}
+
+bool VideoPacketizer::WaitDue(int64_t dueNs) {
+    if (m_stopRequested.load(std::memory_order_relaxed)) return false;
+    if (dueNs - NowNs() <= kPaceWaitThresholdNs) return true;  // due now, send at once
+#ifdef _WIN32
+    if (m_paceTimer && m_stopEvent) {
+        const int64_t remain = dueNs - NowNs();
+        if (remain <= kPaceWaitThresholdNs) return true;
+        LARGE_INTEGER li;
+        li.QuadPart = -std::max<int64_t>(1, remain / 100);  // negative = relative, in 100 ns units
+        if (SetWaitableTimerEx(static_cast<HANDLE>(m_paceTimer), &li, 0, nullptr, nullptr, nullptr, 0)) {
+            const HANDLE handles[2] = {static_cast<HANDLE>(m_paceTimer), static_cast<HANDLE>(m_stopEvent)};
+            const DWORD r = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+            if (r == WAIT_OBJECT_0 + 1) return false;  // the stop event came first
+            return true;
+        }
+    }
+#endif
+    // Fallback when the timer is unavailable: coarse sleeps (still an order of magnitude
+    const int64_t remain = dueNs - NowNs();
+    if (remain > 1'000'000) SleepMs(int(remain / 1'000'000));
+    return !m_stopRequested.load(std::memory_order_relaxed);
+}
 
 size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t frameFlags, uint32_t frameIndex,
                                   const void* metadata, uint16_t metadataSize, const uint8_t* bitstream,
@@ -43,19 +116,32 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
     if (group) parity.assign(fragPayload, 0);
     size_t sent = 0;
     const size_t lastSize = total - (count - 1) * fragPayload;
-    const int64_t paceStart = m_pacingKbps ? NowNs() : 0;
-    const double nsPerByte = m_pacingKbps ? 8e6 / m_pacingKbps : 0;
+    const uint32_t kbps = m_pacingKbps.load(std::memory_order_relaxed);
+    const bool paced = kbps != 0;
+    // Every byte (headers and FEC parity included) takes wire time: this is that count.
+    const double nsPerByte = paced ? 8e6 / double(kbps) : 0.0;
+    if (paced) {
+        const int64_t now = NowNs();
+        if (m_nextSendNs == 0 || m_nextSendNs < now - kPaceIdleResetNs) m_nextSendNs = now;
+    }
 
     for (size_t i = 0; i < count; i++) {
         const size_t offset = i * fragPayload;
         const size_t len = std::min(fragPayload, total - offset);
         h.fragmentIndex = uint16_t(i);
-        if (m_pacingKbps) {
-            const int64_t due = paceStart + int64_t(double(offset) * nsPerByte);
-            if (due - NowNs() > 1'500'000) SleepMs(1);  // small bursts are fine; timers are coarse
+        if (paced) {
+            if (!WaitDue(m_nextSendNs)) {
+                RC_LOGD("Video pacing: stopping mid-frame (%zu of %zu datagrams sent)", sent, count);
+                return sent;
+            }
+            // A big lag drops the extra debt (no burst after a stall); a small lag keeps it, so
+            // the pacing rate is not eaten by the wake error.
+            const int64_t now = NowNs();
+            if (m_nextSendNs < now - kPaceMaxDebtNs) m_nextSendNs = now - kPaceMaxDebtNs;
         }
         m_connection->Send2(PacketType::Video, &h, sizeof(h), m_frame.data() + offset, len);
         sent++;
+        if (paced) m_nextSendNs += int64_t(double(sizeof(h) + len) * nsPerByte);
         if (group) {
             for (size_t b = 0; b < len; b++) parity[b] ^= m_frame[offset + b];
             const bool groupEnd = ((i + 1) % group == 0) || (i + 1 == count);
@@ -71,8 +157,18 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
                 // Only send parity when the group has more than one member.
                 const size_t groupMembers = i - size_t(ph.groupIndex) * group + 1;
                 if (groupMembers > 1) {
+                    // Parity packets cost the same wire time as data ones and go out at the same pace.
+                    if (paced) {
+                        if (!WaitDue(m_nextSendNs)) {
+                            RC_LOGD("Video pacing: stopping mid-frame (%zu of %zu datagrams sent)", sent, count);
+                            return sent;
+                        }
+                        const int64_t now = NowNs();
+                        if (m_nextSendNs < now - kPaceMaxDebtNs) m_nextSendNs = now - kPaceMaxDebtNs;
+                    }
                     m_connection->Send2(PacketType::VideoParity, &ph, sizeof(ph), parity.data(), fragPayload);
                     sent++;
+                    if (paced) m_nextSendNs += int64_t(double(sizeof(ph) + fragPayload) * nsPerByte);
                 }
                 std::fill(parity.begin(), parity.end(), uint8_t(0));
             }
