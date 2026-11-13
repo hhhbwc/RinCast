@@ -11,6 +11,7 @@
 
 #include "../encode/encoder.h"
 #include "rc/connection.h"
+#include "rc/queue_guard.h"
 #include "rc/video_transport.h"
 
 namespace rcs {
@@ -83,10 +84,11 @@ class VideoSender {
     const rc::VideoCodec m_codec;
     std::atomic<bool> m_keyframeRequested{true};
     std::atomic<uint32_t> m_targetKbps;
-    // Fixed-bitrate congestion guard (OnFeedback): dips below the target while the link
-    // saturates, climbs back when the path looks calm. 0 = no dip active. Quality-adaptive
-    // mode leaves this alone - its AIMD owns m_targetKbps.
-    std::atomic<uint32_t> m_congestionKbps{0};
+    // Fixed-bitrate guard (OnFeedback): holds the rate under what the path carries by
+    // watching the queue the headset reports. Its law and the measurements behind it live
+    // in rc/queue_guard.h; this class only owns the timing and the logging around it.
+    rc::QueueGuard m_guard;
+    std::atomic<uint32_t> m_congestionKbps{0};  // mirror of m_guard.Cap() for the sender side
     int64_t m_lastDipNs = 0;         // network thread only
     std::atomic<bool> m_probing{false};
     int64_t m_probeUntilNs = 0;      // network thread only
@@ -94,7 +96,6 @@ class VideoSender {
     std::atomic<uint32_t> m_probeKbps{0};
     int m_baseFecPercent = -1;       // the setting's FEC; network thread only
     std::atomic<int> m_dynamicFec{-1};  // what the packetizer currently runs; network thread only
-    int64_t m_lastClimbNs = 0;       // network thread only
     int64_t m_floorLogNs = 0;        // network thread only
     double m_queueBaselineMs = -1;   // the device's own queue floor; network thread only
     uint32_t m_maxKbps;

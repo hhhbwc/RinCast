@@ -32,6 +32,7 @@
 #include "rc/motion_field.h"
 #include "rc/music.h"
 #include "rc/platform.h"
+#include "rc/queue_guard.h"
 #include "rc/video_transport.h"
 
 using namespace rc;
@@ -997,6 +998,151 @@ static void TestLinkLocalDiscovery() {
     CHECK(tried == 0 || heard > 0);
 }
 
+// ---------------------------------------------------------------------------
+// The fixed-bitrate guard, against a modelled link.
+//
+// This checks the control law, not the radio: the queue is a backlog that grows when the
+// rate is above capacity, and the headset's reading is what its DelayTracker reports - the
+// delay now minus the lowest delay of the last four seconds, so a queue that simply sits
+// there stops being reported (that is why the guard's threshold has to be a band and not a
+// level). What is asserted is what went wrong in the field: never pinning at the floor,
+// never walking the rate down in steps, and settling near the capacity instead of
+// oscillating around it.
+namespace {
+struct SimLink {
+    double capacityKbps = 100000;
+    double backpackMs = 0;
+    double naturalMs = 25;  // what the AP and its queueing add when it carries the stream
+    double ring[40] = {};   // the last 4 s of instantaneous delay, 100 ms apart
+    int ringPos = 0;
+    int ringCount = 0;
+
+    void Step(double rateKbps, double stepMs) {
+        // Above capacity the excess waits: one second of a 10% overload is 100 ms of queue.
+        backpackMs += (rateKbps - capacityKbps) * stepMs / capacityKbps;
+        if (backpackMs < 0) backpackMs = 0;  // a buffer drains at once, it does not go negative
+        ring[ringPos] = naturalMs + backpackMs;
+        ringPos = (ringPos + 1) % 40;
+        if (ringCount < 40) ringCount++;
+    }
+    // What the headset reports: this delay minus the lowest of the last four seconds.
+    double Report() const {
+        if (!ringCount) return -1;
+        double low = ring[0];
+        for (int i = 1; i < ringCount; i++) low = std::min(low, ring[i]);
+        return ring[(ringPos + 39) % 40] - low;
+    }
+};
+
+struct SimRun {
+    uint32_t lastRate = 0;
+    int dips = 0;
+    int climbs = 0;
+    int floorHits = 0;
+    int reversals = 0;
+    int dir = 0;
+};
+
+// Runs the guard against a link, calling it every 100 ms like the headset's feedback does.
+// nowNs is optional: pass it to carry the clock across consecutive runs of one scenario.
+SimRun RunGuard(rc::QueueGuard& guard, SimLink& link, uint32_t targetKbps, double seconds,
+                int64_t* nowNs = nullptr, double keyframeEverySec = 0) {
+    SimRun run;
+    int64_t localNow = 0;
+    int64_t& now = nowNs ? *nowNs : localNow;
+    const int steps = int(seconds * 10);
+    for (int i = 0; i < steps; i++) {
+        const uint32_t cap = guard.Cap();
+        const double rate = cap ? cap : targetKbps;
+        link.Step(rate, 100.0);
+        now += 100'000'000LL;
+        const bool keyframe = keyframeEverySec > 0 && std::fmod(i * 0.1, keyframeEverySec) < 0.099;
+        const auto res = guard.Update(targetKbps, link.Report(), 0, keyframe, now);
+        if (res.action == rc::QueueGuard::Action::Dip) {
+            run.dips++;
+            run.dir = -1;
+        } else if (res.action == rc::QueueGuard::Action::Climb ||
+                   res.action == rc::QueueGuard::Action::Released) {
+            run.climbs++;
+            run.dir = 1;
+        }
+        if (res.capKbps && res.capKbps <= targetKbps / guard.Config().minDivisor) run.floorHits++;
+        run.lastRate = res.capKbps ? res.capKbps : targetKbps;
+    }
+    return run;
+}
+}  // namespace
+
+static void TestQueueGuard() {
+    rc::QueueGuardConfig cfg;
+    const uint32_t target = 140000;
+
+    // 1. A link that carries 100 Mb/s: settle under it, inside the band, and stay there.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        SimLink link;
+        link.capacityKbps = 100000;
+        int64_t now = 0;
+        auto run = RunGuard(guard, link, target, 40);
+        const double steady = link.Report();
+        std::printf("queue guard: 100 Mb/s link settles at %u kbps (reported queue %.0f ms, %d dips)\n",
+                    run.lastRate, steady, run.dips);
+        CHECK(run.lastRate <= 104000);       // did not sit on the target and flood
+        CHECK(run.lastRate >= 84000);        // nor gave the link away
+        CHECK(run.floorHits == 0);           // never pinned
+        CHECK(run.dips < 40);                // 40 s is 400 reports: this is not a sawtooth
+        CHECK(steady < 60);                  // the queue it holds is a budget, not a second
+    }
+
+    // 2. The path halves mid-stream: follow it down without falling to the floor.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        SimLink link;
+        link.capacityKbps = 100000;
+        int64_t now = 0;
+        RunGuard(guard, link, target, 30, &now);
+        link.capacityKbps = 55000;
+        auto run = RunGuard(guard, link, target, 30, &now);
+        std::printf("queue guard: path halves to 55 Mb/s, settles at %u kbps (%d dips, %d at the floor)\n",
+                    run.lastRate, run.dips, run.floorHits);
+        CHECK(run.lastRate <= 62000);
+        CHECK(run.lastRate >= 40000);
+        CHECK(run.floorHits == 0);
+    }
+
+    // 3. A burst of keyframe requests is one lost episode, not a reason to collapse.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        SimLink link;
+        link.capacityKbps = 100000;
+        int64_t now = 0;
+        RunGuard(guard, link, target, 20, &now);
+        const uint32_t before = guard.Cap() ? guard.Cap() : target;
+        auto run = RunGuard(guard, link, target, 5, &now, 0.2);  // a request every 200 ms
+        std::printf("queue guard: keyframe storm 140 -> %u kbps (was %u)\n", run.lastRate, before);
+        // A storm is real loss, so some dip is right - but a sixth of the rate, not two
+        // thirds. Before this law, twelve requests in ten seconds walked 140 to 30 Mb/s.
+        CHECK(run.lastRate > before * 85 / 100);
+    }
+
+    // 4. A device whose own queue is deep is not congested for its whole life.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        SimLink link;
+        link.capacityKbps = 100000;
+        link.naturalMs = 45;  // a headset that adds 45 ms just by existing
+        int64_t now = 0;
+        auto run = RunGuard(guard, link, target, 30);
+        std::printf("queue guard: 45 ms device floor, settles at %u kbps (%d dips)\n", run.lastRate, run.dips);
+        CHECK(run.lastRate >= 84000);  // the baseline is not read as congestion
+        CHECK(run.floorHits == 0);
+    }
+}
+
 int main() {
     TestLinkLocalDiscovery();
     TestMusic();
@@ -1012,6 +1158,7 @@ int main() {
     TestPacing();
     TestPacingBursts();
     TestPacingStop();
+    TestQueueGuard();
     TestFecDeterministic();
     TestHandshakeAndTransport();
     std::printf(g_failures ? "%d FAILURES\n" : "ALL TESTS PASSED\n", g_failures);
