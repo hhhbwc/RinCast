@@ -242,8 +242,10 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
         // on every report - a 15% sawtooth - and once the queue was a second deep it fired
         // forever, so a climb gated on "no harm for 1.5 s" never started and the guard sat
         // at the floor for the rest of the session.
-        const double dipAtMs = std::max(queueFloor + 45.0, 60.0);
-        const double severeMs = std::max(dipAtMs * 4.0, 250.0);
+        // 低延迟优先:平衡点压到基线+20ms(最低 25ms),延迟的队列分量有界;
+        // 码率贴着这个队列高度对应的容量跑,画质损失换来延迟稳定。
+        const double dipAtMs = std::max(queueFloor + 20.0, 25.0);
+        const double severeMs = std::max(dipAtMs * 3.0, 150.0);
         const bool keyframeDip = fb.requestKeyframe;
         const bool queueDip = q > dipAtMs;
         const bool dipGate = now - m_lastDipNs > 500'000'000LL;
@@ -275,7 +277,7 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
             // "no harm for 1.5 s" is a deadlock as soon as the queue rests above the
             // threshold (it did - 130 ms for 30 s at the floor). A climb is a probe; the
             // next dip answers it, and losses stay covered by the recovery frames.
-            const bool calm = q >= 0 && q < dipAtMs * 1.4;
+            const bool calm = q >= 0 && q < dipAtMs * 1.15;
             // Pinned at the floor with the queue down again: the path carries more, get
             // back on air. This is what left the tester 35 s at 17.5 Mb/s after a burst.
             const bool pinned = rate <= target / 8 && now - m_lastDipNs > 4'000'000'000LL && q < severeMs;
