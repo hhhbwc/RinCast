@@ -52,8 +52,7 @@ class StreamServer {
     void Approve(const std::string& deviceId, bool remember);
     void Deny(const std::string& deviceId);
 
-    void ExpectCloudSession(const std::string& sessionId, const ExpectedCloudSession& s);
-    void SetRendezvousHandler(RendezvousHandler h) { m_onRendezvous = std::move(h); }
+    void ExpectCloudSession(const std::string& sessionId, const ExpectedCloudSession& s);    void SetRendezvousHandler(RendezvousHandler h) { m_onRendezvous = std::move(h); }
 
     rc::UdpSocket& Socket() { return m_socket; }
     std::shared_ptr<ClientSession> ActiveSession();
@@ -66,6 +65,8 @@ class StreamServer {
     void DiscoveryV6Loop();
     std::vector<uint8_t> MakeAnnounce(uint32_t nonce);
     void HandleHello(const uint8_t* data, size_t size, const rc::NetAddress& from);
+    // Keeps the per-device handshake state bounded: it is keyed by strings off the network.
+    void PruneDeviceState(int64_t now);
     void SendReject(const rc::NetAddress& to, const std::string& reason, const std::string& message);
 
     rc::UdpSocket m_socket;
@@ -91,6 +92,7 @@ class StreamServer {
     std::map<std::string, int64_t> m_promptedAt;            // deviceId -> when we last asked
     std::map<std::string, int64_t> m_askedAt;               // deviceId -> when it last asked us
     std::map<std::string, std::string> m_approvalKey;       // deviceId -> identity key that asked
+    int64_t m_lastPruneNs = 0;                              // when the maps were last swept
     std::map<std::string, ExpectedCloudSession> m_cloudSessions;
 
     ApprovalCallback m_onApproval;

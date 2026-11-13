@@ -120,6 +120,49 @@ void StreamServer::SendReject(const rc::NetAddress& to, const std::string& reaso
     m_socket.SendTo(to, bytes.data(), bytes.size());
 }
 
+void StreamServer::PruneDeviceState(int64_t now) {
+    // An approval and a denial carry their own deadline; the rest is only interesting while
+    // the device keeps asking, so an hour is generous. Everything here is keyed by a string
+    // that arrived over the network, which is the point: it has to stay bounded.
+    const int64_t keepNs = 3'600'000'000'000LL;
+    for (auto it = m_approved.begin(); it != m_approved.end();) {
+        it = it->second < now ? m_approved.erase(it) : std::next(it);
+    }
+    for (auto it = m_denied.begin(); it != m_denied.end();) {
+        it = it->second < now ? m_denied.erase(it) : std::next(it);
+    }
+    for (auto it = m_askedAt.begin(); it != m_askedAt.end();) {
+        if (now - it->second > keepNs) {
+            m_approvalKey.erase(it->first);
+            m_promptedAt.erase(it->first);
+            it = m_askedAt.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = m_promptedAt.begin(); it != m_promptedAt.end();) {
+        it = now - it->second > keepNs ? m_promptedAt.erase(it) : std::next(it);
+    }
+    for (auto it = m_approvalKey.begin(); it != m_approvalKey.end();) {
+        it = m_askedAt.count(it->first) ? std::next(it) : m_approvalKey.erase(it);
+    }
+    for (auto it = m_cloudSessions.begin(); it != m_cloudSessions.end();) {
+        it = it->second.expiresNs < now ? m_cloudSessions.erase(it) : std::next(it);
+    }
+    // Backstop for a clock that jumped backwards (deadlines then look far in the future) and
+    // for a flood inside the window above. Dropping an entry only costs that device one more
+    // round of "ask again", so the policy is simply: keep the newest handful.
+    const size_t kMaxDevices = 64;
+    while (m_askedAt.size() > kMaxDevices) {
+        m_approvalKey.erase(m_askedAt.begin()->first);
+        m_promptedAt.erase(m_askedAt.begin()->first);
+        m_askedAt.erase(m_askedAt.begin());
+    }
+    while (m_approved.size() > kMaxDevices) m_approved.erase(m_approved.begin());
+    while (m_denied.size() > kMaxDevices) m_denied.erase(m_denied.begin());
+    while (m_cloudSessions.size() > 32) m_cloudSessions.erase(m_cloudSessions.begin());
+}
+
 void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAddress& from) {
     rc::HandshakePacket hello;
     if (!rc::ParseHandshake(data, size, hello) || hello.type != rc::PacketType::Hello) return;
@@ -144,6 +187,15 @@ void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAd
     const int64_t now = rc::NowNs();
 
     std::unique_lock lock(m_mutex);
+
+    // The device state below is keyed by a string that comes straight off the network, so
+    // anyone on the LAN can add an entry per packet: drop expired ones (and the oldest
+    // beyond a cap) before adding more. Once per 10 s is plenty - it only has to outpace
+    // growth, not latency.
+    if (now - m_lastPruneNs > 10'000'000'000LL) {
+        m_lastPruneNs = now;
+        PruneDeviceState(now);
+    }
 
     // Retransmitted Hello for an already-established session: resend Welcome.
     if (m_session && m_session->ClientPublicKeyHex() == pkHex) {

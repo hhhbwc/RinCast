@@ -385,12 +385,17 @@ class NvencEncoder final : public VideoEncoder {
             // 间隙则动不了它。
             if (m_intervalNsSmooth > 0) interval = std::min(interval, m_intervalNsSmooth * 3.0);
             m_intervalNsSmooth = m_intervalNsSmooth > 0 ? m_intervalNsSmooth * 0.4 + interval * 0.6 : interval;
+            // Slow twin: drives the frameRateNum reconfigure. The fast twin absorbs
+            // bursts into the VBV; reconfiguring NVENC off the fast one thrashed the
+            // encoder at ~10 Hz on heavy scenes (the tester's stutter).
+            m_intervalNsSlow = m_intervalNsSlow > 0 ? m_intervalNsSlow * 0.9 + interval * 0.1 : interval;
         }
         m_lastEncodeNs = now;
         if (m_config.desktop || m_intervalNsSmooth <= 0 || !m_encoder) return;
-        const uint32_t fps = uint32_t(std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 2.0, double(m_config.fps)));
+        const uint32_t fpsFast = uint32_t(std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 2.0, double(m_config.fps)));
+        const uint32_t fps = uint32_t(std::clamp(1e9 / m_intervalNsSlow, double(m_config.fps) / 2.0, double(m_config.fps)));
         // 门控从 500ms 缩到 100ms：预算陈旧是超调/欠速的主因，帧率一变就尽快重配。
-        if (m_lastVbvNs && now - m_lastVbvNs < 100'000'000LL) return;
+        if (m_lastVbvNs && now - m_lastVbvNs < 1'000'000'000LL) return;
         // 稳态 fps 在 87-92 间抖，每个整数变化都重配 → 每秒约十次（无害但刷日志、扰动编码）。
         // 只有偏离上次实际下发的 fps 超过一个相对死区（±1/12，至少 3fps）才重配；真实帧率
         // 变化和累积漂移仍会触发。锚在 m_effectiveFps 上，所以缓慢漂移攒够一档照样会重配。
@@ -399,7 +404,7 @@ class NvencEncoder final : public VideoEncoder {
             const uint32_t lo = m_effectiveFps > band ? m_effectiveFps - band : 0;
             if (fps >= lo && fps <= m_effectiveFps + band) return;
         }
-        uint32_t want = uint32_t(double(m_config.bitrateKbps) * 1000.0 / fps) * 3 / 2;
+        uint32_t want = uint32_t(double(m_config.bitrateKbps) * 1000.0 / fpsFast) * 3 / 2;
         // 启动宽限期内把 VBV 钳到标称帧率的大小。重启瞬间 fps 估计剧烈震荡（实测 0→15→96），
         // 低 fps 会把 VBV 撑到 8Mbit 且起始即满，帧率一跳高就整桶倾泻 → 启动超调（实测 101.7Mbps
         // 顶爆链路）。桶钳小后瞬态随之变小；宽限期过后恢复跟踪，真实低帧率仍能拿大 VBV 跑满码率。
@@ -484,6 +489,7 @@ class NvencEncoder final : public VideoEncoder {
     int64_t m_lastEncodeNs = 0;
     int64_t m_streamStartNs = 0;
     double m_intervalNsSmooth = 0;
+    double m_intervalNsSlow = 0;
     uint32_t m_effectiveFps = 0;
     int64_t m_lastVbvNs = 0;
     uint64_t m_lastIntraTs = 0;
