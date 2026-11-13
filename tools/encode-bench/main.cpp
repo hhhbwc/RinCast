@@ -55,6 +55,8 @@ struct NetArrival {
 };
 
 int main(int argc, char** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
     EncoderConfig ec;
     ec.codec = rc::VideoCodec::HEVC;
     ec.width = 3664;

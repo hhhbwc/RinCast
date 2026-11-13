@@ -376,9 +376,14 @@ class NvencEncoder final : public VideoEncoder {
         const int64_t now = rc::NowNs();
         if (!m_streamStartNs) m_streamStartNs = now;
         if (m_lastEncodeNs) {
-            const double interval = double(now - m_lastEncodeNs);
+            double interval = double(now - m_lastEncodeNs);
             // 双向都快跟踪：预算必须贴合当前帧率。升得慢→突发帧沿用慢速大预算→超调；
             // 降得慢→低帧率阶段沿用小预算→跑不满。0.4/0.6 比原来的 0.6/0.4 收敛更快。
+            // 但一次停顿（加载/卡顿）不是帧率：一个 800ms 的间隔会把跟踪率砸到 15fps
+            // 下限，游戏恢复后每帧预算放大六倍（启动时实测过同款 101.7Mbps 顶爆链路）。
+            // 单个样本钳到平滑值的 3 倍：持续变慢照样收敛（上限随平滑自适应），一次性的
+            // 间隙则动不了它。
+            if (m_intervalNsSmooth > 0) interval = std::min(interval, m_intervalNsSmooth * 3.0);
             m_intervalNsSmooth = m_intervalNsSmooth > 0 ? m_intervalNsSmooth * 0.4 + interval * 0.6 : interval;
         }
         m_lastEncodeNs = now;
@@ -404,16 +409,18 @@ class NvencEncoder final : public VideoEncoder {
         }
         const uint32_t rateNum = fps * 1000;
         if (m_init.frameRateNum == rateNum && m_encodeConfig.rcParams.vbvBufferSize == want) return;
-        m_effectiveFps = fps;
-        m_init.frameRateNum = rateNum;
-        m_init.frameRateDen = 1000;
-        m_encodeConfig.rcParams.vbvBufferSize = want;
-        m_encodeConfig.rcParams.vbvInitialDelay = want;
         NV_ENC_RECONFIGURE_PARAMS re{};
         re.version = NV_ENC_RECONFIGURE_PARAMS_VER;
         re.reInitEncodeParams = m_init;
         re.reInitEncodeParams.encodeConfig = &m_encodeConfig;
         if (NvencLib::Get().api.nvEncReconfigureEncoder(m_encoder, &re) == NV_ENC_SUCCESS) {
+            // 记账只在成功后：失败时编码器还是旧码率，把 m_effectiveFps/m_init 记成新值
+            // 会让下一次的判重跳过重试，VBV 的计算口径也和编码器实际状态脱节。
+            m_effectiveFps = fps;
+            m_init.frameRateNum = rateNum;
+            m_init.frameRateDen = 1000;
+            m_encodeConfig.rcParams.vbvBufferSize = want;
+            m_encodeConfig.rcParams.vbvInitialDelay = want;
             m_lastVbvNs = now;
             RC_LOGI("NVENC: %.0f fps measured, encoder rate %u fps, VBV %.2f Mbit", 1e9 / m_intervalNsSmooth, fps, double(want) / 1e6);
         }
