@@ -219,26 +219,28 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
         // Fixed bitrate: the user asked for a constant rate. Chronic small losses are
         // FINE here - the recovery frames cover them - so they must not ratchet the
         // rate down. Only real HARM backs the rate off: the headset asking for a
-        // keyframe (the freeze precursor), or the queue piling well past the device's
-        // own floor. Each harmful event dips 20%; without harm for 1.5 s the rate
-        // climbs back in steps - probing the ceiling, hovering at the true edge.
-        const bool harmful = fb.requestKeyframe || q > queueFloor + 25;
-        if (harmful) {
+        // keyframe (the freeze precursor), or the queue piling past the device's own
+        // floor. Gentle steps - a harsh step per 300 ms swung the rate from 140 to 71
+        // and back every couple of seconds. The ride hovers at the path's edge.
+        const bool keyframeDip = fb.requestKeyframe;
+        const bool queueDip = q > queueFloor + 25;
+        const bool dipGate = now - m_lastDipNs > 500'000'000LL;
+        if (keyframeDip || (queueDip && dipGate)) {
             m_lastDipNs = now;
             const uint32_t base = m_congestionKbps.load() ? m_congestionKbps.load() : m_targetKbps.load();
-            uint32_t cap = base * 4 / 5;
+            uint32_t cap = keyframeDip ? base * 4 / 5 : base * 85 / 100;
             if (queueHigh && m_receivedKbps > 0) cap = std::min(cap, uint32_t(m_receivedKbps * 0.8));
             m_congestionKbps.store(std::max(cap, m_targetKbps.load() / 8));
             RC_LOGI("Stream %u: congestion guard dip to %u kbps (queue %.0f ms, floor %.0f, loss %.1f %%)",
                     m_streamId, m_congestionKbps.load(), q, queueFloor, lossRate * 100);
         } else if (m_congestionKbps.load() && now > m_congestedUntilNs &&
                    now - m_lastDipNs > 1'500'000'000LL) {
-            // No harm for 1.5 s: climb in steps. Small losses on the way are tolerated
+            // No harm for 1.5 s: climb gently. Small losses on the way are tolerated
             // (recovery frames) and do not reset this - only harm does.
             if (now - m_lastClimbNs > 500'000'000LL) {
                 m_lastClimbNs = now;
                 const uint32_t target = m_targetKbps.load();
-                const uint32_t up = std::min(m_congestionKbps.load() * 5 / 4, target);
+                const uint32_t up = std::min(m_congestionKbps.load() * 21 / 20, target);
                 m_congestionKbps.store(up);
                 if (m_congestionKbps.load() >= target) RC_LOGI("Stream %u: congestion guard released, back to %u kbps",
                                                                m_streamId, target);
