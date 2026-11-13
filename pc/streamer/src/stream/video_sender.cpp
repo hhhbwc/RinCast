@@ -230,8 +230,8 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
             if (m_congestedUntilNs == 0) RC_LOGI("Stream %u: congestion guard dip to %u kbps (queue %.0f ms, loss %.1f %%)",
                                                  m_streamId, m_congestionKbps.load(), q, lossRate * 100);
             m_congestedUntilNs = now + 1'500'000'000LL;
-        } else if (m_congestionKbps.load() && q < queueFloor + 5 && now > m_congestedUntilNs &&
-                   now - m_lastLossNs > 1'500'000'000LL) {
+        } else if (m_congestionKbps.load() && now > m_congestedUntilNs &&
+                   now - m_lastDipNs > 1'500'000'000LL) {
             // The queue drained and the losses stopped: climb back in steps.
             if (now - m_lastClimbNs > 300'000'000LL) {
                 m_lastClimbNs = now;
