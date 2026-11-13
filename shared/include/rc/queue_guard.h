@@ -25,6 +25,11 @@ struct QueueGuardConfig {
     double bandMs = 12.0;     // target +- band is the dead band: no dips, no climbs
     double floorExtraMs = 25.0;  // never dip under the device's own queue plus this
     uint32_t minDivisor = 8;  // hard floor = target / minDivisor
+    // A rate that just caused a dip is not a rate to climb back to. The climb stops just
+    // under it, and the ceiling only rises after this long without a dip - otherwise every
+    // cycle ends with two dips and a visible pump (measured: 140 -> 113 -> 140 every ten
+    // seconds, nine encoder reconfigures per cycle).
+    int64_t ceilingRiseNs = 60'000'000'000LL;
 };
 
 class QueueGuard {
@@ -41,6 +46,8 @@ public:
     uint32_t Cap() const { return m_cap; }
     void Reset() {
         m_cap = 0;
+        m_ceiling = 0;
+        m_ceilingNs = 0;
         m_lastDipNs = 0;
         m_lastClimbNs = 0;
         m_lastKeyDipNs = 0;
@@ -62,9 +69,27 @@ public:
         const double climbUnder = std::max(m_cfg.targetMs - m_cfg.bandMs, queueFloorMs + 2.0);
         const double dipAt = std::max(m_cfg.targetMs + m_cfg.bandMs, queueFloorMs + m_cfg.floorExtraMs);
 
-        const auto dip = [&](uint32_t permille) {
+        // The ceiling only rises after a long clean stretch, so the climb stops just under
+        // the level that failed instead of running back into it every few seconds.
+        if (m_ceiling && nowNs - m_ceilingNs > m_cfg.ceilingRiseNs) {
+            const uint32_t raised = m_ceiling + m_ceiling / 32 + 1;
+            m_ceiling = raised >= targetKbps ? 0 : raised;  // cleared: try the target again
+            m_ceilingNs = nowNs;
+        }
+
+        const auto dip = [&](uint32_t permille, bool congestion) {
             const uint32_t base = m_cap ? m_cap : targetKbps;
             const uint32_t next = std::max<uint32_t>(uint64_t(base) * permille / 1000, hardFloor);
+            // The level that failed is the new ceiling: climbing straight back to it is what
+            // made the stream pump between two levels every few seconds. Only a fresh episode
+            // counts - while the queue from the last dip is still draining, every 400 ms looks
+            // like another failure at a lower rate, and taking those as the ceiling ratcheted
+            // it under the path's capacity (76 Mb/s on a 100 Mb/s link in the simulation).
+            // And only congestion counts: a lost frame is not evidence about the path.
+            if (congestion && nowNs - m_lastDipNs > 2'000'000'000LL) {
+                m_ceiling = base;
+                m_ceilingNs = nowNs;
+            }
             if (m_cap && next >= m_cap) return false;  // already at the floor
             m_cap = next;
             m_lastDipNs = nowNs;
@@ -75,11 +100,19 @@ public:
             const uint32_t base = m_cap ? m_cap : targetKbps;
             uint32_t next = uint32_t(uint64_t(base) * permille / 1000);
             if (next <= base) next = base + 1;
-            if (next >= targetKbps) {
-                m_cap = 0;
-                r.action = Action::Released;
+            const uint32_t aim = AimKbps(targetKbps);
+            if (next >= aim) {
+                if (aim >= targetKbps) {
+                    m_cap = 0;
+                    r.action = Action::Released;
+                } else {
+                    m_cap = aim;  // hold under the ceiling; no dip needed to stay there
+                    if (m_cap == base) return;
+                    r.action = Action::Climb;
+                }
             } else {
                 m_cap = next;
+                r.action = Action::Climb;
             }
             m_lastClimbNs = nowNs;
         };
@@ -89,7 +122,7 @@ public:
         // report, and one burst walked 140 -> 30 Mb/s in ten seconds.
         if (keyframeRequested && nowNs - m_lastKeyDipNs > 2'000'000'000LL) {
             m_lastKeyDipNs = nowNs;
-            if (dip(measured && queueMs > dipAt ? 650 : 880)) {
+            if (dip(measured && queueMs > dipAt ? 650 : 880, measured && queueMs > dipAt)) {
                 r.capKbps = m_cap;
                 return r;
             }
@@ -99,7 +132,7 @@ public:
             // How far past the target decides the step: a queue a second deep needs to go
             // now, a queue 10 ms past the band does not.
             const bool deep = queueMs > dipAt * 2.5;
-            if (dip(deep ? 750 : 900)) {
+            if (dip(deep ? 750 : 900, true)) {
                 r.capKbps = m_cap;
                 return r;
             }
@@ -117,8 +150,17 @@ public:
     }
 
 private:
+    // Where the climb is allowed to stop: just under the last rate that failed.
+    uint32_t AimKbps(uint32_t targetKbps) const {
+        if (!m_ceiling) return targetKbps;
+        const uint32_t under = m_ceiling * 97 / 100;
+        return std::min(targetKbps, std::max<uint32_t>(under, 2000u));
+    }
+
     QueueGuardConfig m_cfg{};
     uint32_t m_cap = 0;
+    uint32_t m_ceiling = 0;    // the rate that last caused a dip; 0 = unknown
+    int64_t m_ceilingNs = 0;
     int64_t m_lastDipNs = 0;
     int64_t m_lastClimbNs = 0;
     int64_t m_lastKeyDipNs = 0;

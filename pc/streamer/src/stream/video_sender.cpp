@@ -269,27 +269,10 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
             RC_LOGI("Stream %u: guard at the floor, queue %.0f ms, sending %u of %u kbps, arriving %.0f kbps",
                     m_streamId, q, res.capKbps, target, m_receivedKbps);
         }
-        // Ceiling probe: after a long clean stretch at the target, briefly push above it to
-        // learn whether the path has more headroom. Any queue or loss ends the probe at once;
-        // half a minute passes before the next one.
-        if (m_congestionKbps.load() == 0) {
-            const bool cleanLong = !congested && q >= 0 && q < queueFloor + 8 &&
-                                   now - m_lastDipNs > 10'000'000'000LL &&
-                                   now - m_lastProbeEndNs > 30'000'000'000LL;
-            if (!m_probing.load() && cleanLong) {
-                m_probing.store(true);
-                m_probeKbps.store(uint32_t(m_targetKbps.load() * 115 / 100));
-                m_probeUntilNs = now + 15'000'000'000LL;
-                RC_LOGI("Stream %u: probing above the target (%u kbps) for 15 s", m_streamId, m_probeKbps.load());
-            }
-        }
-        if (m_probing.load()) {
-            if (congested || q > queueFloor + 25 || now > m_probeUntilNs) {
-                m_probing.store(false);
-                m_lastProbeEndNs = now;
-                RC_LOGI("Stream %u: probe ended after a queue or a loss", m_streamId);
-            }
-        }
+        // No ceiling probe above the target: the guard's own ceiling already re-probes
+        // upward after a clean minute, and a flat +15% push fired straight past the path
+        // (161 Mb/s on a link that carries ~115) - every probe ended in a dip within a
+        // second, which is a stutter the user pays for nothing.
         return;
     }
 

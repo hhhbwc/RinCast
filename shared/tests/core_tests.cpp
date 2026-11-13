@@ -1141,6 +1141,38 @@ static void TestQueueGuard() {
         CHECK(run.lastRate >= 84000);  // the baseline is not read as congestion
         CHECK(run.floorHits == 0);
     }
+
+    // 5. Steady state: the climb stops under the rate that just failed, so the stream stops
+    //    pumping between two levels. The field saw 140 <-> 113 every ten seconds, and each
+    //    of those steps reconfigured NVENC (45 a minute on VRChat) - a stutter per step.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        SimLink link;
+        link.capacityKbps = 100000;
+        int64_t now = 0;
+        RunGuard(guard, link, target, 60, &now);  // let the ceiling find the path
+        uint32_t lo = 0, hi = 0;
+        int dips = 0;
+        for (int i = 0; i < 300; i++) {  // 30 s of steady state
+            const uint32_t cap = guard.Cap();
+            const double rate = cap ? cap : target;
+            link.Step(rate, 100.0);
+            now += 100'000'000LL;
+            const auto res = guard.Update(target, link.Report(), 0, false, now);
+            const uint32_t r = res.capKbps ? res.capKbps : target;
+            if (res.action == rc::QueueGuard::Action::Dip) dips++;
+            // Skip the recovery from whatever dip ended the settling run: the question is
+            // whether the rate then sits still.
+            if (i >= 200) {
+                if (!lo || r < lo) lo = r;
+                if (r > hi) hi = r;
+            }
+        }
+        std::printf("queue guard: steady state %u-%u kbps over 25 s, %d dips\n", lo, hi, dips);
+        CHECK(dips <= 3);
+        CHECK(hi - lo <= hi / 12);  // inside 8%: no visible pump
+    }
 }
 
 int main() {

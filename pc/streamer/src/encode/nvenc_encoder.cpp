@@ -361,7 +361,11 @@ class NvencEncoder final : public VideoEncoder {
         // but small enough that a burst of frames can't push the stream far past the setting.
         const uint32_t fps = (!m_config.desktop && m_effectiveFps) ? m_effectiveFps : m_config.fps;
         rc.vbvBufferSize = uint32_t(double(kbps) * 1000.0 / fps) * 3 / 2;
-        rc.vbvInitialDelay = rc.vbvBufferSize;
+        // The initial delay is the buffer's occupancy when encoding starts, and only means
+        // something then. Setting it on every rate change re-primed the buffer to full and
+        // let a burst straight out - the same overshoot the startup clamp exists to stop,
+        // now doing it whenever the guard moved the rate (45 times a minute on VRChat).
+        if (m_frameCount == 0) rc.vbvInitialDelay = rc.vbvBufferSize;
     }
 
     // How far apart encoded frames actually are. NVENC's CBR budgets each frame as bitrate / the
