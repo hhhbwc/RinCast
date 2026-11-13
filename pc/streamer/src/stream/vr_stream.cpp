@@ -5,6 +5,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "foveator.h"
@@ -127,6 +128,10 @@ bool VrStream::Start() {
 
 void VrStream::Stop() {
     m_running = false;
+    // 先停发送线程：它会唤醒阻塞在 Submit 里的编码线程，也会打断 pacing 等待。
+    // 编码线程只碰 sender 的提交侧，connection 在 stream 之后才销毁（ClientSession 里
+    // m_connection 声明在 m_vr 之前，析构顺序反过来），所以这里等它退出是安全的。
+    m_sender.Stop();
     if (m_thread.joinable()) m_thread.join();
 }
 
@@ -369,8 +374,11 @@ void VrStream::Run() {
         // The encoder has waited for the GPU work before it by now, so this doesn't stall.
         if (motionValid && motion.Read(ctx.Get(), motionField)) AppendMotion(motion, motionField, motionPreviousTimestamp, motionGrid, frameMeta);
         motionPreviousTimestamp = slotCopy.headsetTargetNs;
-        m_sender.Send(out, frameMeta.data(), uint16_t(frameMeta.size()), rc::kVideoHasPose | (m_config.tenBit ? rc::kVideoHdr10 : 0),
-                      rc::NsToMs(encEnd - encStart));
+        // 提交即节流：上一帧没发完就阻塞在这里，编码和发送因此重叠。
+        if (!m_sender.Submit(std::move(out), frameMeta.data(), uint16_t(frameMeta.size()),
+                             rc::kVideoHasPose | (m_config.tenBit ? rc::kVideoHdr10 : 0),
+                             rc::NsToMs(encEnd - encStart)))
+            break;  // 发送端已停止：流正在结束，干净退出
 
         lastFrameIndex = slotCopy.frameIndex;
         lastFrameNs = rc::NowNs();

@@ -17,6 +17,49 @@ VideoSender::VideoSender(rc::Connection* connection, uint8_t streamId, rc::Video
       m_adaptive(adaptive) {
     m_packetizer.SetFecPercent(fecPercent);
     m_windowStartNs = rc::NowNs();
+    m_worker = std::thread([this] { WorkerLoop(); });
+}
+
+VideoSender::~VideoSender() { Stop(); }
+
+void VideoSender::Stop() {
+    {
+        std::lock_guard lock(m_slotMutex);
+        if (m_stopped) return;
+        m_stopped = true;
+    }
+    m_slotCv.notify_all();       // 唤醒阻塞在 Submit 里的编码线程，让它看到 false 退出
+    m_packetizer.RequestStop();  // 唤醒 pacing 等待，worker 不用等到下一个包到期
+    if (m_worker.joinable()) m_worker.join();
+    // 流正在结束，槽里还没发出的那一帧直接丢掉（头显也已经不会再等它）。
+    std::lock_guard lock(m_slotMutex);
+    m_slot.frame = EncodedFrame{};
+    m_slot.metadata.clear();
+    m_slot.occupied = false;
+}
+
+void VideoSender::WorkerLoop() {
+    for (;;) {
+        Slot local;
+        {
+            std::unique_lock lock(m_slotMutex);
+            m_slotCv.wait(lock, [this] { return m_slot.occupied || m_stopped; });
+            if (!m_slot.occupied) return;  // 已停止且槽是空的
+            local.frame = std::move(m_slot.frame);
+            local.metadata = std::move(m_slot.metadata);
+            local.flags = m_slot.flags;
+            local.index = m_slot.index;
+            m_slot.occupied = false;
+        }
+        // 槽已经空出来，立刻放编码线程去编下一帧：编码和这一帧的 paced 发送重叠，
+        // 这是端到端延迟不增反降的来源。
+        m_slotCv.notify_all();
+        if (m_pace.load(std::memory_order_relaxed))
+            m_packetizer.SetPacingKbps(uint32_t(m_targetKbps.load() * 1.5));
+        m_packetizer.SendFrame(m_streamId, m_codec, local.flags, local.index, local.metadata.data(),
+                               uint16_t(local.metadata.size()), local.frame.data.data(),
+                               local.frame.data.size());
+    }
 }
 
 void VideoSender::SetMaxBitrate(uint32_t kbps) {
@@ -24,30 +67,47 @@ void VideoSender::SetMaxBitrate(uint32_t kbps) {
     if (!m_adaptive || m_targetKbps > kbps) m_targetKbps = kbps;
 }
 
-void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t metadataSize, uint8_t extraFlags,
-                       double encodeMs) {
+bool VideoSender::Submit(EncodedFrame&& frame, const void* metadata, uint16_t metadataSize, uint8_t extraFlags,
+                         double encodeMs) {
     uint8_t flags = extraFlags;
     if (frame.keyframe) flags |= rc::kVideoKeyframe;
     const bool recovery = m_nextIsRecovery && !frame.keyframe;
     if (recovery) flags |= rc::kVideoRecovery;
     m_nextIsRecovery = false;
-    const uint32_t index = ++m_frameIndex;
+    const size_t frameBytes = frame.data.size();
+
     {
-        std::lock_guard lock(m_lossMutex);
-        m_sent[index % std::size(m_sent)] = {index, frame.timestamp};
-        if (frame.keyframe) m_lastKeyframe = index;
-        if (frame.keyframe || recovery) {
-            m_lastRecovery = index;
-            m_lastRecoveryNs = rc::NowNs();
+        std::unique_lock lock(m_slotMutex);
+        // 槽被占用就等：上一帧发完之前不编下一帧。这一等不会持有 m_lossMutex / m_statsMutex。
+        m_slotCv.wait(lock, [this] { return !m_slot.occupied || m_stopped; });
+        if (m_stopped) return false;
+        const uint32_t index = ++m_frameIndex;
+        {
+            // 丢包恢复簿记留在编码侧：提交顺序就是发送顺序，每帧必发不丢（上一帧此刻已被 worker 取走）。
+            std::lock_guard lossLock(m_lossMutex);
+            m_sent[index % std::size(m_sent)] = {index, frame.timestamp};
+            if (frame.keyframe) m_lastKeyframe = index;
+            if (frame.keyframe || recovery) {
+                m_lastRecovery = index;
+                m_lastRecoveryNs = rc::NowNs();
+            }
         }
+        m_slot.frame = std::move(frame);
+        if (metadataSize) {
+            const auto* b = static_cast<const uint8_t*>(metadata);
+            m_slot.metadata.assign(b, b + metadataSize);
+        } else {
+            m_slot.metadata.clear();
+        }
+        m_slot.flags = flags;
+        m_slot.index = index;
+        m_slot.occupied = true;
     }
-    if (m_pace) m_packetizer.SetPacingKbps(uint32_t(m_targetKbps * 1.5));
-    m_packetizer.SendFrame(m_streamId, m_codec, flags, index, metadata, metadataSize, frame.data.data(),
-                           frame.data.size());
+    m_slotCv.notify_all();  // 叫醒 worker
 
     std::lock_guard lock(m_statsMutex);
     m_windowFrames++;
-    m_windowBytes += frame.data.size();
+    m_windowBytes += frameBytes;
     m_windowEncodeMs += encodeMs;
     const int64_t now = rc::NowNs();
     const double elapsed = double(now - m_windowStartNs) / 1e9;
@@ -66,6 +126,7 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
         m_windowEncodeMs = 0;
         m_windowStartNs = now;
     }
+    return true;
 }
 
 bool VideoSender::WantsFrame() {

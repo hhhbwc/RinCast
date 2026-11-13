@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 #include "../encode/encoder.h"
 #include "rc/connection.h"
@@ -27,10 +30,20 @@ class VideoSender {
    public:
     VideoSender(rc::Connection* connection, uint8_t streamId, rc::VideoCodec codec, uint32_t maxBitrateKbps,
                 int fecPercent, bool adaptive);
+    ~VideoSender();
 
-    // Sends one encoded frame with metadata.
-    void Send(const EncodedFrame& frame, const void* metadata, uint16_t metadataSize, uint8_t extraFlags,
-              double encodeMs);
+    VideoSender(const VideoSender&) = delete;
+    VideoSender& operator=(const VideoSender&) = delete;
+
+    // 把一帧交给发送线程。槽被占用时阻塞（这就是编码侧的节流），返回时保证：
+    // 上一帧已被发送线程取走（正在/即将发出）、这一帧刚进槽。返回 false 表示发送端已停止，调用方应退出。
+    // 发送顺序即提交顺序、且每帧必发不丢，所以丢包恢复簿记（m_sent 环 / BeginFrame）留在编码侧仍然正确。
+    bool Submit(EncodedFrame&& frame, const void* metadata, uint16_t metadataSize, uint8_t extraFlags,
+                double encodeMs);
+
+    // 停发送线程：唤醒阻塞的 Submit 和 pacing 等待，join，然后丢弃槽里没发出的帧。
+    // 幂等；析构也会调。
+    void Stop();
 
     void RequestKeyframe() { m_keyframeRequested = true; }
     // True if the headset is waiting for a frame (keyframe or loss recovery), so one
@@ -45,7 +58,8 @@ class VideoSender {
     // Bitrate the encoder should use now (changes when adaptive).
     uint32_t TargetBitrateKbps() const { return m_targetKbps.load(); }
     void SetMaxBitrate(uint32_t kbps);
-    // Internet paths: spread each frame over time instead of sending it in one burst.
+    // 把每帧的包铺开在时间上发，而不是一口气打出去（局域网和互联网都用）：
+    // Wi-Fi 的浅队列会被整帧突发打爆。必须在 Start/第一次 Submit 之前设好。
     void SetPacing(bool pace) { m_pace = pace; }
     // Adaptive only: begin below the maximum and probe upward.
     void StartAt(uint32_t kbps) {
@@ -64,7 +78,7 @@ class VideoSender {
     std::atomic<uint32_t> m_targetKbps;
     uint32_t m_maxKbps;
     bool m_adaptive;
-    bool m_pace = false;
+    std::atomic<bool> m_pace{false};
     double m_lossAvg = 0;
     uint32_t m_frameIndex = 0;
 
@@ -81,6 +95,22 @@ class VideoSender {
         uint64_t timestamp = 0;  // EncodedFrame::timestamp
     };
     SentFrame m_sent[64];
+
+    // 一帧缓冲（1-slot）+ 发送线程：编码和上一帧的发送重叠。Packetizer 非线程安全，
+    // 只由 worker 线程碰；Submit 只碰槽，不碰 packetizer。
+    struct Slot {
+        EncodedFrame frame;
+        std::vector<uint8_t> metadata;
+        uint8_t flags = 0;
+        uint32_t index = 0;
+        bool occupied = false;
+    };
+    void WorkerLoop();
+    Slot m_slot;
+    std::mutex m_slotMutex;
+    std::condition_variable m_slotCv;
+    std::thread m_worker;
+    bool m_stopped = false;  // 由 m_slotMutex 保护
 
     std::mutex m_statsMutex;
     int64_t m_windowStartNs = 0;

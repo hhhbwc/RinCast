@@ -13,12 +13,19 @@
 // --yuv writes the encoder input, for PSNR comparisons with ffmpeg.
 // --compare-foveated also encodes every frame with foveation into <out>.fov, from the
 // identical input, so centre and edge quality can be compared with and without it.
+//
+// --net sends every encoded frame through the real VideoSender (submit + worker thread +
+// pacing) into a loopback connection and timestamps the arriving datagrams, so pacing,
+// burst size and submit-to-sent latency are measured end to end. --csv writes the raw
+// arrival timeline.
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../../pc/streamer/src/capture/desktop_capture.h"
@@ -26,11 +33,26 @@
 #include "../../pc/streamer/src/encode/color_convert.h"
 #include "../../pc/streamer/src/encode/encoder.h"
 #include "../../pc/streamer/src/gpu.h"
+#include "../../pc/streamer/src/stream/video_sender.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
+#include "rc/connection.h"
+#include "rc/crypto.h"
+#include "rc/handshake.h"
 #include "rc/platform.h"
+#include "rc/socket.h"
 
 using namespace rcs;
+
+// 一个到达的数据报：时刻、字节数，以及（能解析出时）属于哪一帧的第几个分片。
+struct NetArrival {
+    int64_t ns = 0;
+    uint32_t bytes = 0;
+    uint32_t frame = 0;
+    uint16_t frag = 0;
+    uint16_t fragCount = 0;
+    bool video = false;
+};
 
 int main(int argc, char** argv) {
     EncoderConfig ec;
@@ -47,6 +69,11 @@ int main(int argc, char** argv) {
     std::string imagePath;         // pan over this picture instead of the desktop
     bool compareFoveated = false;  // also encode every frame with foveation, into <out>.fov
     bool onePass = false;          // --desktop without the streamer's second pass
+    bool swing = false;
+    bool synthetic = false;
+    bool netBench = false;         // 走真实 VideoSender + 回环，测 pacing 与提交延迟
+    std::string csvPath;
+    double paceFps = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&] { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -71,6 +98,14 @@ int main(int argc, char** argv) {
             ec.twoPass = true;
         } else if (a == "--one-pass") {
             onePass = true;
+        } else if (a == "--swing") {
+            swing = true;
+        } else if (a == "--synthetic") {
+            synthetic = true;
+            moving = true;
+        } else if (a == "--pace") {
+            paceFps = std::stod(next());
+            if (!std::isfinite(paceFps) || paceFps <= 0) return 2;
         } else if (a == "--foveated") {
             ec.foveated = true;
         } else if (a == "--moving") {
@@ -87,6 +122,10 @@ int main(int argc, char** argv) {
             lossCount = std::stoi(next());
         } else if (a == "--out") {
             outPath = next();
+        } else if (a == "--net") {
+            netBench = true;
+        } else if (a == "--csv") {
+            csvPath = next();
         } else if (a == "--yuv") {
             yuvPath = next();
         } else {
@@ -97,6 +136,8 @@ int main(int argc, char** argv) {
     // As the streamer does: desktop streams always take two passes.
     if (ec.desktop && !onePass) ec.twoPass = true;
     if (onePass) ec.twoPass = false;
+    // --net 要按真实帧率喂帧，否则发送端一直阻塞、测不出「帧间隔内的节奏」。
+    if (netBench && paceFps <= 0) paceFps = ec.fps;
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     auto monitors = EnumerateMonitors();
@@ -108,41 +149,55 @@ int main(int argc, char** argv) {
     ComPtr<ID3D11DeviceContext> ctx;
     auto dev = CreateDevice(adapter.Get(), &ctx);
 
-    // One still of the desktop; frames are crops of it that pan around.
     DesktopCapture cap;
-    if (!cap.Init(dev.Get(), mon, mon.width, mon.height)) {
-        std::printf("capture init failed\n");
-        return 1;
-    }
-    for (int i = 0; i < 40; i++)
-        if (cap.Capture(50) == DesktopCapture::Result::NewFrame) break;
-    cap.Recompose();
-    D3D11_TEXTURE2D_DESC sd;
-    cap.Output()->GetDesc(&sd);
-    ID3D11Texture2D* panSource = cap.Output();
+    D3D11_TEXTURE2D_DESC sd{};
+    ID3D11Texture2D* panSource = nullptr;
     ComPtr<ID3D11Texture2D> image;
-    if (!imagePath.empty()) {
-        int iw = 0, ih = 0, comp = 0;
-        stbi_uc* px = stbi_load(imagePath.c_str(), &iw, &ih, &comp, 4);
-        if (!px) {
-            std::printf("can't read %s\n", imagePath.c_str());
-            return 1;
+    if (synthetic || !imagePath.empty()) {
+        int iw = 2048, ih = 2048, comp = 0;
+        std::vector<uint32_t> pixels;
+        stbi_uc* loaded = nullptr;
+        if (synthetic) {
+            pixels.resize(size_t(iw) * ih);
+            for (int y = 0; y < ih; ++y) {
+                for (int x = 0; x < iw; ++x) {
+                    uint32_t v = uint32_t(x / 4) * 0x9e3779b9u ^ uint32_t(y / 4) * 0x85ebca6bu;
+                    v = (v ^ (v >> 16)) * 0x7feb352du;
+                    pixels[size_t(y) * iw + x] = 0xff000000u | ((v ^ (v >> 15)) & 0x00ffffffu);
+                }
+            }
+        } else {
+            loaded = stbi_load(imagePath.c_str(), &iw, &ih, &comp, 4);
+            if (!loaded) {
+                std::printf("can't read %s\n", imagePath.c_str());
+                return 1;
+            }
         }
-        if (sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM || sd.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS)
-            for (int p = 0; p < iw * ih; p++) std::swap(px[p * 4], px[p * 4 + 2]);
         sd.Width = UINT(iw);
         sd.Height = UINT(ih);
-        D3D11_TEXTURE2D_DESC id = sd;
-        id.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        id.MiscFlags = 0;
-        id.MipLevels = 1;
-        D3D11_SUBRESOURCE_DATA init{px, UINT(iw) * 4, 0};
-        if (FAILED(dev->CreateTexture2D(&id, &init, &image))) {
+        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.SampleDesc.Count = 1;
+        sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init{synthetic ? static_cast<const void*>(pixels.data()) : loaded, UINT(iw) * 4, 0};
+        const HRESULT hr = dev->CreateTexture2D(&sd, &init, &image);
+        stbi_image_free(loaded);
+        if (FAILED(hr)) {
             std::printf("can't create the image texture\n");
             return 1;
         }
-        stbi_image_free(px);
         panSource = image.Get();
+    } else {
+        if (!cap.Init(dev.Get(), mon, mon.width, mon.height)) {
+            std::printf("capture init failed\n");
+            return 1;
+        }
+        for (int i = 0; i < 40; i++)
+            if (cap.Capture(50) == DesktopCapture::Result::NewFrame) break;
+        cap.Recompose();
+        cap.Output()->GetDesc(&sd);
+        panSource = cap.Output();
     }
     D3D11_TEXTURE2D_DESC cd = sd;
     cd.Width = sd.Width * 3 / 4;
@@ -237,8 +292,111 @@ float4 ps(V i) : SV_Target {
     bool recoveryWasKey = false;
     uint64_t lastGoodTs = 0;
     EncodedFrame ef;
+
+    // --net：编码结果交给真正的 VideoSender（1 帧缓冲 + 发送线程 + 连续 pacing），
+    // 回环收包线程给每个数据报打时间戳。
+    std::unique_ptr<rc::UdpSocket> txSock, rxSock;
+    std::unique_ptr<rc::Connection> sendConn, recvConn;
+    std::unique_ptr<VideoSender> sender;
+    std::vector<NetArrival> arrivals;
+    std::atomic<bool> rxStop{false};
+    std::atomic<size_t> rxCount{0};
+    std::thread rxThread;
+    std::vector<int64_t> submitNs, encStartNs, encEndNs;  // 与提交顺序一一对应
+    std::vector<size_t> netFrameBytes;
+    rc::VrFrameMetadata netMeta{};
+    if (netBench) {
+        rc::NetInit();
+        txSock = std::make_unique<rc::UdpSocket>();
+        rxSock = std::make_unique<rc::UdpSocket>();
+        if (!txSock->Open(0) || !rxSock->Open(0)) {
+            std::printf("can't open the loopback sockets\n");
+            return 1;
+        }
+        txSock->SetBuffers(16 << 20, 1 << 20);
+        rxSock->SetBuffers(1 << 20, 16 << 20);
+        auto client = rc::crypto::KeyPair::Generate();
+        auto server = rc::crypto::KeyPair::Generate();
+        const std::string ctx = rc::SessionContext("cn", "sn", "bench");
+        auto ck = rc::crypto::DeriveSessionKeys(client.secretKey, server.publicKey, client.publicKey,
+                                                server.publicKey, ctx);
+        auto sk = rc::crypto::DeriveSessionKeys(server.secretKey, client.publicKey, client.publicKey,
+                                                server.publicKey, ctx);
+        const rc::NetAddress txAddr{0x7F000001, txSock->LocalPort()};
+        const rc::NetAddress rxAddr{0x7F000001, rxSock->LocalPort()};
+        sendConn = std::make_unique<rc::Connection>(txSock.get(), rxAddr, 7, sk, true, rc::kMaxDatagramLan);
+        recvConn = std::make_unique<rc::Connection>(rxSock.get(), txAddr, 7, ck, false, rc::kMaxDatagramLan);
+        arrivals.resize(400'000);
+        recvConn->SetPacketHandler([&](rc::PacketType t, const uint8_t* p, size_t n) {
+            const int64_t now = rc::NowNs();
+            NetArrival a;
+            a.ns = now;
+            a.bytes = uint32_t(n);
+            if (t == rc::PacketType::Video && n >= sizeof(rc::VideoFragmentHeader)) {
+                rc::VideoFragmentHeader h;
+                std::memcpy(&h, p, sizeof(h));
+                a.video = true;
+                a.frame = h.frameIndex;
+                a.frag = h.fragmentIndex;
+                a.fragCount = h.fragmentCount;
+            } else if (t == rc::PacketType::VideoParity && n >= sizeof(rc::VideoParityHeader)) {
+                rc::VideoParityHeader h;
+                std::memcpy(&h, p, sizeof(h));
+                a.video = true;
+                a.frame = h.frameIndex;
+                a.frag = 0xFFFF;  // 校验包，不属于某个分片
+                a.fragCount = h.fragmentCount;
+            }
+            const size_t i = rxCount.fetch_add(1);
+            if (i < arrivals.size()) arrivals[i] = a;
+        });
+        rxThread = std::thread([&] {
+            std::vector<uint8_t> buf(2048);
+            rc::NetAddress from;
+            while (!rxStop.load()) {
+                const int n = rxSock->RecvFrom(buf.data(), buf.size(), from, 20);
+                if (n <= 0) {
+                    recvConn->Tick(rc::NowNs());
+                    continue;
+                }
+                recvConn->HandleDatagram(buf.data(), size_t(n), from);
+            }
+        });
+        sender = std::make_unique<VideoSender>(sendConn.get(), rc::kVrStreamId, ec.codec, ec.bitrateKbps,
+                                               5 /* fecPercent，和局域网默认一致 */, false);
+        sender->SetPacing(true);
+        std::printf("net: %u kbps target, pacing at %u kbps (x1.5), %.0f fps frame pacing\n", ec.bitrateKbps,
+                    uint32_t(ec.bitrateKbps * 1.5), paceFps);
+    }
+
     const UINT panW = sd.Width - cd.Width, panH = sd.Height - cd.Height;
+    const bool paced = swing || paceFps > 0;
+    HANDLE timer = paced ? CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                TIMER_ALL_ACCESS) : nullptr;
+    if (paced && !timer) return 1;
+    int64_t nextFrameNs = rc::NowNs(), swingStartNs = nextFrameNs, windowStartNs = nextFrameNs;
+    bool swingHigh = false;
+    size_t windowBytes = 0, windowFrames = 0;
+    double maxWindowMbps = 0;
     for (int i = 0; i < frames; i++) {
+        if (paced) {
+            const int64_t nowNs = rc::NowNs();
+            if (nowNs - swingStartNs > 400'000'000LL) {
+                swingHigh = !swingHigh;
+                swingStartNs = nowNs;
+            }
+            const double rate = swing ? (swingHigh ? 60.0 : 15.0) : paceFps;
+            nextFrameNs += int64_t(1e9 / rate);
+            const int64_t waitNs = nextFrameNs - nowNs;
+            if (waitNs > 0) {
+                LARGE_INTEGER due;
+                due.QuadPart = -std::max<int64_t>(1, waitNs / 100);
+                if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) return 1;
+                if (WaitForSingleObject(timer, INFINITE) != WAIT_OBJECT_0) return 1;
+            } else {
+                nextFrameNs = nowNs;
+            }
+        }
         // Smooth pan: a few pixels per frame, like a slowly turning head.
         const double t = i / double(ec.fps);
         const UINT x = UINT((0.5 + 0.5 * std::sin(t * 1.3)) * panW);
@@ -291,6 +449,18 @@ float4 ps(V i) : SV_Target {
         }
         times.push_back(rc::NsToMs(rc::NowNs() - t0));
         sizes.push_back(ef.data.size());
+        if (paced) {
+            windowBytes += ef.data.size();
+            windowFrames++;
+            const int64_t nowNs = rc::NowNs();
+            const double elapsed = double(nowNs - windowStartNs) / 1e9;
+            if (elapsed >= 1.0) {
+                const double mbps = double(windowBytes) * 8 / 1e6 / elapsed;
+                maxWindowMbps = std::max(maxWindowMbps, mbps);
+                std::printf("  window %.1f Mbps, %.0f fps\n", mbps, windowFrames / elapsed);
+                windowBytes = 0; windowFrames = 0; windowStartNs = nowNs;
+            }
+        }
         if (ef.keyframe && i == 0) keyBytes = ef.data.size();
         if (recover) {
             recoveryBytes = ef.data.size();
@@ -302,6 +472,99 @@ float4 ps(V i) : SV_Target {
             EncodedFrame ff;
             if (!fovEncoder->Encode(conv.Output(), key, ff)) return 1;
             if (fovOut) fovOut.write(reinterpret_cast<const char*>(ff.data.data()), std::streamsize(ff.data.size()));
+        }
+        if (sender) {
+            // 和流里一样：提交即节流，上一帧没发完这里会阻塞。
+            netFrameBytes.push_back(sizes.back());
+            encStartNs.push_back(t0);
+            encEndNs.push_back(rc::NowNs());
+            submitNs.push_back(encEndNs.back());
+            if (!sender->Submit(std::move(ef), &netMeta, sizeof(netMeta), 0, rc::NsToMs(rc::NowNs() - t0))) {
+                std::printf("sender stopped at frame %d\n", i);
+                break;
+            }
+        }
+    }
+
+    if (timer) CloseHandle(timer);
+
+    // --net：把回环上量到的时间线汇总出来。
+    if (sender) {
+        sender->Stop();
+        rc::SleepMs(120);  // 让最后一批包落地
+        rxStop = true;
+        if (rxThread.joinable()) rxThread.join();
+
+        const size_t n = std::min(rxCount.load(), arrivals.size());
+        std::vector<const NetArrival*> v;
+        for (size_t k = 0; k < n; k++)
+            if (arrivals[k].video) v.push_back(&arrivals[k]);
+
+        if (!csvPath.empty()) {
+            std::ofstream csv(csvPath);
+            csv << "arrival_ns,bytes,frame_index,fragment_index\n";
+            for (auto* a : v) csv << a->ns << "," << a->bytes << "," << a->frame << "," << a->frag << "\n";
+        }
+        if (!v.empty()) {
+            const int64_t spanNs = v.back()->ns - v.front()->ns;
+            uint64_t totalBytes = 0;
+            for (auto* a : v) totalBytes += a->bytes;
+            std::vector<double> gaps;
+            for (size_t k = 1; k < v.size(); k++) gaps.push_back(rc::NsToMs(v[k]->ns - v[k - 1]->ns));
+            std::vector<double> sortedGaps = gaps;
+            std::sort(sortedGaps.begin(), sortedGaps.end());
+            // 单批突发：间隔 > 0.15 ms 算批边界。
+            std::vector<size_t> batches;
+            size_t cur = v[0]->bytes;
+            for (size_t k = 1; k < v.size(); k++) {
+                if (v[k]->ns - v[k - 1]->ns <= 150'000) {
+                    cur += v[k]->bytes;
+                } else {
+                    batches.push_back(cur);
+                    cur = v[k]->bytes;
+                }
+            }
+            batches.push_back(cur);
+            std::sort(batches.begin(), batches.end());
+            // 每帧的发送完成时刻：最后一个分片到达的时间。
+            std::vector<int64_t> frameEnd(netFrameBytes.size() + 2, 0);
+            for (auto* a : v) {
+                if (a->frag != 0xFFFF && a->frag + 1 == a->fragCount && a->frame < frameEnd.size())
+                    frameEnd[a->frame] = std::max(frameEnd[a->frame], a->ns);
+            }
+            const double pacingKbps = double(ec.bitrateKbps) * 1.5;
+            std::vector<double> lat, theory;
+            int overlapped = 0, pairs = 0;
+            for (size_t i = 0; i < submitNs.size(); i++) {
+                const uint32_t fi = uint32_t(i) + 1;
+                if (fi < frameEnd.size() && frameEnd[fi] > 0) {
+                    lat.push_back(rc::NsToMs(frameEnd[fi] - submitNs[i]));
+                    theory.push_back(double(netFrameBytes[i]) * 8.0 / pacingKbps);
+                }
+                if (i > 0 && fi - 1 < frameEnd.size() && frameEnd[fi - 1] > 0) {
+                    pairs++;
+                    if (encStartNs[i] < frameEnd[fi - 1]) overlapped++;
+                }
+            }
+            std::sort(lat.begin(), lat.end());
+            double latSum = 0, theorySum = 0;
+            for (double x : lat) latSum += x;
+            for (double x : theory) theorySum += x;
+            std::printf("net: %zu datagrams over %.2f s, %.1f Mbps, packet max %u B\n", v.size(),
+                        double(spanNs) / 1e9, double(totalBytes) * 8 / 1e6 / (double(spanNs) / 1e9),
+                        [&] { uint32_t m = 0; for (auto* a : v) m = std::max(m, a->bytes); return m; }());
+            if (!sortedGaps.empty())
+                std::printf("net: gap p50 %.2f ms p99 %.2f ms max %.2f ms; batch p50 %.1f KB p90 %.1f KB max %.1f KB\n",
+                            sortedGaps[sortedGaps.size() / 2], sortedGaps[sortedGaps.size() * 99 / 100],
+                            sortedGaps.back(), double(batches[batches.size() / 2]) / 1024,
+                            double(batches[batches.size() * 9 / 10]) / 1024, double(batches.back()) / 1024);
+            if (!lat.empty())
+                std::printf("net: submit->sent avg %.2f ms p99 %.2f ms; theoretical avg %.2f ms (ratio %.2f)\n",
+                            latSum / double(lat.size()), lat[lat.size() * 99 / 100],
+                            theorySum / double(theory.size()), latSum / theorySum);
+            if (pairs)
+                std::printf("net: encode/send overlap %d of %d frames (%.0f%%)\n", overlapped, pairs,
+                            100.0 * overlapped / pairs);
         }
     }
 
@@ -327,5 +590,8 @@ float4 ps(V i) : SV_Target {
     if (lossAt >= 0)
         std::printf("recovery frame: %.1f KB (%s, %.1fx average)\n", double(recoveryBytes) / 1024,
                     recoveryWasKey ? "intra" : "inter", double(recoveryBytes) / avgBytes);
+    if (paced)
+        std::printf("paced: peak 1s throughput %.1f Mbps against %u Mbps setting\n", maxWindowMbps,
+                    ec.bitrateKbps / 1000);
     return 0;
 }

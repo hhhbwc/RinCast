@@ -34,6 +34,7 @@ endif()
 # Keep the build machine's paths out of the binaries (__FILE__, asserts). The more
 # specific build folder comes first because it can sit inside the source tree.
 if(MSVC)
+  add_compile_options(/utf-8)  # the sources are UTF-8; the system codepage misreads them
   add_compile_options(/experimental:deterministic)  # /pathmap is ignored without it
   foreach(_map "${CMAKE_BINARY_DIR}=rincast-build" "${RC_ROOT}=rincast")
     file(TO_NATIVE_PATH "${_map}" _map_native)
@@ -84,7 +85,8 @@ target_link_libraries(motion-bench PRIVATE d3d11 dxgi d3dcompiler)
 add_executable(encode-bench ../tools/encode-bench/main.cpp
   streamer/src/capture/desktop_capture.cpp streamer/src/capture/monitors.cpp
   streamer/src/encode/color_convert.cpp streamer/src/encode/encoder.cpp streamer/src/encode/nvenc_encoder.cpp
-  streamer/src/encode/amf_encoder.cpp streamer/src/encode/mf_encoder.cpp streamer/src/gpu.cpp streamer/src/util.cpp)
+  streamer/src/encode/amf_encoder.cpp streamer/src/encode/mf_encoder.cpp streamer/src/gpu.cpp streamer/src/util.cpp
+  streamer/src/stream/video_sender.cpp)
 target_include_directories(encode-bench PRIVATE ../third_party)
 target_compile_definitions(encode-bench PRIVATE UNICODE _UNICODE)
 target_link_libraries(encode-bench PRIVATE rincast-core)
