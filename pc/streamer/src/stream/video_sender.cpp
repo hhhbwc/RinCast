@@ -189,6 +189,17 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     const double lossRate = total ? double(fb.fragmentsLost) / total : 0;
     const bool measured = fb.queueDelayMs >= 0;
     if (measured) m_queueMs = m_queueMs < 0 ? fb.queueDelayMs : m_queueMs * 0.6 + fb.queueDelayMs * 0.4;
+    // Without frames in this report (a still desktop) there is nothing to judge by.
+    const double q = measured ? m_queueMs : -1;
+    // The device's own floor: some decode queues run 10-15 ms even when the link is
+    // idle. Absolute thresholds would ratchet the guard down forever on those. The
+    // baseline jumps down instantly with q, and creeps up very slowly if a queue
+    // stays high (a sustained floor raise is real, just slow to accept).
+    if (q >= 0 || m_queueBaselineMs >= 0) {
+        const double qq = q >= 0 ? q : m_queueBaselineMs;
+        m_queueBaselineMs = qq < m_queueBaselineMs || m_queueBaselineMs < 0 ? qq : m_queueBaselineMs + 0.01;
+    }
+    const double queueFloor = m_queueBaselineMs < 0 ? 0 : m_queueBaselineMs;
     if (fb.receivedKbps) m_receivedKbps = m_receivedKbps ? m_receivedKbps * 0.7 + fb.receivedKbps * 0.3 : fb.receivedKbps;
     if (m_baselineNetworkMs < 0 || fb.networkMs < m_baselineNetworkMs) m_baselineNetworkMs = fb.networkMs;
     m_baselineNetworkMs += 0.01;  // slowly forget
@@ -196,14 +207,13 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
         std::lock_guard lock(m_statsMutex);
         m_stats.queueMs = m_queueMs;
     }
-    // Without frames in this report (a still desktop) there is nothing to judge by.
-    const double q = measured ? m_queueMs : -1;
-    const bool queueHigh = q > 40;  // well past what the path carries
+    const bool queueHigh = q > queueFloor + 40;  // well past what the path carries
     // Wi-Fi and mobile links lose the odd packet without being full: only sustained or
     // heavy loss counts. (Headsets that measure no delay have nothing better than lost frames.)
     m_lossAvg = m_lossAvg * 0.8 + lossRate * 0.2;
     const bool lossy = m_lossAvg > 0.02 || lossRate > 0.2;
-    const bool congested = q > 10 || lossy || (!measured && (fb.framesLost > 0 || fb.networkMs > m_baselineNetworkMs + 8.0));
+    const bool congested = q > queueFloor + 15 || lossy ||
+                           (!measured && (fb.framesLost > 0 || fb.networkMs > m_baselineNetworkMs + 8.0));
 
     if (!m_adaptive) {
         // Fixed bitrate: the user asked for a constant rate, but a saturated link must
@@ -220,14 +230,19 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
             if (m_congestedUntilNs == 0) RC_LOGI("Stream %u: congestion guard dip to %u kbps (queue %.0f ms, loss %.1f %%)",
                                                  m_streamId, m_congestionKbps.load(), q, lossRate * 100);
             m_congestedUntilNs = now + 1'500'000'000LL;
-        } else if (m_congestionKbps.load() && q < 5 && now > m_congestedUntilNs &&
+        } else if (m_congestionKbps.load() && q < queueFloor + 5 && now > m_congestedUntilNs &&
                    now - m_lastLossNs > 1'500'000'000LL) {
             // The queue drained and the losses stopped: climb back in steps.
             if (now - m_lastClimbNs > 300'000'000LL) {
                 m_lastClimbNs = now;
                 const uint32_t target = m_targetKbps.load();
-                const uint32_t up = std::min(m_congestionKbps.load() * 5 / 4, target);
-                m_congestionKbps.store(up >= target ? 0 : up);
+                uint32_t up = std::min(m_congestionKbps.load() * 5 / 4, target);
+                // Hold just below what the path actually carries: climbing to the target
+                // re-saturates it, the queue builds, and the guard dips right back - a
+                // sawtooth the tester feels as quality flapping. The cap follows the
+                // arrival rate up and down, so the ride settles at the path's edge.
+                if (m_receivedKbps > 0) up = std::min(up, uint32_t(m_receivedKbps * 0.95));
+                m_congestionKbps.store(up);
                 if (m_congestionKbps.load() == 0) RC_LOGI("Stream %u: congestion guard released, back to %u kbps",
                                                           m_streamId, target);
             }
