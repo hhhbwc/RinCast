@@ -56,7 +56,11 @@ class VideoSender {
 
     void OnFeedback(const rc::VideoFeedbackPayload& fb);
     // Bitrate the encoder should use now (changes when adaptive).
-    uint32_t TargetBitrateKbps() const { return m_targetKbps.load(); }
+    uint32_t TargetBitrateKbps() const {
+        const uint32_t cap = m_congestionKbps.load();
+        const uint32_t t = m_targetKbps.load();
+        return cap ? std::min(cap, t) : t;
+    }
     void SetMaxBitrate(uint32_t kbps);
     // 把每帧的包铺开在时间上发，而不是一口气打出去（局域网和互联网都用）：
     // Wi-Fi 的浅队列会被整帧突发打爆。必须在 Start/第一次 Submit 之前设好。
@@ -76,6 +80,13 @@ class VideoSender {
     const rc::VideoCodec m_codec;
     std::atomic<bool> m_keyframeRequested{true};
     std::atomic<uint32_t> m_targetKbps;
+    // Fixed-bitrate congestion guard (OnFeedback): dips below the target while the link
+    // saturates, climbs back when the losses stop. 0 = no dip active. Quality-adaptive
+    // mode leaves this alone - its AIMD owns m_targetKbps.
+    std::atomic<uint32_t> m_congestionKbps{0};
+    int64_t m_congestedUntilNs = 0;  // network thread only
+    int64_t m_lastLossNs = 0;        // network thread only
+    int64_t m_lastClimbNs = 0;       // network thread only
     uint32_t m_maxKbps;
     bool m_adaptive;
     std::atomic<bool> m_pace{false};

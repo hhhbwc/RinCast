@@ -55,7 +55,7 @@ void VideoSender::WorkerLoop() {
         // 这是端到端延迟不增反降的来源。
         m_slotCv.notify_all();
         if (m_pace.load(std::memory_order_relaxed))
-            m_packetizer.SetPacingKbps(uint32_t(m_targetKbps.load() * 1.5));
+            m_packetizer.SetPacingKbps(uint32_t(TargetBitrateKbps() * 1.5));
         m_packetizer.SendFrame(m_streamId, m_codec, local.flags, local.index, local.metadata.data(),
                                uint16_t(local.metadata.size()), local.frame.data.data(),
                                local.frame.data.size());
@@ -180,7 +180,35 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
         m_stats.clientDecodeMs = fb.decodeMs;
         m_stats.clientLatencyMs = fb.totalLatencyMs;
     }
-    if (!m_adaptive) return;
+    if (!m_adaptive) {
+        // Fixed bitrate: the user asked for a constant rate, but a saturated link must
+        // not keep asking for keyframes either (every unrecoverable burst is a freeze).
+        // On loss, dip the send rate below the path's capacity for a moment - the
+        // picture softens for a beat instead of freezing - and climb back once the
+        // losses stop. The target itself is never changed.
+        const int64_t now = rc::NowNs();
+        const uint32_t total = fb.fragmentsReceived + fb.fragmentsLost;
+        const double lossRate = total ? double(fb.fragmentsLost) / total : 0;
+        const bool congested = fb.requestKeyframe || lossRate > 0.02;
+        if (congested) {
+            m_lastLossNs = now;
+            // First loss dips to 60% of the target; losses while already dipped deepen
+            // by a quarter, floored at a quarter of the target.
+            const uint32_t base = m_congestionKbps.load() ? m_congestionKbps.load() : m_targetKbps.load();
+            m_congestionKbps.store(std::max(base * 3 / 4, m_targetKbps.load() / 4));
+            m_congestedUntilNs = now + 1'500'000'000LL;
+        } else if (m_congestionKbps.load() && now > m_congestedUntilNs && now - m_lastLossNs > 1'500'000'000LL) {
+            // No losses recently: climb a quarter of the dip back toward the target,
+            // time-gated so a fast feedback stream does not snap straight back.
+            if (now - m_lastClimbNs > 300'000'000LL) {
+                m_lastClimbNs = now;
+                const uint32_t target = m_targetKbps.load();
+                const uint32_t up = std::min(m_congestionKbps.load() * 5 / 4, target);
+                m_congestionKbps.store(up >= target ? 0 : up);
+            }
+        }
+        return;
+    }
 
     // Congestion control. When the stream is faster than the path (an internet upload,
     // weak Wi-Fi), the excess doesn't get lost right away: it waits in some buffer on
