@@ -85,6 +85,8 @@ class VideoSender {
     // mode leaves this alone - its AIMD owns m_targetKbps.
     std::atomic<uint32_t> m_congestionKbps{0};
     int64_t m_lastDipNs = 0;         // network thread only
+    int m_baseFecPercent = -1;       // the setting's FEC; network thread only
+    std::atomic<int> m_dynamicFec{-1};  // what the packetizer currently runs; network thread only
     int64_t m_lastClimbNs = 0;       // network thread only
     int64_t m_floorLogNs = 0;        // network thread only
     double m_queueBaselineMs = -1;   // the device's own queue floor; network thread only

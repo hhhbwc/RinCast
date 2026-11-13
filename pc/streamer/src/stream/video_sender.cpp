@@ -16,6 +16,7 @@ VideoSender::VideoSender(rc::Connection* connection, uint8_t streamId, rc::Video
       m_maxKbps(maxBitrateKbps),
       m_adaptive(adaptive) {
     m_packetizer.SetFecPercent(fecPercent);
+    m_baseFecPercent = fecPercent;
     m_windowStartNs = rc::NowNs();
     m_worker = std::thread([this] { WorkerLoop(); });
 }
@@ -227,6 +228,17 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     // heavy loss counts. (Headsets that measure no delay have nothing better than lost frames.)
     m_lossAvg = m_lossAvg * 0.8 + lossRate * 0.2;
     const bool lossy = m_lossAvg > 0.02 || lossRate > 0.2;
+    // Loss-coupled parity: at the edge of a real link the steady state includes small
+    // losses. The recovery frames cover single-frame gaps; a little more parity covers
+    // the rest. Cheaper than the keyframe waits that unrecoverable frames cost. The
+    // extra parity costs wire time, so it steps back down when the link calms.
+    if (m_baseFecPercent >= 0 && measured) {
+        const int fec = m_lossAvg > 0.10 ? 12 : m_lossAvg > 0.04 ? 8 : m_baseFecPercent;
+        if (fec != m_dynamicFec.exchange(fec)) {
+            m_packetizer.SetFecPercent(fec);
+            RC_LOGI("Stream %u: FEC %d%% (loss %.1f %%)", m_streamId, fec, m_lossAvg * 100);
+        }
+    }
     const bool congested = q > queueFloor + 15 || lossy ||
                            (!measured && (fb.framesLost > 0 || fb.networkMs > m_baselineNetworkMs + 8.0));
 
