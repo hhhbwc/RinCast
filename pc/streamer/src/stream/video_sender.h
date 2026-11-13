@@ -66,10 +66,9 @@ class VideoSender {
     // 把每帧的包铺开在时间上发，而不是一口气打出去（局域网和互联网都用）：
     // Wi-Fi 的浅队列会被整帧突发打爆。必须在 Start/第一次 Submit 之前设好。
     void SetPacing(bool pace) { m_pace = pace; }
-    // Adaptive only: begin below the maximum and probe upward.
-    void StartAt(uint32_t kbps) {
-        if (m_adaptive) m_targetKbps = std::min(kbps, m_maxKbps);
-    }
+    // Adaptive only: begin below the maximum and let the guard explore upward. The ceiling
+    // is where the climb stops, so seeding it is what makes the start point mean anything.
+    void StartAt(uint32_t kbps);
 
     VideoSenderStats Stats();
     uint8_t StreamId() const { return m_streamId; }
@@ -134,11 +133,7 @@ class VideoSender {
     double m_windowEncodeMs = 0;
     VideoSenderStats m_stats;
     int64_t m_lastStatsLogNs = 0;
-    int64_t m_lastIncreaseNs = 0;
-    int64_t m_lastDecreaseNs = 0;
-    double m_baselineNetworkMs = -1;
     double m_queueMs = -1;            // smoothed queueing delay reported by the headset
-    double m_queueAtDecreaseMs = 0;
     double m_receivedKbps = 0;        // smoothed rate that actually arrives
 };
 

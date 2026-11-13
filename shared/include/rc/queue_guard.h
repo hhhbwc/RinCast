@@ -28,8 +28,10 @@ struct QueueGuardConfig {
     // A rate that just caused a dip is not a rate to climb back to. The climb stops just
     // under it, and the ceiling only rises after this long without a dip - otherwise every
     // cycle ends with two dips and a visible pump (measured: 140 -> 113 -> 140 every ten
-    // seconds, nine encoder reconfigures per cycle).
+    // seconds, nine encoder reconfigures per cycle). Adaptive mode sets both fields so the
+    // ceiling explores upward quickly, since there the aim is the maximum, not the setting.
     int64_t ceilingRiseNs = 60'000'000'000LL;
+    uint32_t ceilingRisePercent = 3;
 };
 
 class QueueGuard {
@@ -54,6 +56,13 @@ public:
     }
     // Puts the guard at a cap without a dip (a settings change, a new session).
     void Seed(uint32_t capKbps) { m_cap = capKbps; }
+    // Adaptive mode starts below the maximum and explores upward: seeding the ceiling makes
+    // the first climb stop there instead of jumping to the maximum on the first report.
+    void SeedCeiling(uint32_t kbps, int64_t nowNs) {
+        if (!kbps) return;
+        m_ceiling = kbps;
+        m_ceilingNs = nowNs;
+    }
 
     // One feedback report. targetKbps is what the user asked for; queueMs is the headset's
     // queueing delay estimate (relative to its own recent best, see DelayTracker), or < 0
@@ -72,7 +81,8 @@ public:
         // The ceiling only rises after a long clean stretch, so the climb stops just under
         // the level that failed instead of running back into it every few seconds.
         if (m_ceiling && nowNs - m_ceilingNs > m_cfg.ceilingRiseNs) {
-            const uint32_t raised = m_ceiling + m_ceiling / 32 + 1;
+            const uint32_t step = std::max<uint32_t>(m_ceiling * m_cfg.ceilingRisePercent / 100, 1);
+            const uint32_t raised = m_ceiling + step;
             m_ceiling = raised >= targetKbps ? 0 : raised;  // cleared: try the target again
             m_ceilingNs = nowNs;
         }

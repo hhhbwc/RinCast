@@ -17,6 +17,14 @@ VideoSender::VideoSender(rc::Connection* connection, uint8_t streamId, rc::Video
       m_adaptive(adaptive) {
     m_packetizer.SetFecPercent(fecPercent);
     m_baseFecPercent = fecPercent;
+    // Adaptive explores up to the maximum, so its ceiling rises quickly (10% per clean 5 s);
+    // fixed bitrate only re-tests the setting, so it creeps (3% a minute). Same controller.
+    if (m_adaptive) {
+        rc::QueueGuardConfig cfg;
+        cfg.ceilingRiseNs = 5'000'000'000LL;
+        cfg.ceilingRisePercent = 10;
+        m_guard.Configure(cfg);
+    }
     m_windowStartNs = rc::NowNs();
     m_worker = std::thread([this] { WorkerLoop(); });
 }
@@ -70,8 +78,11 @@ void VideoSender::WorkerLoop() {
     }
 }
 
-void VideoSender::SetMaxBitrate(uint32_t kbps) {
-    m_maxKbps = kbps;
+void VideoSender::StartAt(uint32_t kbps) {
+    if (m_adaptive) m_guard.SeedCeiling(std::min(kbps, m_maxKbps), rc::NowNs());
+}
+
+void VideoSender::SetMaxBitrate(uint32_t kbps) {    m_maxKbps = kbps;
     if (!m_adaptive || m_targetKbps > kbps) m_targetKbps = kbps;
 }
 
@@ -217,17 +228,13 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     }
     const double queueFloor = m_queueBaselineMs < 0 ? 0 : m_queueBaselineMs;
     if (fb.receivedKbps) m_receivedKbps = m_receivedKbps ? m_receivedKbps * 0.7 + fb.receivedKbps * 0.3 : fb.receivedKbps;
-    if (m_baselineNetworkMs < 0 || fb.networkMs < m_baselineNetworkMs) m_baselineNetworkMs = fb.networkMs;
-    m_baselineNetworkMs += 0.01;  // slowly forget
     {
         std::lock_guard lock(m_statsMutex);
         m_stats.queueMs = m_queueMs;
     }
-    const bool queueHigh = q > queueFloor + 40;  // well past what the path carries
     // Wi-Fi and mobile links lose the odd packet without being full: only sustained or
     // heavy loss counts. (Headsets that measure no delay have nothing better than lost frames.)
     m_lossAvg = m_lossAvg * 0.8 + lossRate * 0.2;
-    const bool lossy = m_lossAvg > 0.02 || lossRate > 0.2;
     // Loss-coupled parity: at the edge of a real link the steady state includes small
     // losses. The recovery frames cover single-frame gaps; a little more parity covers
     // the rest. Cheaper than the keyframe waits that unrecoverable frames cost. The
@@ -239,72 +246,37 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
             RC_LOGI("Stream %u: FEC %d%% (loss %.1f %%)", m_streamId, fec, m_lossAvg * 100);
         }
     }
-    const bool congested = q > queueFloor + 15 || lossy ||
-                           (!measured && (fb.framesLost > 0 || fb.networkMs > m_baselineNetworkMs + 8.0));
 
-    if (!m_adaptive) {
-        // Fixed bitrate: the user asked for a constant rate, so the guard only moves it when
-        // the path is demonstrably hurt. The law lives in rc/queue_guard.h, where it is also
-        // simulated: a target with a dead band instead of a threshold, because a threshold
-        // that lands on the queue the link runs at fires forever (measured: 114 of 156 dips
-        // at 25-31 ms against a 25 ms threshold, on a link whose natural queue is 27-30 ms).
-        const uint32_t target = m_targetKbps.load();
-        const auto res = m_guard.Update(target, q, queueFloor, fb.requestKeyframe != 0, now);
-        m_congestionKbps.store(res.capKbps);
-        if (res.action == rc::QueueGuard::Action::Dip) {
-            m_lastDipNs = now;
-            RC_LOGI("Stream %u: guard dip to %u kbps (queue %.0f ms, floor %.0f, loss %.1f %%)", m_streamId,
-                    res.capKbps, q, queueFloor, lossRate * 100);
-        } else if (res.action == rc::QueueGuard::Action::Climb) {
-            RC_LOGD("Stream %u: guard climbed to %u kbps", m_streamId, res.capKbps);
-        } else if (res.action == rc::QueueGuard::Action::Released) {
-            RC_LOGI("Stream %u: congestion guard released, back to %u kbps", m_streamId, target);
-        }
-        // A guard that sits at the floor otherwise leaves nothing behind. The queue alone
-        // cannot say whether the path is full or the estimate is stale - the arrival rate
-        // can, so log both and let the next test answer it.
-        if (res.capKbps && res.capKbps <= target / m_guard.Config().minDivisor &&
-            now - m_floorLogNs > 5'000'000'000LL) {
-            m_floorLogNs = now;
-            RC_LOGI("Stream %u: guard at the floor, queue %.0f ms, sending %u of %u kbps, arriving %.0f kbps",
-                    m_streamId, q, res.capKbps, target, m_receivedKbps);
-        }
-        // No ceiling probe above the target: the guard's own ceiling already re-probes
-        // upward after a clean minute, and a flat +15% push fired straight past the path
-        // (161 Mb/s on a link that carries ~115) - every probe ended in a dip within a
-        // second, which is a stutter the user pays for nothing.
-        return;
+    // One controller for both modes. Fixed bitrate aims at what the user asked for and the
+    // guard only goes under it; adaptive aims at the maximum and lets the same guard find
+    // what the path carries. The law, and why it is a target with a dead band rather than a
+    // threshold, is in rc/queue_guard.h - it is simulated there too.
+    //
+    // The old adaptive branch (an AIMD with "cut when the queue passes floor+15, grow when
+    // it drops under 5") is gone: on a device whose own queue runs at 10-30 ms the grow
+    // condition never came true, so it cut forever and sank to its floor, and its cuts were
+    // sized by the arrival rate - the spiral that walked 119 Mb/s to 17.5 in four steps.
+    const uint32_t aim = m_adaptive ? m_maxKbps : m_targetKbps.load();
+    const auto res = m_guard.Update(aim, q, queueFloor, fb.requestKeyframe != 0, now);
+    m_congestionKbps.store(res.capKbps);
+    if (res.action == rc::QueueGuard::Action::Dip) {
+        m_lastDipNs = now;
+        RC_LOGI("Stream %u: guard dip to %u kbps (queue %.0f ms, floor %.0f, loss %.1f %%)", m_streamId,
+                res.capKbps, q, queueFloor, lossRate * 100);
+    } else if (res.action == rc::QueueGuard::Action::Climb) {
+        RC_LOGD("Stream %u: guard climbed to %u kbps", m_streamId, res.capKbps);
+    } else if (res.action == rc::QueueGuard::Action::Released) {
+        RC_LOGI("Stream %u: congestion guard released, back to %u kbps", m_streamId, aim);
     }
-
-    // Congestion control. When the stream is faster than the path (an internet upload,
-    // weak Wi-Fi), the excess waits in some buffer on the way and every frame arrives
-    // later than the one before - that queueing delay above is the AIMD's main signal.
-    const uint32_t minKbps = std::max<uint32_t>(m_maxKbps / 20, 2000);
-    uint32_t target = m_targetKbps;
-    // A queue takes a moment to drain after a cut: only cut again once that had time,
-    // or if the queue is still growing.
-    const bool mayDecrease = now - m_lastDecreaseNs > 500'000'000LL ||
-                             (now - m_lastDecreaseNs > 150'000'000LL && q > m_queueAtDecreaseMs * 1.5);
-    // Already sending less than arrives: the backlog is draining, so a still high queue
-    // is no reason to cut further (only new loss is).
-    const bool draining = m_receivedKbps > 0 && target <= m_receivedKbps * 0.85 && !lossy;
-    if (congested && mayDecrease && !draining) {
-        double next = target * 0.85;
-        // What arrives is what the path carries right now: go below it so the queue empties
-        // (but at most halve per step: the arrival rate lags behind and starts out low).
-        if (queueHigh && m_receivedKbps > 0) next = std::max(target * 0.5, std::min(target * 0.7, m_receivedKbps * 0.8));
-        target = std::max(minKbps, uint32_t(next));
-        m_lastDecreaseNs = now;
-        m_lastIncreaseNs = now;
-        m_queueAtDecreaseMs = std::max(q, 1.0);
-        RC_LOGI("Stream %u: %s, bitrate %u kbps (queue %.0f ms, loss %.1f %%, arriving %.0f kbps)", m_streamId,
-                queueHigh ? "path overloaded" : "congestion", target, q, lossRate * 100, m_receivedKbps);
-    } else if (!congested && q < 5 && now - m_lastIncreaseNs > 500'000'000LL &&
-               now - m_lastDecreaseNs > 2'000'000'000LL) {
-        target = std::min(m_maxKbps, uint32_t(target * 1.05) + 500);
-        m_lastIncreaseNs = now;
+    // A guard that sits at the floor otherwise leaves nothing behind. The queue alone
+    // cannot say whether the path is full or the estimate is stale - the arrival rate
+    // can, so log both and let the next test answer it.
+    if (res.capKbps && res.capKbps <= aim / m_guard.Config().minDivisor &&
+        now - m_floorLogNs > 5'000'000'000LL) {
+        m_floorLogNs = now;
+        RC_LOGI("Stream %u: guard at the floor, queue %.0f ms, sending %u of %u kbps, arriving %.0f kbps",
+                m_streamId, q, res.capKbps, aim, m_receivedKbps);
     }
-    m_targetKbps = target;
 }
 
 VideoSenderStats VideoSender::Stats() {
