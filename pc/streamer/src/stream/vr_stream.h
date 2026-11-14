@@ -35,6 +35,9 @@ struct VrStreamConfig {
     bool foveated = true;
     bool adaptiveQuant = true;
     bool twoPass = false;
+    // false = plain CBR: spend the ceiling exactly, even on still pictures. The quality
+    // profile's opt-in mode; every other path leaves the encoder on capped VBR.
+    bool cappedVbr = true;
     bool motionField = false;       // for frame generation on the headset
     // Foveated encoding around where the eyes look (see Foveator): the size each eye is
     // encoded at, 0 = off. eyeWidth x eyeHeight stays the size the headset shows.

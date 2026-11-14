@@ -482,6 +482,7 @@ void VrStream::RunEncoder() {
             ec.foveated = m_config.foveated && !job.foveated;
             ec.adaptiveQuant = m_config.adaptiveQuant;
             ec.twoPass = m_config.twoPass;
+            ec.cappedVbr = m_config.cappedVbr;
             encoder = CreateEncoder(device, m_bridge->VendorId(), ec);
             appliedKbps = ec.bitrateKbps;
             m_sender.RequestKeyframe();
