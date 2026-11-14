@@ -82,6 +82,9 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     void NotifyVrState(const std::string& state, const std::string& producer, const std::string& app,
                        const std::string& error = {});
     void OnSettingsChanged();  // PC-side settings changed in the UI
+    // The three-way preference is baked into the encoder and the queue guard when a
+    // stream starts, so switching it has to rebuild the live streams to take effect.
+    void OnStreamProfileChanged();
     void OnMonitorsChanged();
 
     rc::VideoCodec ChooseCodec(bool forVr) const;
@@ -101,6 +104,7 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     void StartVr();
     void StopVr();
     void RestartVr();
+    void RestartVideoForProfile();
     void LaunchSteamVr();
     void UpdateAudio();
     void ApplyClientInfo(const json& m);

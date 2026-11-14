@@ -189,6 +189,10 @@ function commitSetting(el) {
       return;
     }
     if (state) state.settings = r.settings;
+    // A getState reply can land while a save is in flight and re-bind the controls
+    // to the older snapshot. Re-bind to the settings the app just confirmed, so the
+    // selected radio is always the value that actually applies.
+    bindSettings();
     renderDependents();
     renderAudio();
     drawSpark();
@@ -603,6 +607,10 @@ function renderDependents() {
     ? t("video.override", { list: chosen.join(t("misc.listSep")) })
     : t("video.overrideDefault");
   if (unsupported.length) $("#overrideNote").textContent += ` ${t("video.unsupported", { list: unsupported.join(t("misc.listSep")) })}`;
+  // The three-way preference explains itself in words the user picked, not in
+  // queue milliseconds. Only the neutral note is ours; save errors get their own node.
+  const profile = Math.max(0, Math.min(2, Number(state.settings.streamProfile ?? 1)));
+  $("#profileNote").textContent = t(`video.profileNote${profile}`);
   const h264 = state.settings.codec === "h264";
   setOff($("#tenBitRow"), h264);
   $("#tenBitHint").hidden = !h264;
@@ -874,7 +882,7 @@ function mock(msg) {
   const audio = { speaker: false, microphone: false, microphoneFeed: false, steam: { speaker: !(demo === "problem"), microphone: !(demo === "problem") }, active: demo === "problem" ? {} : { speaker: "steam", microphone: "steam" } };
   const base = mock.base ||= {
     type: "state", version: "1.0.0", downloadUrl: "https://rincast.com/#download", downloadSite: "rincast.com",
-    settings: { pcName: "Studio PC", codec: "auto", tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: "auto", autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: true, preventSleep: true, cloudUrl: "https://rincast.com", allowRemote: true,
+    settings: { pcName: "Studio PC", codec: "auto", tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, streamProfile: 1, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: "auto", autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: true, preventSleep: true, cloudUrl: "https://rincast.com", allowRemote: true,
       trustedDevices: none ? [] : [{ id: "q3", name: "Quest 3", model: "Meta Quest 3", lastSeen: Date.now() / 1000 }] },
     cloud: demo === "signedout" || demo === "firstrun" ? { signedIn: false } : { signedIn: true, userName: "Sam", email: "sam@example.com", status: demo === "problem" ? "error" : "online", error: demo === "problem" ? "The server didn't answer." : "", allowRemote: true },
     system: { gpu: demo === "problem" ? "Microsoft Basic Display Adapter" : "NVIDIA GeForce RTX 5070 Ti", port: 38711, addresses: ["192.168.1.20"], vpnAddresses: demo === "vpn" ? [{ name: "Tailscale", address: "100.101.102.103" }] : [], firewall: { otherNetworksOpen: demo !== "problem", publicInUse: demo === "public", publicAllowed: false, publicUnguarded: false }, encoder: demo === "problem" ? {} : { backend: "nvenc", h264: true, hevc: true, av1: true, hevc10: true },

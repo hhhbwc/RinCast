@@ -301,7 +301,13 @@ std::string App::ApplySettingSideEffects(const json& changed) {
         SettingsStore::Get().Update([](Settings& s) { s.startWithWindows = !s.startWithWindows; });
     }
     if (changed.contains("pcName") || changed.contains("allowRemote") || changed.contains("cloudUrl")) m_cloud.Wake();
-    if (auto session = m_server.ActiveSession()) session->OnSettingsChanged();
+    if (auto session = m_server.ActiveSession()) {
+        session->OnSettingsChanged();
+        // A profile switch changes the encoder's QP floor and the guard's queue
+        // budget, both fixed at stream start. Rebuild the live streams so the new
+        // choice takes effect without asking the user to reconnect the headset.
+        if (changed.contains("streamProfile")) session->OnStreamProfileChanged();
+    }
     return error;
 }
 

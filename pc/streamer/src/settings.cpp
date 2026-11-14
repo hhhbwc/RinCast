@@ -106,6 +106,7 @@ void Settings::FromJson(const json& j) {
     vrBitrateMbps = std::clamp(vrBitrateMbps, 10, 500);
     desktopBitrateMbps = std::clamp(desktopBitrateMbps, 5, 200);
     fecPercent = std::clamp(fecPercent, 0, 25);
+    streamProfile = std::clamp(streamProfile, 0, 2);
     if (codec != "auto" && codec != "h264" && codec != "hevc" && codec != "av1") codec = "auto";
     if (openxrRuntime != "rincast" && openxrRuntime != "steamvr") openxrRuntime = "steamvr";
     if (audioDevices != "auto" && audioDevices != "rincast" && audioDevices != "steam" && audioDevices != "system")

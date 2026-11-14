@@ -71,6 +71,13 @@
                     <h3 data-i18n="video.bitrateDesktop">Desktop</h3>
           <label class="bar"><input type="range" min="10" max="150" step="5" data-setting="desktopBitrateMbps" aria-label="Bitrate limit for the desktop" data-i18n-aria="video.bitrateDesktopAria"><output></output></label>
           <label class="check"><input type="checkbox" data-setting="adaptiveBitrate"><span data-i18n="video.adaptive">Adjust bitrate automatically</span></label>
+          <h3 id="l-profile" data-i18n="video.profile">What to favor</h3>
+          <div class="options" role="radiogroup" aria-labelledby="l-profile" aria-describedby="profileNote">
+            <label><input type="radio" name="streamProfile" data-setting="streamProfile" value="0"><span data-i18n="video.profileLatency">Low latency</span></label>
+            <label><input type="radio" name="streamProfile" data-setting="streamProfile" value="1"><span data-i18n="video.profileBalanced">Balanced</span></label>
+            <label><input type="radio" name="streamProfile" data-setting="streamProfile" value="2"><span data-i18n="video.profileQuality">Best picture</span></label>
+          </div>
+          <p class="note" id="profileNote"></p>
           <p class="note" id="overrideNote"></p>
         </div>
         <div>

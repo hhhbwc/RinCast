@@ -354,6 +354,7 @@ void ClientSession::HandleMessage(const json& m) {
     }
     if (type == "_monitors") return SendMonitors();
     if (type == "_audio") return UpdateAudio();
+    if (type == "_profile") return RestartVideoForProfile();
     if (type == rc::msg::kClientInfo) {
         ApplyClientInfo(m);
         SendServerInfo();
@@ -623,6 +624,31 @@ void ClientSession::OnSettingsChanged() {
     m_queue.push_back(json{{"type", rc::msg::kUpdateSettings}, {"settings", json::object()}});
     m_queue.push_back(json{{"type", "_audio"}});
     m_queueCv.notify_one();
+}
+
+void ClientSession::OnStreamProfileChanged() {
+    // Queued rather than restarting here: this comes from the WebView thread, while
+    // the streams are owned by the session worker (same path as kUpdateSettings).
+    std::lock_guard lock(m_queueMutex);
+    m_queue.push_back(json{{"type", "_profile"}});
+    m_queueCv.notify_one();
+}
+
+void ClientSession::RestartVideoForProfile() {
+    // The QP floor, VBV size and the guard's queue budget are chosen at stream start.
+    // Rebuild only streams that are actually running, so switching a profile while
+    // idle doesn't start VR behind the user's back.
+    if (m_vr) RestartVr();
+    json monitors = json::array();
+    {
+        std::lock_guard lock(m_mutex);
+        for (auto& [id, d] : m_desktop) monitors.push_back(d->Monitor().id);
+    }
+    if (!monitors.empty()) {
+        StopDesktop();
+        StartDesktop(json{{"monitors", monitors}});
+    }
+    RC_LOGI("Stream profile changed: rebuilt %s%s", m_vr ? "VR" : "", monitors.empty() ? "" : " and desktop streams");
 }
 
 void ClientSession::StartDesktop(const json& m) {
