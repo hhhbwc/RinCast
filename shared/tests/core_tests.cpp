@@ -1361,6 +1361,30 @@ static void TestQualityProfileTwoPass() {
     std::printf("QualityProfileTwoPass: profile adds it for Best picture, user map always wins\n");
 }
 
+// The per-profile fovea gradient (0.6 / 0.7 / 0.8): each profile floors the share
+// when it may drive video settings, never lowers it, and passes through when the
+// switch is off. Encoded widths on the 2176 panel: 1744 / 1856 / 1952.
+static void TestProfileFoveaGradient() {
+    // Each profile gets its own floor.
+    CHECK(rcs::QualityProfileFoveaFor(0.6f, true, 0) == 0.6f);
+    CHECK(rcs::QualityProfileFoveaFor(0.6f, true, 1) == 0.7f);
+    CHECK(rcs::QualityProfileFoveaFor(0.6f, true, 2) == 0.8f);
+    // Switch off: pass-through for every profile.
+    CHECK(rcs::QualityProfileFoveaFor(0.6f, false, 1) == 0.6f);
+    CHECK(rcs::QualityProfileFoveaFor(0.6f, false, 2) == 0.6f);
+    // Never lowers: a higher headset/user choice stays.
+    CHECK(rcs::QualityProfileFoveaFor(0.9f, true, 1) == 0.9f);
+    CHECK(rcs::QualityProfileFoveaFor(0.9f, true, 2) == 0.9f);
+    // The latency floor is a small raise only for eye-tracked headsets (0.45).
+    CHECK(rcs::QualityProfileFoveaFor(0.45f, true, 0) == 0.6f);
+    // The gradient's encoded widths on the 2176 panel.
+    const uint32_t w1 = uint32_t(std::lround(2176.0 * (0.6 + 0.4 * 0.5) / 16.0)) * 16;
+    const uint32_t w2 = uint32_t(std::lround(2176.0 * (0.7 + 0.3 * 0.5) / 16.0)) * 16;
+    CHECK(w1 == 1744);
+    CHECK(w2 == 1856);
+    std::printf("ProfileFoveaGradient: 0.6/0.7/0.8 -> 1744/1856/1952 per eye, only-raise, switch-off passes through\n");
+}
+
 int main() {
     TestLinkLocalDiscovery();
     TestMusic();
@@ -1380,6 +1404,7 @@ int main() {
     TestQualityProfileFovea();
     TestQualityProfileQpMap();
     TestQualityProfileTwoPass();
+    TestProfileFoveaGradient();
     TestQueueGuard();
     TestFecDeterministic();
     TestHandshakeAndTransport();

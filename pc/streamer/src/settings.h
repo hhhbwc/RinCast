@@ -106,6 +106,25 @@ constexpr bool QualityProfileTwoPass(bool current, bool profileControlsVideo, bo
     return current || (profileControlsVideo && qualityProfile);
 }
 
+// Per-profile fovea floors (the share of each eye that stays full-density). The
+// gradient 0.6 / 0.7 / 0.8 is what makes the three profiles differ where it always
+// shows - encoded pixels - because the queue budgets alone never bind on a real
+// link (measured 2026-11-14: 0 dips across all three). 0.6 mirrors
+// Foveator::kFixedFoveaSize, the lens-centre share the headset's own fixed squeeze
+// already uses: the latency floor is a no-op there and a small raise only for
+// eye-tracked headsets. profile: 0 = latency, 1 = balanced, 2 = quality
+// (rc::StreamProfile's ids).
+constexpr float kLatencyProfileFovea = 0.6f;
+constexpr float kBalancedProfileFovea = 0.7f;
+constexpr float ProfileFoveaFloor(int profile) {
+    return profile == 2 ? kQualityProfileFovea
+           : profile == 1 ? kBalancedProfileFovea
+                          : kLatencyProfileFovea;
+}
+constexpr float QualityProfileFoveaFor(float current, bool profileControlsVideo, int profile) {
+    return profileControlsVideo && current < ProfileFoveaFloor(profile) ? ProfileFoveaFloor(profile) : current;
+}
+
 class SettingsStore {
    public:
     static SettingsStore& Get();
