@@ -34,6 +34,12 @@ struct QueueGuardConfig {
     // ceiling explores upward quickly, since there the aim is the maximum, not the setting.
     int64_t ceilingRiseNs = 60'000'000'000LL;
     uint32_t ceilingRisePercent = 3;
+    // A stream's first keyframe request is the headset asking for an I-frame to start
+    // decoding, not a lost frame. Without this grace every stream start / profile switch
+    // cut the rate 12% for two seconds while the queue was still -1..4 ms and loss 0%
+    // (measured 2026-11-14: "guard dip to 123200 kbps (queue -1 ms, floor 0, loss 0.0 %)"
+    // on each of the three profile switches). Real loss after the grace still dips.
+    int64_t startupGraceNs = 2'000'000'000LL;
 };
 
 // A stream profile's "how much delay do I accept" becomes the guard's brake
@@ -67,6 +73,7 @@ public:
         m_lastDipNs = 0;
         m_lastClimbNs = 0;
         m_lastKeyDipNs = 0;
+        m_firstReportNs = -1;
     }
     // Puts the guard at a cap without a dip (a settings change, a new session).
     void Seed(uint32_t capKbps) { m_cap = capKbps; }
@@ -84,6 +91,8 @@ public:
     Result Update(uint32_t targetKbps, double queueMs, double queueFloorMs, bool keyframeRequested, int64_t nowNs) {
         Result r{0, Action::None};
         if (!targetKbps) return r;
+        if (m_firstReportNs < 0) m_firstReportNs = nowNs;
+        const bool starting = nowNs - m_firstReportNs < m_cfg.startupGraceNs;
         const uint32_t hardFloor = std::max<uint32_t>(targetKbps / m_cfg.minDivisor, 1000);
         const bool measured = queueMs >= 0;
 
@@ -153,7 +162,7 @@ public:
         // A keyframe request is a lost frame, not necessarily a full path: the recovery frame
         // answers it, so it dips once per episode and gently. It used to dip 65% on every
         // report, and one burst walked 140 -> 30 Mb/s in ten seconds.
-        if (keyframeRequested && nowNs - m_lastKeyDipNs > 2'000'000'000LL) {
+        if (keyframeRequested && !starting && nowNs - m_lastKeyDipNs > 2'000'000'000LL) {
             m_lastKeyDipNs = nowNs;
             if (dip(measured && queueMs > dipAt ? 650 : 880, measured && queueMs > dipAt)) {
                 r.capKbps = m_cap;
@@ -197,6 +206,7 @@ private:
     int64_t m_lastDipNs = 0;
     int64_t m_lastClimbNs = 0;
     int64_t m_lastKeyDipNs = 0;
+    int64_t m_firstReportNs = -1;  // the first feedback report of this stream; -1 = none yet
 };
 
 }  // namespace rc

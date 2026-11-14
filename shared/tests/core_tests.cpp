@@ -1270,6 +1270,36 @@ static void TestQueueGuard() {
         std::printf("queue guard: back from the floor at %u kbps (%d dips)\n", run.lastRate, run.dips);
         CHECK(run.lastRate >= 84000);
     }
+
+    // 7. The headset's first keyframe request is "give me an I-frame so I can start
+    //    decoding", not a lost packet. Every stream start and profile switch used to
+    //    answer it with a 12% rate cut while the queue was still -1..4 ms and loss 0%
+    //    (field log 2026-11-14 18:30:39/18:31:46/18:32:21), then spend 2-3 s climbing
+    //    back. Ignore keyframe dips only for the first two seconds; real congestion and
+    //    real loss after that must still dip.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        const auto first = guard.Update(target, -1, 0, true, 1'000'000'000LL);
+        CHECK(first.action == rc::QueueGuard::Action::None);
+        CHECK(first.capKbps == 0);
+        for (int i = 2; i <= 10; ++i) {
+            const auto r = guard.Update(target, 2, 0, true, int64_t(i) * 200'000'000LL);
+            CHECK(r.action == rc::QueueGuard::Action::None);
+        }
+        // Loss once the stream is up is real.
+        const auto late = guard.Update(target, 3, 0, true, 4'000'000'000LL);
+        CHECK(late.action == rc::QueueGuard::Action::Dip);
+        CHECK(late.capKbps < target);
+        // A queue over the budget still dips even inside the grace: only the keyframe
+        // branch is suppressed, not congestion control.
+        rc::QueueGuard congested;
+        congested.Configure(cfg);
+        const auto over = congested.Update(target, 200, 0, false, 1'000'000'000LL);
+        CHECK(over.action == rc::QueueGuard::Action::Dip);
+        std::printf("queue guard: startup keyframe ignored, loss after grace dips to %u kbps\n",
+                    late.capKbps);
+    }
 }
 
 int main() {
