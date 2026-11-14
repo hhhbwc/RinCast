@@ -41,6 +41,12 @@ struct Settings {
     // 2 = picture quality. Stored as an int so the settings file stays readable.
     // See rc/stream_profile.h for what each value actually changes.
     int streamProfile = 1;
+    // When the user lets the Best-picture profile drive video settings, it may raise
+    // video-side choices on its own (right now: the fovea's full-density share, see
+    // QualityProfileFovea below). It only ever raises; a higher choice of the user's
+    // or the headset's stays. Default off: profiles then change rate control only,
+    // exactly like the builds before it.
+    bool profileControlsVideo = false;
     int fecPercent = 5;
     bool foveatedEncoding = false;  // VR: fewer bits towards the lens edges
     bool adaptiveQuantization = true;
@@ -69,6 +75,36 @@ struct Settings {
     json ToJson(bool forUi) const;
     void FromJson(const json& j);
 };
+
+// The fovea's full-density share the Best-picture profile asks for when it may
+// drive video settings (rcs::Settings::profileControlsVideo). Pure arithmetic so
+// the offline core tests check the same number the session feeds
+// Foveator::EncodedSize; the headset stretches whatever size it is sent, so the
+// share and the encoded size can never disagree (see client_session.cpp).
+constexpr float kQualityProfileFovea = 0.8f;
+constexpr float QualityProfileFovea(float current, bool profileControlsVideo, bool qualityProfile) {
+    return profileControlsVideo && qualityProfile && current < kQualityProfileFovea ? kQualityProfileFovea
+                                                                                    : current;
+}
+
+// When the Best-picture profile may drive video settings, it also asks NVENC for a
+// QP map: fewer bits towards the lens edges, so the centre keeps more of the same
+// ceiling. Only ever raises - a map the user enabled themselves stays on. The map is
+// computed from the field of view and needs no geometric squeeze; the stream still
+// runs it only on unsqueezed pictures (vr_stream.cpp gates it with !job.foveated),
+// see DEVIATIONS D-007 for what that means when the headset's own squeeze is on.
+constexpr bool QualityProfileQpMap(bool current, bool profileControlsVideo, bool qualityProfile) {
+    return current || (profileControlsVideo && qualityProfile);
+}
+
+// The Best-picture profile also wants the quick first pass (better rate control:
+// measured offline, keyframes came out 38% smaller at the same ceiling, which is
+// what spikes the queue at every scene cut or recovery). Only ever raises - a
+// two-pass the user enabled stays on. VR stream only; desktop always two-passes
+// anyway (see the desktop stream).
+constexpr bool QualityProfileTwoPass(bool current, bool profileControlsVideo, bool qualityProfile) {
+    return current || (profileControlsVideo && qualityProfile);
+}
 
 class SettingsStore {
    public:

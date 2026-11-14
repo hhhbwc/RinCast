@@ -3,6 +3,7 @@
 // recovery by reference invalidation.
 //
 //   encode-bench [--codec hevc|av1|h264] [--size 3664x1920] [--fps 90] [--mbps 150]
+//                [--preset P1..P7] [--tuning ull|ll|hq]
 //                [--frames 300] [--desktop] [--no-split] [--foveated] [--ten-bit]
 //                [--no-aq] [--two-pass] [--one-pass]
 //                [--loss <frame>] [--out <bitstream>] [--yuv <nv12 file>] [--compare-foveated]
@@ -84,6 +85,7 @@ int main(int argc, char** argv) {
     bool flat = false;             // smooth gradient instead of noise (easy still content)
     bool netBench = false;         // 走真实 VideoSender + 回环，测 pacing 与提交延迟
     std::string csvPath;
+    std::string presetArg, tuningArg;  // --preset/--tuning as typed, for the override line
     double paceFps = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -126,6 +128,24 @@ int main(int argc, char** argv) {
             ec.vbrMinQp = std::stoi(next());  // -1 = profile default, 0 = off
         } else if (a == "--avgpct") {
             ec.vbrAveragePercent = uint32_t(std::stoi(next()));
+        } else if (a == "--preset") {
+            presetArg = next();
+            std::string p = presetArg;
+            if (p.size() == 2 && p[0] >= 'a' && p[0] <= 'z') p[0] = char(p[0] - 'a' + 'A');
+            if (p.size() != 2 || p[0] != 'P' || p[1] < '1' || p[1] > '7') {
+                std::printf("--preset wants P1..P7\n");
+                return 2;
+            }
+            ec.preset = p[1] - '0';
+        } else if (a == "--tuning") {
+            tuningArg = next();
+            if (tuningArg == "ull") ec.tuning = 0;        // built-in = ultra-low-latency here
+            else if (tuningArg == "ll") ec.tuning = 1;
+            else if (tuningArg == "hq") ec.tuning = 2;
+            else {
+                std::printf("--tuning wants ull, ll or hq\n");
+                return 2;
+            }
         } else if (a == "--pace") {
             paceFps = std::stod(next());
             if (!std::isfinite(paceFps) || paceFps <= 0) return 2;
@@ -158,6 +178,10 @@ int main(int argc, char** argv) {
     }
     // As the streamer does: desktop streams always take two passes.
     if (ec.desktop && !onePass) ec.twoPass = true;
+    if (!presetArg.empty() || !tuningArg.empty())
+        std::printf("encoder override: preset %s, tuning %s\n",
+                    presetArg.empty() ? "built-in" : presetArg.c_str(),
+                    tuningArg.empty() ? "built-in (ultra-low-latency here)" : tuningArg.c_str());
     if (onePass) ec.twoPass = false;
     if (still) moving = false;
     // --net 要按真实帧率喂帧，否则发送端一直阻塞、测不出「帧间隔内的节奏」。

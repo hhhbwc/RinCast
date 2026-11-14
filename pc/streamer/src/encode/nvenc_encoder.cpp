@@ -93,9 +93,22 @@ class NvencEncoder final : public VideoEncoder {
             return false;
         }
         const GUID codec = CodecGuid(config.codec);
-        const GUID preset = config.desktop ? NV_ENC_PRESET_P4_GUID : NV_ENC_PRESET_P1_GUID;
+        // Preset and tuning: built-in is the streaming choice (VR = P1 + ultra-low-latency,
+        // desktop = P4 + low-latency). encode-bench can override both to price a slower
+        // preset against the frame budget; production leaves them 0 (see encoder.h).
+        static const GUID* const kPresets[] = {
+            nullptr,
+            &NV_ENC_PRESET_P1_GUID, &NV_ENC_PRESET_P2_GUID, &NV_ENC_PRESET_P3_GUID,
+            &NV_ENC_PRESET_P4_GUID, &NV_ENC_PRESET_P5_GUID, &NV_ENC_PRESET_P6_GUID,
+            &NV_ENC_PRESET_P7_GUID,
+        };
+        const GUID preset = config.preset > 0 && config.preset <= 7 ? *kPresets[config.preset]
+                                                                    : (config.desktop ? NV_ENC_PRESET_P4_GUID : NV_ENC_PRESET_P1_GUID);
         const NV_ENC_TUNING_INFO tuning =
-            config.desktop ? NV_ENC_TUNING_INFO_LOW_LATENCY : NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+            config.tuning == 1   ? NV_ENC_TUNING_INFO_LOW_LATENCY
+            : config.tuning == 2 ? NV_ENC_TUNING_INFO_HIGH_QUALITY
+                                 : (config.desktop ? NV_ENC_TUNING_INFO_LOW_LATENCY
+                                                   : NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY);
 
         NV_ENC_PRESET_CONFIG presetConfig{};
         presetConfig.version = NV_ENC_PRESET_CONFIG_VER;

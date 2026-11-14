@@ -36,6 +36,11 @@
 #include "rc/stream_profile.h"
 #include "rc/video_transport.h"
 
+// WP1a: the pure fovea override the VR session feeds Foveator::EncodedSize. The
+// relative include keeps the test target free of pc-side link dependencies: the
+// helper is constexpr and nothing else from this header is used here.
+#include "../../pc/streamer/src/settings.h"
+
 using namespace rc;
 
 static int g_failures = 0;
@@ -1310,6 +1315,52 @@ static void TestQueueGuard() {
     }
 }
 
+// The Best-picture fovea override: off = pass-through, on = only raises, and the
+// widened share is what must reach Foveator::EncodedSize (task card F10:
+// EncodedSize(2176, 0.8) == 1952 vs 1744 at the legacy 0.6).
+static void TestQualityProfileFovea() {
+    // Switch off (or not the quality profile): the headset's own share passes through.
+    CHECK(rcs::QualityProfileFovea(0.6f, false, true) == 0.6f);
+    CHECK(rcs::QualityProfileFovea(0.45f, false, true) == 0.45f);
+    CHECK(rcs::QualityProfileFovea(0.6f, true, false) == 0.6f);
+    // Only raises: below 0.8 the widened share applies; a higher choice stays.
+    CHECK(rcs::QualityProfileFovea(0.6f, true, true) == 0.8f);
+    CHECK(rcs::QualityProfileFovea(0.45f, true, true) == 0.8f);
+    CHECK(rcs::QualityProfileFovea(0.9f, true, true) == 0.9f);
+    // Ordering: the session runs the override BEFORE Foveator::EncodedSize, so the
+    // encoded width comes from the widened share. Computing the width from the
+    // function's OUTPUT must give the widened size; getting 1744 here would mean
+    // the session fed the original 0.6 into the sizing.
+    const float share = rcs::QualityProfileFovea(0.6f, true, true);
+    const uint32_t widened = uint32_t(std::lround(2176.0 * (share + (1.0 - share) * 0.5) / 16.0)) * 16;
+    CHECK(widened == 1952);
+    std::printf("quality profile fovea: 0.6 -> %.2f, 2176/eye encodes %u wide (1744 legacy)\n",
+                share, widened);
+}
+
+// The Best-picture QP map: off unless the user enabled it themselves, added by the
+// profile when it may drive video settings, and never revoked.
+static void TestQualityProfileQpMap() {
+    // Off: no user map, and either the switch or the profile is missing.
+    CHECK(rcs::QualityProfileQpMap(false, false, true) == false);
+    CHECK(rcs::QualityProfileQpMap(false, true, false) == false);
+    // On: the profile adds it when it may drive video settings.
+    CHECK(rcs::QualityProfileQpMap(false, true, true) == true);
+    // Only raises: a user-enabled map survives every combination.
+    CHECK(rcs::QualityProfileQpMap(true, false, false) == true);
+    std::printf("QualityProfileQpMap: profile adds it for Best picture, user map always wins\n");
+}
+
+// The Best-picture two-pass: off unless the user enabled it, added by the profile
+// when it may drive video settings, and never revoked.
+static void TestQualityProfileTwoPass() {
+    CHECK(rcs::QualityProfileTwoPass(false, false, true) == false);
+    CHECK(rcs::QualityProfileTwoPass(false, true, false) == false);
+    CHECK(rcs::QualityProfileTwoPass(false, true, true) == true);
+    CHECK(rcs::QualityProfileTwoPass(true, false, false) == true);
+    std::printf("QualityProfileTwoPass: profile adds it for Best picture, user map always wins\n");
+}
+
 int main() {
     TestLinkLocalDiscovery();
     TestMusic();
@@ -1326,6 +1377,9 @@ int main() {
     TestPacingBursts();
     TestPacingStop();
     TestStreamProfile();
+    TestQualityProfileFovea();
+    TestQualityProfileQpMap();
+    TestQualityProfileTwoPass();
     TestQueueGuard();
     TestFecDeterministic();
     TestHandshakeAndTransport();

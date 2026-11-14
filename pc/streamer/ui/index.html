@@ -78,6 +78,11 @@
             <label><input type="radio" name="streamProfile" data-setting="streamProfile" value="2"><span data-i18n="video.profileQuality">Best picture</span></label>
           </div>
           <p class="note" id="profileNote"></p>
+          <label class="check spaced" id="profileVideoRow">
+            <input type="checkbox" data-setting="profileControlsVideo">
+            <span data-i18n="video.profileVideo">Let Best picture sharpen the centre</span>
+            <small id="profileVideoHint" data-i18n="video.profileVideoHint">Widens the always-sharp centre from 0.6 to 0.8 - about 25% more encoded pixels (1744 to 1952 per eye). Only active with Best picture; needs foveated encoding on. Applies after switching the profile or reconnecting.</small>
+          </label>
           <p class="note" id="overrideNote"></p>
         </div>
         <div>

@@ -43,6 +43,13 @@ struct EncoderConfig {
     // QP floor: -1 = take the profile's value, 0 = off, >0 = override. This is
     // what makes a still picture cheap without starving a complex one.
     int vbrMinQp = -1;
+    // Bench-only overrides: 0 = the built-in choice (VR = P1 + ultra-low-latency,
+    // desktop = P4 + low-latency), so the streaming paths always stay 0 and behave
+    // exactly as before. 1..7 = NVENC preset P1..P7 (slower = better quality);
+    // tuning 1 = low latency, 2 = high quality. encode-bench sets these to price a
+    // slower preset against the frame budget; production code never does.
+    int preset = 0;
+    int tuning = 0;
     // 0 = use the profile's value. Lets the benchmark answer "what if the average
     // target stayed at the ceiling and only the QP floor did the saving?".
     uint32_t vbrAveragePercent = 0;

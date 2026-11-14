@@ -825,12 +825,23 @@ void ClientSession::StartVr() {
     cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate);  // see above
     cfg.profile = rc::ProfileFromId(pc.streamProfile);
     if (m_slowPath) cfg.startBitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 12000);
-    cfg.foveated = pc.foveatedEncoding;
+    cfg.foveated = rcs::QualityProfileQpMap(pc.foveatedEncoding, pc.profileControlsVideo && !match && !m_slowPath,
+                                            cfg.profile == rc::StreamProfile::Quality);
     cfg.adaptiveQuant = pc.adaptiveQuantization;
-    cfg.twoPass = pc.twoPassEncoding;
+    // Same gating as the fovea and QP-map lines above: the profile may drive video
+    // settings only where its choices apply (not SteamVR-matched, not the slow path).
+    cfg.twoPass = rcs::QualityProfileTwoPass(pc.twoPassEncoding, pc.profileControlsVideo && !match && !m_slowPath,
+                                             cfg.profile == rc::StreamProfile::Quality);
     cfg.motionField = st.frameGeneration;
     if (st.gazeFoveation) {
         cfg.foveaSize = st.eyesTracked ? Foveator::kFoveaSize : Foveator::kFixedFoveaSize;
+        // Best picture widens the full-density centre when the user lets the profile
+        // drive video settings (rcs::Settings::profileControlsVideo). It only raises;
+        // matched-SteamVR sizes and the slow internet path pick their own. This runs
+        // BEFORE the EncodedSize calls, so the sizes encoded - and the share sent to
+        // the headset - come from the same widened value.
+        cfg.foveaSize = QualityProfileFovea(cfg.foveaSize, pc.profileControlsVideo && !match && !m_slowPath,
+                                            cfg.profile == rc::StreamProfile::Quality);
         cfg.foveatedEyeWidth = Foveator::EncodedSize(cfg.eyeWidth, cfg.foveaSize);
         cfg.foveatedEyeHeight = Foveator::EncodedSize(cfg.eyeHeight, cfg.foveaSize);
         RC_LOGI("VR stream: foveated %s, encoding %ux%u per eye", st.eyesTracked ? "where the eyes look" : "at the lens centre",
