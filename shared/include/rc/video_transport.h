@@ -6,6 +6,7 @@
 // monitor streams.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -20,24 +21,51 @@ namespace rc {
 
 class VideoPacketizer {
    public:
-    explicit VideoPacketizer(Connection* connection) : m_connection(connection) {}
+    explicit VideoPacketizer(Connection* connection);
+    ~VideoPacketizer();
+
+    VideoPacketizer(const VideoPacketizer&) = delete;
+    VideoPacketizer& operator=(const VideoPacketizer&) = delete;
 
     // fecPercent: 0 disables FEC; otherwise one parity packet per
     // round(100 / fecPercent) data fragments (clamped to [2, 64]).
     void SetFecPercent(int fecPercent) { m_fecPercent = fecPercent; }
-    // Spreads each frame's datagrams at this rate instead of sending them in one burst,
-    // which shallow internet queues drop. Blocks the caller. 0 = no pacing (LAN).
-    void SetPacingKbps(uint32_t kbps) { m_pacingKbps = kbps; }
+    // Spreads the datagrams at this rate instead of sending them in one burst, which
+    // shallow queues (Wi-Fi, the internet) drop. Blocks the caller. 0 = no pacing.
+    // The rate only changes the spacing: the clock carries on across frames, so a frame
+    // never starts with a burst of the previous frame's leftovers.
+    void SetPacingKbps(uint32_t kbps) { m_pacingKbps.store(kbps, std::memory_order_relaxed); }
 
-    // Sends one frame. Returns number of datagrams sent.
+    // Sends one frame. Returns number of datagrams sent. May return early (count <
+    // expected) once RequestStop() was called.
     size_t SendFrame(uint8_t streamId, VideoCodec codec, uint8_t frameFlags, uint32_t frameIndex,
                      const void* metadata, uint16_t metadataSize, const uint8_t* bitstream, size_t bitstreamSize);
 
+    // Makes a SendFrame waiting in the pacer return at once (used by shutdown).
+    void RequestStop();
+
+    // Datagrams the socket refused (a full send buffer after SO_SNDTIMEO). They never
+    // reach the path, so the headset counts them as loss while the sender's own stats and
+    // the congestion guard see nothing - the one loss source neither can explain.
+    uint32_t SendFailures() const { return m_sendFailures.load(std::memory_order_relaxed); }
+
    private:
+    // Waits until dueNs; false means a stop was requested: wrap up at once.
+    bool WaitDue(int64_t dueNs);
+
     Connection* m_connection;
     int m_fecPercent = 5;
-    uint32_t m_pacingKbps = 0;
+    std::atomic<uint32_t> m_pacingKbps{0};
+    // Continuous send clock: always the earliest moment the next packet may leave. It
+    // accumulates across frames; idle over 50 ms resets it to now (a hiccup would
+    int64_t m_nextSendNs = 0;
+    std::atomic<bool> m_stopRequested{false};
+    // otherwise repay the debt as one burst). Stored as void* to keep windows.h out
+    void* m_paceTimer = nullptr;
+    void* m_stopEvent = nullptr;
     std::vector<uint8_t> m_frame;
+    std::atomic<uint32_t> m_sendFailures{0};
+    int64_t m_lastSendFailLogNs = 0;
 };
 
 struct ReceivedFrame {

@@ -221,7 +221,7 @@ void StreamClient::Connect(const ConnectTarget& target, const json& hello) {
     m_state = State::Connecting;
     {
         std::lock_guard lock(m_mutex);
-        m_status = "Connecting to " + target.name + "…";
+        m_status = "Connecting to " + target.name + "...";
         m_serverName = target.name;
     }
     m_remote = !target.cloudSession.empty();

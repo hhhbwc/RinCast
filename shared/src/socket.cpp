@@ -420,6 +420,21 @@ std::vector<NetAddress> ListGlobalIpv6(uint16_t port) {
 // UdpSocket
 // ---------------------------------------------------------------------------
 
+namespace {
+    // SO_SNDTIMEO: how long a sendto may block on a full send buffer. Ordinary UDP
+    // sends never hit it; it frees the send thread when a link truly stalls
+void SetUdpSendTimeout(uintptr_t sock) {
+#ifdef _WIN32
+    DWORD ms = 200;
+    setsockopt(static_cast<SOCKET>(sock), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
+#else
+    timeval tv{};
+    tv.tv_usec = 200 * 1000;  // Linux/Android ignore this on UDP; harmless to set
+    setsockopt(int(sock), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+}  // namespace
+
 UdpSocket::~UdpSocket() { Close(); }
 
 bool UdpSocket::Open(uint16_t port, bool broadcast, bool reuse) {
@@ -451,6 +466,9 @@ bool UdpSocket::Open(uint16_t port, bool broadcast, bool reuse) {
 #endif
     int one = 1, zero = 0;
     if (reuse) setsockopt(RC_SOCK(m_socket), SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
+    // The send timeout backstop: sendto would block forever on a full send buffer and
+    // there is no other way to interrupt it. 200 ms never fires on ordinary sends -
+    // it runs the normal send-failure path when the link has truly stalled.
     if (broadcast)
         setsockopt(RC_SOCK(m_socket), SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
     int bound;
@@ -496,6 +514,7 @@ bool UdpSocket::OpenV6(uint16_t port, bool reuse) {
     int one = 1;
     if (reuse) setsockopt(RC_SOCK(m_socket), SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
     setsockopt(RC_SOCK(m_socket), IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&one), sizeof(one));
+    SetUdpSendTimeout(m_socket);
     sockaddr_in6 addr{};
     addr.sin6_family = AF_INET6;
     addr.sin6_addr = in6addr_any;

@@ -2,6 +2,8 @@
 
 #include <avrt.h>
 
+#include <utility>
+
 #include "../gpu.h"
 #include "../input/input_injector.h"
 #include "rc/platform.h"

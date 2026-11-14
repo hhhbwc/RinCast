@@ -6,9 +6,12 @@
 #include <atomic>
 #include <mutex>
 #include <utility>
+#include <thread>
+#include <vector>
 
 #include "../encode/encoder.h"
 #include "rc/connection.h"
+#include "rc/queue_guard.h"
 #include "rc/video_transport.h"
 
 namespace rcs {
@@ -28,6 +31,7 @@ class VideoSender {
    public:
     VideoSender(rc::Connection* connection, uint8_t streamId, rc::VideoCodec codec, uint32_t maxBitrateKbps,
                 int fecPercent, bool adaptive);
+    ~VideoSender();
 
     // Sends one encoded frame with metadata.
     void Send(const EncodedFrame& frame, const void* metadata, uint16_t metadataSize, uint8_t extraFlags,
@@ -50,15 +54,19 @@ class VideoSender {
     bool BeginFrame(VideoEncoder& encoder);
 
     void OnFeedback(const rc::VideoFeedbackPayload& fb);
-    // Bitrate the encoder should use now (changes when adaptive).
-    uint32_t TargetBitrateKbps() const { return m_targetKbps.load(); }
-    void SetMaxBitrate(uint32_t kbps);
-    // Internet paths: spread each frame over time instead of sending it in one burst.
-    void SetPacing(bool pace) { m_pace = pace; }
-    // Adaptive only: begin below the maximum and probe upward.
-    void StartAt(uint32_t kbps) {
-        if (m_adaptive) m_targetKbps = std::min(kbps, m_maxKbps);
+    // Bitrate the encoder should use now (changes when the guard caps).
+    uint32_t TargetBitrateKbps() const {
+        const uint32_t cap = m_congestionKbps.load();
+        const uint32_t t = m_targetKbps.load();
+        return cap ? std::min(cap, t) : t;
     }
+    void SetMaxBitrate(uint32_t kbps);
+    // 把每帧的包铺开在时间上发，而不是一口气打出去（局域网和互联网都用）：
+    // Wi-Fi 的浅队列会被整帧突发打爆。必须在 Start 之前设好。
+    void SetPacing(bool pace) { m_pace = pace; }
+    // Adaptive only: begin below the maximum and let the guard explore upward. The ceiling
+    // is where the climb stops, so seeding it is what makes the start point mean anything.
+    void StartAt(uint32_t kbps);
 
     VideoSenderStats Stats();
     uint8_t StreamId() const { return m_streamId; }
@@ -70,9 +78,19 @@ class VideoSender {
     const rc::VideoCodec m_codec;
     std::atomic<bool> m_keyframeRequested{true};
     std::atomic<uint32_t> m_targetKbps;
+    // Fixed-bitrate guard (OnFeedback): holds the rate under what the path carries by
+    // watching the queue the headset reports. Its law and the measurements behind it live
+    // in rc/queue_guard.h; this class only owns the timing and the logging around it.
+    rc::QueueGuard m_guard;
+    std::atomic<uint32_t> m_congestionKbps{0};  // mirror of m_guard.Cap() for the sender side
+    int64_t m_lastDipNs = 0;         // network thread only
+    int m_baseFecPercent = -1;       // the setting's FEC; network thread only
+    std::atomic<int> m_dynamicFec{-1};  // what the packetizer currently runs; network thread only
+    int64_t m_floorLogNs = 0;        // network thread only
+    double m_queueBaselineMs = -1;   // the device's own queue floor; network thread only
     uint32_t m_maxKbps;
     bool m_adaptive;
-    bool m_pace = false;
+    std::atomic<bool> m_pace{false};
     double m_lossAvg = 0;
     uint32_t m_frameIndex = 0;
 
@@ -96,11 +114,8 @@ class VideoSender {
     uint64_t m_windowBytes = 0;
     double m_windowEncodeMs = 0;
     VideoSenderStats m_stats;
-    int64_t m_lastIncreaseNs = 0;
-    int64_t m_lastDecreaseNs = 0;
-    double m_baselineNetworkMs = -1;
+    int64_t m_lastStatsLogNs = 0;
     double m_queueMs = -1;            // smoothed queueing delay reported by the headset
-    double m_queueAtDecreaseMs = 0;
     double m_receivedKbps = 0;        // smoothed rate that actually arrives
 };
 

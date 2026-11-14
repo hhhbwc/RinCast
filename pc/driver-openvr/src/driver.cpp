@@ -1089,7 +1089,8 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
                 score += std::fabs(m.m[i][3] - p.vecPosition[i]);
                 for (int j = 0; j < 3; j++) score += std::fabs(m.m[i][j] - r[i][j]);
             }
-            if (score < bestScore) {
+            // Equal poses carry no age information; prefer the newest matching sample.
+            if (score <= bestScore) {
                 bestScore = score;
                 best = &t;
             }

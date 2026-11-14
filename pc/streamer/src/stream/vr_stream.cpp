@@ -5,6 +5,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "foveator.h"
@@ -489,9 +490,16 @@ void VrStream::RunEncoder() {
             }
         }
 
-        // The encoder budgets bitrate / fps per frame, so half the frames need twice the rate.
+        // Half rate pays nothing extra here. The encoder tracks the interval between the
+        // frames it actually sees (the slow EMA in nvenc_encoder reconfigures frameRateNum
+        // to the real rate), so halving the frames already doubles the per-frame budget by
+        // itself. Doubling the bitrate as well paid it twice: whenever the guard sat low
+        // enough to trip half rate, the encoder produced twice what the pacer was allowed
+        // to send (17.5 -> 35 Mb/s against a 26 Mb/s pacer) and the frame rate fell to
+        // 29-33 fps. The handoff is bounded anyway - RunEncoder waits for the previous
+        // SendJob to be taken - so 2x output would only queue against a 1x wire.
         const uint32_t target = m_sender.TargetBitrateKbps();
-        const uint32_t encoderKbps = job.halfRate ? target * 2 : target;
+        const uint32_t encoderKbps = target;
         if (encoderKbps != appliedKbps) {
             encoder->SetBitrate(encoderKbps);
             appliedKbps = encoderKbps;

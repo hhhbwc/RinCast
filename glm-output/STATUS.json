@@ -1,0 +1,31 @@
+{
+  "tasks": [
+    {
+      "id": 1,
+      "name": "fps 反馈链路核实",
+      "status": "done",
+      "notes": "实现正确;补停顿钳制 + 成功后才记账两处缺陷"
+    },
+    {
+      "id": 2,
+      "name": "pacing 与 VBV 相互作用",
+      "status": "done",
+      "notes": "稳态 153.6/150;swing 峰值 159.3/150(旧 +74%);VBV 1.5 帧 + 欠账丢弃把突发压平"
+    },
+    {
+      "id": 3,
+      "name": "固定码率无退让的评估",
+      "status": "partial",
+      "notes": "分析已给(任务书任务 3 三方向);等真机数据决定是否需要拥塞信号触发"
+    },
+    {
+      "id": 4,
+      "name": "头显侧丢包反馈审查",
+      "status": "pending",
+      "notes": "未做;等真机数据说话"
+    }
+  ],
+  "build": "pass",
+  "tests": "pass (6 consecutive runs)",
+  "date": "2026-11-13"
+}
