@@ -331,6 +331,25 @@ class NvencEncoder final : public VideoEncoder {
                 // An intra frame (also what NVENC produces when an invalidation left
                 // nothing to reference) resets what older frames can be recovered from.
                 if (out.keyframe) m_lastIntraTs = ts;
+                {
+                    const int64_t now = rc::NowNs();
+                    if (!m_statStartNs) m_statStartNs = now;
+                    m_statFrames++;
+                    m_statQpSum += lock.frameAvgQP;
+                    m_statBytes += lock.bitstreamSizeInBytes;
+                    const int64_t elapsed = now - m_statStartNs;
+                    if (elapsed >= 5 * 1000 * 1000 * 1000LL) {
+                        const double secs = double(elapsed) / 1e9;
+                        RC_LOGI("ENC 5s: %.0f fps, qp %.1f, %.1f KB/frame, %.1f Mbps (ceiling %u)",
+                                m_statFrames / secs, double(m_statQpSum) / m_statFrames,
+                                double(m_statBytes) / m_statFrames / 1024.0,
+                                double(m_statBytes) * 8.0 / secs / 1e6, m_config.bitrateKbps / 1000);
+                        m_statStartNs = now;
+                        m_statFrames = 0;
+                        m_statQpSum = 0;
+                        m_statBytes = 0;
+                    }
+                }
                 api.nvEncUnlockBitstream(m_encoder, m_bitstream);
             } else {
                 ok = false;
@@ -562,6 +581,14 @@ class NvencEncoder final : public VideoEncoder {
     uint32_t m_effectiveFps = 0;
     int64_t m_lastVbvNs = 0;
     uint64_t m_lastIntraTs = 0;
+
+    // Encoder-side truth, summarised every 5 s from the lock path below: the QP the
+    // rate control actually ran and the bytes that actually came out, so "why didn't
+    // it spend the ceiling" stops being a guess. Encoding thread only - no locks.
+    int64_t m_statStartNs = 0;
+    uint32_t m_statFrames = 0;
+    uint64_t m_statQpSum = 0;
+    uint64_t m_statBytes = 0;
     bool m_canInvalidate = false;
     bool m_split = false;
     bool m_foveated = false;
