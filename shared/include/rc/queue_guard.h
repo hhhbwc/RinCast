@@ -96,7 +96,12 @@ public:
             // like another failure at a lower rate, and taking those as the ceiling ratcheted
             // it under the path's capacity (76 Mb/s on a 100 Mb/s link in the simulation).
             // And only congestion counts: a lost frame is not evidence about the path.
-            if (congestion && nowNs - m_lastDipNs > 2'000'000'000LL) {
+            // Nor does a dip that happens while already at the floor: that says the path is
+            // gone, not that the floor is the rate it carries. Recording it there set the
+            // ceiling to the floor itself, aim fell under the current cap, and the climb then
+            // walked the rate *down* - the stream sat at 16 Mb/s and could not climb out.
+            const bool meaningful = base > hardFloor + hardFloor / 20;
+            if (congestion && meaningful && nowNs - m_lastDipNs > 2'000'000'000LL) {
                 m_ceiling = base;
                 m_ceilingNs = nowNs;
             }
@@ -116,8 +121,12 @@ public:
                     m_cap = 0;
                     r.action = Action::Released;
                 } else {
-                    m_cap = aim;  // hold under the ceiling; no dip needed to stay there
-                    if (m_cap == base) return;
+                    // Never let a climb lower the rate: an aim under the current cap means the
+                    // ceiling is stale or was recorded at the floor, and moving down is the one
+                    // thing a climb must not do (it walked 18.7 -> 16.5 Mb/s and stayed there).
+                    const uint32_t held = std::max(aim, base);
+                    if (held == base) return;
+                    m_cap = held;  // hold under the ceiling; no dip needed to stay there
                     r.action = Action::Climb;
                 }
             } else {

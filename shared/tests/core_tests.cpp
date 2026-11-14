@@ -1173,6 +1173,31 @@ static void TestQueueGuard() {
         CHECK(dips <= 3);
         CHECK(hi - lo <= hi / 12);  // inside 8%: no visible pump
     }
+
+    // 6. A collapse to the floor must not be a trap. The field log left the stream at 16 Mb/s
+    //    and climbing *down*: a dip while already at the floor recorded the floor itself as
+    //    the ceiling, so the climb's aim sat under the current cap.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        SimLink link;
+        link.capacityKbps = 100000;
+        int64_t now = 0;
+        RunGuard(guard, link, target, 20, &now);
+        // The path disappears and the queue lands a second deep, as it did in the field.
+        link.capacityKbps = 2000;
+        link.backpackMs = 1400;
+        RunGuard(guard, link, target, 3, &now);
+        const uint32_t atFloor = guard.Cap();
+        const uint32_t floorKbps = target / cfg.minDivisor;
+        std::printf("queue guard: collapse put it at %u kbps (floor %u)\n", atFloor, floorKbps);
+        CHECK(atFloor == 0 || atFloor <= floorKbps + floorKbps / 20);  // it did reach the floor
+        // The path comes back: the climb has to get out of there.
+        link.capacityKbps = 100000;
+        auto run = RunGuard(guard, link, target, 40, &now);
+        std::printf("queue guard: back from the floor at %u kbps (%d dips)\n", run.lastRate, run.dips);
+        CHECK(run.lastRate >= 84000);
+    }
 }
 
 int main() {
