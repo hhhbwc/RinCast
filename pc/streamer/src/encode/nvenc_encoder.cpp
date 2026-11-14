@@ -82,6 +82,8 @@ class NvencEncoder final : public VideoEncoder {
     ~NvencEncoder() override { Destroy(); }
 
     const char* Name() const override { return "NVENC"; }
+    // The rolling 5 s window the ENC 5s line already summarises - read, never reset here.
+    float AverageQp() const override { return m_statFrames ? float(m_statQpSum) / m_statFrames : -1.0f; }
 
     bool Init(ID3D11Device* device, const EncoderConfig& config) override {
         m_config = config;

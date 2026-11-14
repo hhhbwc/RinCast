@@ -60,9 +60,13 @@ constexpr StreamProfileParams ProfileParams(StreamProfile p) {
         default:
             // Keep the guard's current, measured numbers: changing the default
             // brake line without a real-link test is how we got here before.
-            // Only the encoder's spending changes for existing users.
-            // Latency-first (15) and quality-first (60) bracket it.
-            return {45.0, 12.0, 25.0, 100, 20, 150};
+            // Latency-first (15) and quality-first (60) bracket it. The QP floor
+            // went the way of Quality's (real device 2026-11-15: with the floor at
+            // 20 the QP stopped exactly at 20.0 and the stream sat at 35 Mbps of a
+            // 100 ceiling; floor off, the same content spent 100.8) - spending less
+            // on simple frames is the latency profile's job now, and the queue
+            // budget plus the guard stay responsible for the safety.
+            return {45.0, 12.0, 25.0, 100, 0, 150};
     }
 }
 

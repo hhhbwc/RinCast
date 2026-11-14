@@ -604,7 +604,12 @@ function renderDependents() {
   // reports it; the plain cap shows before that.
   const ceiling = fromHeadset ? session.headsetBitrateMbps : state.settings.vrBitrateMbps;
   const actual = session?.vr?.mbps;
-  $("#vrBitrateBar output").textContent = actual ? `${Math.round(actual)} / ${ceiling} Mbps` : `${ceiling} Mbps`;
+  // What the encoder really ran: "96 / 100 Mbps · 1952² · QP 11.8" tells spent vs cap
+  // and the encoded size without opening logs. Hidden while nothing streams.
+  const encW = session?.vr?.encWidth || 0;
+  const qp = session?.vr?.qp || -1;
+  const detail = actual && encW > 0 && qp > 0 ? ` · ${Math.round(encW / 2)}² · QP ${qp.toFixed(1)}` : "";
+  $("#vrBitrateBar output").textContent = actual ? `${Math.round(actual)} / ${ceiling} Mbps${detail}` : `${ceiling} Mbps`;
   if (fromHeadset) $("#vrBitrateBar input").style.setProperty("--fill", `${((session.headsetBitrateMbps - 20) / 480) * 100}%`);
   const codec = session?.headsetCodec && session.headsetCodec !== "auto" ? session.headsetCodec : "";
   const chosen = [fromHeadset && t("video.overrideBitrate", { mbps: session.headsetBitrateMbps }), codec && { hevc: "HEVC", av1: "AV1", h264: "H.264" }[codec]].filter(Boolean);

@@ -70,6 +70,9 @@ class VideoEncoder {
     virtual bool Encode(ID3D11Texture2D* input, bool forceKeyframe, EncodedFrame& out) = 0;
     virtual void SetBitrate(uint32_t kbps) = 0;
     virtual const char* Name() const = 0;
+    // The QP the last finished 5 s window actually ran at, -1 when unknown. Lets the
+    // UI show "was the ceiling spent, and at what quality" without opening logs.
+    virtual float AverageQp() const { return -1.0f; }
     // Loss recovery without a keyframe: marks every frame encoded after `timestamp`
     // as unusable, so the next frame only references `timestamp` or older. Returns
     // false if that isn't possible (the caller then forces a keyframe).

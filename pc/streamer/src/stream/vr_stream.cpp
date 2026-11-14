@@ -484,6 +484,10 @@ void VrStream::RunEncoder() {
             ec.twoPass = m_config.twoPass;
             ec.cappedVbr = m_config.cappedVbr;
             encoder = CreateEncoder(device, m_bridge->VendorId(), ec);
+            // The stats path reads these from any thread; the encoder is local to
+            // RunEncoder, so its QP and size travel out through atomics.
+            m_statEncW.store(ec.width, std::memory_order_relaxed);
+            m_statEncH.store(ec.height, std::memory_order_relaxed);
             appliedKbps = ec.bitrateKbps;
             m_sender.RequestKeyframe();
             if (!encoder) {
@@ -518,6 +522,7 @@ void VrStream::RunEncoder() {
         const int64_t encEnd = rc::NowNs();
         const bool recovery = m_sender.TakeRecovery();
         m_flowEncoded++;
+        m_statQp.store(encoder->AverageQp(), std::memory_order_relaxed);
         m_flowEncodeNs += encEnd - encStart;
         const int64_t encodeAvg = m_encodeAvgNs;
         m_encodeAvgNs = encodeAvg ? (encodeAvg * 7 + (encEnd - encStart)) / 8 : encEnd - encStart;

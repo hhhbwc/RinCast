@@ -202,7 +202,25 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     // sized by the arrival rate - the spiral that walked 119 Mb/s to 17.5 in four steps.
     const uint32_t aim = m_adaptive ? m_maxKbps : m_targetKbps.load();
     const auto res = m_guard.Update(aim, q, queueFloor, fb.requestKeyframe != 0, now);
-    m_congestionKbps.store(res.capKbps);
+    // The loss brake runs beside the guard: whichever cap is lower wins, and neither
+    // side's climb can override the other's hold (the real link oscillated 88 <-> 99
+    // Mbps for 12 minutes on loss-driven dips that the climb instantly undid).
+    const auto brake = rc::LossBrakeStep(m_brake, m_lossAvg, aim, now);
+    const uint32_t guardCap = res.capKbps ? res.capKbps : UINT32_MAX;
+    const uint32_t brakeCap = brake.capKbps ? brake.capKbps : UINT32_MAX;
+    const uint32_t finalCap = guardCap < brakeCap ? guardCap : brakeCap;
+    m_congestionKbps.store(finalCap == UINT32_MAX ? 0 : finalCap);
+    if (brake.changed) {
+        if (brake.released) {
+            RC_LOGI("Stream %u: loss brake released, back to %u kbps (loss %.1f %%)", m_streamId, aim,
+                    m_lossAvg * 100);
+        } else {
+            const int64_t holdSecs = (m_brake.holdUntilNs - now) / 1000000000LL;
+            RC_LOGI("Stream %u: loss brake %s %u kbps (loss %.1f %%, hold %lld s)", m_streamId,
+                    brake.capKbps < res.capKbps || res.capKbps == 0 ? "cut to" : "holds", brake.capKbps,
+                    m_lossAvg * 100, (long long)holdSecs);
+        }
+    }
     if (res.action == rc::QueueGuard::Action::Dip) {
         m_lastDipNs = now;
         RC_LOGI("Stream %u: guard dip to %u kbps (queue %.0f ms, floor %.0f, loss %.1f %%)", m_streamId,

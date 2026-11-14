@@ -70,7 +70,13 @@ class VrStream {
         m_gaze = gaze;
         m_gazeNs = rc::NowNs();
     }
-    VideoSenderStats Stats() { return m_sender.Stats(); }
+    VideoSenderStats Stats() {
+        VideoSenderStats s = m_sender.Stats();
+        s.qp = m_statQp.load(std::memory_order_relaxed);
+        s.encWidth = m_statEncW.load(std::memory_order_relaxed);
+        s.encHeight = m_statEncH.load(std::memory_order_relaxed);
+        return s;
+    }
     const VrStreamConfig& Config() const { return m_config; }
     bool Running() const { return m_streaming; }
 
@@ -133,6 +139,9 @@ class VrStream {
     // When the encoder started its frame and how long a frame usually takes it: the conversion
     // thread takes the game's next frame just in time for the encoder (see Run).
     std::atomic<int64_t> m_encodeStartNs{0}, m_encodeAvgNs{0};
+    // Live encoder truth for the stats path (the encoder itself is local to RunEncoder).
+    std::atomic<float> m_statQp{-1.0f};
+    std::atomic<uint32_t> m_statEncW{0}, m_statEncH{0};
     // Frame flow since the last report: given by the game, replaced in the bridge before
     // conversion, replaced while waiting for the encoder, encoded; conversion and encoding time,
     // and how long the game's frames were held back so the encoder could keep up.

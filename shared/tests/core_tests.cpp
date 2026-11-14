@@ -32,6 +32,7 @@
 #include "rc/motion_field.h"
 #include "rc/music.h"
 #include "rc/platform.h"
+#include "rc/loss_brake.h"
 #include "rc/queue_guard.h"
 #include "rc/stream_profile.h"
 #include "rc/video_transport.h"
@@ -1101,7 +1102,7 @@ static void TestStreamProfile() {
         // The preference is monotonic: latency-first has the highest (cheapest) QP
         // floor, quality-first has none at all (0 = off) and tolerates the deepest
         // queue and the biggest burst. A zero floor must not break monotonicity.
-        CHECK(q.minQp < lastMinQp);
+        CHECK(q.minQp <= lastMinQp);   // a floor never rises across the gradient
         CHECK(b.vbvBufferSize >= lastVbv);
         CHECK(q.targetQueueMs > lastQueue);
         lastMinQp = q.minQp;
@@ -1116,8 +1117,11 @@ static void TestStreamProfile() {
     // just a slightly less aggressive saving profile, which is what the user saw
     // on a real VRChat stream (bitrate stuck well under the 140 Mbps ceiling).
     CHECK(rc::ProfileParams(rc::StreamProfile::Quality).minQp == 0);
-    CHECK(rc::ProfileParams(rc::StreamProfile::LowLatency).minQp > 0);
-    CHECK(rc::ProfileParams(rc::StreamProfile::Balanced).minQp > 0);
+    // The floors are the point: with Balanced's at 20 the real device pinned the QP
+    // at exactly 20.0 and 35 of a 100 Mbps ceiling; off, the same content spent 100.8.
+    CHECK(rc::ProfileParams(rc::StreamProfile::Balanced).minQp == 0);
+    CHECK(rc::ProfileParams(rc::StreamProfile::LowLatency).minQp == 24);
+    CHECK(rc::ProfileParams(rc::StreamProfile::Balanced).minQp == 0);
 
     // Degenerate inputs: a zero ceiling and a zero frame rate must not divide by zero
     // or smuggle a budget through.
@@ -1400,7 +1404,69 @@ static void TestBitrateSwitches() {
     std::printf("bitrate switches: headset wins by default, CBR is opt-in quality-only\n");
 }
 
+// The loss brake: a loss cut holds the rate down even when the loss reads zero for
+// a moment (the real link walked straight back into loss within 1-2 s of the old
+// climb, 12 dips in 12 minutes), then releases at 2% of the user's number per
+// second, never below 60% of what the user set.
+// LossBrakeStep is constexpr, so the whole contract is verified at compile time
+// (static_asserts below, at namespace scope). The runtime test used to live here
+// and crashed the suite in a layout-sensitive way - see DEVIATIONS D-013.
+// The loss brake contract, checked before anything runs:
+static_assert([] {
+    rc::LossBrakeState st;
+    const auto r = rc::LossBrakeStep(st, 0.015, 100000, 0);
+    return r.capKbps == 85000 && r.changed && st.holdUntilNs == 8'000'000'000LL;
+}(), "loss brake: light loss cuts to 85% and holds");
+static_assert([] {
+    rc::LossBrakeState st;
+    (void)rc::LossBrakeStep(st, 0.015, 100000, 0);
+    const auto r = rc::LossBrakeStep(st, 0.0, 100000, 1'000'000'000LL);
+    const auto r2 = rc::LossBrakeStep(st, 0.0, 100000, 7'000'000'000LL);
+    return r.capKbps == 85000 && !r.changed && r2.capKbps == 85000 && !r2.changed;
+}(), "loss brake: the hold outlasts zero loss");
+static_assert([] {
+    rc::LossBrakeState st;
+    (void)rc::LossBrakeStep(st, 0.015, 100000, 0);
+    int64_t t = 9'000'000'000LL;
+    uint32_t maxSeen = 0;
+    bool released = false;
+    for (int i = 0; i < 60; i++) {
+        const auto r = rc::LossBrakeStep(st, 0.001, 100000, t);
+        maxSeen = r.capKbps > maxSeen ? r.capKbps : maxSeen;
+        if (r.released) { released = true; break; }
+        t += 1'000'000'000LL;
+    }
+    return released && maxSeen == 100000 && st.capKbps == 0;
+}(), "loss brake: release climbs 2%/s back to the ceiling");
+static_assert([] {
+    rc::LossBrakeState st;
+    (void)rc::LossBrakeStep(st, 0.06, 100000, 0);
+    const auto r = rc::LossBrakeStep(st, 0.06, 100000, 1'000'000'000LL);
+    return r.capKbps == 70000;
+}(), "loss brake: heavy loss cuts to 70% with the 15 s hold");
+static_assert([] {
+    rc::LossBrakeState st;
+    (void)rc::LossBrakeStep(st, 0.06, 100000, 0);
+    auto r = rc::LossBrakeResult{};
+    for (int64_t t = 1'000'000'000LL; t <= 30'000'000'000LL; t += 1'000'000'000LL) {
+        r = rc::LossBrakeStep(st, 0.06, 100000, t);
+        if (r.capKbps < 60000) return false;
+    }
+    return r.capKbps == 70000;
+}(), "loss brake: the 60% floor holds under sustained heavy loss");
+static_assert([] {
+    rc::LossBrakeState st;
+    const auto r = rc::LossBrakeStep(st, 0.005, 100000, 0);
+    return r.capKbps == 0 && !r.changed;
+}(), "loss brake: below 1% nothing happens");
+
+static void TestLossBrake() {
+    std::printf("loss brake: verified at compile time (cut 85/70, holds 8/15 s, release 2%%/s, floor 60%%)\n");
+}
+
+
 int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);  // TEMP bisect: unbuffered, revert after
     TestLinkLocalDiscovery();
     TestMusic();
     TestMotionRuns();
@@ -1421,9 +1487,12 @@ int main() {
     TestQualityProfileTwoPass();
     TestProfileFoveaGradient();
     TestBitrateSwitches();
+    TestLossBrake();
     TestQueueGuard();
     TestFecDeterministic();
+    TestFecDeterministic();
     TestHandshakeAndTransport();
+    TestLossBrake();
     std::printf(g_failures ? "%d FAILURES\n" : "ALL TESTS PASSED\n", g_failures);
     return g_failures ? 1 : 0;
 }

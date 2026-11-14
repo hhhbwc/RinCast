@@ -338,7 +338,8 @@ void ClientSession::HandleMessage(const json& m) {
             if (m_vr) {
                 auto s = m_vr->Stats();
                 stats["vr"] = {{"fps", s.fps}, {"encodeMs", s.encodeMs}, {"mbps", s.mbps},
-                               {"bitrateKbps", s.bitrateKbps}, {"framesLost", s.framesLost}};
+                               {"bitrateKbps", s.bitrateKbps}, {"framesLost", s.framesLost},
+                               {"qp", s.qp}, {"encWidth", s.encWidth}, {"encHeight", s.encHeight}};
             }
             json desk = json::array();
             for (auto& [id, d] : m_desktop) {
@@ -855,8 +856,12 @@ void ClientSession::StartVr() {
                                                                            : "balanced";
     const uint32_t profileMinQp = rc::ProfileParams(cfg.profile).minQp;
     const std::string qpText = profileMinQp ? std::to_string(profileMinQp) : std::string("off");
-    RC_LOGI("VR stream: %s bitrate, %s, ceiling %u kbps, capped VBR (QP floor %s)%s",
-            cfg.adaptive ? "adaptive" : "fixed", profileName, cfg.bitrateKbps, qpText.c_str(),
+    // "capped VBR" used to be hardcoded while the encoder actually ran CBR when the
+    // quality profile's switch asked for it - a log that lied about the rate control.
+    RC_LOGI("VR stream: %s bitrate, %s, ceiling %u kbps, %s (QP floor %s)%s",
+            cfg.adaptive ? "adaptive" : "fixed", profileName, cfg.bitrateKbps,
+            cfg.cappedVbr ? "capped VBR" : "CBR",
+            cfg.cappedVbr ? qpText.c_str() : "n/a",
             cfg.startBitrateKbps ? (", starting at " + std::to_string(cfg.startBitrateKbps) + " kbps").c_str() : "");
 
     std::weak_ptr<ClientSession> weak = shared_from_this();
@@ -1059,7 +1064,8 @@ json ClientSession::StatusJson() {
         const auto& c = m_vr->Config();
         j["vr"] = {{"fps", s.fps}, {"encodeMs", s.encodeMs}, {"mbps", s.mbps}, {"bitrateKbps", s.bitrateKbps},
                    {"codec", CodecName(c.codec)}, {"eyeWidth", c.eyeWidth}, {"eyeHeight", c.eyeHeight},
-                   {"refreshRate", c.fps}, {"latencyMs", s.clientLatencyMs}, {"decodeMs", s.clientDecodeMs}};
+                   {"refreshRate", c.fps}, {"latencyMs", s.clientLatencyMs}, {"decodeMs", s.clientDecodeMs},
+                   {"qp", s.qp}, {"encWidth", s.encWidth}, {"encHeight", s.encHeight}};
     }
     json desk = json::array();
     for (auto& [id, d] : m_desktop) {

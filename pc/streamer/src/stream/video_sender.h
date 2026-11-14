@@ -11,6 +11,7 @@
 
 #include "../encode/encoder.h"
 #include "rc/connection.h"
+#include "rc/loss_brake.h"
 #include "rc/queue_guard.h"
 #include "rc/stream_profile.h"
 #include "rc/video_transport.h"
@@ -26,6 +27,8 @@ struct VideoSenderStats {
     double clientDecodeMs = 0;
     double clientLatencyMs = 0;
     double queueMs = -1;  // queueing delay on the way to the headset, -1 = unknown
+    float qp = -1;        // the encoder's rolling mean QP, -1 = unknown
+    uint32_t encWidth = 0, encHeight = 0;  // what is actually being encoded, 0 = unknown
 };
 
 class VideoSender {
@@ -87,6 +90,10 @@ class VideoSender {
     // watching the queue the headset reports. Its law and the measurements behind it live
     // in rc/queue_guard.h; this class only owns the timing and the logging around it.
     rc::QueueGuard m_guard;
+    // Loss-side brake (loss_brake.h): the guard watches the queue, this watches
+    // actual loss and HOLDS the rate down after a loss cut. Both caps are taken
+    // together; neither one's climb may override the other's hold.
+    rc::LossBrakeState m_brake;
     std::atomic<uint32_t> m_congestionKbps{0};  // mirror of m_guard.Cap() for the sender side
     int64_t m_lastDipNs = 0;         // network thread only
     int m_baseFecPercent = -1;       // the setting's FEC; network thread only
