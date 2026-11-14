@@ -35,12 +35,21 @@ struct Settings {
     std::string codec = "auto";    // auto | h264 | hevc | av1
     bool tenBit = false;
     int vrBitrateMbps = 150;
+    // The headset sends its own bitrate choice and it wins by default: it plans its
+    // decode buffers around that number, and a PC-side ceiling it didn't expect can
+    // starve or flood them. This switch makes the PC's number apply anyway. Opt-in.
+    bool pcBitrateWins = false;
     int desktopBitrateMbps = 40;
     bool adaptiveBitrate = true;
     // What the automatic-bitrate switch now selects: 0 = latency, 1 = balanced,
     // 2 = picture quality. Stored as an int so the settings file stays readable.
     // See rc/stream_profile.h for what each value actually changes.
     int streamProfile = 1;
+    // CBR for the Best-picture profile: "the number I set is what every frame costs".
+    // Measured on real headset frames at +7.5% on stills vs capped VBR (encode-bench,
+    // 2026-11-15). The queue risk that retired CBR is back with it - the congestion
+    // guard carries fixed bitrate, but the switch stays opt-in and off by default.
+    bool qualityProfileCbr = false;
     // When the user lets the Best-picture profile drive video settings, it may raise
     // video-side choices on its own (right now: the fovea's full-density share, see
     // QualityProfileFovea below). It only ever raises; a higher choice of the user's
@@ -123,6 +132,21 @@ constexpr float ProfileFoveaFloor(int profile) {
 }
 constexpr float QualityProfileFoveaFor(float current, bool profileControlsVideo, int profile) {
     return profileControlsVideo && current < ProfileFoveaFloor(profile) ? ProfileFoveaFloor(profile) : current;
+}
+
+// CBR for the Best-picture profile: every frame costs exactly the limit. Measured
+// on real headset frames at +7.5% on stills vs capped VBR (encode-bench,
+// 2026-11-15) - the queue risk that retired CBR is back with it, so the switch is
+// opt-in, off by default, and the congestion guard carries the fixed rate.
+constexpr bool QualityProfileCbr(bool cbrSwitch, bool profileControlsVideo, bool qualityProfile) {
+    return cbrSwitch && profileControlsVideo && qualityProfile;
+}
+
+// Which ceiling a VR stream runs at: the headset's choice wins unless the PC user
+// explicitly overrides it (rcs::Settings::pcBitrateWins). A headset that asked for
+// 123 planned its buffers around 123; headset <= 0 = it sent no number.
+constexpr int EffectiveVrBitrate(int pcMbps, int headsetMbps, bool pcWins) {
+    return pcWins || headsetMbps <= 0 ? pcMbps : headsetMbps;
 }
 
 class SettingsStore {

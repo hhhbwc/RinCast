@@ -599,7 +599,12 @@ function renderDependents() {
   const session = state.session;
   const fromHeadset = session?.headsetBitrateMbps > 0;
   setOff($("#vrBitrateBar"), !!fromHeadset);
-  $("#vrBitrateBar output").textContent = fromHeadset ? `${session.headsetBitrateMbps} Mbps` : `${state.settings.vrBitrateMbps} Mbps`;
+  // "actual / ceiling": the throughput the encoder really managed, next to the cap,
+  // so "set 140, got 90" is visible without opening the logs. Only while a stream
+  // reports it; the plain cap shows before that.
+  const ceiling = fromHeadset ? session.headsetBitrateMbps : state.settings.vrBitrateMbps;
+  const actual = session?.vr?.mbps;
+  $("#vrBitrateBar output").textContent = actual ? `${Math.round(actual)} / ${ceiling} Mbps` : `${ceiling} Mbps`;
   if (fromHeadset) $("#vrBitrateBar input").style.setProperty("--fill", `${((session.headsetBitrateMbps - 20) / 480) * 100}%`);
   const codec = session?.headsetCodec && session.headsetCodec !== "auto" ? session.headsetCodec : "";
   const chosen = [fromHeadset && t("video.overrideBitrate", { mbps: session.headsetBitrateMbps }), codec && { hevc: "HEVC", av1: "AV1", h264: "H.264" }[codec]].filter(Boolean);
@@ -620,6 +625,7 @@ function renderDependents() {
   const tunable = ["nvenc", "amf"].includes(state.system.encoder.backend);
   setOff($("#aqRow"), !tunable);
   setOff($("#twoPassRow"), !tunable);
+  setOff($("#cbrRow"), profile !== 2);
   setOff($("#playOnPcRow"), !state.settings.streamAudio);
   setOff($("#micRow"), state.settings.audioDevices === "system");
 }
@@ -885,7 +891,7 @@ function mock(msg) {
   const audio = { speaker: false, microphone: false, microphoneFeed: false, steam: { speaker: !(demo === "problem"), microphone: !(demo === "problem") }, active: demo === "problem" ? {} : { speaker: "steam", microphone: "steam" } };
   const base = mock.base ||= {
     type: "state", version: "1.0.0", downloadUrl: "https://rincast.com/#download", downloadSite: "rincast.com",
-    settings: { pcName: "Studio PC", codec: "auto", tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, streamProfile: 1, profileControlsVideo: false, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: "auto", autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: true, preventSleep: true, cloudUrl: "https://rincast.com", allowRemote: true,
+    settings: { pcName: "Studio PC", codec: "auto", tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, streamProfile: 1, profileControlsVideo: false, qualityProfileCbr: false, pcBitrateWins: false, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: "auto", autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: true, preventSleep: true, cloudUrl: "https://rincast.com", allowRemote: true,
       trustedDevices: none ? [] : [{ id: "q3", name: "Quest 3", model: "Meta Quest 3", lastSeen: Date.now() / 1000 }] },
     cloud: demo === "signedout" || demo === "firstrun" ? { signedIn: false } : { signedIn: true, userName: "Sam", email: "sam@example.com", status: demo === "problem" ? "error" : "online", error: demo === "problem" ? "The server didn't answer." : "", allowRemote: true },
     system: { gpu: demo === "problem" ? "Microsoft Basic Display Adapter" : "NVIDIA GeForce RTX 5070 Ti", port: 38711, addresses: ["192.168.1.20"], vpnAddresses: demo === "vpn" ? [{ name: "Tailscale", address: "100.101.102.103" }] : [], firewall: { otherNetworksOpen: demo !== "problem", publicInUse: demo === "public", publicAllowed: false, publicUnguarded: false }, encoder: demo === "problem" ? {} : { backend: "nvenc", h264: true, hevc: true, av1: true, hevc10: true },

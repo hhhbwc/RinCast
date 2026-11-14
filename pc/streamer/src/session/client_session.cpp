@@ -818,7 +818,7 @@ void ClientSession::StartVr() {
     cfg.eyeWidth = dc.eyeWidth;
     cfg.eyeHeight = dc.eyeHeight;
     cfg.fps = rate;
-    cfg.bitrateKbps = uint32_t((st.vrBitrateMbps > 0 ? st.vrBitrateMbps : pc.vrBitrateMbps) * 1000);
+    cfg.bitrateKbps = uint32_t(rcs::EffectiveVrBitrate(pc.vrBitrateMbps, st.vrBitrateMbps, pc.pcBitrateWins) * 1000);
     if (m_slowPath) cfg.bitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 60000);
     cfg.fecPercent = m_slowPath ? std::max(pc.fecPercent, 12) : pc.fecPercent;
     cfg.pace = true;  // 局域网也一样，见桌面流处说明
@@ -832,6 +832,9 @@ void ClientSession::StartVr() {
     // settings only where its choices apply (not SteamVR-matched, not the slow path).
     cfg.twoPass = rcs::QualityProfileTwoPass(pc.twoPassEncoding, pc.profileControlsVideo && !match && !m_slowPath,
                                              cfg.profile == rc::StreamProfile::Quality);
+    // CBR is the quality profile's "spend exactly this" mode; opt-in, quality only.
+    cfg.cappedVbr = !rcs::QualityProfileCbr(pc.qualityProfileCbr, pc.profileControlsVideo && !match && !m_slowPath,
+                                            cfg.profile == rc::StreamProfile::Quality);
     cfg.motionField = st.frameGeneration;
     if (st.gazeFoveation) {
         cfg.foveaSize = st.eyesTracked ? Foveator::kFoveaSize : Foveator::kFixedFoveaSize;

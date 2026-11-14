@@ -1385,6 +1385,21 @@ static void TestProfileFoveaGradient() {
     std::printf("ProfileFoveaGradient: 0.6/0.7/0.8 -> 1744/1856/1952 per eye, only-raise, switch-off passes through\n");
 }
 
+// The bitrate ceiling: the headset's choice wins unless the PC user overrides, and
+// a missing headset number always falls back to the PC. The quality-profile CBR:
+// opt-in switch AND the profile AND the takeover switch.
+static void TestBitrateSwitches() {
+    CHECK(rcs::EffectiveVrBitrate(140, 123, false) == 123);
+    CHECK(rcs::EffectiveVrBitrate(140, 123, true) == 140);
+    CHECK(rcs::EffectiveVrBitrate(140, 0, false) == 140);
+    CHECK(rcs::EffectiveVrBitrate(140, 0, true) == 140);
+    CHECK(rcs::QualityProfileCbr(true, true, true) == true);
+    CHECK(rcs::QualityProfileCbr(true, true, false) == false);
+    CHECK(rcs::QualityProfileCbr(true, false, true) == false);
+    CHECK(rcs::QualityProfileCbr(false, true, true) == false);
+    std::printf("bitrate switches: headset wins by default, CBR is opt-in quality-only\n");
+}
+
 int main() {
     TestLinkLocalDiscovery();
     TestMusic();
@@ -1405,6 +1420,7 @@ int main() {
     TestQualityProfileQpMap();
     TestQualityProfileTwoPass();
     TestProfileFoveaGradient();
+    TestBitrateSwitches();
     TestQueueGuard();
     TestFecDeterministic();
     TestHandshakeAndTransport();
