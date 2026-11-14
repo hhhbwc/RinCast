@@ -6,6 +6,12 @@
 //                [--frames 300] [--desktop] [--no-split] [--foveated] [--ten-bit]
 //                [--no-aq] [--two-pass] [--one-pass]
 //                [--loss <frame>] [--out <bitstream>] [--yuv <nv12 file>] [--compare-foveated]
+//                [--still] [--flat] [--cbr] [--profile 0|1|2] [--minqp <qp>]
+//
+// --still freezes the picture (a still menu) and --flat makes the synthetic source a
+// smooth gradient instead of noise. --cbr restores the old constant-bitrate law,
+// --profile picks latency/balanced/quality, and --minqp adds a QP floor. Together
+// they give an A/B for "does a simple picture actually cost fewer bits now?".
 //
 // --loss F drops frames F..F+3 from --out (as if lost on the network) and answers the
 // loss the way the streamer does: InvalidateAfter(F-1), then the next frame is a
@@ -41,6 +47,7 @@
 #include "rc/handshake.h"
 #include "rc/platform.h"
 #include "rc/socket.h"
+#include "rc/stream_profile.h"
 
 using namespace rcs;
 
@@ -73,6 +80,8 @@ int main(int argc, char** argv) {
     bool onePass = false;          // --desktop without the streamer's second pass
     bool swing = false;
     bool synthetic = false;
+    bool still = false;            // freeze the pan: every frame is identical (a still menu)
+    bool flat = false;             // smooth gradient instead of noise (easy still content)
     bool netBench = false;         // 走真实 VideoSender + 回环，测 pacing 与提交延迟
     std::string csvPath;
     double paceFps = 0;
@@ -105,6 +114,18 @@ int main(int argc, char** argv) {
         } else if (a == "--synthetic") {
             synthetic = true;
             moving = true;
+        } else if (a == "--still") {
+            still = true;  // no pan, no colour drift: the same picture every frame
+        } else if (a == "--flat") {
+            flat = true;
+        } else if (a == "--cbr") {
+            ec.cappedVbr = false;  // the old behaviour, for A/B comparisons
+        } else if (a == "--profile") {
+            ec.profile = rc::ProfileFromId(std::stoi(next()));
+        } else if (a == "--minqp") {
+            ec.vbrMinQp = std::stoi(next());  // -1 = profile default, 0 = off
+        } else if (a == "--avgpct") {
+            ec.vbrAveragePercent = uint32_t(std::stoi(next()));
         } else if (a == "--pace") {
             paceFps = std::stod(next());
             if (!std::isfinite(paceFps) || paceFps <= 0) return 2;
@@ -138,6 +159,7 @@ int main(int argc, char** argv) {
     // As the streamer does: desktop streams always take two passes.
     if (ec.desktop && !onePass) ec.twoPass = true;
     if (onePass) ec.twoPass = false;
+    if (still) moving = false;
     // --net 要按真实帧率喂帧，否则发送端一直阻塞、测不出「帧间隔内的节奏」。
     if (netBench && paceFps <= 0) paceFps = ec.fps;
 
@@ -163,9 +185,15 @@ int main(int argc, char** argv) {
             pixels.resize(size_t(iw) * ih);
             for (int y = 0; y < ih; ++y) {
                 for (int x = 0; x < iw; ++x) {
-                    uint32_t v = uint32_t(x / 4) * 0x9e3779b9u ^ uint32_t(y / 4) * 0x85ebca6bu;
-                    v = (v ^ (v >> 16)) * 0x7feb352du;
-                    pixels[size_t(y) * iw + x] = 0xff000000u | ((v ^ (v >> 15)) & 0x00ffffffu);
+                    if (flat) {
+                        // A menu-like smooth gradient: almost nothing to encode.
+                        const uint32_t r = uint32_t(x * 255 / iw), g = uint32_t(y * 255 / ih);
+                        pixels[size_t(y) * iw + x] = 0xff000000u | (g << 16) | (r << 8) | 0x40u;
+                    } else {
+                        uint32_t v = uint32_t(x / 4) * 0x9e3779b9u ^ uint32_t(y / 4) * 0x85ebca6bu;
+                        v = (v ^ (v >> 16)) * 0x7feb352du;
+                        pixels[size_t(y) * iw + x] = 0xff000000u | ((v ^ (v >> 15)) & 0x00ffffffu);
+                    }
                 }
             }
         } else {
@@ -380,6 +408,7 @@ float4 ps(V i) : SV_Target {
     bool swingHigh = false;
     size_t windowBytes = 0, windowFrames = 0;
     double maxWindowMbps = 0;
+    const int64_t benchStartNs = rc::NowNs();
     for (int i = 0; i < frames; i++) {
         if (paced) {
             const int64_t nowNs = rc::NowNs();
@@ -401,8 +430,8 @@ float4 ps(V i) : SV_Target {
         }
         // Smooth pan: a few pixels per frame, like a slowly turning head.
         const double t = i / double(ec.fps);
-        const UINT x = UINT((0.5 + 0.5 * std::sin(t * 1.3)) * panW);
-        const UINT y = UINT((0.5 + 0.5 * std::sin(t * 0.7)) * panH);
+        const UINT x = still ? 0u : UINT((0.5 + 0.5 * std::sin(t * 1.3)) * panW);
+        const UINT y = still ? 0u : UINT((0.5 + 0.5 * std::sin(t * 0.7)) * panH);
         D3D11_BOX box{x, y, 0, x + cd.Width, y + cd.Height, 1};
         if (moving) {
             const float c[4] = {float(std::sin(t * 1.7) * 0.15), float(std::sin(t * 1.1) * 0.1), float(std::sin(t * 0.9) * 0.05),
@@ -485,6 +514,8 @@ float4 ps(V i) : SV_Target {
         }
     }
 
+    const double benchSec = double(rc::NowNs() - benchStartNs) / 1e9;
+    const double benchFps = benchSec > 0 ? double(sizes.size()) / benchSec : double(ec.fps);
     if (timer) CloseHandle(timer);
 
     // --net：把回环上量到的时间线汇总出来。
@@ -579,9 +610,24 @@ float4 ps(V i) : SV_Target {
         maxBytes = std::max(maxBytes, sizes[i]);
     }
     const double avgBytes = double(bytes) / double(sizes.size() - skip);
+    const auto pq = rc::ProfileParams(ec.profile);
+    const auto budget = ec.cappedVbr
+                            ? rc::ComputeCappedVbr(ec.bitrateKbps, uint32_t(ec.fps),
+                                                   ec.vbrAveragePercent ? ec.vbrAveragePercent : pq.vbrAveragePercent,
+                                                   pq.vbvFramesPercent)
+                            : rc::ComputeCappedVbr(ec.bitrateKbps, uint32_t(ec.fps), 100, 150);
+    const double wireMbps = avgBytes * 8 * benchFps / 1e6;
     std::printf("%s %ux%u @%.0f, %u Mbps%s%s%s\n", encoder->Name(), ec.width, ec.height, ec.fps,
                 ec.bitrateKbps / 1000, ec.desktop ? ", desktop" : "", ec.foveated ? ", foveated" : "",
                 ec.splitFrame ? "" : ", no split");
+    const int effectiveMinQp = !ec.cappedVbr ? 0 : ec.vbrMinQp < 0 ? int(rc::ProfileParams(ec.profile).minQp)
+                                                                    : ec.vbrMinQp;
+    std::printf("rc: %s, profile %d, avg target %u Mbps, max %u Mbps, VBV %.2f Mbit, QP floor %d\n",
+                ec.cappedVbr ? "capped VBR" : "CBR", int(ec.profile), budget.averageBitrate / 1000000,
+                budget.maxBitrate / 1000000, double(budget.vbvBufferSize) / 1e6, effectiveMinQp);
+    std::printf("content: %s, %s\n", still ? "still" : "moving", flat ? "flat gradient" : synthetic ? "noise" : "capture");
+    std::printf("wire: %.1f Mbps at %.0f fps (measured) = %.0f%% of the ceiling\n", wireMbps, benchFps,
+                100.0 * wireMbps / double(ec.bitrateKbps / 1000.0));
     std::printf("encode ms: avg %.2f  p50 %.2f  p95 %.2f  max %.2f\n", sum / double(t.size()), t[t.size() / 2],
                 t[t.size() * 95 / 100], t.back());
     std::printf("frame KB: avg %.1f  max %.1f  keyframe %.1f\n", avgBytes / 1024, double(maxBytes) / 1024,

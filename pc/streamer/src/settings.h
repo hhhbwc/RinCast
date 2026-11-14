@@ -37,6 +37,10 @@ struct Settings {
     int vrBitrateMbps = 150;
     int desktopBitrateMbps = 40;
     bool adaptiveBitrate = true;
+    // What the automatic-bitrate switch now selects: 0 = latency, 1 = balanced,
+    // 2 = picture quality. Stored as an int so the settings file stays readable.
+    // See rc/stream_profile.h for what each value actually changes.
+    int streamProfile = 1;
     int fecPercent = 5;
     bool foveatedEncoding = false;  // VR: fewer bits towards the lens edges
     bool adaptiveQuantization = true;

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "rc/stream_profile.h"
+
 namespace rc {
 
 // The fixed-bitrate guard: it holds the send rate just under what the path carries by
@@ -33,6 +35,18 @@ struct QueueGuardConfig {
     int64_t ceilingRiseNs = 60'000'000'000LL;
     uint32_t ceilingRisePercent = 3;
 };
+
+// A stream profile's "how much delay do I accept" becomes the guard's brake
+// line. Kept next to the guard so the sender, the tests and any future caller
+// all start from the same numbers.
+inline QueueGuardConfig GuardConfigFor(StreamProfile profile) {
+    QueueGuardConfig cfg;
+    const StreamProfileParams p = ProfileParams(profile);
+    cfg.targetMs = p.targetQueueMs;
+    cfg.bandMs = p.bandMs;
+    cfg.floorExtraMs = p.floorExtraMs;
+    return cfg;
+}
 
 class QueueGuard {
 public:

@@ -8,6 +8,7 @@
 #include "encoder.h"
 #include "nvenc/nvEncodeAPI.h"
 #include "rc/platform.h"
+#include "rc/stream_profile.h"
 
 namespace rcs {
 
@@ -108,12 +109,26 @@ class NvencEncoder final : public VideoEncoder {
         m_encodeConfig.gopLength = NVENC_INFINITE_GOPLENGTH;
         m_encodeConfig.frameIntervalP = 1;
         auto& rc = m_encodeConfig.rcParams;
-        rc.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+        // CBR spent the whole budget even on a still menu: rate control drove QP down
+        // until the frame was big enough, and the needless bytes queued on the way to
+        // the headset. VBR with maxBitRate == the ceiling lets a simple frame cost what
+        // it costs and still lets a complex one use the full budget. See stream_profile.h.
+        m_cappedVbr = config.cappedVbr;
+        rc.rateControlMode = m_cappedVbr ? NV_ENC_PARAMS_RC_VBR : NV_ENC_PARAMS_RC_CBR;
         // The first pass at quarter resolution: most of the benefit for a fraction of the time.
         rc.multiPass = config.twoPass ? NV_ENC_TWO_PASS_QUARTER_RESOLUTION : NV_ENC_MULTI_PASS_DISABLED;
         ApplyBitrate(config.bitrateKbps);
         rc.zeroReorderDelay = 1;
         rc.enableAQ = config.adaptiveQuant ? 1 : 0;  // strength 0: the driver picks it
+        // The QP floor is the "spend less on a simple picture" half of capped VBR.
+        // Rate control cannot lower QP past it, so a still menu stays small even
+        // though averageBitRate still offers the whole ceiling to a complex frame.
+        const int minQp = config.vbrMinQp < 0 ? int(rc::ProfileParams(config.profile).minQp) : config.vbrMinQp;
+        if (m_cappedVbr && minQp > 0) {
+            rc.enableMinQP = 1;
+            const uint32_t q = std::clamp<uint32_t>(uint32_t(minQp), 1u, 51u);
+            rc.minQP.qpInterP = rc.minQP.qpInterB = rc.minQP.qpIntra = q;
+        }
 
         // Loss recovery: keep a few older frames as references so a loss can be answered
         // by invalidating the lost ones instead of sending a keyframe (5-10x the size).
@@ -222,6 +237,20 @@ class NvencEncoder final : public VideoEncoder {
             m_encodeConfig.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
             st = api.nvEncInitializeEncoder(m_encoder, &m_init);
         }
+        if (st != NV_ENC_SUCCESS && m_cappedVbr) {
+            // A driver that refuses VBR with this preset/codec still works in CBR.
+            // Losing the stream over a rate-control mode would be a poor trade.
+            RC_LOGW("NVENC: VBR initialize failed (%d): %s; retrying with CBR", int(st),
+                    api.nvEncGetLastErrorString(m_encoder));
+            api.nvEncDestroyEncoder(m_encoder);
+            m_encoder = OpenSession(device);
+            if (!m_encoder) return false;
+            m_cappedVbr = false;
+            m_encodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+            m_encodeConfig.rcParams.enableMinQP = 0;
+            ApplyBitrate(config.bitrateKbps);
+            st = api.nvEncInitializeEncoder(m_encoder, &m_init);
+        }
         if (st != NV_ENC_SUCCESS) {
             RC_LOGE("NVENC: initialize failed (%d): %s", int(st), api.nvEncGetLastErrorString(m_encoder));
             return false;
@@ -232,8 +261,12 @@ class NvencEncoder final : public VideoEncoder {
         bb.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
         if (api.nvEncCreateBitstreamBuffer(m_encoder, &bb) != NV_ENC_SUCCESS) return false;
         m_bitstream = bb.bitstreamBuffer;
-        RC_LOGI("NVENC %s %ux%u @%.0f fps, %u kbps%s%s%s%s%s%s", CodecName(config.codec), config.width, config.height,
-                config.fps, config.bitrateKbps, config.tenBit ? ", 10-bit" : "",
+        const auto budget = BudgetFor(config.bitrateKbps, uint32_t(config.fps));
+        RC_LOGI("NVENC %s %ux%u @%.0f fps, ceiling %u kbps (%s, avg %u kbps, QP floor %d)%s%s%s%s%s%s",
+                CodecName(config.codec), config.width, config.height, config.fps, config.bitrateKbps,
+                m_cappedVbr ? "capped VBR" : "CBR",
+                m_cappedVbr ? budget.averageBitrate / 1000 : config.bitrateKbps, m_cappedVbr ? minQp : 0,
+                config.tenBit ? ", 10-bit" : "",
                 m_split ? ", split across engines" : "", m_foveated ? ", foveated" : "",
                 m_canInvalidate ? ", loss recovery" : "", m_encodeConfig.rcParams.enableAQ ? ", AQ" : "",
                 m_encodeConfig.rcParams.multiPass != NV_ENC_MULTI_PASS_DISABLED ? ", two-pass" : "");
@@ -349,18 +382,31 @@ class NvencEncoder final : public VideoEncoder {
 
    private:
     static constexpr uint32_t kDpbFrames = 8;
+    // The old CBR behaviour, kept for --cbr A/B runs and as a driver fallback:
+    // average == maximum, and 1.5 frames of VBV.
+    static constexpr uint32_t kLegacyVbvFramesPercent = 150;
     // 流启动后 fps 估计震荡约 3s（实测重启 0→15→96 后趋稳）；这段时间钳紧 VBV 抑制超调。
     static constexpr int64_t kStartupVbvClampNs = 3'000'000'000LL;
 
+    rc::CappedVbrParams BudgetFor(uint32_t kbps, uint32_t fps) const {
+        const auto q = rc::ProfileParams(m_config.profile);
+        const uint32_t avgPct = m_config.vbrAveragePercent ? m_config.vbrAveragePercent : q.vbrAveragePercent;
+        return m_cappedVbr ? rc::ComputeCappedVbr(kbps, fps, avgPct, q.vbvFramesPercent)
+                           : rc::ComputeCappedVbr(kbps, fps, 100, kLegacyVbvFramesPercent);
+    }
+
+    uint32_t EffectiveFps() const {
+        return (!m_config.desktop && m_effectiveFps) ? m_effectiveFps : uint32_t(m_config.fps);
+    }
+
     void ApplyBitrate(uint32_t kbps) {
         auto& rc = m_encodeConfig.rcParams;
-        rc.averageBitRate = kbps * 1000;
-        rc.maxBitRate = kbps * 1000;
-        // About one and a half frames' worth of VBV at the rate the stream actually runs (VR tracks
-        // it; desktop keeps the nominal rate). Enough to carry the set bitrate at any frame rate,
-        // but small enough that a burst of frames can't push the stream far past the setting.
-        const uint32_t fps = (!m_config.desktop && m_effectiveFps) ? uint32_t(m_effectiveFps) : uint32_t(m_config.fps);
-        rc.vbvBufferSize = uint32_t(double(kbps) * 1000.0 / fps) * 3 / 2;
+        // One place computes the budget, so Init / SetBitrate / fps-driven VBV
+        // reconfigures can never disagree about what the ceiling means.
+        const auto budget = BudgetFor(kbps, EffectiveFps());
+        rc.averageBitRate = budget.averageBitrate;
+        rc.maxBitRate = budget.maxBitrate;
+        rc.vbvBufferSize = budget.vbvBufferSize;
         // The initial delay is the buffer's occupancy when encoding starts, and only means
         // something then. Setting it on every rate change re-primed the buffer to full and
         // let a burst straight out - the same overshoot the startup clamp exists to stop,
@@ -408,12 +454,12 @@ class NvencEncoder final : public VideoEncoder {
             const uint32_t lo = m_effectiveFps > band ? m_effectiveFps - band : 0;
             if (fps >= lo && fps <= m_effectiveFps + band) return;
         }
-        uint32_t want = uint32_t(double(m_config.bitrateKbps) * 1000.0 / fpsFast) * 3 / 2;
+        uint32_t want = BudgetFor(m_config.bitrateKbps, fpsFast).vbvBufferSize;
         // 启动宽限期内把 VBV 钳到标称帧率的大小。重启瞬间 fps 估计剧烈震荡（实测 0→15→96），
         // 低 fps 会把 VBV 撑到 8Mbit 且起始即满，帧率一跳高就整桶倾泻 → 启动超调（实测 101.7Mbps
         // 顶爆链路）。桶钳小后瞬态随之变小；宽限期过后恢复跟踪，真实低帧率仍能拿大 VBV 跑满码率。
         if (now - m_streamStartNs < kStartupVbvClampNs) {
-            const uint32_t nominal = uint32_t(double(m_config.bitrateKbps) * 1000.0 / m_config.fps) * 3 / 2;
+            const uint32_t nominal = BudgetFor(m_config.bitrateKbps, uint32_t(m_config.fps)).vbvBufferSize;
             want = std::min(want, nominal);
         }
         const uint32_t rateNum = fps * 1000;
@@ -429,7 +475,10 @@ class NvencEncoder final : public VideoEncoder {
             m_init.frameRateNum = rateNum;
             m_init.frameRateDen = 1000;
             m_encodeConfig.rcParams.vbvBufferSize = want;
-            m_encodeConfig.rcParams.vbvInitialDelay = want;
+            // Do NOT re-prime vbvInitialDelay here: it is the buffer's occupancy at
+            // encoder start and only means anything then. Writing it on every fps
+            // reconfigure re-filled the bucket and let the next burst straight out -
+            // the same overshoot ApplyBitrate() was fixed for.
             m_lastVbvNs = now;
             RC_LOGI("NVENC: %.0f fps measured, encoder rate %u fps, VBV %.2f Mbit", 1e9 / m_intervalNsSmooth, fps, double(want) / 1e6);
         }
@@ -500,6 +549,7 @@ class NvencEncoder final : public VideoEncoder {
     bool m_canInvalidate = false;
     bool m_split = false;
     bool m_foveated = false;
+    bool m_cappedVbr = true;  // false after a driver refused VBR, or with --cbr
     uint32_t m_blockSize = 32;
     float m_fov[2][4] = {};
     std::vector<int8_t> m_qpMap;

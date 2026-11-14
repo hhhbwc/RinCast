@@ -18,7 +18,8 @@ DesktopStream::DesktopStream(rc::Connection* connection, uint8_t streamId, const
       m_streamId(streamId),
       m_monitor(monitor),
       m_config(config),
-      m_sender(connection, streamId, config.codec, config.bitrateKbps, config.fecPercent, config.adaptive) {
+      m_sender(connection, streamId, config.codec, config.bitrateKbps, config.fecPercent, config.adaptive,
+               config.profile) {
     if (config.startBitrateKbps) m_sender.StartAt(config.startBitrateKbps);
 }
 
@@ -75,6 +76,7 @@ void DesktopStream::Run() {
         ec.height = m_config.height;
         ec.fps = m_config.fps;
         ec.bitrateKbps = m_sender.TargetBitrateKbps();
+        ec.profile = m_config.profile;
         ec.tenBit = m_config.tenBit;
         ec.desktop = true;
         ec.adaptiveQuant = m_config.adaptiveQuant;

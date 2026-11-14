@@ -26,6 +26,7 @@ json Settings::ToJson(bool forUi) const {
         {"vrBitrateMbps", vrBitrateMbps},
         {"desktopBitrateMbps", desktopBitrateMbps},
         {"adaptiveBitrate", adaptiveBitrate},
+        {"streamProfile", streamProfile},
         {"fecPercent", fecPercent},
         {"foveatedEncoding", foveatedEncoding},
         {"adaptiveQuantization", adaptiveQuantization},
@@ -69,6 +70,7 @@ void Settings::FromJson(const json& j) {
     get("vrBitrateMbps", vrBitrateMbps);
     get("desktopBitrateMbps", desktopBitrateMbps);
     get("adaptiveBitrate", adaptiveBitrate);
+    get("streamProfile", streamProfile);
     get("fecPercent", fecPercent);
     get("foveatedEncoding", foveatedEncoding);
     get("adaptiveQuantization", adaptiveQuantization);

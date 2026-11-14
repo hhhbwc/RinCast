@@ -29,6 +29,7 @@ struct VrStreamConfig {
     uint32_t bitrateKbps = 150000;
     int fecPercent = 5;
     bool adaptive = true;
+    rc::StreamProfile profile = rc::StreamProfile::Balanced;  // what to favour (latency / balanced / quality)
     uint32_t startBitrateKbps = 0;  // adaptive: where to start (0 = at bitrateKbps)
     bool pace = false;              // internet paths: no bursts
     bool foveated = true;

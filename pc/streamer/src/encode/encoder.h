@@ -9,6 +9,7 @@
 
 #include "../util.h"
 #include "rc/protocol.h"
+#include "rc/stream_profile.h"
 
 namespace rcs {
 
@@ -33,6 +34,18 @@ struct EncoderConfig {
     // A quick first pass over the frame before the real one, so rate control knows where
     // the detail is. Costs encode time. NVENC and AMF.
     bool twoPass = false;
+    // What to favour: latency / balanced / picture quality. Decides the encoder's
+    // spending policy (capped VBR) and, on the sender side, the queue budget.
+    rc::StreamProfile profile = rc::StreamProfile::Balanced;
+    // CBR is kept only for A/B benchmarks and as a fallback when the driver says
+    // it has no VBR. Production uses capped VBR, where bitrateKbps is a ceiling.
+    bool cappedVbr = true;
+    // QP floor: -1 = take the profile's value, 0 = off, >0 = override. This is
+    // what makes a still picture cheap without starving a complex one.
+    int vbrMinQp = -1;
+    // 0 = use the profile's value. Lets the benchmark answer "what if the average
+    // target stayed at the ceiling and only the QP floor did the saving?".
+    uint32_t vbrAveragePercent = 0;
 };
 
 struct EncodedFrame {

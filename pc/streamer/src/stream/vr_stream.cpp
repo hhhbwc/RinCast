@@ -113,7 +113,8 @@ VrStream::VrStream(rc::Connection* connection, VrBridgeHost* bridge, const VrStr
     : m_connection(connection),
       m_bridge(bridge),
       m_config(config),
-      m_sender(connection, rc::kVrStreamId, config.codec, config.bitrateKbps, config.fecPercent, config.adaptive),
+      m_sender(connection, rc::kVrStreamId, config.codec, config.bitrateKbps, config.fecPercent, config.adaptive,
+               config.profile),
       m_onState(std::move(onState)) {
     if (config.startBitrateKbps) m_sender.StartAt(config.startBitrateKbps);
 }
@@ -474,6 +475,7 @@ void VrStream::RunEncoder() {
             ec.height = encHeight;
             ec.fps = m_config.fps;
             ec.bitrateKbps = m_sender.TargetBitrateKbps();
+            ec.profile = m_config.profile;
             ec.tenBit = m_config.tenBit;
             ec.inputFormat = encFormat;
             // The lens-based bit budget assumes a picture that isn't squeezed.

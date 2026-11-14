@@ -12,6 +12,7 @@
 #include "../encode/encoder.h"
 #include "rc/connection.h"
 #include "rc/queue_guard.h"
+#include "rc/stream_profile.h"
 #include "rc/video_transport.h"
 
 namespace rcs {
@@ -30,7 +31,7 @@ struct VideoSenderStats {
 class VideoSender {
    public:
     VideoSender(rc::Connection* connection, uint8_t streamId, rc::VideoCodec codec, uint32_t maxBitrateKbps,
-                int fecPercent, bool adaptive);
+                int fecPercent, bool adaptive, rc::StreamProfile profile = rc::StreamProfile::Balanced);
     ~VideoSender();
 
     // Sends one encoded frame with metadata.
@@ -61,6 +62,10 @@ class VideoSender {
         return cap ? std::min(cap, t) : t;
     }
     void SetMaxBitrate(uint32_t kbps);
+    // The preference behind the automatic-bitrate switch. Maps to the guard's
+    // latency budget before the first frame; the UI can call it at runtime too.
+    void SetProfile(rc::StreamProfile profile);
+    rc::StreamProfile Profile() const { return m_profile; }
     // 把每帧的包铺开在时间上发，而不是一口气打出去（局域网和互联网都用）：
     // Wi-Fi 的浅队列会被整帧突发打爆。必须在 Start 之前设好。
     void SetPacing(bool pace) { m_pace = pace; }
@@ -90,6 +95,7 @@ class VideoSender {
     double m_queueBaselineMs = -1;   // the device's own queue floor; network thread only
     uint32_t m_maxKbps;
     bool m_adaptive;
+    rc::StreamProfile m_profile = rc::StreamProfile::Balanced;
     std::atomic<bool> m_pace{false};
     double m_lossAvg = 0;
     uint32_t m_frameIndex = 0;

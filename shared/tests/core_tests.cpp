@@ -33,6 +33,7 @@
 #include "rc/music.h"
 #include "rc/platform.h"
 #include "rc/queue_guard.h"
+#include "rc/stream_profile.h"
 #include "rc/video_transport.h"
 
 using namespace rc;
@@ -1073,6 +1074,77 @@ SimRun RunGuard(rc::QueueGuard& guard, SimLink& link, uint32_t targetKbps, doubl
 }
 }  // namespace
 
+static void TestStreamProfile() {
+    const uint32_t cap = 150000;  // 150 Mbps ceiling
+    const uint32_t fps = 90;
+    const rc::StreamProfile all[] = {rc::StreamProfile::LowLatency, rc::StreamProfile::Balanced,
+                                     rc::StreamProfile::Quality};
+    uint32_t lastVbv = 0, lastMinQp = 100;
+    double lastQueue = 0;
+    for (auto p : all) {
+        const auto q = rc::ProfileParams(p);
+        const auto b = rc::ComputeCappedVbr(cap, fps, p);
+        // The ceiling is a ceiling: no profile may ask for more than the user allowed.
+        CHECK(b.maxBitrate == uint64_t(cap) * 1000);
+        CHECK(b.averageBitrate > 0 && b.averageBitrate <= b.maxBitrate);
+        CHECK(b.averageBitrate == uint64_t(cap) * 1000 * q.vbrAveragePercent / 100);
+        // The average must STAY at the ceiling: lowering it is not "saving on simple
+        // pictures", it starves complex ones too. The QP floor does the saving.
+        CHECK(b.averageBitrate == b.maxBitrate);
+        CHECK(b.vbvBufferSize > 0);
+        CHECK(b.vbvBufferSize >= b.averageBitrate / fps);  // the bucket still holds a frame
+        // The preference is monotonic: latency-first has the highest (cheapest) QP
+        // floor, quality-first tolerates the deepest queue and the biggest burst.
+        CHECK(q.minQp > 0 && q.minQp < lastMinQp);
+        CHECK(b.vbvBufferSize >= lastVbv);
+        CHECK(q.targetQueueMs > lastQueue);
+        lastMinQp = q.minQp;
+        lastVbv = b.vbvBufferSize;
+        lastQueue = q.targetQueueMs;
+        std::printf("profile %d: queue %.0f+-%.0f ms, avg %u/%u kbps, QP floor %u, VBV %.2f Mbit\n", int(p),
+                    q.targetQueueMs, q.bandMs, b.averageBitrate / 1000, b.maxBitrate / 1000, q.minQp,
+                    double(b.vbvBufferSize) / 1e6);
+    }
+
+    // Degenerate inputs: a zero ceiling and a zero frame rate must not divide by zero
+    // or smuggle a budget through.
+    CHECK(rc::ComputeCappedVbr(0, fps, rc::StreamProfile::Balanced).maxBitrate == 0);
+    const auto noFps = rc::ComputeCappedVbr(cap, 0, rc::StreamProfile::Balanced);
+    CHECK(noFps.vbvBufferSize > 0 && noFps.maxBitrate == uint64_t(cap) * 1000);
+    // The budget is linear in the ceiling, so raising it never changes the shape.
+    const auto half = rc::ComputeCappedVbr(cap / 2, fps, rc::StreamProfile::Balanced);
+    const auto full = rc::ComputeCappedVbr(cap, fps, rc::StreamProfile::Balanced);
+    CHECK(half.maxBitrate * 2 == full.maxBitrate);
+    CHECK(std::abs(int64_t(half.averageBitrate) * 2 - int64_t(full.averageBitrate)) <= 1);
+    CHECK(half.vbvBufferSize * 2 == full.vbvBufferSize);
+    // Out-of-range percentages are clamped, not UB.
+    CHECK(rc::ComputeCappedVbr(cap, fps, 0, 0).averageBitrate > 0);
+    CHECK(rc::ComputeCappedVbr(cap, fps, 200, 1000).averageBitrate == full.maxBitrate);
+    CHECK(rc::ProfileFromId(0) == rc::StreamProfile::LowLatency);
+    CHECK(rc::ProfileFromId(2) == rc::StreamProfile::Quality);
+    CHECK(rc::ProfileFromId(99) == rc::StreamProfile::Balanced);  // unknown -> safe default
+
+    // The sender must not invent its own brake line: it uses the same helper.
+    const auto g = rc::GuardConfigFor(rc::StreamProfile::Quality);
+    CHECK(g.targetMs == rc::ProfileParams(rc::StreamProfile::Quality).targetQueueMs);
+    CHECK(g.bandMs == rc::ProfileParams(rc::StreamProfile::Quality).bandMs);
+    CHECK(g.floorExtraMs == rc::ProfileParams(rc::StreamProfile::Quality).floorExtraMs);
+
+    // All three presets must still find the link's capacity. A tighter latency budget
+    // is allowed to dip earlier, but none may strand the stream at the floor.
+    for (auto p : all) {
+        rc::QueueGuard guard;
+        guard.Configure(rc::GuardConfigFor(p));
+        SimLink link;
+        link.capacityKbps = 100000;
+        const auto run = RunGuard(guard, link, 140000, 40);
+        std::printf("profile %d on a 100 Mb/s link: %u kbps, queue %.0f ms, %d dips\n", int(p), run.lastRate,
+                    link.Report(), run.dips);
+        CHECK(run.lastRate >= 75000 && run.lastRate <= 104000);
+        CHECK(run.floorHits == 0);
+    }
+}
+
 static void TestQueueGuard() {
     rc::QueueGuardConfig cfg;
     const uint32_t target = 140000;
@@ -1215,6 +1287,7 @@ int main() {
     TestPacing();
     TestPacingBursts();
     TestPacingStop();
+    TestStreamProfile();
     TestQueueGuard();
     TestFecDeterministic();
     TestHandshakeAndTransport();

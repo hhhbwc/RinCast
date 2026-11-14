@@ -16,6 +16,7 @@
 #include "../vr/steamvr.h"
 #include "../vr/vr_bridge_host.h"
 #include "rc/platform.h"
+#include "rc/stream_profile.h"
 
 namespace rcs {
 
@@ -492,6 +493,8 @@ void ClientSession::ApplyClientInfo(const json& m) {
         m_settings.desktopBitrateMbps = s.value("desktopBitrateMbps", m_settings.desktopBitrateMbps);
         m_settings.desktopFps = s.value("desktopFps", m_settings.desktopFps);
         m_settings.adaptiveBitrate = s.value("adaptiveBitrate", m_settings.adaptiveBitrate);
+        // The preference is a PC-side setting for now (rcs::Settings::streamProfile).
+        // The headset will send its own choice once its three-way UI exists.
         m_settings.streamAudio = s.value("streamAudio", m_settings.streamAudio);
         m_settings.micPassthrough = s.value("micPassthrough", m_settings.micPassthrough);
     }
@@ -677,6 +680,7 @@ void ClientSession::StartDesktop(const json& m) {
         cfg.adaptiveQuant = pc.adaptiveQuantization;
         // Over the internet a fixed bitrate only fills queues or loses frames: always adapt.
         cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate);
+        cfg.profile = rc::ProfileFromId(pc.streamProfile);
         // Over the internet the upload is often far below the LAN bitrate: start low and
         // let the bitrate control find what the path carries, instead of filling queues.
         if (m_slowPath) cfg.startBitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, std::max<uint32_t>(3000, 8000 / uint32_t(selected.size())));
@@ -793,6 +797,7 @@ void ClientSession::StartVr() {
     cfg.fecPercent = m_slowPath ? std::max(pc.fecPercent, 12) : pc.fecPercent;
     cfg.pace = true;  // 局域网也一样，见桌面流处说明
     cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate);  // see above
+    cfg.profile = rc::ProfileFromId(pc.streamProfile);
     if (m_slowPath) cfg.startBitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 12000);
     cfg.foveated = pc.foveatedEncoding;
     cfg.adaptiveQuant = pc.adaptiveQuantization;
@@ -805,7 +810,12 @@ void ClientSession::StartVr() {
         RC_LOGI("VR stream: foveated %s, encoding %ux%u per eye", st.eyesTracked ? "where the eyes look" : "at the lens centre",
                 cfg.foveatedEyeWidth, cfg.foveatedEyeHeight);
     }
-    RC_LOGI("VR stream: %s bitrate, up to %u kbps%s", cfg.adaptive ? "adaptive" : "fixed", cfg.bitrateKbps,
+    const char* profileName = cfg.profile == rc::StreamProfile::LowLatency ? "latency-first"
+                              : cfg.profile == rc::StreamProfile::Quality  ? "quality-first"
+                                                                           : "balanced";
+    RC_LOGI("VR stream: %s bitrate, %s, ceiling %u kbps, capped VBR (QP floor %u)%s",
+            cfg.adaptive ? "adaptive" : "fixed", profileName, cfg.bitrateKbps,
+            rc::ProfileParams(cfg.profile).minQp,
             cfg.startBitrateKbps ? (", starting at " + std::to_string(cfg.startBitrateKbps) + " kbps").c_str() : "");
 
     std::weak_ptr<ClientSession> weak = shared_from_this();

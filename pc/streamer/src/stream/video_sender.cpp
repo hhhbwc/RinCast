@@ -7,7 +7,7 @@
 namespace rcs {
 
 VideoSender::VideoSender(rc::Connection* connection, uint8_t streamId, rc::VideoCodec codec, uint32_t maxBitrateKbps,
-                         int fecPercent, bool adaptive)
+                         int fecPercent, bool adaptive, rc::StreamProfile profile)
     : m_connection(connection),
       m_packetizer(connection),
       m_streamId(streamId),
@@ -17,15 +17,22 @@ VideoSender::VideoSender(rc::Connection* connection, uint8_t streamId, rc::Video
       m_adaptive(adaptive) {
     m_packetizer.SetFecPercent(fecPercent);
     m_baseFecPercent = fecPercent;
+    SetProfile(profile);
+    m_windowStartNs = rc::NowNs();
+}
+
+void VideoSender::SetProfile(rc::StreamProfile profile) {
+    m_profile = profile;
+    // The user's "how much delay do I accept" is the brake line, not an arbitrary
+    // constant. The device's own idle queue is still added on top inside the guard.
+    rc::QueueGuardConfig cfg = rc::GuardConfigFor(profile);
     // Adaptive explores up to the maximum, so its ceiling rises quickly (10% per clean 5 s);
     // fixed bitrate only re-tests the setting, so it creeps (3% a minute). Same controller.
     if (m_adaptive) {
-        rc::QueueGuardConfig cfg;
         cfg.ceilingRiseNs = 5'000'000'000LL;
         cfg.ceilingRisePercent = 10;
-        m_guard.Configure(cfg);
     }
-    m_windowStartNs = rc::NowNs();
+    m_guard.Configure(cfg);
 }
 
 VideoSender::~VideoSender() {
