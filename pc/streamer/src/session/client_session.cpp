@@ -835,13 +835,13 @@ void ClientSession::StartVr() {
     cfg.motionField = st.frameGeneration;
     if (st.gazeFoveation) {
         cfg.foveaSize = st.eyesTracked ? Foveator::kFoveaSize : Foveator::kFixedFoveaSize;
-        // Best picture widens the full-density centre when the user lets the profile
-        // drive video settings (rcs::Settings::profileControlsVideo). It only raises;
-        // matched-SteamVR sizes and the slow internet path pick their own. This runs
-        // BEFORE the EncodedSize calls, so the sizes encoded - and the share sent to
-        // the headset - come from the same widened value.
-        cfg.foveaSize = QualityProfileFovea(cfg.foveaSize, pc.profileControlsVideo && !match && !m_slowPath,
-                                            cfg.profile == rc::StreamProfile::Quality);
+        // When the user lets the profiles drive video settings, each one floors the
+        // full-density centre at its own share (latency 0.6, balanced 0.7, quality 0.8)
+        // and only ever raises; matched-SteamVR sizes and the slow internet path pick
+        // their own. This runs BEFORE the EncodedSize calls, so the sizes encoded - and
+        // the share sent to the headset - come from the same value.
+        cfg.foveaSize = QualityProfileFoveaFor(cfg.foveaSize, pc.profileControlsVideo && !match && !m_slowPath,
+                                               int(cfg.profile));
         cfg.foveatedEyeWidth = Foveator::EncodedSize(cfg.eyeWidth, cfg.foveaSize);
         cfg.foveatedEyeHeight = Foveator::EncodedSize(cfg.eyeHeight, cfg.foveaSize);
         RC_LOGI("VR stream: foveated %s, encoding %ux%u per eye", st.eyesTracked ? "where the eyes look" : "at the lens centre",

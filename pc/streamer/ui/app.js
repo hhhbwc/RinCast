@@ -614,9 +614,9 @@ function renderDependents() {
   const h264 = state.settings.codec === "h264";
   setOff($("#tenBitRow"), h264);
   $("#tenBitHint").hidden = !h264;
-  // Only the Best-picture profile reads profileControlsVideo; the other two ignore
-  // it, so leaving it clickable would promise something they don't do.
-  setOff($("#profileVideoRow"), profile !== 2);
+  // All three profiles read profileControlsVideo (each floors the fovea at its own
+  // share; only Best picture adds two-pass and the QP map), so the checkbox stays
+  // clickable on every profile.
   const tunable = ["nvenc", "amf"].includes(state.system.encoder.backend);
   setOff($("#aqRow"), !tunable);
   setOff($("#twoPassRow"), !tunable);
