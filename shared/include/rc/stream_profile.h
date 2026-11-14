@@ -33,9 +33,14 @@ struct StreamProfileParams {
     // still menu is a QP floor: rate control may not lower QP past it, so it stops
     // inflating an already-trivial frame to fill the budget.
     uint32_t vbrAveragePercent = 100;
-    // QP floor, 0 = off. Higher = fewer bits on easy content = lower latency.
-    // With the ceiling at 110 Mbps, QP 20 took a still menu from 49 KB/frame to
-    // 2.3 KB/frame while a moving noisy scene still used 137 KB of the 142 KB CBR used.
+    // QP floor, 0 = off (rate control may spend the whole ceiling on ANY picture).
+    // Higher = fewer bits on easy content = lower latency. With the ceiling at
+    // 110 Mbps, QP 20 took a still menu from 49 KB/frame to 2.3 KB/frame.
+    // Quality uses 0: a picture the user paid 140 Mbps for should not be held back
+    // by a floor. Measured on a real VRChat stream the floor left frames at
+    // 150-168 KB when the per-frame budget was ~194 KB - the encoder wanted a
+    // lower QP and was not allowed to. Noisy synthetic clips hide this (their QP
+    // is naturally above any floor), which is why the offline A/B looked flat.
     uint32_t minQp = 20;
     // VBV size as a percentage of ONE frame at the ceiling (150 = 1.5 frames).
     // Small VBV = smaller bursts = less queueing; large VBV lets a keyframe breathe.
@@ -47,7 +52,10 @@ constexpr StreamProfileParams ProfileParams(StreamProfile p) {
         case StreamProfile::LowLatency:
             return {15.0, 6.0, 15.0, 100, 24, 100};
         case StreamProfile::Quality:
-            return {60.0, 12.0, 30.0, 100, 16, 200};
+            // No QP floor at all. "Best picture" must actually be allowed to spend
+            // the ceiling; the other two profiles keep their savings. Latency-first
+            // and balanced still bracket it on the queue side (15 / 45 / 60 ms).
+            return {60.0, 12.0, 30.0, 100, 0, 200};
         case StreamProfile::Balanced:
         default:
             // Keep the guard's current, measured numbers: changing the default

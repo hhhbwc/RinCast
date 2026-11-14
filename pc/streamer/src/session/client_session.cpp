@@ -839,9 +839,10 @@ void ClientSession::StartVr() {
     const char* profileName = cfg.profile == rc::StreamProfile::LowLatency ? "latency-first"
                               : cfg.profile == rc::StreamProfile::Quality  ? "quality-first"
                                                                            : "balanced";
-    RC_LOGI("VR stream: %s bitrate, %s, ceiling %u kbps, capped VBR (QP floor %u)%s",
-            cfg.adaptive ? "adaptive" : "fixed", profileName, cfg.bitrateKbps,
-            rc::ProfileParams(cfg.profile).minQp,
+    const uint32_t profileMinQp = rc::ProfileParams(cfg.profile).minQp;
+    const std::string qpText = profileMinQp ? std::to_string(profileMinQp) : std::string("off");
+    RC_LOGI("VR stream: %s bitrate, %s, ceiling %u kbps, capped VBR (QP floor %s)%s",
+            cfg.adaptive ? "adaptive" : "fixed", profileName, cfg.bitrateKbps, qpText.c_str(),
             cfg.startBitrateKbps ? (", starting at " + std::to_string(cfg.startBitrateKbps) + " kbps").c_str() : "");
 
     std::weak_ptr<ClientSession> weak = shared_from_this();

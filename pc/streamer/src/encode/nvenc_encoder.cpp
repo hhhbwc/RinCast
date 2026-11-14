@@ -262,10 +262,13 @@ class NvencEncoder final : public VideoEncoder {
         if (api.nvEncCreateBitstreamBuffer(m_encoder, &bb) != NV_ENC_SUCCESS) return false;
         m_bitstream = bb.bitstreamBuffer;
         const auto budget = BudgetFor(config.bitrateKbps, uint32_t(config.fps));
-        RC_LOGI("NVENC %s %ux%u @%.0f fps, ceiling %u kbps (%s, avg %u kbps, QP floor %d)%s%s%s%s%s%s",
+        const std::string qpText = !m_cappedVbr ? std::string("n/a")
+                                   : minQp > 0  ? std::to_string(minQp)
+                                                : std::string("off");
+        RC_LOGI("NVENC %s %ux%u @%.0f fps, ceiling %u kbps (%s, avg %u kbps, QP floor %s)%s%s%s%s%s%s",
                 CodecName(config.codec), config.width, config.height, config.fps, config.bitrateKbps,
                 m_cappedVbr ? "capped VBR" : "CBR",
-                m_cappedVbr ? budget.averageBitrate / 1000 : config.bitrateKbps, m_cappedVbr ? minQp : 0,
+                m_cappedVbr ? budget.averageBitrate / 1000 : config.bitrateKbps, qpText.c_str(),
                 config.tenBit ? ", 10-bit" : "",
                 m_split ? ", split across engines" : "", m_foveated ? ", foveated" : "",
                 m_canInvalidate ? ", loss recovery" : "", m_encodeConfig.rcParams.enableAQ ? ", AQ" : "",

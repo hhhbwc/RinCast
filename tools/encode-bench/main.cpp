@@ -622,9 +622,10 @@ float4 ps(V i) : SV_Target {
                 ec.splitFrame ? "" : ", no split");
     const int effectiveMinQp = !ec.cappedVbr ? 0 : ec.vbrMinQp < 0 ? int(rc::ProfileParams(ec.profile).minQp)
                                                                     : ec.vbrMinQp;
-    std::printf("rc: %s, profile %d, avg target %u Mbps, max %u Mbps, VBV %.2f Mbit, QP floor %d\n",
+    const std::string qpText = effectiveMinQp > 0 ? std::to_string(effectiveMinQp) : std::string("off");
+    std::printf("rc: %s, profile %d, avg target %u Mbps, max %u Mbps, VBV %.2f Mbit, QP floor %s\n",
                 ec.cappedVbr ? "capped VBR" : "CBR", int(ec.profile), budget.averageBitrate / 1000000,
-                budget.maxBitrate / 1000000, double(budget.vbvBufferSize) / 1e6, effectiveMinQp);
+                budget.maxBitrate / 1000000, double(budget.vbvBufferSize) / 1e6, qpText.c_str());
     std::printf("content: %s, %s\n", still ? "still" : "moving", flat ? "flat gradient" : synthetic ? "noise" : "capture");
     std::printf("wire: %.1f Mbps at %.0f fps (measured) = %.0f%% of the ceiling\n", wireMbps, benchFps,
                 100.0 * wireMbps / double(ec.bitrateKbps / 1000.0));

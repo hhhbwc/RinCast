@@ -1094,8 +1094,9 @@ static void TestStreamProfile() {
         CHECK(b.vbvBufferSize > 0);
         CHECK(b.vbvBufferSize >= b.averageBitrate / fps);  // the bucket still holds a frame
         // The preference is monotonic: latency-first has the highest (cheapest) QP
-        // floor, quality-first tolerates the deepest queue and the biggest burst.
-        CHECK(q.minQp > 0 && q.minQp < lastMinQp);
+        // floor, quality-first has none at all (0 = off) and tolerates the deepest
+        // queue and the biggest burst. A zero floor must not break monotonicity.
+        CHECK(q.minQp < lastMinQp);
         CHECK(b.vbvBufferSize >= lastVbv);
         CHECK(q.targetQueueMs > lastQueue);
         lastMinQp = q.minQp;
@@ -1105,6 +1106,13 @@ static void TestStreamProfile() {
                     q.targetQueueMs, q.bandMs, b.averageBitrate / 1000, b.maxBitrate / 1000, q.minQp,
                     double(b.vbvBufferSize) / 1e6);
     }
+
+    // "Best picture" really means no QP floor: without this the quality profile is
+    // just a slightly less aggressive saving profile, which is what the user saw
+    // on a real VRChat stream (bitrate stuck well under the 140 Mbps ceiling).
+    CHECK(rc::ProfileParams(rc::StreamProfile::Quality).minQp == 0);
+    CHECK(rc::ProfileParams(rc::StreamProfile::LowLatency).minQp > 0);
+    CHECK(rc::ProfileParams(rc::StreamProfile::Balanced).minQp > 0);
 
     // Degenerate inputs: a zero ceiling and a zero frame rate must not divide by zero
     // or smuggle a budget through.
