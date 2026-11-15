@@ -34,12 +34,19 @@
 // fragment count, linearly interpolated between the listed seconds. Without feedback the
 // queue guard only ever sees "not measured" and the loss brake never fires; this is how
 // both are driven offline (PLAN-ROBUST R1).
+//
+// --fec <pct> sets the parity percentage the sender uses (0 = off, the production
+// default for LAN). --drop <pct> loses that percentage of datagrams in the loopback
+// receiver, the way Wi-Fi does, so the FEC on/off A/B measures what actually reaches
+// the assembler instead of an ideal link. Both are seeded/reproducible.
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <random>
 #include <string>
 #include <mutex>
 #include <condition_variable>
@@ -121,6 +128,8 @@ int main(int argc, char** argv) {
     int frames = 300;
     int lossAt = -1;
     int lossCount = 4;
+    int fecPercent = 5;        // --fec: parity on the wire; 5 = the LAN default, 0 = off
+    double dropPercent = 0.0;  // --drop: datagram loss injected in the loopback receiver
     std::string outPath, yuvPath;
     bool moving = false;           // every pixel changes, like a turning head in a game
     std::string imagePath;         // pan over this picture instead of the desktop
@@ -222,6 +231,18 @@ int main(int argc, char** argv) {
             lossAt = std::stoi(next());
         } else if (a == "--lost") {
             lossCount = std::stoi(next());
+        } else if (a == "--fec") {
+            fecPercent = std::stoi(next());
+            if (fecPercent < 0 || fecPercent > 60) {
+                std::printf("--fec wants 0..60\n");
+                return 2;
+            }
+        } else if (a == "--drop") {
+            dropPercent = std::stod(next());
+            if (!std::isfinite(dropPercent) || dropPercent < 0.0 || dropPercent > 50.0) {
+                std::printf("--drop wants 0..50 (percent)\n");
+                return 2;
+            }
         } else if (a == "--out") {
             outPath = next();
         } else if (a == "--net") {
@@ -442,6 +463,7 @@ float4 ps(V i) : SV_Target {
     std::vector<NetArrival> arrivals;
     std::atomic<bool> rxStop{false};
     std::atomic<size_t> rxCount{0};
+    std::atomic<int> dropped{0};
     std::thread rxThread;
     std::vector<int64_t> submitNs, encStartNs, encEndNs;  // 与提交顺序一一对应
     std::vector<size_t> netFrameBytes;
@@ -494,17 +516,25 @@ float4 ps(V i) : SV_Target {
         rxThread = std::thread([&] {
             std::vector<uint8_t> buf(2048);
             rc::NetAddress from;
+            std::mt19937 rng(20261116u);  // seeded: the A/B below is reproducible
+            std::uniform_real_distribution<double> unit(0.0, 1.0);
             while (!rxStop.load()) {
                 const int n = rxSock->RecvFrom(buf.data(), buf.size(), from, 20);
                 if (n <= 0) {
                     recvConn->Tick(rc::NowNs());
                     continue;
                 }
+                // --drop: lose the datagram the way Wi-Fi does, BEFORE the receiver
+                // assembles it. What survives is what the headset would have seen.
+                if (dropPercent > 0.0 && unit(rng) < dropPercent / 100.0) {
+                    dropped.fetch_add(1);
+                    continue;
+                }
                 recvConn->HandleDatagram(buf.data(), size_t(n), from);
             }
         });
         sender = std::make_unique<VideoSender>(sendConn.get(), rc::kVrStreamId, ec.codec, ec.bitrateKbps,
-                                               5 /* fecPercent，和局域网默认一致 */, false);
+                                               fecPercent /* --fec; 5 = the LAN default */, false);
         // Default: the legacy follow mode, so the existing 51-group matrix stays
         // reproducible; --pace-mode switches the behavior on explicitly.
         int mode = 2;
@@ -803,6 +833,32 @@ float4 ps(V i) : SV_Target {
             if (pairs)
                 std::printf("net: encode/send overlap %d of %d frames (%.0f%%)\n", overlapped, pairs,
                             100.0 * overlapped / pairs);
+            // 丢包下的成帧率：一个帧少收一个分片，头显就只能等恢复帧（真机每次约 35-50 ms）。
+            // 校验包数量决定这一帧能否被 FEC 救回；这条线就是「FEC 该不该开」的量化依据。
+            if (dropPercent > 0.0) {
+                std::map<uint32_t, std::pair<uint32_t, uint32_t>> frames;  // frame -> {fragCount, received}
+                std::map<uint32_t, uint32_t> parity;                       // frame -> parity datagrams
+                for (auto* a : v) {
+                    if (a->frag == 0xFFFF) parity[a->frame] += 1;
+                    else {
+                        auto& f = frames[a->frame];
+                        f.first = std::max(f.first, uint32_t(a->fragCount));
+                        f.second += 1;
+                    }
+                }
+                uint32_t complete = 0, damaged = 0, covered = 0;
+                for (const auto& [fi, f] : frames) {
+                    if (f.second >= f.first) complete++;
+                    else {
+                        damaged++;
+                        if (f.second + parity[fi] >= f.first) covered++;
+                    }
+                }
+                std::printf("net: drop %.1f%% (%d datagrams): %u/%u frames complete, %u damaged, "
+                            "%u covered by FEC, %d%% parity\n",
+                            dropPercent, dropped.load(), complete, uint32_t(frames.size()), damaged,
+                            covered, fecPercent);
+            }
         }
     }
 
