@@ -303,6 +303,8 @@ std::string App::ApplySettingSideEffects(const json& changed) {
     if (changed.contains("pcName") || changed.contains("allowRemote") || changed.contains("cloudUrl")) m_cloud.Wake();
     if (auto session = m_server.ActiveSession()) {
         session->OnSettingsChanged();
+        // PC 改了可同步项 → 推给一体机端，两边显示同一个选择（一体机改了会把所有权拿回去）。
+        session->OwnSyncedSettings(changed);
         // PC 视频参数在建流时读取；复用 session worker，只重建已有流。
         // 同一批设置只排入一次重建，避免 profile 与其他视频键重复触发。
         if (changed.contains("streamProfile") || changed.contains("codec") || changed.contains("tenBit") ||

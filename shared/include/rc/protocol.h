@@ -404,6 +404,19 @@ inline constexpr const char* kNotice = "notice";
 inline constexpr const char* kVrPoseWait = "vr.poseWait";
 }  // namespace msg
 
+// Settings both ends can change and both ends show: the PC pushes its value, the headset
+// applies it (and stops pushing its own), and the other way round. "Last change wins" -
+// whoever touched a setting last owns it until the other side changes it too.
+// The bitrate is deliberately not here: the headset's "follow the PC" (0) already covers it.
+namespace synced {
+inline constexpr const char* kCodec = "codec";
+inline constexpr const char* kTenBit = "tenBit";
+inline constexpr const char* kAdaptiveBitrate = "adaptiveBitrate";
+inline constexpr const char* kDesktopFps = "desktopFps";
+inline constexpr const char* kStreamProfile = "streamProfile";
+inline constexpr const char* kAll[] = {kCodec, kTenBit, kAdaptiveBitrate, kDesktopFps, kStreamProfile};
+}  // namespace synced
+
 // How fast the PC moves its VR frame timing for a "slipNs": 3% of the time that passes, so a
 // whole frame at 120 Hz takes 280 ms and the game runs 3% slow for that long. The headset
 // waits that out before it steers the timing again.

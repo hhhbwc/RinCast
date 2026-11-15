@@ -558,6 +558,15 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
     bool changed = false;
     const float gap = 44, w = (body.w - gap) / 2;
     Column l{body.x, body.y, w};
+    // 画质档位放在最上面：VR 用户最常改的就是它，改完电脑端也同步（最后一次改动生效）。
+    Section(ui, l, Tr("vr.profileSection"));
+    const std::vector<std::string> profiles = {Tr("profile.latency"), Tr("profile.balanced"), Tr("profile.quality")};
+    int pi = std::clamp(s.streamProfile, 0, 2);
+    if (RadioLine(ui, l, "profile", Tr("vr.profileLabel"), profiles, pi)) {
+        s.streamProfile = pi;
+        changed = true;
+    }
+    Label(ui, l, Tr("vr.profileHint"));
     Section(ui, l, Tr("vr.imageSection"));
     // Pixels per eye, against the headset's panel. Each change restarts the stream (and may ask
     // for a SteamVR restart), so it's applied when the handle is let go.
@@ -575,6 +584,7 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
         changed = true;
     }
     changed |= CheckRow(ui, l, "match-steamvr", Tr("vr.matchSteamVr"), s.matchSteamVr, Tr("vr.matchSteamVrHint"));
+    Label(ui, l, Tr("vr.resolutionHint"));
     l.y += 14;
     Label(ui, l, Tr("vr.fpsLabel"));
     std::vector<std::string> rates;

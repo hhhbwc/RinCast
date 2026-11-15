@@ -30,6 +30,7 @@ json HeadsetSettings::ToJson() const {
             {"vrBitrateMbps", vrBitrateMbps},
             {"adaptiveBitrate", adaptiveBitrate},
             {"desktopFps", desktopFps},
+            {"streamProfile", streamProfile},
             {"curvature", curvature},
             {"sharpLayers", sharpLayers},
             {"desktopInput", desktopInput},
@@ -99,6 +100,7 @@ void HeadsetSettings::FromJson(const json& j) {
     get("vrBitrateMbps", vrBitrateMbps);
     get("adaptiveBitrate", adaptiveBitrate);
     get("desktopFps", desktopFps);
+    streamProfile = std::clamp(j.value("streamProfile", streamProfile), 0, 2);
     get("curvature", curvature);
     get("sharpLayers", sharpLayers);
     get("desktopInput", desktopInput);
@@ -147,6 +149,7 @@ json HeadsetSettings::StreamSettingsJson() const {
             {"vrBitrateMbps", vrBitrateMbps},
             {"adaptiveBitrate", adaptiveBitrate},
             {"desktopFps", desktopFps},
+            {"streamProfile", streamProfile},
             {"streamAudio", streamAudio},
             {"micPassthrough", micPassthrough}};
 }

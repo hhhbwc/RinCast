@@ -33,6 +33,7 @@ struct HeadsetSettings {
     int vrBitrateMbps = 0;              // 0 = PC default
     bool adaptiveBitrate = true;
     int desktopFps = 0;                 // 0 = match refresh rate
+    int streamProfile = 1;              // 0 latency, 1 balanced, 2 best picture (the same three the PC offers)
     bool upscaling = false;             // Snapdragon GSR on the VR picture
     bool frameGeneration = false;       // make a frame from motion when the next is late
     bool bodyTracking = false;          // send the body to SteamVR as trackers

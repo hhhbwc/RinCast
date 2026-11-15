@@ -248,6 +248,7 @@ void App::ApplyPcSettings(const json& info) {
     if (s.contains("tenBit")) m_settings.tenBit = s.value("tenBit", m_settings.tenBit);
     if (s.contains("adaptiveBitrate")) m_settings.adaptiveBitrate = s.value("adaptiveBitrate", m_settings.adaptiveBitrate);
     if (s.contains("desktopFps")) m_settings.desktopFps = s.value("desktopFps", m_settings.desktopFps);
+    if (s.contains("streamProfile")) m_settings.streamProfile = std::clamp(s.value("streamProfile", m_settings.streamProfile), 0, 2);
     SaveSettings();
 }
 

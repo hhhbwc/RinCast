@@ -391,6 +391,14 @@ void ClientSession::HandleMessage(const json& m) {
             }
         }
         if (before.streamAudio != after.streamAudio || before.micPassthrough != after.micPassthrough) UpdateAudio();
+        // 一体机端选了画质档位 → PC 也用这个档位（PC 页面随之更新），并重建流让档位真的生效。
+        // 这是「最后一次改动生效」：一体机改了，PC 的这一项所有权就归它，PC 不再推回去。
+        const int pcProfile = SettingsStore::Get().Snapshot().streamProfile;
+        if (after.streamProfile != pcProfile) {
+            SettingsStore::Get().Update([&](Settings& s) { s.streamProfile = after.streamProfile; });
+            RestartVideoForProfile();
+            App::Get().PushUi(App::Get().StateJson());
+        }
         return;
     }
     if (type == rc::msg::kStartDesktop) return StartDesktop(m);
@@ -497,10 +505,18 @@ void ClientSession::ApplyClientInfo(const json& m) {
         m_settings.desktopBitrateMbps = s.value("desktopBitrateMbps", m_settings.desktopBitrateMbps);
         m_settings.desktopFps = s.value("desktopFps", m_settings.desktopFps);
         m_settings.adaptiveBitrate = s.value("adaptiveBitrate", m_settings.adaptiveBitrate);
+        m_settings.streamProfile = std::clamp(s.value("streamProfile", m_settings.streamProfile), 0, 2);
         // The preference is a PC-side setting for now (rcs::Settings::streamProfile).
         // The headset will send its own choice once its three-way UI exists.
         m_settings.streamAudio = s.value("streamAudio", m_settings.streamAudio);
         m_settings.micPassthrough = s.value("micPassthrough", m_settings.micPassthrough);
+        // 头显改了某个可同步项（值与 PC 推过去的不一样）→ 这一项的所有权归它，PC 不再推。
+        for (const char* key : rc::synced::kAll) {
+            if (!s.contains(key)) continue;
+            auto it = m_ownedSettings.find(key);
+            if (it == m_ownedSettings.end()) continue;
+            if (it->second != s[key]) m_ownedSettings.erase(it);
+        }
     }
 }
 
@@ -594,14 +610,33 @@ void ClientSession::SendServerInfo() {
         {"account", s.cloudUserName},
         {"remote", m_remote},
         {"vrState", m_vrState},
-        // 可同步的共享设置：头显把这些选项也展示并回填，PC 改它们会推到头显端（双向同步）。
+        // 可同步的共享设置：只推 PC 仍然拥有的那些项（头显改过的项所有权已收回）。
         // 码率不算：头显已有「跟随 PC」的 0 值语义，双向覆盖会破坏它。
-        {"settings",
-         {{"codec", s.codec},
-          {"tenBit", s.tenBit},
-          {"adaptiveBitrate", s.adaptiveBitrate},
-          {"desktopFps", s.desktopFps}}},
+        {"settings", OwnedSettingsJson()},
     });
+}
+
+// The synced settings the PC still owns, as a json object for server.info.
+json ClientSession::OwnedSettingsJson() {
+    std::lock_guard lock(m_mutex);
+    json out = json::object();
+    for (const auto& [k, v] : m_ownedSettings) out[k] = v;
+    return out;
+}
+
+// The PC changed these settings: it owns them now and pushes them to the headset, so
+// the headset shows the same choice. The headset takes a key back by changing it there.
+void ClientSession::OwnSyncedSettings(const json& changed) {
+    const Settings s = SettingsStore::Get().Snapshot();
+    json values = json::object();
+    values[rc::synced::kCodec] = s.codec;
+    values[rc::synced::kTenBit] = s.tenBit;
+    values[rc::synced::kAdaptiveBitrate] = s.adaptiveBitrate;
+    values[rc::synced::kDesktopFps] = s.desktopFps;
+    values[rc::synced::kStreamProfile] = s.streamProfile;
+    std::lock_guard lock(m_mutex);
+    for (const char* key : rc::synced::kAll)
+        if (changed.contains(key)) m_ownedSettings[key] = values[key];
 }
 
 void ClientSession::SendMonitors() {
