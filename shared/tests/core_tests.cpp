@@ -1202,7 +1202,8 @@ static void TestQueueGuard() {
         CHECK(run.floorHits == 0);
     }
 
-    // 3. A burst of keyframe requests is one lost episode, not a reason to collapse.
+    // 3. Frame loss on a clean link is not congestion. A keyframe storm used to cut
+    // 140 -> 85 Mbps every two seconds while queue and loss both read zero (S3, 2026-11-15).
     {
         rc::QueueGuard guard;
         guard.Configure(cfg);
@@ -1211,11 +1212,27 @@ static void TestQueueGuard() {
         int64_t now = 0;
         RunGuard(guard, link, target, 20, &now);
         const uint32_t before = guard.Cap() ? guard.Cap() : target;
-        auto run = RunGuard(guard, link, target, 5, &now, 0.2);  // a request every 200 ms
-        std::printf("queue guard: keyframe storm 140 -> %u kbps (was %u)\n", run.lastRate, before);
-        // A storm is real loss, so some dip is right - but a sixth of the rate, not two
-        // thirds. Before this law, twelve requests in ten seconds walked 140 to 30 Mb/s.
-        CHECK(run.lastRate > before * 85 / 100);
+        auto run = RunGuard(guard, link, target, 10, &now, 0.2);  // a request every 200 ms
+        std::printf("queue guard: clean-link keyframe storm stays at %u kbps (was %u, %d dips)\n",
+                    run.lastRate, before, run.dips);
+        CHECK(run.dips == 0);
+        CHECK(run.lastRate >= before * 98 / 100);
+    }
+
+    // 3b. The early-warning path is still there when the queue agrees: a request on a
+    // congested link must still bring the rate down, not be ignored altogether.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        SimLink link;
+        link.capacityKbps = 100000;
+        int64_t now = 0;
+        RunGuard(guard, link, target, 20, &now);
+        link.capacityKbps = 55000;  // path collapses while frames are being lost
+        auto run = RunGuard(guard, link, target, 10, &now, 0.2);
+        std::printf("queue guard: congested keyframe storm -> %u kbps (%d dips)\n", run.lastRate, run.dips);
+        CHECK(run.dips > 0);
+        CHECK(run.lastRate <= 62000);
     }
 
     // 4. A device whose own queue is deep is not congested for its whole life.
@@ -1293,8 +1310,9 @@ static void TestQueueGuard() {
     //    decoding", not a lost packet. Every stream start and profile switch used to
     //    answer it with a 12% rate cut while the queue was still -1..4 ms and loss 0%
     //    (field log 2026-11-14 18:30:39/18:31:46/18:32:21), then spend 2-3 s climbing
-    //    back. Ignore keyframe dips only for the first two seconds; real congestion and
-    //    real loss after that must still dip.
+    //    back. Ignore keyframe dips for the first two seconds; after the grace a request
+    //    alone still must not cut a clean link (test 3), but real queue pressure always
+    //    dips. Actual packet loss is LossBrake's job, not the guard's.
     {
         rc::QueueGuard guard;
         guard.Configure(cfg);
@@ -1305,18 +1323,22 @@ static void TestQueueGuard() {
             const auto r = guard.Update(target, 2, 0, true, int64_t(i) * 200'000'000LL);
             CHECK(r.action == rc::QueueGuard::Action::None);
         }
-        // Loss once the stream is up is real.
+        // A lost frame on a clean queue, even after the grace, is not congestion.
         const auto late = guard.Update(target, 3, 0, true, 4'000'000'000LL);
-        CHECK(late.action == rc::QueueGuard::Action::Dip);
-        CHECK(late.capKbps < target);
+        CHECK(late.action == rc::QueueGuard::Action::None);
+        CHECK(late.capKbps == 0);
+        // Real pressure after the grace still dips, with or without a keyframe request.
+        const auto lateBusy = guard.Update(target, 200, 0, true, 4'100'000'000LL);
+        CHECK(lateBusy.action == rc::QueueGuard::Action::Dip);
+        CHECK(lateBusy.capKbps < target);
         // A queue over the budget still dips even inside the grace: only the keyframe
         // branch is suppressed, not congestion control.
         rc::QueueGuard congested;
         congested.Configure(cfg);
         const auto over = congested.Update(target, 200, 0, false, 1'000'000'000LL);
         CHECK(over.action == rc::QueueGuard::Action::Dip);
-        std::printf("queue guard: startup keyframe ignored, loss after grace dips to %u kbps\n",
-                    late.capKbps);
+        std::printf("queue guard: startup keyframe ignored, clean late request held, congestion dips to %u kbps\n",
+                    lateBusy.capKbps);
     }
 }
 

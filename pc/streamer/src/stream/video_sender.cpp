@@ -131,6 +131,10 @@ bool VideoSender::BeginFrame(VideoEncoder& encoder) {
 }
 
 void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
+    // Only a request that actually starts a recovery is a new loss episode. Passing every
+    // repetition straight to the guard bypassed the in-flight de-dup below and made one
+    // lost frame look like sustained congestion (the 34 <-> 40 Mbps sawtooth, S3).
+    bool keyframeEpisode = false;
     if (fb.requestKeyframe) {
         std::lock_guard lock(m_lossMutex);
         // The headset asks again until it gets something to resume from. If a keyframe
@@ -143,6 +147,7 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
         if (!inFlight) {
             m_lossPending = true;
             m_lossGoodFrame = fb.lastGoodFrame;
+            keyframeEpisode = true;
         }
     }
     {
@@ -201,7 +206,7 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     // condition never came true, so it cut forever and sank to its floor, and its cuts were
     // sized by the arrival rate - the spiral that walked 119 Mb/s to 17.5 in four steps.
     const uint32_t aim = m_adaptive ? m_maxKbps : m_targetKbps.load();
-    const auto res = m_guard.Update(aim, q, queueFloor, fb.requestKeyframe != 0, now);
+    const auto res = m_guard.Update(aim, q, queueFloor, keyframeEpisode, now);
     // The loss brake runs beside the guard: whichever cap is lower wins, and neither
     // side's climb can override the other's hold (the real link oscillated 88 <-> 99
     // Mbps for 12 minutes on loss-driven dips that the climb instantly undid).

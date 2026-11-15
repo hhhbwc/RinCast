@@ -159,12 +159,17 @@ public:
             m_lastClimbNs = nowNs;
         };
 
-        // A keyframe request is a lost frame, not necessarily a full path: the recovery frame
-        // answers it, so it dips once per episode and gently. It used to dip 65% on every
-        // report, and one burst walked 140 -> 30 Mb/s in ten seconds.
-        if (keyframeRequested && !starting && nowNs - m_lastKeyDipNs > 2'000'000'000LL) {
+        // A keyframe request is one lost FRAME, not evidence that the path is full: the
+        // recovery frame answers it, FEC covers the gap, and LossBrake handles actual
+        // packet loss. Dipping for the request alone made a clean link pump 34 <-> 40
+        // Mbps every two seconds with queue 0 ms and loss 0 % (headset-sim --drop-every 2,
+        // 2026-11-15): the 2 s throttle only paced the sawtooth, it did not remove it.
+        // Only let a request deepen a dip the queue already justifies. It used to dip 65%
+        // on every report, and one burst walked 140 -> 30 Mb/s in ten seconds.
+        if (keyframeRequested && !starting && measured && queueMs > dipAt &&
+            nowNs - m_lastKeyDipNs > 2'000'000'000LL) {
             m_lastKeyDipNs = nowNs;
-            if (dip(measured && queueMs > dipAt ? 650 : 880, measured && queueMs > dipAt)) {
+            if (dip(650, true)) {
                 r.capKbps = m_cap;
                 return r;
             }
