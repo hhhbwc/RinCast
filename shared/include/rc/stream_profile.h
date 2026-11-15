@@ -44,13 +44,20 @@ struct StreamProfileParams {
     uint32_t minQp = 20;
     // VBV size as a percentage of ONE frame at the ceiling (150 = 1.5 frames).
     // Small VBV = smaller bursts = less queueing; large VBV lets a keyframe breathe.
+    // BUT one frame is too small for NVENC's VBR rate control to converge. Measured
+    // 2026-11-15 (3488x1744 @90, synthetic noise): a 1-frame VBV sent 136 / 126 / 109 %
+    // of a 20 / 30 / 40 Mbps ceiling and only 87 % of a 140 Mbps one, while 1.5 frames
+    // brought every ceiling to 95-97 %. Never go below 150.
     uint32_t vbvFramesPercent = 150;
 };
 
 constexpr StreamProfileParams ProfileParams(StreamProfile p) {
     switch (p) {
         case StreamProfile::LowLatency:
-            return {15.0, 6.0, 15.0, 100, 24, 100};
+            // 150, not 100: a one-frame VBV made capped VBR miss the ceiling in BOTH
+            // directions (see the note on vbvFramesPercent). The 15 ms queue budget is
+            // what makes this profile latency-first, not an undersized buffer.
+            return {15.0, 6.0, 15.0, 100, 24, 150};
         case StreamProfile::Quality:
             // No QP floor at all. "Best picture" must actually be allowed to spend
             // the ceiling; the other two profiles keep their savings. Latency-first

@@ -1124,6 +1124,17 @@ static void TestStreamProfile() {
     CHECK(rc::ProfileParams(rc::StreamProfile::LowLatency).minQp == 24);
     CHECK(rc::ProfileParams(rc::StreamProfile::Balanced).minQp == 0);
 
+    // A one-frame VBV cannot hold NVENC's VBR rate control. Measured 2026-11-15
+    // (encode-bench --synthetic, 3488x1744 @90): LowLatency with 100 % sent
+    // 136 / 126 / 109 % of a 20 / 30 / 40 Mbps ceiling and only 87 % of 140 Mbps;
+    // at 150 % every ceiling landed at 95-97 %. Never let a profile go under 1.5
+    // frames again -- the user's bitrate is a CEILING, not a target to average above.
+    for (auto p : all) {
+        CHECK(rc::ProfileParams(p).vbvFramesPercent >= 150);
+        std::printf("profile %d: VBV %u%% of one frame\n", int(p),
+                    rc::ProfileParams(p).vbvFramesPercent);
+    }
+
     // Degenerate inputs: a zero ceiling and a zero frame rate must not divide by zero
     // or smuggle a budget through.
     CHECK(rc::ComputeCappedVbr(0, fps, rc::StreamProfile::Balanced).maxBitrate == 0);
