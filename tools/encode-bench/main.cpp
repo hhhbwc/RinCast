@@ -434,7 +434,6 @@ float4 ps(V i) : SV_Target {
     EncodedFrame asyncFrame;
     rc::VrFrameMetadata asyncMeta{};
     double asyncEncodeMs = 0;
-    uint32_t asyncFrameIndex = 0;
     bool asyncSlotBusy = false;
     bool asyncStop = false;
     std::mutex asyncMutex;
@@ -519,6 +518,28 @@ float4 ps(V i) : SV_Target {
         std::printf("net: %u kbps target, pace mode %s, frame budget %lld ms, %.0f fps frame pacing\n",
                     ec.bitrateKbps, mode == 1 ? "off" : mode == 3 ? "burst" : "follow",
                     (long long)frameBudgetMs, paceFps);
+        if (netAsync) {
+            // Same shape as VrStream::RunSender: take the frame out of the capacity-1
+            // slot, free the slot so the encoder can overlap, then send.
+            asyncThread = std::thread([&] {
+                for (;;) {
+                    EncodedFrame frame;
+                    rc::VrFrameMetadata meta{};
+                    double encodeMs = 0;
+                    {
+                        std::unique_lock<std::mutex> lock(asyncMutex);
+                        asyncFilledCv.wait(lock, [&] { return asyncSlotBusy || asyncStop; });
+                        if (!asyncSlotBusy) break;
+                        frame = std::move(asyncFrame);
+                        meta = asyncMeta;
+                        encodeMs = asyncEncodeMs;
+                        asyncSlotBusy = false;
+                    }
+                    asyncDoneCv.notify_one();
+                    sender->Send(frame, &meta, sizeof(meta), 0, encodeMs);
+                }
+            });
+        }
     }
 
     const UINT panW = sd.Width - cd.Width, panH = sd.Height - cd.Height;
@@ -532,6 +553,7 @@ float4 ps(V i) : SV_Target {
     double maxWindowMbps = 0;
     const int64_t benchStartNs = rc::NowNs();
     int64_t nextFbNs = benchStartNs;
+    uint32_t appliedKbps = ec.bitrateKbps;
     for (int i = 0; i < frames; i++) {
         if (stallEvery > 0 && i > 0 && i % stallEvery == 0 && stallMs > 0) {
             rc::SleepMs(stallMs);   // the game stopped submitting: a load hitch, not a frame
@@ -650,6 +672,16 @@ float4 ps(V i) : SV_Target {
                     nextFbNs = fbNow + int64_t(fbEveryMs) * 1'000'000LL;
                 }
             }
+            // The async path mirrors production: the guard's cap feeds the encoder
+            // target, so the user's ceiling remains an average-rate ceiling. The
+            // synchronous --net path keeps its historical behavior unchanged.
+            if (netAsync) {
+                const uint32_t target = sender->TargetBitrateKbps();
+                if (target && target != appliedKbps) {
+                    encoder->SetBitrate(target);
+                    appliedKbps = target;
+                }
+            }
             // --net-async: the VR stream's shape - the encode thread fills a capacity-1
             // slot and a sender thread drains it, so submit->sent and overlap carry the
             // production meaning. Without it: the synchronous Send.
@@ -663,7 +695,6 @@ float4 ps(V i) : SV_Target {
                 asyncFrame = std::move(ef);
                 asyncMeta = netMeta;
                 asyncEncodeMs = rc::NsToMs(rc::NowNs() - t0);
-                asyncFrameIndex = uint32_t(submitNs.size());
                 asyncSlotBusy = true;
                 asyncFilledCv.notify_one();   // wake the sender: nothing woke it before (deadlock)
             } else {

@@ -75,18 +75,23 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
             m_lastRecoveryNs = rc::NowNs();
         }
     }
-    // The pacing rate follows the USER's ceiling, not the guard's cap: the cap is a
-    // budget for frames not yet encoded, while an encoded frame must leave within its
-    // own frame period - a slower pacer only stretched the frame, back-pressured the
-    // capacity-1 send slot and pushed the queue up (the real device's 205 ms at a
-    // 100 Mbps ceiling). In burst mode the frame budget comes from the measured fps
-    // (cold start: 90 fps). TargetBitrateKbps() itself is untouched: the encoder's
-    // budget still obeys the guard.
+    // Burst pacing follows the USER's ceiling, not the guard's cap: an encoded frame
+    // must leave within its own frame period, otherwise the capacity-1 send slot
+    // back-pressures the encoder and the queue climbs (the real device's 205 ms at a
+    // 100 Mbps ceiling). The legacy follow mode keeps pacing from TargetBitrateKbps()
+    // so remote paths and the follow control retain the old behavior. The encoder's
+    // budget still obeys the guard in both modes.
     if (m_pace) {
-        m_packetizer.SetPacingKbps(uint32_t(m_maxKbps.load() * 1.08));
-        if (m_pacingMode.load(std::memory_order_relaxed) == 3) {
-            const double fps = m_measuredFps.load(std::memory_order_relaxed);
-            m_packetizer.SetPacingFrameBudgetNs(fps > 1.0 ? int64_t(1e9 / fps) : 11'100'000LL);
+        const int mode = m_pacingMode.load(std::memory_order_relaxed);
+        const uint32_t paceBase = mode == 3 ? m_maxKbps.load() : TargetBitrateKbps();
+        m_packetizer.SetPacingKbps(uint32_t(paceBase * 1.08));
+        if (mode == 3) {
+            int64_t budgetNs = m_pacingBudgetNs.load(std::memory_order_relaxed);
+            if (budgetNs <= 0) {
+                const double fps = m_measuredFps.load(std::memory_order_relaxed);
+                budgetNs = fps > 1.0 ? int64_t(1e9 / fps) : 11'100'000LL;
+            }
+            m_packetizer.SetPacingFrameBudgetNs(budgetNs);
         }
     }
     m_packetizer.SendFrame(m_streamId, m_codec, flags, index, metadata, metadataSize, frame.data.data(),

@@ -703,8 +703,6 @@ void ClientSession::StartDesktop(const json& m) {
         cfg.bitrateKbps = std::max<uint32_t>(cfg.bitrateKbps, 5000);
         // Internet paths lose packets and have no retransmissions: recover more of them locally.
         cfg.fecPercent = m_slowPath ? std::max(pc.fecPercent, 12) : pc.fecPercent;
-        // 局域网也铺开发：整帧突发会打爆 Wi-Fi 的浅队列。pacing 只改变发送节奏，
-        // 不增加端到端延迟（编码和上一帧的发送重叠）。
         // The desktop stream keeps the legacy pacing for now (PLAN-pacing-fix §7: it
         // was not part of the diagnosed lock). NOTE: the send thread back-pressures the
         // capacity-1 send slot when the pacer is slower than the encode - the old claim

@@ -76,7 +76,7 @@ class VideoSender {
     // Pacing mode (PLAN-pacing-fix): 0 auto (session resolves), 1 off, 2 follow the
     // guard cap (the legacy self-locking behavior), 3 burst (frame budget: the user's
     // ceiling drives the rate, an encoded frame leaves within its own frame period).
-    // The frame budget comes from the sender's measured fps at send time.
+    // frameBudgetNs > 0 is an explicit override (bench); 0 = the sender's measured fps.
     void SetPacingMode(int mode, int64_t frameBudgetNs);
     // Adaptive only: begin below the maximum and let the guard explore upward. The ceiling
     // is where the climb stops, so seeding it is what makes the start point mean anything.
