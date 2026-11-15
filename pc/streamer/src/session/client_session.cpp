@@ -885,10 +885,10 @@ void ClientSession::StartVr() {
     cfg.foveated = rcs::QualityProfileQpMap(pc.foveatedEncoding, pc.profileControlsVideo && !match && !m_slowPath,
                                             cfg.profile == rc::StreamProfile::Quality);
     cfg.adaptiveQuant = pc.adaptiveQuantization;
-    // Same gating as the fovea and QP-map lines above: the profile may drive video
-    // settings only where its choices apply (not SteamVR-matched, not the slow path).
-    cfg.twoPass = rcs::QualityProfileTwoPass(pc.twoPassEncoding, pc.profileControlsVideo && !match && !m_slowPath,
-                                             cfg.profile == rc::StreamProfile::Quality);
+    // Two-pass is the user's own switch, never forced by a profile. The Best-picture
+    // profile used to turn it on by itself (and the page greyed it out), which
+    // surprised users who had deliberately left it off; the user decides.
+    cfg.twoPass = pc.twoPassEncoding;
     // CBR is the quality profile's "spend exactly this" mode; opt-in, quality only.
     cfg.cappedVbr = !rcs::QualityProfileCbr(pc.qualityProfileCbr, pc.profileControlsVideo && !match && !m_slowPath,
                                             cfg.profile == rc::StreamProfile::Quality);

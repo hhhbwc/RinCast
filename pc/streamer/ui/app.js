@@ -638,12 +638,11 @@ function renderDependents() {
   // clickable on every profile.
   const tunable = ["nvenc", "amf"].includes(state.system.encoder.backend);
   setOff($("#aqRow"), !tunable);
-  // 画质优先档在「由档位控制视频」开启时会自己开两遍编码（QualityProfileTwoPass 只升不降），
-  // 复选框要如实勾上并置灰，否则页面显示“关”而编码器实际在跑两遍，会误导用户。
-  // 服务端还额外排除 SteamVR 匹配分辨率 / 慢链路，这两项 UI 拿不到，用最常见分支近似。
-  const profileForcesTwoPass = tunable && profile === 2 && !!state.settings.profileControlsVideo;
-  $("#twoPassRow input").checked = profileForcesTwoPass ? true : !!state.settings.twoPassEncoding;
-  setOff($("#twoPassRow"), profileForcesTwoPass || !tunable);
+  // Two-pass is the user's own switch. A profile no longer forces it on (the old
+  // Best-picture behaviour surprised users who had left it off), so the checkbox
+  // simply mirrors the setting and is only greyed when the encoder can't do it.
+  $("#twoPassRow input").checked = !!state.settings.twoPassEncoding;
+  setOff($("#twoPassRow"), !tunable);
   setOff($("#cbrRow"), profile !== 2);
   setOff($("#playOnPcRow"), !state.settings.streamAudio);
   setOff($("#micRow"), state.settings.audioDevices === "system");

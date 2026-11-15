@@ -110,15 +110,6 @@ constexpr bool QualityProfileQpMap(bool current, bool profileControlsVideo, bool
     return current || (profileControlsVideo && qualityProfile);
 }
 
-// The Best-picture profile also wants the quick first pass (better rate control:
-// measured offline, keyframes came out 38% smaller at the same ceiling, which is
-// what spikes the queue at every scene cut or recovery). Only ever raises - a
-// two-pass the user enabled stays on. VR stream only; desktop always two-passes
-// anyway (see the desktop stream).
-constexpr bool QualityProfileTwoPass(bool current, bool profileControlsVideo, bool qualityProfile) {
-    return current || (profileControlsVideo && qualityProfile);
-}
-
 // Per-profile fovea floors (the share of each eye that stays full-density). The
 // gradient 0.6 / 0.7 / 0.8 is what makes the three profiles differ where it always
 // shows - encoded pixels - because the queue budgets alone never bind on a real

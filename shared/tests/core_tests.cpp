@@ -1406,16 +1406,6 @@ static void TestQualityProfileQpMap() {
     std::printf("QualityProfileQpMap: profile adds it for Best picture, user map always wins\n");
 }
 
-// The Best-picture two-pass: off unless the user enabled it, added by the profile
-// when it may drive video settings, and never revoked.
-static void TestQualityProfileTwoPass() {
-    CHECK(rcs::QualityProfileTwoPass(false, false, true) == false);
-    CHECK(rcs::QualityProfileTwoPass(false, true, false) == false);
-    CHECK(rcs::QualityProfileTwoPass(false, true, true) == true);
-    CHECK(rcs::QualityProfileTwoPass(true, false, false) == true);
-    std::printf("QualityProfileTwoPass: profile adds it for Best picture, user map always wins\n");
-}
-
 // The per-profile fovea gradient (0.6 / 0.7 / 0.8): each profile floors the share
 // when it may drive video settings, never lowers it, and passes through when the
 // switch is off. Encoded widths on the 2176 panel: 1744 / 1856 / 1952.
@@ -1946,7 +1936,6 @@ int main() {
     TestStreamProfile();
     TestQualityProfileFovea();
     TestQualityProfileQpMap();
-    TestQualityProfileTwoPass();
     TestProfileFoveaGradient();
     TestBitrateSwitches();
     TestFpsLadder();
