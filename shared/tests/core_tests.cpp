@@ -1716,6 +1716,30 @@ static void TestPacingBurstShaping() {
 // second of WIRE bytes stays inside the quota and that no frame is lost.
 //
 // The existing assertions are untouched: this is a new test only.
+// D-028: the encoder is handed a rate scaled by rung/real, so its per-frame budget stays
+// ceiling/realFps regardless of which ladder rung it runs at. The field case that forced
+// this: 38 fps frames at the 30 fps rung produced 1.27x (124 Mbps against a 100 Mbps
+// setting), 390 KB frames the pacer could not drain in a 27 ms frame period.
+static void TestRateScaleForLadder() {
+    // A rung at or above the real rate is left alone: the setting is a ceiling, and
+    // under-spending is not this function's business.
+    CHECK(rc::ScaleRateToRealFps(100000, 90, 90.0) == 100000);
+    CHECK(rc::ScaleRateToRealFps(100000, 90, 87.0) == 100000);   // measured jitter
+    CHECK(rc::ScaleRateToRealFps(100000, 30, 30.0) == 100000);   // rung == real
+    // A rung below the real rate is undone exactly: 72/90 -> 0.8, 30/38 -> ~0.789.
+    CHECK(rc::ScaleRateToRealFps(100000, 72, 90.0) == 80000);
+    const uint32_t s = rc::ScaleRateToRealFps(100000, 30, 38.0);
+    CHECK(s >= 78900 && s <= 78960);
+    // The floor: one bad second may not quarter the target (24/90 would be 0.267).
+    CHECK(rc::ScaleRateToRealFps(100000, 24, 90.0) == 50000);
+    // Unknowns leave the rate untouched (encoder Init calls ApplyBitrate before any frame).
+    CHECK(rc::ScaleRateToRealFps(100000, 30, 0.0) == 100000);
+    CHECK(rc::ScaleRateToRealFps(100000, 0, 38.0) == 100000);
+    CHECK(rc::ScaleRateToRealFps(0, 30, 38.0) == 0);
+    std::printf("rate scale: 90/90 stays, 72/90 -> %u, 30/38 -> %u, 24/90 floor -> %u\n",
+                rc::ScaleRateToRealFps(100000, 72, 90.0), s, rc::ScaleRateToRealFps(100000, 24, 90.0));
+}
+
 static void TestWireCeilingBudget() {
     constexpr uint32_t kCeilingKbps = 100000;  // the user's ceiling, wire
     constexpr int kFps = 90;
@@ -1804,6 +1828,7 @@ int main() {
     TestPacingFrameBudget();
     TestPacingBurstShaping();
     TestWireCeilingBudget();
+    TestRateScaleForLadder();
     TestStreamProfile();
     TestQualityProfileFovea();
     TestQualityProfileQpMap();

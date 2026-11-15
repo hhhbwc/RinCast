@@ -32,4 +32,27 @@ constexpr int QuantizeFps(double measured, int current) {
     return rung;
 }
 
+// The budget NVENC receives is averageBitRate / frameRateNum, so a rung BELOW the rate
+// frames really arrive at inflates every frame by real/rung - the overshoot the comment
+// above names, which the ladder alone cannot undo. This converts the user's ceiling into
+// the rate to hand the encoder so that the per-frame budget is ceiling / realFps whatever
+// rung was picked: rate = ceiling * rung / real.
+//
+// Only the overshoot direction is corrected (anything at or above 0.98 is left alone):
+// the setting is a ceiling, so a rung ABOVE the real rate - which under-spends - must not
+// be inflated past what the user asked for. 0.5 is the same floor the measured-rate clamp
+// uses: one bad second may not quarter the target.
+//
+// Measured on the real device 2026-11-16 00:05-00:09: 38 fps frames at the 30 fps rung
+// gave 1.27x - 124 Mbps against a 100 Mbps setting, 390 KB/frame. The pacer could not
+// drain it (390 KB at 108 Mbps is 28.9 ms; the frame period is 27 ms), the receive queue
+// grew to 74 ms, and the headset reported 190-215 ms pose-to-display.
+inline uint32_t ScaleRateToRealFps(uint32_t kbps, uint32_t rcFps, double realFps) {
+    if (!kbps || !rcFps || realFps < 1.0) return kbps;
+    const double ratio = double(rcFps) / realFps;
+    if (ratio >= 0.98) return kbps;
+    const double bounded = ratio < 0.5 ? 0.5 : ratio;
+    return uint32_t(double(kbps) * bounded);
+}
+
 }  // namespace rc

@@ -462,11 +462,18 @@ class NvencEncoder final : public VideoEncoder {
         return (!m_config.desktop && m_effectiveFps) ? m_effectiveFps : uint32_t(m_config.fps);
     }
 
+    // D-028: NVENC budgets each frame as averageBitRate / frameRateNum, so a ladder rung
+    // BELOW the rate frames really arrive at inflates every frame by real/rung and the
+    // stream runs over the user's ceiling by that factor (field: 38 fps at the 30 fps
+    // rung = 1.27x = 124 Mbps against 100, 390 KB/frame, receive queue 74 ms, 190-215 ms
+    // pose-to-display because the pacer cannot drain 390 KB in a 27 ms frame period).
+    // rc::ScaleRateToRealFps() is the pure, unit-tested conversion.
     void ApplyBitrate(uint32_t kbps) {
         auto& rc = m_encodeConfig.rcParams;
         // One place computes the budget, so Init / SetBitrate / fps-driven VBV
         // reconfigures can never disagree about what the ceiling means.
-        const auto budget = BudgetFor(kbps, EffectiveFps());
+        const uint32_t budgetKbps = rc::ScaleRateToRealFps(kbps, m_init.frameRateNum / 1000, m_realFps);
+        const auto budget = BudgetFor(budgetKbps, EffectiveFps());
         rc.averageBitRate = budget.averageBitrate;
         rc.maxBitRate = budget.maxBitrate;
         rc.vbvBufferSize = budget.vbvBufferSize;
@@ -504,6 +511,12 @@ class NvencEncoder final : public VideoEncoder {
             m_intervalNsSlow = m_intervalNsSlow > 0 ? m_intervalNsSlow * 0.9 + interval * 0.1 : interval;
         }
         m_lastEncodeNs = now;
+        // D-028: the rate frames really arrive at, used by ScaleToRealRate() to undo the
+        // ladder's rung mismatch. Same fast twin the VBV uses, same clamp: one hitch is
+        // not a frame rate.
+        if (m_intervalNsSmooth > 0) {
+            m_realFps = std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 2.0, double(m_config.fps));
+        }
         if (m_config.desktop || m_intervalNsSmooth <= 0 || !m_encoder) return;
         const uint32_t fpsFast = uint32_t(std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 2.0, double(m_config.fps)));
         // 重配目标走阶梯（fps_ladder.h）：量化后每分钟的重配从 11.7-16.8 次降到个位数，
@@ -539,6 +552,14 @@ class NvencEncoder final : public VideoEncoder {
         }
         const uint32_t rateNum = fps * 1000;
         if (m_init.frameRateNum == rateNum && m_encodeConfig.rcParams.vbvBufferSize == want) return;
+        // D-028: the rung IS the per-frame divisor, so the budget has to be recomputed
+        // with the new one BEFORE the reconfigure params are copied. Without this the
+        // encoder kept the old rung's budget while running at the new rung's rate - the
+        // 1.27x overshoot the field measured at 38 fps / 30 fps rung.
+        const uint32_t prevRateNum = m_init.frameRateNum;
+        m_init.frameRateNum = rateNum;
+        ApplyBitrate(m_config.bitrateKbps);
+        m_encodeConfig.rcParams.vbvBufferSize = want;
         NV_ENC_RECONFIGURE_PARAMS re{};
         re.version = NV_ENC_RECONFIGURE_PARAMS_VER;
         re.reInitEncodeParams = m_init;
@@ -547,7 +568,6 @@ class NvencEncoder final : public VideoEncoder {
             // 记账只在成功后：失败时编码器还是旧码率，把 m_effectiveFps/m_init 记成新值
             // 会让下一次的判重跳过重试，VBV 的计算口径也和编码器实际状态脱节。
             m_effectiveFps = fps;
-            m_init.frameRateNum = rateNum;
             m_init.frameRateDen = 1000;
             m_encodeConfig.rcParams.vbvBufferSize = want;
             // Do NOT re-prime vbvInitialDelay here: it is the buffer's occupancy at
@@ -556,6 +576,11 @@ class NvencEncoder final : public VideoEncoder {
             // the same overshoot ApplyBitrate() was fixed for.
             m_lastVbvNs = now;
             RC_LOGI("NVENC: %.0f fps measured, encoder rate %u fps, VBV %.2f Mbit", 1e9 / m_intervalNsSmooth, fps, double(want) / 1e6);
+        } else {
+            // The encoder kept the old rung: put the divisor back, so ScaleToRealRate()
+            // and the next dedupe check see the state the encoder is really in.
+            m_init.frameRateNum = prevRateNum;
+            ApplyBitrate(m_config.bitrateKbps);
         }
     }
 
@@ -619,6 +644,7 @@ class NvencEncoder final : public VideoEncoder {
     double m_intervalNsSmooth = 0;
     double m_intervalNsSlow = 0;
     uint32_t m_effectiveFps = 0;
+    double m_realFps = 0;  // D-028: frames really arrive at this rate (fast twin, clamped)
     int64_t m_lastVbvNs = 0;
     uint64_t m_lastIntraTs = 0;
 
