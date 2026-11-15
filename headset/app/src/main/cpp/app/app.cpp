@@ -240,6 +240,17 @@ void App::Shutdown() {
 
 void App::SaveSettings() { m_settings.Save(m_settingsPath); }
 
+// PC 端改了共享设置后推到一体机：本地回填并保存，但**不回传**（避免 PC↔一体机互相回显成环）。
+void App::ApplyPcSettings(const json& info) {
+    const json& s = info.value("settings", json::object());
+    if (s.empty()) return;
+    if (s.contains("codec")) m_settings.codec = s.value("codec", m_settings.codec);
+    if (s.contains("tenBit")) m_settings.tenBit = s.value("tenBit", m_settings.tenBit);
+    if (s.contains("adaptiveBitrate")) m_settings.adaptiveBitrate = s.value("adaptiveBitrate", m_settings.adaptiveBitrate);
+    if (s.contains("desktopFps")) m_settings.desktopFps = s.value("desktopFps", m_settings.desktopFps);
+    SaveSettings();
+}
+
 void App::ApplyStreamSettings() {
     SaveSettings();
     m_xr.SetRefreshRate(m_settings.refreshRate);
@@ -941,6 +952,7 @@ void App::HandleControl(const json& m) {
                         m.value("frequency", 0.f) > 0 ? m.value("frequency", 0.f) : XR_FREQUENCY_UNSPECIFIED);
     } else if (type == rc::msg::kServerInfo) {
         m_serverInfo = m;
+        ApplyPcSettings(m);  // 回填 PC 端改过的可同步设置（不回传）
     } else if (type == rc::msg::kMonitors) {
         m_monitors.clear();
         for (const auto& mon : m.value("monitors", json::array()))

@@ -357,6 +357,7 @@ void ClientSession::HandleMessage(const json& m) {
     if (type == "_monitors") return SendMonitors();
     if (type == "_audio") return UpdateAudio();
     if (type == "_profile") return RestartVideoForProfile();
+    if (type == "_serverInfo") return SendServerInfo();
     if (type == rc::msg::kClientInfo) {
         ApplyClientInfo(m);
         SendServerInfo();
@@ -593,6 +594,13 @@ void ClientSession::SendServerInfo() {
         {"account", s.cloudUserName},
         {"remote", m_remote},
         {"vrState", m_vrState},
+        // 可同步的共享设置：头显把这些选项也展示并回填，PC 改它们会推到头显端（双向同步）。
+        // 码率不算：头显已有「跟随 PC」的 0 值语义，双向覆盖会破坏它。
+        {"settings",
+         {{"codec", s.codec},
+          {"tenBit", s.tenBit},
+          {"adaptiveBitrate", s.adaptiveBitrate},
+          {"desktopFps", s.desktopFps}}},
     });
 }
 
@@ -625,6 +633,7 @@ void ClientSession::OnSettingsChanged() {
     std::lock_guard lock(m_queueMutex);
     m_queue.push_back(json{{"type", rc::msg::kUpdateSettings}, {"settings", json::object()}});
     m_queue.push_back(json{{"type", "_audio"}});
+    m_queue.push_back(json{{"type", "_serverInfo"}});  // 把可同步设置推到一体机端
     m_queueCv.notify_one();
 }
 

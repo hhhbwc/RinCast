@@ -81,6 +81,7 @@ class App {
     kb::Keyboard& Kb() { return m_keyboard; }
     void SaveSettings();
     void ApplyStreamSettings();      // pushes streaming settings to the PC
+    void ApplyPcSettings(const nlohmann::json& serverInfo);  // PC 推来的可同步设置，本地回填不回传
     Mode CurrentMode() const { return m_mode; }
     Discovery& Lan() { return m_discovery; }
     Cloud& Account() { return m_cloud; }
