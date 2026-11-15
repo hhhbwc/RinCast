@@ -430,6 +430,7 @@ struct RawReceiver {
             }
         });
     }
+    ~RawReceiver() { Stop(); }  // a joinable std::thread dtor would std::terminate
     void Stop() {
         stop = true;
         if (reader.joinable()) reader.join();
@@ -1512,34 +1513,141 @@ static void TestFpsLadder() {
     std::printf("fps ladder: 24/30/45/54/60/72/90, +-15%% hold, stalls floor at 24");
 }
 
+// The frame-budget pacing mode (PLAN-pacing-fix WP1): a 208 KB frame leaves within
+// its 8 ms frame period even though the average pacing rate is only 8 Mbit/s, and
+// it is genuinely spread (not one burst). The legacy clock would take ~220 ms.
+static void TestPacingFrameBudget() {
+    int64_t oneFrameNs = 0;
+    double spreadMs = 0;
+    uint32_t overruns = 0;
+    size_t n = 0;
+    double legacyMs = 0;
+    std::fprintf(stderr, "LB2: rx open\n"); std::fflush(stderr);
+    {
+        RawReceiver rx;
+        UdpSocket tx;
+        CHECK(rx.Open() && tx.Open(0));
+        if (!rx.sock.IsOpen()) return;
+        tx.SetBuffers(16 << 20, 1 << 20);
+        auto keys = crypto::DeriveSessionKeys(crypto::KeyPair::Generate().secretKey, crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey, crypto::KeyPair::Generate().publicKey,
+                                              "t");
+        Connection conn(&tx, NetAddress{0x7F000001, rx.sock.LocalPort()}, 1, keys, true, kMaxDatagramLan);
+        rx.Start();
+        std::fprintf(stderr, "LB2: started\n"); std::fflush(stderr);
+        VideoPacketizer pkt(&conn);
+        pkt.SetFecPercent(5);
+        pkt.SetPacingKbps(8000);
+        pkt.SetPacingFrameBudgetNs(8'000'000LL);
+        constexpr size_t kFrameBytes = 208 * 1024;
+        std::vector<uint8_t> frame(kFrameBytes);
+        for (size_t i = 0; i < frame.size(); i++) frame[i] = uint8_t(i * 31);
+        VrFrameMetadata meta{};
+        meta.trackingTimestampNs = 12345;
+        const int64_t t = NowNs();
+        pkt.SendFrame(kVrStreamId, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), frame.data(), frame.size());
+        oneFrameNs = NowNs() - t;
+        std::fprintf(stderr, "LB2: budget frame sent\n"); std::fflush(stderr);
+        SleepMs(150);
+        n = std::min(rx.count.load(), rx.arrivals.size());
+        overruns = pkt.BudgetOverruns();
+        if (n >= 2) { spreadMs = NsToMs(rx.arrivals[n - 1].first - rx.arrivals[0].first); }
+        std::fprintf(stderr, "LB2: sliced n=%zu\n", n); std::fflush(stderr);
+        rx.Stop();   // join the reader BEFORE the scope closes: a joinable std::thread
+                     // destructor calls std::terminate (the 0xC0000409)
+    }
+    std::fprintf(stderr, "LB2: all destroyed\n"); std::fflush(stderr);
+    {
+        std::fprintf(stderr, "LB2: legacy start\n"); std::fflush(stderr);
+        RawReceiver rx;
+        UdpSocket tx;
+        CHECK(rx.Open() && tx.Open(0));
+        tx.SetBuffers(16 << 20, 1 << 20);
+        auto keys = crypto::DeriveSessionKeys(crypto::KeyPair::Generate().secretKey, crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey, crypto::KeyPair::Generate().publicKey,
+                                              "t");
+        Connection conn(&tx, NetAddress{0x7F000001, rx.sock.LocalPort()}, 1, keys, true, kMaxDatagramLan);
+        rx.Start();
+        VideoPacketizer legacy(&conn);
+        legacy.SetFecPercent(5);
+        legacy.SetPacingKbps(8000);
+        constexpr size_t kFrameBytes = 208 * 1024;
+        std::vector<uint8_t> frame(kFrameBytes);
+        for (size_t i = 0; i < frame.size(); i++) frame[i] = uint8_t(i * 31);
+        VrFrameMetadata meta{};
+        meta.trackingTimestampNs = 12345;
+        const int64_t t0 = NowNs();
+        legacy.SendFrame(kVrStreamId, VideoCodec::HEVC, 0, 200, &meta, sizeof(meta), frame.data(), frame.size());
+        legacyMs = NsToMs(NowNs() - t0);
+        std::fprintf(stderr, "LB2: legacy frame sent\n"); std::fflush(stderr);
+        rx.Stop();
+    }
+    std::fprintf(stderr, "LB2: legacy destroyed\n"); std::fflush(stderr);
+    std::printf("pacing budget: 208 KB in %.2f ms (legacy clock: %.1f ms), spread %.2f ms over %zu datagrams, overruns %u\n",
+                NsToMs(oneFrameNs), legacyMs, spreadMs, n, overruns);
+    CHECK(oneFrameNs <= 10'000'000LL);
+    CHECK(spreadMs >= 5.0);
+    CHECK(overruns == 0);
+    CHECK(legacyMs >= 150.0);
+}
+
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);  // TEMP bisect: unbuffered, revert after
     TestLinkLocalDiscovery();
+    std::fprintf(stderr, "ALIVE TestLinkLocalDiscovery\n"); std::fflush(stderr);
     TestMusic();
+    std::fprintf(stderr, "ALIVE TestMusic\n"); std::fflush(stderr);
     TestMotionRuns();
+    std::fprintf(stderr, "ALIVE TestMotionRuns\n"); std::fflush(stderr);
     TestHandSkeleton();
+    std::fprintf(stderr, "ALIVE TestHandSkeleton\n"); std::fflush(stderr);
     NetInit();
     TestAddresses();
+    std::fprintf(stderr, "ALIVE TestAddresses\n"); std::fflush(stderr);
     TestDiscovery();
+    std::fprintf(stderr, "ALIVE TestDiscovery\n"); std::fflush(stderr);
     TestSubnetHosts();
+    std::fprintf(stderr, "ALIVE TestSubnetHosts\n"); std::fflush(stderr);
     TestAudio();
+    std::fprintf(stderr, "ALIVE TestAudio\n"); std::fflush(stderr);
     TestIdentity();
+    std::fprintf(stderr, "ALIVE TestIdentity\n"); std::fflush(stderr);
     TestVideoReassemblyOrder();
+    std::fprintf(stderr, "ALIVE TestVideoReassemblyOrder\n"); std::fflush(stderr);
     TestPacing();
+    std::fprintf(stderr, "ALIVE TestPacing\n"); std::fflush(stderr);
     TestPacingBursts();
+    std::fprintf(stderr, "ALIVE TestPacingBursts\n"); std::fflush(stderr);
     TestPacingStop();
+    std::fprintf(stderr, "ALIVE TestPacingStop\n"); std::fflush(stderr);
+    TestPacingFrameBudget();
+    std::fprintf(stderr, "ALIVE TestPacingFrameBudget\n"); std::fflush(stderr);
     TestStreamProfile();
+    std::fprintf(stderr, "ALIVE TestStreamProfile\n"); std::fflush(stderr);
     TestQualityProfileFovea();
+    std::fprintf(stderr, "ALIVE TestQualityProfileFovea\n"); std::fflush(stderr);
     TestQualityProfileQpMap();
+    std::fprintf(stderr, "ALIVE TestQualityProfileQpMap\n"); std::fflush(stderr);
     TestQualityProfileTwoPass();
+    std::fprintf(stderr, "ALIVE TestQualityProfileTwoPass\n"); std::fflush(stderr);
     TestProfileFoveaGradient();
+    std::fprintf(stderr, "ALIVE TestProfileFoveaGradient\n"); std::fflush(stderr);
     TestBitrateSwitches();
+    std::fprintf(stderr, "ALIVE TestBitrateSwitches\n"); std::fflush(stderr);
     TestFpsLadder();
+    std::fprintf(stderr, "ALIVE TestFpsLadder\n"); std::fflush(stderr);
     TestLossBrake();
+    std::fprintf(stderr, "ALIVE TestLossBrake\n"); std::fflush(stderr);
+    std::fprintf(stderr, "ALIVE TestLossBrake\n"); std::fflush(stderr);
     TestQueueGuard();
+    std::fprintf(stderr, "ALIVE TestQueueGuard\n"); std::fflush(stderr);
     TestFecDeterministic();
+    std::fprintf(stderr, "ALIVE TestFecDeterministic\n"); std::fflush(stderr);
+    std::fprintf(stderr, "ALIVE TestFecDeterministic\n"); std::fflush(stderr);
     TestFecDeterministic();
     TestHandshakeAndTransport();
+    std::fprintf(stderr, "ALIVE TestHandshakeAndTransport\n"); std::fflush(stderr);
     TestLossBrake();
     std::printf(g_failures ? "%d FAILURES\n" : "ALL TESTS PASSED\n", g_failures);
     return g_failures ? 1 : 0;

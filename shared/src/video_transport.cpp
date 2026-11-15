@@ -33,6 +33,11 @@ constexpr int64_t kPaceWaitThresholdNs = 200'000;
 constexpr int64_t kPaceMaxDebtNs = 600'000;
 // (better to send less than to repay a stall as one burst).
 constexpr int64_t kPaceIdleResetNs = 50'000'000;
+// The ceiling for the frame-budget pacing mode (PLAN-pacing-fix WP1): a local UDP
+// flood delivered 800 Mbps steadily (D-016), so bursts up to this rate are worth
+// trying on a LAN. This is a measurement of THIS machine's link, not a universal
+// capability - the remote path never arms the frame budget at all.
+constexpr uint32_t kMaxBurstKbps = 800000;
 }  // namespace
 
 VideoPacketizer::VideoPacketizer(Connection* connection) : m_connection(connection) {
@@ -132,10 +137,26 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
     };
     const size_t lastSize = total - (count - 1) * fragPayload;
     const uint32_t kbps = m_pacingKbps.load(std::memory_order_relaxed);
+    const int64_t budgetNs = m_frameBudgetNs.load(std::memory_order_relaxed);
     const bool paced = kbps != 0;
     // Every byte (headers and FEC parity included) takes wire time: this is that count.
-    const double nsPerByte = paced ? 8e6 / double(kbps) : 0.0;
-    if (paced) {
+    double nsPerByte = paced ? 8e6 / double(kbps) : 0.0;
+    int64_t frameStartNs = 0;
+    if (budgetNs > 0 && paced) {
+        // Frame-level budget: the clock restarts at every frame start (the continuous
+        // clock let one stretched frame push the next ones later and later), and the
+        // rate rises to whatever sends THIS frame inside the budget - wire bytes
+        // including headers and FEC parity, exactly what the loop below bills.
+        const int64_t now = NowNs();
+        m_nextSendNs = now;
+        frameStartNs = now;
+        const size_t nParity = group ? (count + group - 1) / group : 0;
+        const size_t wireBytes = total + count * sizeof(VideoFragmentHeader) +
+                                 nParity * (sizeof(VideoParityHeader) + fragPayload);
+        const double budgetKbps = double(wireBytes) * 8.0 * 1e6 / double(budgetNs);
+        const double effKbps = std::min(double(kMaxBurstKbps), std::max(double(kbps), budgetKbps));
+        nsPerByte = 8e6 / effKbps;
+    } else if (paced) {
         const int64_t now = NowNs();
         if (m_nextSendNs == 0 || m_nextSendNs < now - kPaceIdleResetNs) m_nextSendNs = now;
     }
@@ -187,6 +208,16 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
                 }
                 std::fill(parity.begin(), parity.end(), uint8_t(0));
             }
+        }
+    }
+    if (frameStartNs) {
+        m_nextSendNs = NowNs();   // the next frame restarts its own clock anyway
+        const int64_t took = NowNs() - frameStartNs;
+        const int64_t budget = m_frameBudgetNs.load(std::memory_order_relaxed);
+        if (took > budget + 1'000'000LL) {
+            m_budgetOverruns.fetch_add(1, std::memory_order_relaxed);
+            RC_LOGD("Video pacing: frame %u took %.1f ms for a %lld ms budget", frameIndex,
+                    double(took) / 1e6, (long long)(budget / 1000000));
         }
     }
     return sent;

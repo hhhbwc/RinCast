@@ -35,6 +35,14 @@ class VideoPacketizer {
     // The rate only changes the spacing: the clock carries on across frames, so a frame
     // never starts with a burst of the previous frame's leftovers.
     void SetPacingKbps(uint32_t kbps) { m_pacingKbps.store(kbps, std::memory_order_relaxed); }
+    // Frame-level budget (nanoseconds), PLAN-pacing-fix WP1. When armed, one frame's
+    // datagrams leave within that period no matter what the average pacing rate says:
+    // the effective rate is max(pacing rate, this frame's wire bytes / budget) capped
+    // at kMaxBurstKbps, and the send clock restarts at every frame start (no cross-
+    // frame debt). 0 = off (the legacy continuous clock). The remote path never arms it.
+    void SetPacingFrameBudgetNs(int64_t budgetNs) { m_frameBudgetNs.store(budgetNs, std::memory_order_relaxed); }
+    // Frames whose send window exceeded their budget + ~1 ms of timer error.
+    uint32_t BudgetOverruns() const { return m_budgetOverruns.load(std::memory_order_relaxed); }
 
     // Sends one frame. Returns number of datagrams sent. May return early (count <
     // expected) once RequestStop() was called.
@@ -56,6 +64,8 @@ class VideoPacketizer {
     Connection* m_connection;
     int m_fecPercent = 5;
     std::atomic<uint32_t> m_pacingKbps{0};
+    std::atomic<int64_t> m_frameBudgetNs{0};
+    std::atomic<uint32_t> m_budgetOverruns{0};
     // Continuous send clock: always the earliest moment the next packet may leave. It
     // accumulates across frames; idle over 50 ms resets it to now (a hiccup would
     int64_t m_nextSendNs = 0;
