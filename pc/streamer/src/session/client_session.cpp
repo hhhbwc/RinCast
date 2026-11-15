@@ -705,6 +705,10 @@ void ClientSession::StartDesktop(const json& m) {
         cfg.fecPercent = m_slowPath ? std::max(pc.fecPercent, 12) : pc.fecPercent;
         // 局域网也铺开发：整帧突发会打爆 Wi-Fi 的浅队列。pacing 只改变发送节奏，
         // 不增加端到端延迟（编码和上一帧的发送重叠）。
+        // The desktop stream keeps the legacy pacing for now (PLAN-pacing-fix §7: it
+        // was not part of the diagnosed lock). NOTE: the send thread back-pressures the
+        // capacity-1 send slot when the pacer is slower than the encode - the old claim
+        // that "encoding overlaps the send for free" only holds while the send is faster.
         cfg.pace = true;
         cfg.adaptiveQuant = pc.adaptiveQuantization;
         // Over the internet a fixed bitrate only fills queues or loses frames: always adapt.
@@ -824,7 +828,15 @@ void ClientSession::StartVr() {
     cfg.bitrateKbps = uint32_t(rcs::EffectiveVrBitrate(pc.vrBitrateMbps, st.vrBitrateMbps, pc.pcBitrateWins) * 1000);
     if (m_slowPath) cfg.bitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 60000);
     cfg.fecPercent = m_slowPath ? std::max(pc.fecPercent, 12) : pc.fecPercent;
-    cfg.pace = true;  // 局域网也一样，见桌面流处说明
+    // PLAN-pacing-fix WP2b: the legacy "pace = true" made the pacer follow the guard's
+    // cap, which self-locked (cap down -> pacer slower -> one frame stretched -> the
+    // capacity-1 send slot back-pressures the encoder -> the queue climbs -> cap down;
+    // the real device's downlink hit 76.7 ms). The user's ceiling drives the pacer now,
+    // and a frame leaves within its own frame period. A remote path keeps the legacy.
+    if (m_slowPath || pc.videoPacingMode == 2) cfg.pacingMode = 2;
+    else if (pc.videoPacingMode == 1) cfg.pacingMode = 1;
+    else cfg.pacingMode = 3;  // burst: the LAN default
+    cfg.pace = cfg.pacingMode != 1;
     cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate);  // see above
     cfg.profile = rc::ProfileFromId(pc.streamProfile);
     if (m_slowPath) cfg.startBitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 12000);

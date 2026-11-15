@@ -45,6 +45,10 @@ struct Settings {
     // 2 = picture quality. Stored as an int so the settings file stays readable.
     // See rc/stream_profile.h for what each value actually changes.
     int streamProfile = 1;
+    // How a LAN stream paces its datagrams (PLAN-pacing-fix): 0 = auto (burst on the
+    // LAN, the legacy follow on a remote path), 1 = off, 2 = follow the guard cap
+    // (the legacy self-locking behavior), 3 = burst. See VideoSender::SetPacingMode.
+    int videoPacingMode = 0;
     // CBR for the Best-picture profile: "the number I set is what every frame costs".
     // Measured on real headset frames at +7.5% on stills vs capped VBR (encode-bench,
     // 2026-11-15). The queue risk that retired CBR is back with it - the congestion

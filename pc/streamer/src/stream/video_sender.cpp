@@ -40,12 +40,22 @@ VideoSender::~VideoSender() {
 }
 
 void VideoSender::StartAt(uint32_t kbps) {
-    if (m_adaptive) m_guard.SeedCeiling(std::min(kbps, m_maxKbps), rc::NowNs());
+    if (m_adaptive) m_guard.SeedCeiling(std::min(kbps, m_maxKbps.load()), rc::NowNs());
 }
 
 void VideoSender::SetMaxBitrate(uint32_t kbps) {
     m_maxKbps = kbps;
     if (!m_adaptive || m_targetKbps > kbps) m_targetKbps = kbps;
+}
+
+void VideoSender::SetPacingMode(int mode, int64_t frameBudgetNs) {
+    m_pacingMode.store(mode, std::memory_order_relaxed);
+    m_pacingBudgetNs.store(frameBudgetNs, std::memory_order_relaxed);
+    switch (mode) {
+        case 1: SetPacing(false); m_packetizer.SetPacingFrameBudgetNs(0); break;
+        case 3: SetPacing(true); m_packetizer.SetPacingFrameBudgetNs(frameBudgetNs); break;
+        default: SetPacing(true); m_packetizer.SetPacingFrameBudgetNs(0); break;  // follow
+    }
 }
 
 void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t metadataSize, uint8_t extraFlags,
@@ -65,7 +75,20 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
             m_lastRecoveryNs = rc::NowNs();
         }
     }
-    if (m_pace) m_packetizer.SetPacingKbps(uint32_t(TargetBitrateKbps() * 1.08));
+    // The pacing rate follows the USER's ceiling, not the guard's cap: the cap is a
+    // budget for frames not yet encoded, while an encoded frame must leave within its
+    // own frame period - a slower pacer only stretched the frame, back-pressured the
+    // capacity-1 send slot and pushed the queue up (the real device's 205 ms at a
+    // 100 Mbps ceiling). In burst mode the frame budget comes from the measured fps
+    // (cold start: 90 fps). TargetBitrateKbps() itself is untouched: the encoder's
+    // budget still obeys the guard.
+    if (m_pace) {
+        m_packetizer.SetPacingKbps(uint32_t(m_maxKbps.load() * 1.08));
+        if (m_pacingMode.load(std::memory_order_relaxed) == 3) {
+            const double fps = m_measuredFps.load(std::memory_order_relaxed);
+            m_packetizer.SetPacingFrameBudgetNs(fps > 1.0 ? int64_t(1e9 / fps) : 11'100'000LL);
+        }
+    }
     m_packetizer.SendFrame(m_streamId, m_codec, flags, index, metadata, metadataSize, frame.data.data(),
                            frame.data.size());
 
@@ -77,6 +100,7 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
     const double elapsed = double(now - m_windowStartNs) / 1e9;
     if (elapsed >= 1.0) {
         m_stats.fps = m_windowFrames / elapsed;
+        m_measuredFps.store(m_stats.fps, std::memory_order_relaxed);
         m_stats.mbps = double(m_windowBytes) * 8 / 1e6 / elapsed;
         m_stats.encodeMs = m_windowFrames ? m_windowEncodeMs / m_windowFrames : 0;
         m_stats.bitrateKbps = m_targetKbps;
@@ -205,7 +229,7 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     // it drops under 5") is gone: on a device whose own queue runs at 10-30 ms the grow
     // condition never came true, so it cut forever and sank to its floor, and its cuts were
     // sized by the arrival rate - the spiral that walked 119 Mb/s to 17.5 in four steps.
-    const uint32_t aim = m_adaptive ? m_maxKbps : m_targetKbps.load();
+    const uint32_t aim = m_adaptive ? m_maxKbps.load() : m_targetKbps.load();
     const auto res = m_guard.Update(aim, q, queueFloor, keyframeEpisode, now);
     // The loss brake runs beside the guard: whichever cap is lower wins, and neither
     // side's climb can override the other's hold (the real link oscillated 88 <-> 99

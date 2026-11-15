@@ -222,7 +222,7 @@ void VrStream::Run() {
     bool convertersReady = false;
     constexpr double kHalfRateBelowBpp = 0.03, kFullRateAboveBpp = 0.05;
     bool halfRate = false, skipNext = false;
-    m_sender.SetPacing(m_config.pace);
+    m_sender.SetPacingMode(m_config.pacingMode, m_config.pacingFrameBudgetNs);
     uint64_t lastFrameIndex = 0;
     int64_t lastFrameNs = 0;
     bool streaming = false;

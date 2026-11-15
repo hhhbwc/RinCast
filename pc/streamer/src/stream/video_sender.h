@@ -73,6 +73,11 @@ class VideoSender {
     // 把每帧的包铺开在时间上发，而不是一口气打出去（局域网和互联网都用）：
     // Wi-Fi 的浅队列会被整帧突发打爆。必须在 Start 之前设好。
     void SetPacing(bool pace) { m_pace = pace; }
+    // Pacing mode (PLAN-pacing-fix): 0 auto (session resolves), 1 off, 2 follow the
+    // guard cap (the legacy self-locking behavior), 3 burst (frame budget: the user's
+    // ceiling drives the rate, an encoded frame leaves within its own frame period).
+    // The frame budget comes from the sender's measured fps at send time.
+    void SetPacingMode(int mode, int64_t frameBudgetNs);
     // Adaptive only: begin below the maximum and let the guard explore upward. The ceiling
     // is where the climb stops, so seeding it is what makes the start point mean anything.
     void StartAt(uint32_t kbps);
@@ -102,10 +107,13 @@ class VideoSender {
     std::atomic<int> m_dynamicFec{-1};  // what the packetizer currently runs; network thread only
     int64_t m_floorLogNs = 0;        // network thread only
     double m_queueBaselineMs = -1;   // the device's own queue floor; network thread only
-    uint32_t m_maxKbps;
+    std::atomic<uint32_t> m_maxKbps;  // read from two threads (feedback and send)
     bool m_adaptive;
     rc::StreamProfile m_profile = rc::StreamProfile::Balanced;
     std::atomic<bool> m_pace{false};
+    std::atomic<int> m_pacingMode{0};
+    std::atomic<int64_t> m_pacingBudgetNs{0};
+    std::atomic<double> m_measuredFps{0};  // the send-side copy of the stats fps
     double m_lossAvg = 0;
     uint32_t m_frameIndex = 0;
 

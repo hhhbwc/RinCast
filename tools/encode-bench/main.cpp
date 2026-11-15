@@ -3,7 +3,8 @@
 // recovery by reference invalidation.
 //
 //   encode-bench [--codec hevc|av1|h264] [--size 3664x1920] [--fps 90] [--mbps 150]
-//                [--preset P1..P7] [--tuning ull|ll|hq]
+//                [--preset P1..P7] [--tuning ull|ll|hq] [--pace-mode off|follow|burst]
+//                [--frame-budget-ms <ms>] [--net-async]
 //                [--frames 300] [--desktop] [--no-split] [--foveated] [--ten-bit]
 //                [--no-aq] [--two-pass] [--one-pass]
 //                [--loss <frame>] [--out <bitstream>] [--yuv <nv12 file>] [--compare-foveated]
@@ -40,6 +41,8 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <vector>
 
@@ -139,6 +142,9 @@ int main(int argc, char** argv) {
     int stallEvery = 0, stallMs = 0;
     std::string csvPath;
     std::string presetArg, tuningArg;  // --preset/--tuning as typed, for the override line
+    std::string paceModeArg;           // --pace-mode off|follow|burst (default: follow)
+    int64_t frameBudgetMs = 0;         // --frame-budget-ms, 0 = the sender's measured fps
+    bool netAsync = false;             // --net-async: a capacity-1 send slot like the VR stream
     double paceFps = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -220,6 +226,12 @@ int main(int argc, char** argv) {
             outPath = next();
         } else if (a == "--net") {
             netBench = true;
+        } else if (a == "--pace-mode") {
+            paceModeArg = next();
+        } else if (a == "--frame-budget-ms") {
+            frameBudgetMs = std::stoll(next());
+        } else if (a == "--net-async") {
+            netAsync = true;
         } else if (a == "--fb-every") {
             fbEveryMs = std::stoi(next());
         } else if (a == "--fb-queue") {
@@ -418,6 +430,16 @@ float4 ps(V i) : SV_Target {
     std::unique_ptr<rc::UdpSocket> txSock, rxSock;
     std::unique_ptr<rc::Connection> sendConn, recvConn;
     std::unique_ptr<VideoSender> sender;
+    // --net-async state: the capacity-1 send slot behind the sender thread.
+    EncodedFrame asyncFrame;
+    rc::VrFrameMetadata asyncMeta{};
+    double asyncEncodeMs = 0;
+    uint32_t asyncFrameIndex = 0;
+    bool asyncSlotBusy = false;
+    bool asyncStop = false;
+    std::mutex asyncMutex;
+    std::condition_variable asyncFilledCv, asyncDoneCv;
+    std::thread asyncThread;
     std::vector<NetArrival> arrivals;
     std::atomic<bool> rxStop{false};
     std::atomic<size_t> rxCount{0};
@@ -484,9 +506,19 @@ float4 ps(V i) : SV_Target {
         });
         sender = std::make_unique<VideoSender>(sendConn.get(), rc::kVrStreamId, ec.codec, ec.bitrateKbps,
                                                5 /* fecPercent，和局域网默认一致 */, false);
-        sender->SetPacing(true);
-        std::printf("net: %u kbps target, pacing at %u kbps (x1.5), %.0f fps frame pacing\n", ec.bitrateKbps,
-                    uint32_t(ec.bitrateKbps * 1.5), paceFps);
+        // Default: the legacy follow mode, so the existing 51-group matrix stays
+        // reproducible; --pace-mode switches the behavior on explicitly.
+        int mode = 2;
+        if (paceModeArg == "off") mode = 1;
+        else if (paceModeArg == "burst") mode = 3;
+        else if (!paceModeArg.empty() && paceModeArg != "follow") {
+            std::printf("--pace-mode wants off, follow or burst\n");
+            return 2;
+        }
+        sender->SetPacingMode(mode, frameBudgetMs * 1'000'000LL);
+        std::printf("net: %u kbps target, pace mode %s, frame budget %lld ms, %.0f fps frame pacing\n",
+                    ec.bitrateKbps, mode == 1 ? "off" : mode == 3 ? "burst" : "follow",
+                    (long long)frameBudgetMs, paceFps);
     }
 
     const UINT panW = sd.Width - cd.Width, panH = sd.Height - cd.Height;
@@ -618,12 +650,25 @@ float4 ps(V i) : SV_Target {
                     nextFbNs = fbNow + int64_t(fbEveryMs) * 1'000'000LL;
                 }
             }
-            // 同步 Send：铺发在调用线程内完成，时间线与真流一致。
+            // --net-async: the VR stream's shape - the encode thread fills a capacity-1
+            // slot and a sender thread drains it, so submit->sent and overlap carry the
+            // production meaning. Without it: the synchronous Send.
             netFrameBytes.push_back(sizes.back());
             encStartNs.push_back(t0);
             encEndNs.push_back(rc::NowNs());
             submitNs.push_back(encEndNs.back());
-            sender->Send(ef, &netMeta, sizeof(netMeta), 0, rc::NsToMs(rc::NowNs() - t0));
+            if (netAsync) {
+                std::unique_lock<std::mutex> slotLock(asyncMutex);
+                asyncDoneCv.wait(slotLock, [&] { return !asyncSlotBusy; });   // the sender frees the slot on this cv
+                asyncFrame = std::move(ef);
+                asyncMeta = netMeta;
+                asyncEncodeMs = rc::NsToMs(rc::NowNs() - t0);
+                asyncFrameIndex = uint32_t(submitNs.size());
+                asyncSlotBusy = true;
+                asyncFilledCv.notify_one();   // wake the sender: nothing woke it before (deadlock)
+            } else {
+                sender->Send(ef, &netMeta, sizeof(netMeta), 0, rc::NsToMs(rc::NowNs() - t0));
+            }
         }
     }
 
@@ -631,6 +676,16 @@ float4 ps(V i) : SV_Target {
     const double benchFps = benchSec > 0 ? double(sizes.size()) / benchSec : double(ec.fps);
     if (timer) CloseHandle(timer);
 
+    // --net-async：让发送线程把最后一帧发完再汇总（先于 sender 析构）。
+    if (netAsync) {
+        {
+            std::lock_guard<std::mutex> slotLock(asyncMutex);
+            asyncStop = true;
+        }
+        asyncFilledCv.notify_all();
+        asyncDoneCv.notify_all();
+        if (asyncThread.joinable()) asyncThread.join();
+    }
     // --net：把回环上量到的时间线汇总出来。
     if (sender) {
         // 析构函数里的 RequestStop 负责收尾；最后一批包靠下面的等待落地。
@@ -675,14 +730,23 @@ float4 ps(V i) : SV_Target {
                 if (a->frag != 0xFFFF && a->frag + 1 == a->fragCount && a->frame < frameEnd.size())
                     frameEnd[a->frame] = std::max(frameEnd[a->frame], a->ns);
             }
-            const double pacingKbps = double(ec.bitrateKbps) * 1.5;
+            // The rate the sender actually paces at: the user's ceiling x 1.08 (WP2a),
+            // raised inside the frame budget when burst mode asks for it.
+            const double pacingKbps = double(ec.bitrateKbps) * 1.08;
+            const double budgetNs = double(frameBudgetMs) * 1e6;
             std::vector<double> lat, theory;
             int overlapped = 0, pairs = 0;
             for (size_t i = 0; i < submitNs.size(); i++) {
                 const uint32_t fi = uint32_t(i) + 1;
                 if (fi < frameEnd.size() && frameEnd[fi] > 0) {
                     lat.push_back(rc::NsToMs(frameEnd[fi] - submitNs[i]));
-                    theory.push_back(double(netFrameBytes[i]) * 8.0 / pacingKbps);
+                    double rate = pacingKbps;
+                    if (paceModeArg == "burst" && budgetNs > 0) {
+                        const double frameBits = double(netFrameBytes[i]) * 8.0;
+                        const double budgetKbps = frameBits * 1e6 / budgetNs;
+                        rate = std::max(rate, std::min(800000.0, budgetKbps));
+                    }
+                    theory.push_back(double(netFrameBytes[i]) * 8.0 / rate);
                 }
                 if (i > 0 && fi - 1 < frameEnd.size() && frameEnd[fi - 1] > 0) {
                     pairs++;

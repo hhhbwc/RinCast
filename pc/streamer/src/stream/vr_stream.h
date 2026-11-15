@@ -31,7 +31,9 @@ struct VrStreamConfig {
     bool adaptive = true;
     rc::StreamProfile profile = rc::StreamProfile::Balanced;  // what to favour (latency / balanced / quality)
     uint32_t startBitrateKbps = 0;  // adaptive: where to start (0 = at bitrateKbps)
-    bool pace = false;              // internet paths: no bursts
+    bool pace = false;
+    int pacingMode = 2;                  // 0 auto-resolved by the session, 1 off, 2 follow, 3 burst
+    int64_t pacingFrameBudgetNs = 0;     // 0 = the sender's measured fps              // internet paths: no bursts
     bool foveated = true;
     bool adaptiveQuant = true;
     bool twoPass = false;

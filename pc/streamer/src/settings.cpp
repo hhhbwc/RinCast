@@ -28,6 +28,7 @@ json Settings::ToJson(bool forUi) const {
         {"adaptiveBitrate", adaptiveBitrate},
         {"streamProfile", streamProfile},
         {"profileControlsVideo", profileControlsVideo},
+        {"videoPacingMode", videoPacingMode},
         {"qualityProfileCbr", qualityProfileCbr},
         {"pcBitrateWins", pcBitrateWins},
         {"fecPercent", fecPercent},
@@ -75,6 +76,7 @@ void Settings::FromJson(const json& j) {
     get("adaptiveBitrate", adaptiveBitrate);
     get("streamProfile", streamProfile);
     get("profileControlsVideo", profileControlsVideo);
+    get("videoPacingMode", videoPacingMode);
     get("qualityProfileCbr", qualityProfileCbr);
     get("pcBitrateWins", pcBitrateWins);
     get("fecPercent", fecPercent);
