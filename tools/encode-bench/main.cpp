@@ -26,6 +26,8 @@
 // burst size and submit-to-sent latency are measured end to end. --csv writes the raw
 // arrival timeline.
 //
+// --stall-every <N:ms> stops submitting for M ms every N frames (a load hitch).
+//
 // --fb-every <ms> --fb-queue "0:3,5:60,20:3" --fb-loss "0:0,5:0.02,20:0" script the
 // headset feedback that --net would otherwise never receive: queueDelayMs and the lost
 // fragment count, linearly interpolated between the listed seconds. Without feedback the
@@ -131,6 +133,10 @@ int main(int argc, char** argv) {
     // headset to exercise them. Timelines are "sec:value" pairs, linearly interpolated.
     int fbEveryMs = 0;             // 0 = no feedback at all (the old behaviour)
     std::vector<std::pair<double, double>> fbQueue, fbLoss;
+    // Frame-rate stalls: the game freezes for M ms every N frames (a load hitch). The rate
+    // tracker clamps a single long interval to 3x the smoothed one, so this is the
+    // regression test for "one 800 ms hitch must not blow the VBV open".
+    int stallEvery = 0, stallMs = 0;
     std::string csvPath;
     std::string presetArg, tuningArg;  // --preset/--tuning as typed, for the override line
     double paceFps = 0;
@@ -220,6 +226,13 @@ int main(int argc, char** argv) {
             fbQueue = ParseTimeline(next());
         } else if (a == "--fb-loss") {
             fbLoss = ParseTimeline(next());
+        } else if (a == "--stall-every") {
+            const std::string v = next();
+            const size_t colon = v.find(':');
+            if (colon != std::string::npos) {
+                stallEvery = std::stoi(v.substr(0, colon));
+                stallMs = std::stoi(v.substr(colon + 1));
+            }
         } else if (a == "--csv") {
             csvPath = next();
         } else if (a == "--yuv") {
@@ -488,6 +501,9 @@ float4 ps(V i) : SV_Target {
     const int64_t benchStartNs = rc::NowNs();
     int64_t nextFbNs = benchStartNs;
     for (int i = 0; i < frames; i++) {
+        if (stallEvery > 0 && i > 0 && i % stallEvery == 0 && stallMs > 0) {
+            rc::SleepMs(stallMs);   // the game stopped submitting: a load hitch, not a frame
+        }
         if (paced) {
             const int64_t nowNs = rc::NowNs();
             if (nowNs - swingStartNs > 400'000'000LL) {
