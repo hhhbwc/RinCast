@@ -604,15 +604,21 @@ function renderDependents() {
   // reports it; the plain cap shows before that.
   const ceiling = fromHeadset ? session.headsetBitrateMbps : state.settings.vrBitrateMbps;
   const actual = session?.vr?.mbps;
-  // What the encoder really ran: "96 / 100 Mbps · 1952² · QP 11.8" tells spent vs cap
-  // and the encoded size without opening logs. Hidden while nothing streams.
+  // What the encoder really ran: "96 / 100 Mbps" says spent vs cap. The extra
+  // details (encoded size, QP, fps) go to their own line so the slider never
+  // overflows when a profile switch changes the resolution.
   const encW = session?.vr?.encWidth || 0;
   const qp = session?.vr?.qp || -1;
   const gameFps = Math.round(session?.vr?.gameFps || 0);
   const encFps = Math.round(session?.vr?.encFps || 0);
-  let detail = actual && encW > 0 && qp > 0 ? ` · ${Math.round(encW / 2)}² · QP ${qp.toFixed(1)}` : "";
-  if (actual && encFps > 0) detail += ` · ${gameFps}/${encFps} fps`;
-  $("#vrBitrateBar output").textContent = actual ? `${Math.round(actual)} / ${ceiling} Mbps${detail}` : `${ceiling} Mbps`;
+  $("#vrBitrateBar output").textContent = actual ? `${Math.round(actual)} / ${ceiling} Mbps` : `${ceiling} Mbps`;
+  const liveBits = [];
+  if (actual && encW > 0) liveBits.push(`${Math.round(encW / 2)}²`);
+  if (actual && qp > 0) liveBits.push(`QP ${qp.toFixed(1)}`);
+  if (actual && encFps > 0) liveBits.push(`${gameFps}/${encFps} fps`);
+  const streamNote = $("#streamNote");
+  streamNote.textContent = liveBits.length ? liveBits.join(" · ") : "";
+  streamNote.hidden = !liveBits.length;
   if (fromHeadset) $("#vrBitrateBar input").style.setProperty("--fill", `${((session.headsetBitrateMbps - 20) / 480) * 100}%`);
   const codec = session?.headsetCodec && session.headsetCodec !== "auto" ? session.headsetCodec : "";
   const chosen = [fromHeadset && t("video.overrideBitrate", { mbps: session.headsetBitrateMbps }), codec && { hevc: "HEVC", av1: "AV1", h264: "H.264" }[codec]].filter(Boolean);
