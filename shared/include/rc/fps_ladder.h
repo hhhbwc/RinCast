@@ -81,32 +81,22 @@ inline bool SameRatePlan(const EncoderRatePlan& a, const EncoderRatePlan& b) {
 inline EncoderRatePlan PlanEncoderRate(uint32_t kbps, double nominal, bool desktop, bool startup,
                                       const EncoderRateTracker& tracker, uint32_t currentRateNum,
                                       uint32_t averagePercent, uint32_t vbvFramesPercent) {
-    // 防止非有限值转整数；不改用户配置，非法标称值使用保守的 90fps 预算。
+    // 帧率补偿已冻结（D-034）：不再让 frameRateNum 跟随实时 fps 降档。降档会把每帧预算放大
+    // real/rung 倍（真机 38fps@30档 = 390KB/帧、124Mbps、190-215ms 的根因），再和标称 VBV 互相
+    // 打架造成 QP「呼吸」。冻结在标称后：每帧预算 = kbps/nominal（恒定小帧），VBV = 标称线上
+    // 时间上限，预算恒小于桶 → 既不爆队列也不泵。低帧率时码率自然降低，这是延迟优先的物理取舍。
+    (void)desktop;
+    (void)startup;
+    (void)tracker;
+    (void)currentRateNum;
     nominal = std::isfinite(nominal) && nominal >= 1.0 ? std::min(nominal, 1000.0) : 90.0;
-    const uint32_t nominalNum = uint32_t(nominal * 1000.0);
-    double real = nominal;
-    uint32_t rateNum = nominalNum;
-    if (!desktop) {
-        real = tracker.RealFps(nominal);
-        // 追赶/补帧可能让两次提交间隔远小于标称周期（1e9/real 变成上千 fps），
-        // 那会把每帧预算压到十分之一以下。超过标称 1.25 倍的估计不采信。
-        real = std::min(real, nominal * 1.25);
-        if (!startup && tracker.slowIntervalNs > 0) {
-            const double slow = 1e9 / tracker.slowIntervalNs;
-            int rung = QuantizeFps(slow, int(currentRateNum / 1000));
-            // 慢 EMA/保持窗口不能把 38fps 锁在 45fps 而欠用；不用抬高 kbps 补偿。
-            rung = std::min(rung, QuantizeFps(real, 0));
-            rateNum = std::min(nominalNum, uint32_t(rung) * 1000u);
-        }
-    }
-    const double rateFps = double(rateNum) / 1000.0;
-    const uint32_t scaled = desktop ? kbps : ScaleRateToRealFps(kbps, rateFps, real);
+    const uint32_t rateNum = uint32_t(nominal * 1000.0);
+    const uint32_t scaled = kbps;
     auto budget = ComputeCappedVbr(scaled, 1, averagePercent, vbvFramesPercent);
-    // 桶按标称帧率算，不按当前档位：档位掉到 30fps 时按「30fps 的 2 帧」算会给出 66ms 的桶，
-    // 实测单帧涨到 364KB、submit->sent p99 41ms（90fps 档是 13ms），这正是排队和尖峰的来源。
-    // 固定成标称帧周期后，桶就是一个与档位无关的线上时间上限（1.5 帧 = 16.7ms，2 帧 = 22ms）。
+    // 桶按标称帧率算，与档位无关：固定的线上时间上限（1.5 帧 = 16.7ms，2 帧 = 22ms），
+    // 且恒 ≥ 每帧预算（kbps/nominal），驱动不会被桶夹住而振荡。
     const uint32_t vbvPct = std::clamp(vbvFramesPercent, 25u, 400u);
-    const double vbv = double(scaled) * 1000.0 * vbvPct / 100.0 / nominal;
+    const double vbv = double(kbps) * 1000.0 * vbvPct / 100.0 / nominal;
     budget.vbvBufferSize = uint32_t(std::min(vbv, double(UINT32_MAX)));
     return {kbps, rateNum, budget};
 }
