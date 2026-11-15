@@ -66,10 +66,36 @@ void VideoPacketizer::RequestStop() {
 #endif
 }
 
-bool VideoPacketizer::WaitDue(int64_t dueNs) {
+bool VideoPacketizer::WaitDue(int64_t dueNs, bool precise) {
     if (m_stopRequested.load(std::memory_order_relaxed)) return false;
-    if (dueNs - NowNs() <= kPaceWaitThresholdNs) return true;  // due now, send at once
+    // Legacy mode keeps the 0.2 ms "due now" window (fragments inside it leave together).
+    // Precise mode (ROUND4 R4.1 shaping) waits down to ~0 so fragments are placed at the
+    // computed sub-ms interval instead of clumping into a micro-burst after each timer wake.
+    const int64_t threshold = precise ? 0 : kPaceWaitThresholdNs;
+    if (dueNs - NowNs() <= threshold) return true;  // due now, send at once
 #ifdef _WIN32
+    if (precise) {
+        // The high-resolution waitable timer still quantizes to ~1 ms on this machine, which
+        // is coarser than a fragment interval (~50-100 us). Sleep the bulk of a long wait via
+        // the timer (so shutdown stays responsive and CPU is not burned on long gaps), then
+        // spin the final tail for precise placement. Short waits spin outright.
+        constexpr int64_t kSpinTailNs = 400'000;
+        const int64_t remain = dueNs - NowNs();
+        if (remain > kSpinTailNs + 1'000'000 && m_paceTimer && m_stopEvent) {
+            LARGE_INTEGER li;
+            li.QuadPart = -std::max<int64_t>(1, (remain - kSpinTailNs) / 100);
+            if (SetWaitableTimerEx(static_cast<HANDLE>(m_paceTimer), &li, 0, nullptr, nullptr, nullptr, 0)) {
+                const HANDLE handles[2] = {static_cast<HANDLE>(m_paceTimer), static_cast<HANDLE>(m_stopEvent)};
+                const DWORD r = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+                if (r == WAIT_OBJECT_0 + 1) return false;
+            }
+        }
+        while (!m_stopRequested.load(std::memory_order_relaxed)) {
+            if (dueNs - NowNs() <= 0) break;
+            YieldProcessor();
+        }
+        return !m_stopRequested.load(std::memory_order_relaxed);
+    }
     if (m_paceTimer && m_stopEvent) {
         const int64_t remain = dueNs - NowNs();
         if (remain <= kPaceWaitThresholdNs) return true;
@@ -142,6 +168,16 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
     // Every byte (headers and FEC parity included) takes wire time: this is that count.
     double nsPerByte = paced ? 8e6 / double(kbps) : 0.0;
     int64_t frameStartNs = 0;
+    // ROUND4 R4.1: with an instant-rate ceiling armed, cap effKbps at the ceiling and place
+    // each datagram at the computed sub-ms interval via the precise spin wait, so a frame
+    // never leaves as one ~22 KB micro-burst. The ceiling rate alone bounds the instant rate
+    // (packet bits / interval <= ceiling) for ANY frame size. An earlier revision also forced
+    // interval >= budgetNs/count ("spread across the budget"); that stretched small frames to
+    // fill the whole frame period and, via the measured-fps budget, spiralled 90->67 fps
+    // (submit->sent 6.24->36.44 ms, D-025). The anti-burst goal needs only the rate cap + spin,
+    // so the floor is gone. precisePace stays false when no ceiling is armed: the legacy
+    // budget timeline is then byte-for-byte unchanged.
+    bool precisePace = false;
     if (budgetNs > 0 && paced) {
         // Frame-level budget: the clock restarts at every frame start (the continuous
         // clock let one stretched frame push the next ones later and later), and the
@@ -154,7 +190,12 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
         const size_t wireBytes = total + count * sizeof(VideoFragmentHeader) +
                                  nParity * (sizeof(VideoParityHeader) + fragPayload);
         const double budgetKbps = double(wireBytes) * 8.0 * 1e6 / double(budgetNs);
-        const double effKbps = std::min(double(kMaxBurstKbps), std::max(double(kbps), budgetKbps));
+        double effKbps = std::min(double(kMaxBurstKbps), std::max(double(kbps), budgetKbps));
+        const uint32_t ceiling = m_burstCeilingKbps.load(std::memory_order_relaxed);
+        if (ceiling > 0) {
+            effKbps = std::min(effKbps, double(ceiling));
+            precisePace = true;
+        }
         nsPerByte = 8e6 / effKbps;
     } else if (paced) {
         const int64_t now = NowNs();
@@ -166,7 +207,7 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
         const size_t len = std::min(fragPayload, total - offset);
         h.fragmentIndex = uint16_t(i);
         if (paced) {
-            if (!WaitDue(m_nextSendNs)) {
+            if (!WaitDue(m_nextSendNs, precisePace)) {
                 RC_LOGD("Video pacing: stopping mid-frame (%zu of %zu datagrams sent)", sent, count);
                 return sent;
             }
@@ -195,7 +236,7 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
                 if (groupMembers > 1) {
                     // Parity packets cost the same wire time as data ones and go out at the same pace.
                     if (paced) {
-                        if (!WaitDue(m_nextSendNs)) {
+                        if (!WaitDue(m_nextSendNs, precisePace)) {
                             RC_LOGD("Video pacing: stopping mid-frame (%zu of %zu datagrams sent)", sent, count);
                             return sent;
                         }

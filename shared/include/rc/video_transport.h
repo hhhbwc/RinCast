@@ -41,6 +41,14 @@ class VideoPacketizer {
     // at kMaxBurstKbps, and the send clock restarts at every frame start (no cross-
     // frame debt). 0 = off (the legacy continuous clock). The remote path never arms it.
     void SetPacingFrameBudgetNs(int64_t budgetNs) { m_frameBudgetNs.store(budgetNs, std::memory_order_relaxed); }
+    // Instant-rate ceiling for the frame-budget mode (ROUND4 R4.1), kbps. 0 = off (the
+    // legacy budget behavior, capped only by kMaxBurstKbps). When armed, the effective
+    // burst rate is clamped to this value AND the frame's datagrams are spread evenly
+    // across the budget (interval floor = budgetNs / fragmentCount), so a big frame no
+    // longer leaves as one ~22 KB micro-burst that overruns a shallow Wi-Fi queue. The
+    // production sender arms 180000 (180 Mbps); the raw default stays 0 so callers that
+    // never opt in keep the exact pre-ROUND4 timeline.
+    void SetBurstCeilingKbps(uint32_t kbps) { m_burstCeilingKbps.store(kbps, std::memory_order_relaxed); }
     // Frames whose send window exceeded their budget + ~1 ms of timer error.
     uint32_t BudgetOverruns() const { return m_budgetOverruns.load(std::memory_order_relaxed); }
 
@@ -58,13 +66,15 @@ class VideoPacketizer {
     uint32_t SendFailures() const { return m_sendFailures.load(std::memory_order_relaxed); }
 
    private:
-    // Waits until dueNs; false means a stop was requested: wrap up at once.
-    bool WaitDue(int64_t dueNs);
+    // Waits until dueNs; false means a stop was requested: wrap up at once. precise=true
+    // (shaping armed) places fragments at sub-ms intervals instead of the legacy 0.2 ms batch.
+    bool WaitDue(int64_t dueNs, bool precise);
 
     Connection* m_connection;
     int m_fecPercent = 5;
     std::atomic<uint32_t> m_pacingKbps{0};
     std::atomic<int64_t> m_frameBudgetNs{0};
+    std::atomic<uint32_t> m_burstCeilingKbps{0};  // 0 = legacy budget; >0 = instant-rate cap + even spread
     std::atomic<uint32_t> m_budgetOverruns{0};
     // Continuous send clock: always the earliest moment the next packet may leave. It
     // accumulates across frames; idle over 50 ms resets it to now (a hiccup would

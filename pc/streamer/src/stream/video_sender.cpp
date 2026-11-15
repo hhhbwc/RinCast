@@ -6,6 +6,11 @@
 
 namespace rcs {
 
+// R4.1/R4.2: the instant-rate ceiling burst mode arms on the packetizer. 180 Mbps keeps
+// a single frame's datagrams spread evenly (no AP-buffer micro-burst) while still leaving
+// well inside the frame period; the packetizer's absolute kMaxBurstKbps=800000 is unchanged.
+constexpr uint32_t kBurstCeilingKbps = 180000;
+
 VideoSender::VideoSender(rc::Connection* connection, uint8_t streamId, rc::VideoCodec codec, uint32_t maxBitrateKbps,
                          int fecPercent, bool adaptive, rc::StreamProfile profile)
     : m_connection(connection),
@@ -52,9 +57,19 @@ void VideoSender::SetPacingMode(int mode, int64_t frameBudgetNs) {
     m_pacingMode.store(mode, std::memory_order_relaxed);
     m_pacingBudgetNs.store(frameBudgetNs, std::memory_order_relaxed);
     switch (mode) {
-        case 1: SetPacing(false); m_packetizer.SetPacingFrameBudgetNs(0); break;
-        case 3: SetPacing(true); m_packetizer.SetPacingFrameBudgetNs(frameBudgetNs); break;
-        default: SetPacing(true); m_packetizer.SetPacingFrameBudgetNs(0); break;  // follow
+        case 1: SetPacing(false); m_packetizer.SetPacingFrameBudgetNs(0); m_packetizer.SetBurstCeilingKbps(0); break;
+        case 3:
+            SetPacing(true);
+            m_packetizer.SetPacingFrameBudgetNs(frameBudgetNs);
+            m_packetizer.SetBurstCeilingKbps(kBurstCeilingKbps);
+            break;
+        default: SetPacing(true); m_packetizer.SetPacingFrameBudgetNs(0); m_packetizer.SetBurstCeilingKbps(0); break;  // follow
+    }
+    // The wire ceiling belongs to the burst mode only: leaving it behind would change
+    // the follow modes' encoder target, and their behaviour must stay as it was.
+    if (mode != 3) {
+        m_wireCeiling.Reset();
+        m_wireCapKbps.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -94,8 +109,35 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
             m_packetizer.SetPacingFrameBudgetNs(budgetNs);
         }
     }
+    // R4.2: 1 s sliding-window wire-byte ceiling (burst mode only). The window counts wire
+    // bytes (headers + FEC parity), exactly what the packetizer puts on the path.
+    const int paceMode = m_pacingMode.load(std::memory_order_relaxed);
+    const uint32_t capKbps = m_maxKbps.load();
+    size_t frameWireBytes = 0;
+    if (paceMode == 3 && capKbps > 0) {
+        const size_t fragPayload = m_connection->MaxPayload() - sizeof(rc::VideoFragmentHeader);
+        const size_t total = 2 + metadataSize + frame.data.size();
+        const size_t count = fragPayload ? (total + fragPayload - 1) / fragPayload : 0;
+        int fecPct = m_dynamicFec.load(std::memory_order_relaxed);
+        if (fecPct < 0) fecPct = m_baseFecPercent;
+        const size_t group = fecPct > 0 ? size_t(std::clamp(100 / fecPct, 2, 64)) : 0;
+        const size_t nParity = group ? (count + group - 1) / group : 0;
+        frameWireBytes = total + count * sizeof(rc::VideoFragmentHeader) +
+                         nParity * (sizeof(rc::VideoParityHeader) + fragPayload);
+    }
     m_packetizer.SendFrame(m_streamId, m_codec, flags, index, metadata, metadataSize, frame.data.data(),
                            frame.data.size());
+    // R4.2 (D-026): the ceiling acts on the ENCODER TARGET, never on already-encoded
+    // frames. An earlier revision delayed a frame whose wire bytes would push the
+    // trailing second over the ceiling: that held the wire ceiling but walked bench
+    // submit->sent 5.88 -> 8.25 ms avg / 11.4 -> 49.0 ms p99 (G4.3 FAIL). The target
+    // route keeps the latency untouched: the encoder is simply told what the wire
+    // ceiling means in encoded bytes, and the NEXT frames are smaller.
+    if (paceMode == 3 && capKbps > 0) {
+        rc::WireCeiling::Snapshot snap;
+        if (m_wireCeiling.OnFrame(rc::NowNs(), frameWireBytes, frame.data.size(), capKbps, snap))
+            m_wireCapKbps.store(snap.encoderTargetKbps, std::memory_order_relaxed);
+    }
 
     std::lock_guard lock(m_statsMutex);
     m_windowFrames++;
@@ -243,6 +285,12 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     const uint32_t guardCap = res.capKbps ? res.capKbps : UINT32_MAX;
     const uint32_t brakeCap = brake.capKbps ? brake.capKbps : UINT32_MAX;
     const uint32_t finalCap = guardCap < brakeCap ? guardCap : brakeCap;
+    // R4.2 (D-026): the wire ceiling is NOT folded in here. The congestion cap stays
+    // exactly what it was - the guard's cap and the brake's cap - so the follow modes
+    // and the guard's own law are untouched. The wire ceiling rides on top of it in
+    // TargetBitrateKbps() instead: that way it does not depend on the headset's
+    // feedback cadence (the feedback-gated version never reached the encoder when
+    // the reports were slow or absent - measured appliedKbps stayed at 100000).
     m_congestionKbps.store(finalCap == UINT32_MAX ? 0 : finalCap);
     // Sustained heavy loss means the path is below the user's ceiling - say it once
     // every 30 s so the setting vs. reality mismatch shows up in the log.

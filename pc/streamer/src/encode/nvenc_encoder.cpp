@@ -228,6 +228,22 @@ class NvencEncoder final : public VideoEncoder {
         m_init.encodeHeight = m_init.darHeight = m_init.maxEncodeHeight = config.height;
         m_init.frameRateNum = uint32_t(config.fps * 1000);
         m_init.frameRateDen = 1000;
+        // The rate control's frame rate IS the per-frame budget (averageBitRate /
+        // frameRateNum), so it has to match the rate the frames really arrive at: a
+        // rung below it inflates every frame by (real fps / rung) and the stream runs
+        // over the ceiling by exactly that factor.
+        //
+        // m_effectiveFps starts at the configured rate so the ladder's +-15% hold
+        // applies from the first report. Without it the first reconfigure after start
+        // had no anchor and picked the ladder rung under the startup-polluted estimate
+        // (measured: the slow twin said 72 fps while the real rate was 89-90), which
+        // put the rate control at 72 fps and produced 90/72 = 1.25x the requested
+        // bitrate for as long as it stayed there - the whole first seconds of every
+        // stream. Measured on the bench: the 1 s wire peak was 125 Mbps against a
+        // 100 Mbps ceiling, and it scaled exactly with the target (100 -> 125.1,
+        // 95 -> 118.7, 93 -> 116.5 Mbps), which is the fingerprint of a fixed
+        // 1.25x factor rather than of a content problem (D-026).
+        m_effectiveFps = config.fps;
         m_init.enablePTD = 1;
         m_init.enableEncodeAsync = 0;
         m_init.encodeConfig = &m_encodeConfig;
@@ -492,7 +508,17 @@ class NvencEncoder final : public VideoEncoder {
         const uint32_t fpsFast = uint32_t(std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 2.0, double(m_config.fps)));
         // 重配目标走阶梯（fps_ladder.h）：量化后每分钟的重配从 11.7-16.8 次降到个位数，
         // 每次重配都会重置码控并把 VBV 翻倍。VBV 仍用快均值（上面），不受阶梯影响。
-        const uint32_t fps = uint32_t(rc::QuantizeFps(1e9 / m_intervalNsSlow, int(m_effectiveFps)));
+        uint32_t fps = uint32_t(rc::QuantizeFps(1e9 / m_intervalNsSlow, int(m_effectiveFps)));
+        // 启动宽限期：码控的帧率就是每帧预算的分母（averageBitRate / frameRateNum），
+        // 它必须等于帧真正到达的速率，否则每一帧都被放大 real/rung 倍，整条流就按这个
+        // 倍数超出用户的上限。开机头几秒 GPU 还没热起来，帧率估计从 ~20 一路爬到真实
+        // 速率，阶梯在爬升途中选到的那一档（实测 72，而真实速率 89-90）在速率恢复后
+        // 就一直落在后面：整条流多出 90/72 = 1.25 倍（实测 1 s 线上峰值 125 Mbps 对
+        // 100 Mbps 上限，且随目标等比变化：100→125.1、95→118.7、93→116.5 Mbps，
+        // 是固定倍率的指纹，不是画面的问题）。所以宽限期内码控帧率保持标称值，
+        // 只有帧率真的塌到标称值的一半以下（那是半帧率会话，不是启动抖动）才跟随。
+        if (now - m_streamStartNs < kStartupVbvClampNs && 1e9 / m_intervalNsSlow > m_config.fps * 0.6)
+            fps = m_config.fps;
         // 门控 3 秒：阶梯已把无意义的重配挡掉，剩下的都是真实档位变化，3 秒内至多一次。
         if (m_lastVbvNs && now - m_lastVbvNs < 3'000'000'000LL) return;
         // 稳态 fps 在 87-92 间抖，每个整数变化都重配 → 每秒约十次（无害但刷日志、扰动编码）。

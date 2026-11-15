@@ -15,6 +15,7 @@
 #include "rc/queue_guard.h"
 #include "rc/stream_profile.h"
 #include "rc/video_transport.h"
+#include "rc/wire_ceiling.h"
 
 namespace rcs {
 
@@ -63,7 +64,12 @@ class VideoSender {
     uint32_t TargetBitrateKbps() const {
         const uint32_t cap = m_congestionKbps.load();
         const uint32_t t = m_targetKbps.load();
-        return cap ? std::min(cap, t) : t;
+        const uint32_t base = cap ? std::min(cap, t) : t;
+        // R4.2 (D-026): in burst mode the user's ceiling is a WIRE ceiling, so the
+        // encoder target is the ceiling converted into encoded bytes. The cap is 0 in
+        // the follow modes, so their behaviour is exactly as before.
+        const uint32_t wire = m_wireCapKbps.load(std::memory_order_relaxed);
+        return wire && wire < base ? wire : base;
     }
     void SetMaxBitrate(uint32_t kbps);
     // The preference behind the automatic-bitrate switch. Maps to the guard's
@@ -116,6 +122,14 @@ class VideoSender {
     std::atomic<double> m_measuredFps{0};  // the send-side copy of the stats fps
     double m_lossAvg = 0;
     uint32_t m_frameIndex = 0;
+
+    // R4.2: the 1 s wire-byte ceiling (burst mode only). The user's setting is a WIRE
+    // ceiling, so the encoder has to be given the encoded equivalent; the conversion
+    // (and the hysteresis that keeps the encoder from being reconfigured ten times a
+    // second) lives in rc/wire_ceiling.h. The controller is send-thread only; the
+    // target it publishes is read by whoever asks the encoder for a bitrate.
+    rc::WireCeiling m_wireCeiling;
+    std::atomic<uint32_t> m_wireCapKbps{0};  // 0 = no wire cap; >0 = the encoder target
 
     // Loss recovery (OnFeedback runs on the network thread, the rest on the stream thread).
     std::mutex m_lossMutex;
