@@ -303,10 +303,16 @@ std::string App::ApplySettingSideEffects(const json& changed) {
     if (changed.contains("pcName") || changed.contains("allowRemote") || changed.contains("cloudUrl")) m_cloud.Wake();
     if (auto session = m_server.ActiveSession()) {
         session->OnSettingsChanged();
-        // A profile switch changes the encoder's QP floor and the guard's queue
-        // budget, both fixed at stream start. Rebuild the live streams so the new
-        // choice takes effect without asking the user to reconnect the headset.
-        if (changed.contains("streamProfile")) session->OnStreamProfileChanged();
+        // PC 视频参数在建流时读取；复用 session worker，只重建已有流。
+        // 同一批设置只排入一次重建，避免 profile 与其他视频键重复触发。
+        if (changed.contains("streamProfile") || changed.contains("codec") || changed.contains("tenBit") ||
+            changed.contains("vrBitrateMbps") || changed.contains("pcBitrateWins") ||
+            changed.contains("desktopBitrateMbps") || changed.contains("adaptiveBitrate") ||
+            changed.contains("videoPacingMode") || changed.contains("qualityProfileCbr") ||
+            changed.contains("profileControlsVideo") || changed.contains("fecPercent") ||
+            changed.contains("foveatedEncoding") || changed.contains("adaptiveQuantization") ||
+            changed.contains("twoPassEncoding") || changed.contains("desktopMaxHeight") || changed.contains("desktopFps"))
+            session->OnStreamProfileChanged();
     }
     return error;
 }

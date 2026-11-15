@@ -226,24 +226,9 @@ class NvencEncoder final : public VideoEncoder {
         m_init.tuningInfo = tuning;
         m_init.encodeWidth = m_init.darWidth = m_init.maxEncodeWidth = config.width;
         m_init.encodeHeight = m_init.darHeight = m_init.maxEncodeHeight = config.height;
-        m_init.frameRateNum = uint32_t(config.fps * 1000);
+        m_init.frameRateNum = RatePlan(0).rateNum;
         m_init.frameRateDen = 1000;
-        // The rate control's frame rate IS the per-frame budget (averageBitRate /
-        // frameRateNum), so it has to match the rate the frames really arrive at: a
-        // rung below it inflates every frame by (real fps / rung) and the stream runs
-        // over the ceiling by exactly that factor.
-        //
-        // m_effectiveFps starts at the configured rate so the ladder's +-15% hold
-        // applies from the first report. Without it the first reconfigure after start
-        // had no anchor and picked the ladder rung under the startup-polluted estimate
-        // (measured: the slow twin said 72 fps while the real rate was 89-90), which
-        // put the rate control at 72 fps and produced 90/72 = 1.25x the requested
-        // bitrate for as long as it stayed there - the whole first seconds of every
-        // stream. Measured on the bench: the 1 s wire peak was 125 Mbps against a
-        // 100 Mbps ceiling, and it scaled exactly with the target (100 -> 125.1,
-        // 95 -> 118.7, 93 -> 116.5 Mbps), which is the fingerprint of a fixed
-        // 1.25x factor rather than of a content problem (D-026).
-        m_effectiveFps = config.fps;
+        // 启动时用标称分母；运行期由统一事务同步更新分母、码率及 VBV（D-030）。
         m_init.enablePTD = 1;
         m_init.enableEncodeAsync = 0;
         m_init.encodeConfig = &m_encodeConfig;
@@ -293,7 +278,8 @@ class NvencEncoder final : public VideoEncoder {
         bb.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
         if (api.nvEncCreateBitstreamBuffer(m_encoder, &bb) != NV_ENC_SUCCESS) return false;
         m_bitstream = bb.bitstreamBuffer;
-        const auto budget = BudgetFor(config.bitrateKbps, uint32_t(config.fps));
+        m_rateState.applied = RatePlan(0);
+        const auto budget = m_rateState.applied.budget;
         const std::string qpText = !m_cappedVbr ? std::string("n/a")
                                    : minQp > 0  ? std::to_string(minQp)
                                                 : std::string("off");
@@ -390,17 +376,8 @@ class NvencEncoder final : public VideoEncoder {
     }
 
     void SetBitrate(uint32_t kbps) override {
-        if (!m_encoder || kbps == m_config.bitrateKbps) return;
-        m_config.bitrateKbps = kbps;
-        ApplyBitrate(kbps);
-        NV_ENC_RECONFIGURE_PARAMS re{};
-        re.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-        re.reInitEncodeParams = m_init;
-        re.reInitEncodeParams.encodeConfig = &m_encodeConfig;
-        re.resetEncoder = 0;
-        re.forceIDR = 0;
-        if (NvencLib::Get().api.nvEncReconfigureEncoder(m_encoder, &re) != NV_ENC_SUCCESS)
-            RC_LOGW("NVENC: bitrate reconfigure failed");
+        // 与下一帧的新鲜 fps 观测合并，避免同一帧先改码率、再改 fps 的两次 API 调用。
+        m_requestedKbps = kbps;
     }
 
     bool InvalidateAfter(uint64_t timestamp) override {
@@ -448,140 +425,71 @@ class NvencEncoder final : public VideoEncoder {
     // The old CBR behaviour, kept for --cbr A/B runs and as a driver fallback:
     // average == maximum, and 1.5 frames of VBV.
     static constexpr uint32_t kLegacyVbvFramesPercent = 150;
-    // 流启动后 fps 估计震荡约 3s（实测重启 0→15→96 后趋稳）；这段时间钳紧 VBV 抑制超调。
-    static constexpr int64_t kStartupVbvClampNs = 3'000'000'000LL;
-
-    rc::CappedVbrParams BudgetFor(uint32_t kbps, uint32_t fps) const {
+    rc::EncoderRatePlan RatePlan(int64_t now) const {
         const auto q = rc::ProfileParams(m_config.profile);
         const uint32_t avgPct = m_config.vbrAveragePercent ? m_config.vbrAveragePercent : q.vbrAveragePercent;
-        return m_cappedVbr ? rc::ComputeCappedVbr(kbps, fps, avgPct, q.vbvFramesPercent)
-                           : rc::ComputeCappedVbr(kbps, fps, 100, kLegacyVbvFramesPercent);
+        const bool startup = !m_streamStartNs || now - m_streamStartNs < rc::kRateStartupNs;
+        return rc::PlanEncoderRate(m_requestedKbps, m_config.fps, m_config.desktop, startup, m_rateTracker,
+                                   m_rateState.applied.rateNum, m_cappedVbr ? avgPct : 100,
+                                   m_cappedVbr ? q.vbvFramesPercent : kLegacyVbvFramesPercent);
     }
 
-    uint32_t EffectiveFps() const {
-        return (!m_config.desktop && m_effectiveFps) ? m_effectiveFps : uint32_t(m_config.fps);
+    static void ApplyBudget(NV_ENC_CONFIG& config, const rc::EncoderRatePlan& plan) {
+        auto& params = config.rcParams;
+        params.averageBitRate = plan.budget.averageBitrate;
+        params.maxBitRate = plan.budget.maxBitrate;
+        params.vbvBufferSize = plan.budget.vbvBufferSize;
     }
 
-    // D-028: NVENC budgets each frame as averageBitRate / frameRateNum, so a ladder rung
-    // BELOW the rate frames really arrive at inflates every frame by real/rung and the
-    // stream runs over the user's ceiling by that factor (field: 38 fps at the 30 fps
-    // rung = 1.27x = 124 Mbps against 100, 390 KB/frame, receive queue 74 ms, 190-215 ms
-    // pose-to-display because the pacer cannot drain 390 KB in a 27 ms frame period).
-    // rc::ScaleRateToRealFps() is the pure, unit-tested conversion.
+    // 仅初始化使用；运行期必须经过完整候选事务，不能提前修改已提交快照。
     void ApplyBitrate(uint32_t kbps) {
-        auto& rc = m_encodeConfig.rcParams;
-        // One place computes the budget, so Init / SetBitrate / fps-driven VBV
-        // reconfigures can never disagree about what the ceiling means.
-        const uint32_t budgetKbps = rc::ScaleRateToRealFps(kbps, m_init.frameRateNum / 1000, m_realFps);
-        const auto budget = BudgetFor(budgetKbps, EffectiveFps());
-        rc.averageBitRate = budget.averageBitrate;
-        rc.maxBitRate = budget.maxBitrate;
-        rc.vbvBufferSize = budget.vbvBufferSize;
-        // The initial delay is the buffer's occupancy when encoding starts, and only means
-        // something then. Setting it on every rate change re-primed the buffer to full and
-        // let a burst straight out - the same overshoot the startup clamp exists to stop,
-        // now doing it whenever the guard moved the rate (45 times a minute on VRChat).
-        if (m_frameCount == 0) rc.vbvInitialDelay = rc.vbvBufferSize;
+        m_requestedKbps = kbps;
+        const auto plan = RatePlan(0);
+        ApplyBudget(m_encodeConfig, plan);
+        m_encodeConfig.rcParams.vbvInitialDelay = plan.budget.vbvBufferSize;
     }
 
-    // How far apart encoded frames actually are. NVENC's CBR budgets each frame as bitrate / the
-    // frame rate it was told, so telling it 90 while the game runs at 30 caps the stream at a third
-    // of the setting no matter how big the VBV is. Tell it the rate frames really arrive at and size
-    // the VBV for about one and a half of those frames, so the stream carries the set bitrate at any
-    // frame rate.
-    // The rate has to track quickly: if it lags while a burst of frames arrives, each frame still
-    // gets the slow rate's big budget and the stream overshoots the setting (a 15 fps budget fed
-    // 26 frames in a second sends ~170 Mbps against a 100 Mbps setting), which saturates the link.
+    void ReconfigureRate(int64_t now) {
+        if (!m_requestedKbps) return;  // 还没有有效请求，不下发 0 码率
+        const auto plan = RatePlan(now);
+        if (!m_rateState.ShouldAttempt(plan, now)) return;
+        auto candidateConfig = m_encodeConfig;
+        auto candidateInit = m_init;
+        ApplyBudget(candidateConfig, plan);
+        // 降码率或升档都会缩小 VBV；旧的 initial delay 若大于新桶，驱动拒收整次重配置，
+        // 请求就会永远重试失败、码率再也降不下来。夹到桶内，仍不重新灌满。
+        candidateConfig.rcParams.vbvInitialDelay =
+            rc::ClampVbvInitialDelay(candidateConfig.rcParams.vbvInitialDelay, plan.budget.vbvBufferSize);
+        candidateInit.frameRateNum = plan.rateNum;
+        candidateInit.frameRateDen = 1000;
+        candidateInit.encodeConfig = &candidateConfig;
+        const bool ok = rc::ApplyEncoderRateTransaction(m_rateState, plan, now, [&] {
+            NV_ENC_RECONFIGURE_PARAMS re{};
+            re.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+            re.reInitEncodeParams = candidateInit;
+            // resetEncoder/forceIDR 为零；保留已提交的 vbvInitialDelay，不重新灌满桶。
+            return NvencLib::Get().api.nvEncReconfigureEncoder(m_encoder, &re) == NV_ENC_SUCCESS;
+        });
+        if (!ok) {
+            RC_LOGW("NVENC: rate reconfigure failed; request retained for throttled retry");
+            return;
+        }
+        m_encodeConfig = candidateConfig;
+        m_init = candidateInit;
+        m_init.encodeConfig = &m_encodeConfig;
+        m_config.bitrateKbps = plan.requestedKbps;
+        RC_LOGI("NVENC: %.1f fps measured, encoder rate %.1f fps, max %u kbps, VBV %.2f Mbit",
+                m_rateTracker.RealFps(m_config.fps), double(plan.rateNum) / 1000.0,
+                plan.budget.maxBitrate / 1000, double(plan.budget.vbvBufferSize) / 1e6);
+    }
+
     void TrackFrameInterval() {
         const int64_t now = rc::NowNs();
         if (!m_streamStartNs) m_streamStartNs = now;
-        if (m_lastEncodeNs) {
-            double interval = double(now - m_lastEncodeNs);
-            // 双向都快跟踪：预算必须贴合当前帧率。升得慢→突发帧沿用慢速大预算→超调；
-            // 降得慢→低帧率阶段沿用小预算→跑不满。0.4/0.6 比原来的 0.6/0.4 收敛更快。
-            // 但一次停顿（加载/卡顿）不是帧率：一个 800ms 的间隔会把跟踪率砸到 15fps
-            // 下限，游戏恢复后每帧预算放大六倍（启动时实测过同款 101.7Mbps 顶爆链路）。
-            // 单个样本钳到平滑值的 3 倍：持续变慢照样收敛（上限随平滑自适应），一次性的
-            // 间隙则动不了它。
-            if (m_intervalNsSmooth > 0) interval = std::min(interval, m_intervalNsSmooth * 3.0);
-            m_intervalNsSmooth = m_intervalNsSmooth > 0 ? m_intervalNsSmooth * 0.4 + interval * 0.6 : interval;
-            // Slow twin: drives the frameRateNum reconfigure. The fast twin absorbs
-            // bursts into the VBV; reconfiguring NVENC off the fast one thrashed the
-            // encoder at ~10 Hz on heavy scenes (the tester's stutter).
-            m_intervalNsSlow = m_intervalNsSlow > 0 ? m_intervalNsSlow * 0.9 + interval * 0.1 : interval;
-        }
+        if (!m_config.desktop && m_lastEncodeNs) m_rateTracker.Observe(double(now - m_lastEncodeNs));
         m_lastEncodeNs = now;
-        // D-028: the rate frames really arrive at, used by ScaleToRealRate() to undo the
-        // ladder's rung mismatch. Same fast twin the VBV uses, same clamp: one hitch is
-        // not a frame rate.
-        if (m_intervalNsSmooth > 0) {
-            m_realFps = std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 2.0, double(m_config.fps));
-        }
-        if (m_config.desktop || m_intervalNsSmooth <= 0 || !m_encoder) return;
-        const uint32_t fpsFast = uint32_t(std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 2.0, double(m_config.fps)));
-        // 重配目标走阶梯（fps_ladder.h）：量化后每分钟的重配从 11.7-16.8 次降到个位数，
-        // 每次重配都会重置码控并把 VBV 翻倍。VBV 仍用快均值（上面），不受阶梯影响。
-        uint32_t fps = uint32_t(rc::QuantizeFps(1e9 / m_intervalNsSlow, int(m_effectiveFps)));
-        // 启动宽限期：码控的帧率就是每帧预算的分母（averageBitRate / frameRateNum），
-        // 它必须等于帧真正到达的速率，否则每一帧都被放大 real/rung 倍，整条流就按这个
-        // 倍数超出用户的上限。开机头几秒 GPU 还没热起来，帧率估计从 ~20 一路爬到真实
-        // 速率，阶梯在爬升途中选到的那一档（实测 72，而真实速率 89-90）在速率恢复后
-        // 就一直落在后面：整条流多出 90/72 = 1.25 倍（实测 1 s 线上峰值 125 Mbps 对
-        // 100 Mbps 上限，且随目标等比变化：100→125.1、95→118.7、93→116.5 Mbps，
-        // 是固定倍率的指纹，不是画面的问题）。所以宽限期内码控帧率保持标称值，
-        // 只有帧率真的塌到标称值的一半以下（那是半帧率会话，不是启动抖动）才跟随。
-        if (now - m_streamStartNs < kStartupVbvClampNs && 1e9 / m_intervalNsSlow > m_config.fps * 0.6)
-            fps = m_config.fps;
-        // 门控 3 秒：阶梯已把无意义的重配挡掉，剩下的都是真实档位变化，3 秒内至多一次。
-        if (m_lastVbvNs && now - m_lastVbvNs < 3'000'000'000LL) return;
-        // 稳态 fps 在 87-92 间抖，每个整数变化都重配 → 每秒约十次（无害但刷日志、扰动编码）。
-        // 只有偏离上次实际下发的 fps 超过一个相对死区（±1/12，至少 3fps）才重配；真实帧率
-        // 变化和累积漂移仍会触发。锚在 m_effectiveFps 上，所以缓慢漂移攒够一档照样会重配。
-        if (m_effectiveFps) {
-            const uint32_t band = std::max(3u, m_effectiveFps / 12);
-            const uint32_t lo = m_effectiveFps > band ? m_effectiveFps - band : 0;
-            if (fps >= lo && fps <= m_effectiveFps + band) return;
-        }
-        uint32_t want = BudgetFor(m_config.bitrateKbps, fpsFast).vbvBufferSize;
-        // 启动宽限期内把 VBV 钳到标称帧率的大小。重启瞬间 fps 估计剧烈震荡（实测 0→15→96），
-        // 低 fps 会把 VBV 撑到 8Mbit 且起始即满，帧率一跳高就整桶倾泻 → 启动超调（实测 101.7Mbps
-        // 顶爆链路）。桶钳小后瞬态随之变小；宽限期过后恢复跟踪，真实低帧率仍能拿大 VBV 跑满码率。
-        if (now - m_streamStartNs < kStartupVbvClampNs) {
-            const uint32_t nominal = BudgetFor(m_config.bitrateKbps, uint32_t(m_config.fps)).vbvBufferSize;
-            want = std::min(want, nominal);
-        }
-        const uint32_t rateNum = fps * 1000;
-        if (m_init.frameRateNum == rateNum && m_encodeConfig.rcParams.vbvBufferSize == want) return;
-        // D-028: the rung IS the per-frame divisor, so the budget has to be recomputed
-        // with the new one BEFORE the reconfigure params are copied. Without this the
-        // encoder kept the old rung's budget while running at the new rung's rate - the
-        // 1.27x overshoot the field measured at 38 fps / 30 fps rung.
-        const uint32_t prevRateNum = m_init.frameRateNum;
-        m_init.frameRateNum = rateNum;
-        ApplyBitrate(m_config.bitrateKbps);
-        m_encodeConfig.rcParams.vbvBufferSize = want;
-        NV_ENC_RECONFIGURE_PARAMS re{};
-        re.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-        re.reInitEncodeParams = m_init;
-        re.reInitEncodeParams.encodeConfig = &m_encodeConfig;
-        if (NvencLib::Get().api.nvEncReconfigureEncoder(m_encoder, &re) == NV_ENC_SUCCESS) {
-            // 记账只在成功后：失败时编码器还是旧码率，把 m_effectiveFps/m_init 记成新值
-            // 会让下一次的判重跳过重试，VBV 的计算口径也和编码器实际状态脱节。
-            m_effectiveFps = fps;
-            m_init.frameRateDen = 1000;
-            m_encodeConfig.rcParams.vbvBufferSize = want;
-            // Do NOT re-prime vbvInitialDelay here: it is the buffer's occupancy at
-            // encoder start and only means anything then. Writing it on every fps
-            // reconfigure re-filled the bucket and let the next burst straight out -
-            // the same overshoot ApplyBitrate() was fixed for.
-            m_lastVbvNs = now;
-            RC_LOGI("NVENC: %.0f fps measured, encoder rate %u fps, VBV %.2f Mbit", 1e9 / m_intervalNsSmooth, fps, double(want) / 1e6);
-        } else {
-            // The encoder kept the old rung: put the divisor back, so ScaleToRealRate()
-            // and the next dedupe check see the state the encoder is really in.
-            m_init.frameRateNum = prevRateNum;
-            ApplyBitrate(m_config.bitrateKbps);
-        }
+        // 即使外层 appliedKbps 已去重，失败的请求仍能在编码线程重试；桌面不参与 fps 观测。
+        if (m_encoder) ReconfigureRate(now);
     }
 
     NV_ENC_REGISTERED_PTR Register(ID3D11Texture2D* tex) {
@@ -637,15 +545,12 @@ class NvencEncoder final : public VideoEncoder {
     NV_ENC_INITIALIZE_PARAMS m_init{};
     std::map<ID3D11Texture2D*, NV_ENC_REGISTERED_PTR> m_registered;
     uint64_t m_frameCount = 0;
-    // The interval between encoded frames, smoothed, the rate last told to the encoder, and when
-    // the VBV was last sized for it.
+    // 仅编码线程访问：请求、观测与最后一次成功提交的硬件计划分开保存。
     int64_t m_lastEncodeNs = 0;
     int64_t m_streamStartNs = 0;
-    double m_intervalNsSmooth = 0;
-    double m_intervalNsSlow = 0;
-    uint32_t m_effectiveFps = 0;
-    double m_realFps = 0;  // D-028: frames really arrive at this rate (fast twin, clamped)
-    int64_t m_lastVbvNs = 0;
+    uint32_t m_requestedKbps = 0;
+    rc::EncoderRateTracker m_rateTracker;
+    rc::EncoderRateState m_rateState;
     uint64_t m_lastIntraTs = 0;
 
     // Encoder-side truth, summarised every 5 s from the lock path below: the QP the

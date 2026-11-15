@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <string>
@@ -1730,14 +1731,209 @@ static void TestRateScaleForLadder() {
     CHECK(rc::ScaleRateToRealFps(100000, 72, 90.0) == 80000);
     const uint32_t s = rc::ScaleRateToRealFps(100000, 30, 38.0);
     CHECK(s >= 78900 && s <= 78960);
-    // The floor: one bad second may not quarter the target (24/90 would be 0.267).
-    CHECK(rc::ScaleRateToRealFps(100000, 24, 90.0) == 50000);
+    // D-030：旧 0.5 下限会让 24/90 的每帧预算仍超顶，不能保留。
+    CHECK(rc::ScaleRateToRealFps(100000, 24, 90.0) == 26666);
+    CHECK(rc::ScaleRateToRealFps(100000, 30, 30.5) < 100000);
+    CHECK(rc::ScaleRateToRealFps(100000, 30, std::numeric_limits<double>::quiet_NaN()) == 100000);
+    CHECK(rc::ScaleRateToRealFps(100000, 30, std::numeric_limits<double>::infinity()) == 100000);
     // Unknowns leave the rate untouched (encoder Init calls ApplyBitrate before any frame).
     CHECK(rc::ScaleRateToRealFps(100000, 30, 0.0) == 100000);
     CHECK(rc::ScaleRateToRealFps(100000, 0, 38.0) == 100000);
     CHECK(rc::ScaleRateToRealFps(0, 30, 38.0) == 0);
-    std::printf("rate scale: 90/90 stays, 72/90 -> %u, 30/38 -> %u, 24/90 floor -> %u\n",
+    std::printf("rate scale: 90/90 stays, 72/90 -> %u, 30/38 -> %u, 24/90 -> %u\n",
                 rc::ScaleRateToRealFps(100000, 72, 90.0), s, rc::ScaleRateToRealFps(100000, 24, 90.0));
+}
+
+// D-030：驱动生产路径实际使用的观测、候选、门控和事务，不只测缩放公式。
+static void TestEncoderRateTransaction() {
+    constexpr int64_t second = 1'000'000'000LL;
+    rc::EncoderRateTracker tracker;
+    auto plan = [&](uint32_t kbps, uint32_t current, bool startup = false, bool desktop = false) {
+        return rc::PlanEncoderRate(kbps, 90.0, desktop, startup, tracker, current, 100, 150);
+    };
+    auto settle = [&](double fps) {
+        for (int i = 0; i < 200; ++i) tracker.Observe(1e9 / fps);
+    };
+    auto withinCap = [&](const rc::EncoderRatePlan& p, double real) {
+        CHECK(p.budget.maxBitrate <= uint64_t(p.requestedKbps) * 1000);
+        CHECK(double(p.budget.maxBitrate) * real * 1000.0 / p.rateNum <=
+              double(p.requestedKbps) * 1000.0 + 1.0);
+    };
+
+    settle(37);
+    rc::EncoderRateState state;
+    state.applied = plan(100000, 30000);
+    CHECK(state.applied.rateNum == 30000);
+    withinCap(state.applied, 37);
+    const auto at37 = state.applied;
+    int calls = 0;
+    auto submit = [&](bool ok) { ++calls; return ok; };
+
+    // 同一 30fps 档，37->44 必须更新硬件预算；成功后禁止逐帧重复下发。
+    settle(44);
+    auto next = plan(100000, state.applied.rateNum);
+    CHECK(next.rateNum == at37.rateNum);
+    CHECK(next.budget.maxBitrate < at37.budget.maxBitrate);
+    CHECK(state.ShouldAttempt(next, 10 * second));
+    CHECK(rc::ApplyEncoderRateTransaction(state, next, 10 * second, [&] { return submit(true); }));
+    CHECK(!state.ShouldAttempt(next, 10 * second + 1));
+    withinCap(state.applied, 44);
+
+    // 44->37 回升先迟滞，三秒后同档也能恢复，不会被阶梯判重吞掉。
+    settle(37);
+    next = plan(100000, state.applied.rateNum);
+    CHECK(next.rateNum == at37.rateNum);
+    CHECK(!state.ShouldAttempt(next, 11 * second));
+    CHECK(!state.ShouldAttempt(next, 14 * second - 1));
+    CHECK(state.ShouldAttempt(next, 14 * second));
+    CHECK(rc::ApplyEncoderRateTransaction(state, next, 14 * second, [&] { return submit(true); }));
+    CHECK(state.applied.budget.maxBitrate == at37.budget.maxBitrate);
+    CHECK(calls == 2);
+
+    // 失败保留整组已提交预算；外层不再 SetBitrate 时，下一帧仍能重试同一请求。
+    const auto snapshot = state.applied;
+    next = plan(60000, state.applied.rateNum);
+    CHECK(!state.ShouldAttempt(next, 14 * second + 1));
+    CHECK(state.ShouldAttempt(next, 16 * second));
+    CHECK(!rc::ApplyEncoderRateTransaction(state, next, 16 * second, [&] { return submit(false); }));
+    CHECK(rc::SameRatePlan(state.applied, snapshot));
+    CHECK(state.failed);
+    for (int i = 1; i < 10; ++i) CHECK(!state.ShouldAttempt(next, 16 * second + i * second / 10));
+    CHECK(state.ShouldAttempt(next, 17 * second));
+    CHECK(rc::ApplyEncoderRateTransaction(state, next, 17 * second, [&] { return submit(true); }));
+    CHECK(state.applied.requestedKbps == 60000);
+    CHECK(!state.failed);
+
+    // 阶梯切换候选失败后，分母/avg/max/VBV 都必须保持原快照。
+    settle(90);
+    const auto beforeFpsFailure = state.applied;
+    next = plan(60000, state.applied.rateNum);
+    CHECK(next.rateNum != state.applied.rateNum);
+    CHECK(state.ShouldAttempt(next, 20 * second));
+    CHECK(!rc::ApplyEncoderRateTransaction(state, next, 20 * second, [&] { return submit(false); }));
+    CHECK(rc::SameRatePlan(state.applied, beforeFpsFailure));
+    CHECK(!state.ShouldAttempt(next, 20 * second + second / 10));
+    CHECK(state.ShouldAttempt(next, 21 * second));
+    CHECK(rc::ApplyEncoderRateTransaction(state, next, 21 * second, [&] { return submit(true); }));
+    withinCap(state.applied, 90);
+
+    // 30->90 第一份有效间隔立即降低每帧预算；慢 EMA 仍在 30 时也不能被 0.5 下限挡住。
+    tracker = {};
+    settle(30);
+    state = {};
+    state.applied = plan(100000, 30000);
+    tracker.Observe(1e9 / 90.0);
+    next = plan(100000, state.applied.rateNum);
+    CHECK(next.rateNum == 30000);
+    CHECK(next.budget.maxBitrate <= 33'334'000);
+    CHECK(state.ShouldAttempt(next, 30 * second));
+    CHECK(rc::ApplyEncoderRateTransaction(state, next, 30 * second, [&] { return submit(true); }));
+    withinCap(state.applied, 90);
+
+    // 单个 800ms stall 不改变两条观测线，不制造大桶或大预算恢复请求。
+    const auto beforeStall = tracker;
+    tracker.Observe(800'000'000.0);
+    CHECK(tracker.fastIntervalNs == beforeStall.fastIntervalNs);
+    CHECK(tracker.slowIntervalNs == beforeStall.slowIntervalNs);
+    CHECK(rc::SameRatePlan(plan(100000, state.applied.rateNum), state.applied));
+    CHECK(!state.ShouldAttempt(state.applied, 31 * second));
+
+    // 38fps 不得被钳到 45；桶按标称帧率算，与档位无关：档位 30 时桶不再被放大 3 倍。
+    tracker = {};
+    settle(38);
+    next = plan(100000, 45000);
+    CHECK(next.rateNum == 30000);
+    withinCap(next, 38);
+    const uint32_t scaled = rc::ScaleRateToRealFps(100000, 30, tracker.RealFps(90));
+    // 旧口径是 scaled*1.5/30（档位分母），会把桶放大到 66ms；新口径固定 /90（标称）。
+    CHECK(next.budget.vbvBufferSize == uint32_t(double(scaled) * 1000 * 1.5 / 90));
+    CHECK(next.budget.vbvBufferSize < uint32_t(double(scaled) * 1000 * 1.5 / 30));
+    const auto startup = plan(100000, 30000, true);
+    CHECK(startup.rateNum == 90000);
+    CHECK(startup.budget.vbvBufferSize <= rc::ComputeCappedVbr(100000, 90, 100, 150).vbvBufferSize);
+    const auto startupRateChange = plan(60000, 30000, true);
+    CHECK(startupRateChange.budget.vbvBufferSize <= rc::ComputeCappedVbr(60000, 90, 100, 150).vbvBufferSize);
+
+    // 追赶补帧把两次提交挤到 2ms（500fps）：估计不得把每帧预算压到标称以下。
+    // 上限按标称 1.25 倍采信，预算至多缩到 90/112.5。
+    tracker = {};
+    settle(90);
+    tracker.Observe(2'000'000.0);
+    next = plan(100000, 90000);
+    CHECK(next.rateNum == 90000);
+    CHECK(next.budget.maxBitrate == 80'000'000);
+    withinCap(next, 90);
+
+    // 降码率会让候选桶变小；已提交的 initial delay 必须夹进新桶，否则驱动拒收整次重配置，
+    // 降码率请求永远重试失败。夹紧不等于重新灌满桶。
+    tracker = {};
+    settle(38);
+    const auto bigBucket = plan(100000, 30000);
+    const auto halfBucket = plan(50000, 30000);
+    CHECK(halfBucket.budget.vbvBufferSize < bigBucket.budget.vbvBufferSize);
+    CHECK(rc::ClampVbvInitialDelay(bigBucket.budget.vbvBufferSize, halfBucket.budget.vbvBufferSize) ==
+          halfBucket.budget.vbvBufferSize);
+    CHECK(rc::ClampVbvInitialDelay(1000, 0) == 1000);
+
+    // 桌面忽略所有 fps 观测/启动阶段，只保留其标称预算；请求失败仍走同一个重试事务。
+    const auto desktop = plan(100000, 30000, false, true);
+    tracker = {};
+    settle(240);
+    CHECK(rc::SameRatePlan(plan(100000, 90000, true, true), desktop));
+    CHECK(desktop.rateNum == 90000);
+    CHECK(desktop.budget.maxBitrate == 100'000'000);
+    state = {};
+    state.applied = desktop;
+    next = plan(60000, 90000, true, true);
+    CHECK(state.ShouldAttempt(next, 40 * second));
+    CHECK(!rc::ApplyEncoderRateTransaction(state, next, 40 * second, [] { return false; }));
+    CHECK(rc::SameRatePlan(state.applied, desktop));
+    CHECK(!state.ShouldAttempt(next, 40 * second + 1));
+    CHECK(state.ShouldAttempt(next, 41 * second));
+
+    // 非有限观测不得污染状态；非有限标称值不能直接参与整数转换。
+    const auto finiteTracker = tracker;
+    for (double bad : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                       std::numeric_limits<double>::quiet_NaN()}) tracker.Observe(bad);
+    CHECK(tracker.fastIntervalNs == finiteTracker.fastIntervalNs);
+    CHECK(tracker.slowIntervalNs == finiteTracker.slowIntervalNs);
+    CHECK(rc::QuantizeFps(std::numeric_limits<double>::quiet_NaN(), 45) == 45);
+    const auto finitePlan = rc::PlanEncoderRate(UINT32_MAX, std::numeric_limits<double>::infinity(),
+                                               true, false, tracker, 90000, 100, 150);
+    CHECK(finitePlan.rateNum == 90000);
+    CHECK(finitePlan.budget.maxBitrate == UINT32_MAX);
+    CHECK(finitePlan.budget.vbvBufferSize > 0);
+
+    // 每 100ms 的扰动：只执行生产 ShouldAttempt 允许的事务，成功/失败都不得形成 10Hz 风暴。
+    tracker = {};
+    settle(37);
+    state = {};
+    state.applied = plan(100000, 30000);
+    int attempts = 0;
+    for (int i = 0; i < 100; ++i) {
+        tracker.Observe(1e9 / (i % 2 ? 37.0 : 44.0));
+        next = plan(100000, state.applied.rateNum);
+        const int64_t now = 50 * second + i * second / 10;
+        if (state.ShouldAttempt(next, now)) {
+            ++attempts;
+            rc::ApplyEncoderRateTransaction(state, next, now, [] { return true; });
+        }
+    }
+    CHECK(attempts > 0 && attempts <= 10);
+    attempts = 0;
+    state.lastAttemptNs = 0;
+    for (int i = 0; i < 100; ++i) {
+        // 即使新降码率请求不断到来，API 连续失败也至多每秒一次。
+        next = plan(60000 - uint32_t(i), state.applied.rateNum);
+        const int64_t now = 70 * second + i * second / 10;
+        if (state.ShouldAttempt(next, now)) {
+            ++attempts;
+            rc::ApplyEncoderRateTransaction(state, next, now, [] { return false; });
+        }
+    }
+    CHECK(attempts == 10);
+    CHECK(state.applied.requestedKbps == 100000);
+    std::printf("encoder rate transaction: same-rung correction, retry, stall, desktop and finite inputs\n");
 }
 
 static void TestWireCeilingBudget() {
@@ -1829,6 +2025,7 @@ int main() {
     TestPacingBurstShaping();
     TestWireCeilingBudget();
     TestRateScaleForLadder();
+    TestEncoderRateTransaction();
     TestStreamProfile();
     TestQualityProfileFovea();
     TestQualityProfileQpMap();
