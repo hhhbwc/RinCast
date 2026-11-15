@@ -210,6 +210,18 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     const uint32_t brakeCap = brake.capKbps ? brake.capKbps : UINT32_MAX;
     const uint32_t finalCap = guardCap < brakeCap ? guardCap : brakeCap;
     m_congestionKbps.store(finalCap == UINT32_MAX ? 0 : finalCap);
+    // Sustained heavy loss means the path is below the user's ceiling - say it once
+    // every 30 s so the setting vs. reality mismatch shows up in the log.
+    if (m_lossAvg > 0.05) {
+        if (!m_lossHeavySinceNs) m_lossHeavySinceNs = now;
+        else if (now - m_lossHeavySinceNs > 30'000'000'000LL) {
+            RC_LOGW("Stream %u: loss still %.1f %% at the 70 %% brake (path below the user's ceiling)",
+                    m_streamId, m_lossAvg * 100);
+            m_lossHeavySinceNs = now;
+        }
+    } else {
+        m_lossHeavySinceNs = 0;
+    }
     if (brake.changed) {
         if (brake.released) {
             RC_LOGI("Stream %u: loss brake released, back to %u kbps (loss %.1f %%)", m_streamId, aim,

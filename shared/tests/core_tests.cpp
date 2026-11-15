@@ -32,6 +32,7 @@
 #include "rc/motion_field.h"
 #include "rc/music.h"
 #include "rc/platform.h"
+#include "rc/fps_ladder.h"
 #include "rc/loss_brake.h"
 #include "rc/queue_guard.h"
 #include "rc/stream_profile.h"
@@ -1465,6 +1466,19 @@ static void TestLossBrake() {
 }
 
 
+// The frame-rate ladder: the budget follows real swing, the reconfigures do not.
+static void TestFpsLadder() {
+    CHECK(rc::QuantizeFps(90.0, 90) == 90);
+    CHECK(rc::QuantizeFps(87.0, 90) == 90);   // within 15%: no reconfigure
+    CHECK(rc::QuantizeFps(47.0, 90) == 45);
+    CHECK(rc::QuantizeFps(44.0, 45) == 45);   // within 15%: no reconfigure
+    CHECK(rc::QuantizeFps(30.0, 45) == 30);
+    CHECK(rc::QuantizeFps(25.0, 30) == 24);
+    CHECK(rc::QuantizeFps(15.0, 45) == 24);   // a stall must not inflate the budget
+    CHECK(rc::QuantizeFps(60.0, 45) == 60);   // measured above current: follow it up
+    std::printf("fps ladder: 24/30/45/54/60/72/90, +-15%% hold, stalls floor at 24");
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);  // TEMP bisect: unbuffered, revert after
     TestLinkLocalDiscovery();
@@ -1487,6 +1501,7 @@ int main() {
     TestQualityProfileTwoPass();
     TestProfileFoveaGradient();
     TestBitrateSwitches();
+    TestFpsLadder();
     TestLossBrake();
     TestQueueGuard();
     TestFecDeterministic();

@@ -75,6 +75,9 @@ class VrStream {
         s.qp = m_statQp.load(std::memory_order_relaxed);
         s.encWidth = m_statEncW.load(std::memory_order_relaxed);
         s.encHeight = m_statEncH.load(std::memory_order_relaxed);
+        s.gameFps = m_lastGameFps.load(std::memory_order_relaxed);
+        s.encFps = m_lastEncFps.load(std::memory_order_relaxed);
+        s.droppedFps = m_lastDroppedFps.load(std::memory_order_relaxed);
         return s;
     }
     const VrStreamConfig& Config() const { return m_config; }
@@ -142,6 +145,7 @@ class VrStream {
     // Live encoder truth for the stats path (the encoder itself is local to RunEncoder).
     std::atomic<float> m_statQp{-1.0f};
     std::atomic<uint32_t> m_statEncW{0}, m_statEncH{0};
+    std::atomic<double> m_lastGameFps{0}, m_lastEncFps{0}, m_lastDroppedFps{0};
     // Frame flow since the last report: given by the game, replaced in the bridge before
     // conversion, replaced while waiting for the encoder, encoded; conversion and encoding time,
     // and how long the game's frames were held back so the encoder could keep up.

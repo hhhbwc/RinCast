@@ -28,8 +28,10 @@ struct LossBrakeResult {
 };
 
 // One feedback step. lossAvg is the smoothed loss fraction (0..1), userKbps the
-// ceiling the user set - the brake never holds the stream below 60% of it (the
-// user's number is a contract, and a brake this deep means the path is gone).
+// ceiling the user set. The brakes: light loss cuts to user x 85%, heavy loss to
+// user x 70% (runtime-verified: sustained 20% loss settles AT the 70% line) - the
+// 60% figure is only a guard rail the brake can never cross, not a step. The
+// user's number is a contract, and a brake this deep means the path is gone.
 constexpr LossBrakeResult LossBrakeStep(LossBrakeState& state, double lossAvg, uint32_t userKbps,
                                         int64_t nowNs) {
     LossBrakeResult r{state.capKbps, false, false};

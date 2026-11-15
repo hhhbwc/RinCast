@@ -339,7 +339,8 @@ void ClientSession::HandleMessage(const json& m) {
                 auto s = m_vr->Stats();
                 stats["vr"] = {{"fps", s.fps}, {"encodeMs", s.encodeMs}, {"mbps", s.mbps},
                                {"bitrateKbps", s.bitrateKbps}, {"framesLost", s.framesLost},
-                               {"qp", s.qp}, {"encWidth", s.encWidth}, {"encHeight", s.encHeight}};
+                               {"qp", s.qp}, {"encWidth", s.encWidth}, {"encHeight", s.encHeight},
+                               {"gameFps", s.gameFps}, {"encFps", s.encFps}, {"droppedFps", s.droppedFps}};
             }
             json desk = json::array();
             for (auto& [id, d] : m_desktop) {
@@ -692,6 +693,7 @@ void ClientSession::StartDesktop(const json& m) {
         if (pc.desktopMaxHeight > 0 && h > pc.desktopMaxHeight) scale = pc.desktopMaxHeight / h;
         scale = std::min({scale, maxW / w, maxH / h});
         DesktopStreamConfig cfg;
+        cfg.cheapEncode = m_vr != nullptr;  // VR in flight: the desktop skips two-pass
         cfg.codec = codec;
         cfg.tenBit = st.tenBit && codec != rc::VideoCodec::H264;
         cfg.width = Align(uint32_t(w * scale), 2);
@@ -1065,7 +1067,8 @@ json ClientSession::StatusJson() {
         j["vr"] = {{"fps", s.fps}, {"encodeMs", s.encodeMs}, {"mbps", s.mbps}, {"bitrateKbps", s.bitrateKbps},
                    {"codec", CodecName(c.codec)}, {"eyeWidth", c.eyeWidth}, {"eyeHeight", c.eyeHeight},
                    {"refreshRate", c.fps}, {"latencyMs", s.clientLatencyMs}, {"decodeMs", s.clientDecodeMs},
-                   {"qp", s.qp}, {"encWidth", s.encWidth}, {"encHeight", s.encHeight}};
+                   {"qp", s.qp}, {"encWidth", s.encWidth}, {"encHeight", s.encHeight},
+                   {"gameFps", s.gameFps}, {"encFps", s.encFps}, {"droppedFps", s.droppedFps}};
     }
     json desk = json::array();
     for (auto& [id, d] : m_desktop) {

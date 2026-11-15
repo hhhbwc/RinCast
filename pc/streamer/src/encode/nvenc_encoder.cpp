@@ -7,6 +7,7 @@
 
 #include "encoder.h"
 #include "nvenc/nvEncodeAPI.h"
+#include "rc/fps_ladder.h"
 #include "rc/platform.h"
 #include "rc/stream_profile.h"
 
@@ -318,7 +319,9 @@ class NvencEncoder final : public VideoEncoder {
             pic.qpDeltaMap = m_qpMap.data();
             pic.qpDeltaMapSize = uint32_t(m_qpMap.size());
         }
+        const int64_t submitStart = rc::NowNs();
         NVENCSTATUS st = api.nvEncEncodePicture(m_encoder, &pic);
+        const int64_t submitEnd = rc::NowNs();
         bool ok = st == NV_ENC_SUCCESS;
         if (ok) {
             NV_ENC_LOCK_BITSTREAM lock{};
@@ -326,6 +329,9 @@ class NvencEncoder final : public VideoEncoder {
             lock.outputBitstream = m_bitstream;
             lock.doNotWait = 0;
             if (api.nvEncLockBitstream(m_encoder, &lock) == NV_ENC_SUCCESS) {
+                const int64_t lockEnd = rc::NowNs();
+                m_statSubmitNs += submitEnd - submitStart;
+                m_statGpuWaitNs += lockEnd - submitEnd;
                 const auto* p = static_cast<const uint8_t*>(lock.bitstreamBufferPtr);
                 out.data.assign(p, p + lock.bitstreamSizeInBytes);
                 out.keyframe = lock.pictureType == NV_ENC_PIC_TYPE_IDR || lock.pictureType == NV_ENC_PIC_TYPE_I;
@@ -342,14 +348,18 @@ class NvencEncoder final : public VideoEncoder {
                     const int64_t elapsed = now - m_statStartNs;
                     if (elapsed >= 5 * 1000 * 1000 * 1000LL) {
                         const double secs = double(elapsed) / 1e9;
-                        RC_LOGI("ENC 5s: %.0f fps, qp %.1f, %.1f KB/frame, %.1f Mbps (ceiling %u)",
+                        RC_LOGI("ENC 5s: %.0f fps, qp %.1f, %.1f KB/frame, %.1f Mbps (ceiling %u), submit %.1f ms, gpu wait %.1f ms",
                                 m_statFrames / secs, double(m_statQpSum) / m_statFrames,
                                 double(m_statBytes) / m_statFrames / 1024.0,
-                                double(m_statBytes) * 8.0 / secs / 1e6, m_config.bitrateKbps / 1000);
+                                double(m_statBytes) * 8.0 / secs / 1e6, m_config.bitrateKbps / 1000,
+                                double(m_statSubmitNs) / m_statFrames / 1e6,
+                                double(m_statGpuWaitNs) / m_statFrames / 1e6);
                         m_statStartNs = now;
                         m_statFrames = 0;
                         m_statQpSum = 0;
                         m_statBytes = 0;
+                        m_statSubmitNs = 0;
+                        m_statGpuWaitNs = 0;
                     }
                 }
                 api.nvEncUnlockBitstream(m_encoder, m_bitstream);
@@ -480,9 +490,11 @@ class NvencEncoder final : public VideoEncoder {
         m_lastEncodeNs = now;
         if (m_config.desktop || m_intervalNsSmooth <= 0 || !m_encoder) return;
         const uint32_t fpsFast = uint32_t(std::clamp(1e9 / m_intervalNsSmooth, double(m_config.fps) / 2.0, double(m_config.fps)));
-        const uint32_t fps = uint32_t(std::clamp(1e9 / m_intervalNsSlow, double(m_config.fps) / 2.0, double(m_config.fps)));
-        // 门控从 500ms 缩到 100ms：预算陈旧是超调/欠速的主因，帧率一变就尽快重配。
-        if (m_lastVbvNs && now - m_lastVbvNs < 1'000'000'000LL) return;
+        // 重配目标走阶梯（fps_ladder.h）：量化后每分钟的重配从 11.7-16.8 次降到个位数，
+        // 每次重配都会重置码控并把 VBV 翻倍。VBV 仍用快均值（上面），不受阶梯影响。
+        const uint32_t fps = uint32_t(rc::QuantizeFps(1e9 / m_intervalNsSlow, int(m_effectiveFps)));
+        // 门控 3 秒：阶梯已把无意义的重配挡掉，剩下的都是真实档位变化，3 秒内至多一次。
+        if (m_lastVbvNs && now - m_lastVbvNs < 3'000'000'000LL) return;
         // 稳态 fps 在 87-92 间抖，每个整数变化都重配 → 每秒约十次（无害但刷日志、扰动编码）。
         // 只有偏离上次实际下发的 fps 超过一个相对死区（±1/12，至少 3fps）才重配；真实帧率
         // 变化和累积漂移仍会触发。锚在 m_effectiveFps 上，所以缓慢漂移攒够一档照样会重配。
@@ -591,6 +603,11 @@ class NvencEncoder final : public VideoEncoder {
     uint32_t m_statFrames = 0;
     uint64_t m_statQpSum = 0;
     uint64_t m_statBytes = 0;
+    // Where the encode time actually goes: nvEncEncodePicture (the submit) versus
+    // nvEncLockBitstream (waiting for the GPU to finish). The gap is the diagnosis
+    // for "the engine is at 13% but the frame took 10 ms".
+    int64_t m_statSubmitNs = 0;
+    int64_t m_statGpuWaitNs = 0;
     bool m_canInvalidate = false;
     bool m_split = false;
     bool m_foveated = false;

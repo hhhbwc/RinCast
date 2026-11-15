@@ -80,8 +80,8 @@ void DesktopStream::Run() {
         ec.tenBit = m_config.tenBit;
         ec.desktop = true;
         ec.adaptiveQuant = m_config.adaptiveQuant;
-        // Latency matters less than sharp text here, so always.
-        ec.twoPass = true;
+        // Two passes by default; while VR streams the desktop gives them up (T8).
+        ec.twoPass = !m_config.cheapEncode;
         ec.inputFormat = converter.Format();
         encoder = CreateEncoder(device.Get(), gpu.vendorId, ec);
         return encoder != nullptr;

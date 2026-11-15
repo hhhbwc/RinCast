@@ -29,6 +29,7 @@ struct VideoSenderStats {
     double queueMs = -1;  // queueing delay on the way to the headset, -1 = unknown
     float qp = -1;        // the encoder's rolling mean QP, -1 = unknown
     uint32_t encWidth = 0, encHeight = 0;  // what is actually being encoded, 0 = unknown
+    double gameFps = 0, encFps = 0, droppedFps = 0;  // 10 s averages from the frame-flow log
 };
 
 class VideoSender {
@@ -94,6 +95,7 @@ class VideoSender {
     // actual loss and HOLDS the rate down after a loss cut. Both caps are taken
     // together; neither one's climb may override the other's hold.
     rc::LossBrakeState m_brake;
+    int64_t m_lossHeavySinceNs = 0;  // when the current >5% loss episode began
     std::atomic<uint32_t> m_congestionKbps{0};  // mirror of m_guard.Cap() for the sender side
     int64_t m_lastDipNs = 0;         // network thread only
     int m_baseFecPercent = -1;       // the setting's FEC; network thread only

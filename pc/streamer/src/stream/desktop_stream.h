@@ -13,6 +13,8 @@
 namespace rcs {
 
 struct DesktopStreamConfig {
+    // VR is streaming: the desktop drops its two-pass (sharp text is worthless next
+    // to a VR startup that dipped 47 -> 20 -> 5 fps while both encoders ran).
     rc::VideoCodec codec = rc::VideoCodec::HEVC;
     bool tenBit = false;
     uint32_t width = 0;
@@ -24,6 +26,7 @@ struct DesktopStreamConfig {
     rc::StreamProfile profile = rc::StreamProfile::Balanced;  // what to favour (latency / balanced / quality)
     uint32_t startBitrateKbps = 0;  // adaptive: where to start (0 = at bitrateKbps)
     bool pace = false;              // internet paths: no bursts
+    bool cheapEncode = false;       // VR in flight: the desktop gives up two-pass
     bool adaptiveQuant = true;
 };
 

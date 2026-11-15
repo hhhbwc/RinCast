@@ -162,6 +162,10 @@ void VrStream::LogFrameFlow(int64_t now) {
                   heldNs = m_flowHeldNs.exchange(0);
     if (!given) return;
     const uint32_t converted = given - bridge;
+    // Live rates for the stats path (atomics: Stats() reads from another thread).
+    m_lastGameFps.store(double(given) / secs, std::memory_order_relaxed);
+    m_lastEncFps.store(double(encoded) / secs, std::memory_order_relaxed);
+    m_lastDroppedFps.store(double(queue) / secs, std::memory_order_relaxed);
     RC_LOGI("VR frames: %.0f/s from the game, %.0f/s encoded; %.0f/s replaced before conversion, %.0f/s while "
             "the encoder was busy; conversion %.1f ms, encoding %.1f ms, held for the encoder %.1f ms",
             given / secs, encoded / secs, bridge / secs, queue / secs,
@@ -443,6 +447,15 @@ void VrStream::RunEncoder() {
     DWORD taskIndex = 0;
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
     if (mmcss) AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_HIGH);
+    // Same relative GPU priority the conversion thread uses: the sampler showed the
+    // NVENC engine at 13% while frames waited ~7 ms in queue - the encode thread was
+    // last in line for GPU time. Failure here is cosmetic (logged once).
+    {
+        static std::once_flag logged;
+        ComPtr<IDXGIDevice> dxgi;
+        const HRESULT hr = SUCCEEDED(m_bridge->Device()->QueryInterface(IID_PPV_ARGS(&dxgi))) ? dxgi->SetGPUThreadPriority(7) : E_NOINTERFACE;
+        std::call_once(logged, [hr] { RC_LOGI("VR: GPU priority for encoding %s", SUCCEEDED(hr) ? "raised" : "unchanged (refused)"); });
+    }
 
     ID3D11Device* device = m_bridge->Device();
     rcvr::Shared* shared = m_bridge->Shared();

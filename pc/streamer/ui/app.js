@@ -608,7 +608,10 @@ function renderDependents() {
   // and the encoded size without opening logs. Hidden while nothing streams.
   const encW = session?.vr?.encWidth || 0;
   const qp = session?.vr?.qp || -1;
-  const detail = actual && encW > 0 && qp > 0 ? ` · ${Math.round(encW / 2)}² · QP ${qp.toFixed(1)}` : "";
+  const gameFps = Math.round(session?.vr?.gameFps || 0);
+  const encFps = Math.round(session?.vr?.encFps || 0);
+  let detail = actual && encW > 0 && qp > 0 ? ` · ${Math.round(encW / 2)}² · QP ${qp.toFixed(1)}` : "";
+  if (actual && encFps > 0) detail += ` · ${gameFps}/${encFps} fps`;
   $("#vrBitrateBar output").textContent = actual ? `${Math.round(actual)} / ${ceiling} Mbps${detail}` : `${ceiling} Mbps`;
   if (fromHeadset) $("#vrBitrateBar input").style.setProperty("--fill", `${((session.headsetBitrateMbps - 20) / 480) * 100}%`);
   const codec = session?.headsetCodec && session.headsetCodec !== "auto" ? session.headsetCodec : "";
