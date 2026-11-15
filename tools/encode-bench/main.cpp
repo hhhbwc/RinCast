@@ -25,6 +25,12 @@
 // pacing) into a loopback connection and timestamps the arriving datagrams, so pacing,
 // burst size and submit-to-sent latency are measured end to end. --csv writes the raw
 // arrival timeline.
+//
+// --fb-every <ms> --fb-queue "0:3,5:60,20:3" --fb-loss "0:0,5:0.02,20:0" script the
+// headset feedback that --net would otherwise never receive: queueDelayMs and the lost
+// fragment count, linearly interpolated between the listed seconds. Without feedback the
+// queue guard only ever sees "not measured" and the loss brake never fires; this is how
+// both are driven offline (PLAN-ROBUST R1).
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -62,6 +68,42 @@ struct NetArrival {
     bool video = false;
 };
 
+// "0:3,5:60,20:3" -> {(0,3),(5,60),(20,3)}; empty string -> empty list.
+static std::vector<std::pair<double, double>> ParseTimeline(const std::string& text) {
+    std::vector<std::pair<double, double>> out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t comma = text.find(',', pos);
+        const std::string item = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        const size_t colon = item.find(':');
+        if (colon != std::string::npos) {
+            try {
+                out.emplace_back(std::stod(item.substr(0, colon)), std::stod(item.substr(colon + 1)));
+            } catch (const std::exception&) {
+            }
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return out;
+}
+
+// Value of a timeline at t seconds: hold before the first point, linear between, hold after
+// the last. An empty timeline returns fallback.
+static double TimelineAt(const std::vector<std::pair<double, double>>& tl, double t, double fallback) {
+    if (tl.empty()) return fallback;
+    if (t <= tl.front().first) return tl.front().second;
+    for (size_t i = 1; i < tl.size(); ++i) {
+        if (t <= tl[i].first) {
+            const double span = tl[i].first - tl[i - 1].first;
+            if (span <= 0) return tl[i].second;
+            const double k = (t - tl[i - 1].first) / span;
+            return tl[i - 1].second + (tl[i].second - tl[i - 1].second) * k;
+        }
+    }
+    return tl.back().second;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
@@ -84,6 +126,11 @@ int main(int argc, char** argv) {
     bool still = false;            // freeze the pan: every frame is identical (a still menu)
     bool flat = false;             // smooth gradient instead of noise (easy still content)
     bool netBench = false;         // 走真实 VideoSender + 回环，测 pacing 与提交延迟
+    // Synthetic feedback for --net. Without it the sender never sees a queue delay or a
+    // lost fragment, so QueueGuard and the loss brake run blind: the real link needed a
+    // headset to exercise them. Timelines are "sec:value" pairs, linearly interpolated.
+    int fbEveryMs = 0;             // 0 = no feedback at all (the old behaviour)
+    std::vector<std::pair<double, double>> fbQueue, fbLoss;
     std::string csvPath;
     std::string presetArg, tuningArg;  // --preset/--tuning as typed, for the override line
     double paceFps = 0;
@@ -167,6 +214,12 @@ int main(int argc, char** argv) {
             outPath = next();
         } else if (a == "--net") {
             netBench = true;
+        } else if (a == "--fb-every") {
+            fbEveryMs = std::stoi(next());
+        } else if (a == "--fb-queue") {
+            fbQueue = ParseTimeline(next());
+        } else if (a == "--fb-loss") {
+            fbLoss = ParseTimeline(next());
         } else if (a == "--csv") {
             csvPath = next();
         } else if (a == "--yuv") {
@@ -433,6 +486,7 @@ float4 ps(V i) : SV_Target {
     size_t windowBytes = 0, windowFrames = 0;
     double maxWindowMbps = 0;
     const int64_t benchStartNs = rc::NowNs();
+    int64_t nextFbNs = benchStartNs;
     for (int i = 0; i < frames; i++) {
         if (paced) {
             const int64_t nowNs = rc::NowNs();
@@ -529,6 +583,25 @@ float4 ps(V i) : SV_Target {
             if (fovOut) fovOut.write(reinterpret_cast<const char*>(ff.data.data()), std::streamsize(ff.data.size()));
         }
         if (sender) {
+            // Synthetic headset feedback: the queue guard and the loss brake only move on
+            // what the headset reports, and a loopback has no headset. Feeding a scripted
+            // timeline is the only way to drive them without a device (see PLAN-ROBUST R1).
+            if (fbEveryMs > 0) {
+                const int64_t fbNow = rc::NowNs();
+                if (fbNow >= nextFbNs) {
+                    const double sec = double(fbNow - benchStartNs) / 1e9;
+                    rc::VideoFeedbackPayload fb{};
+                    fb.streamId = rc::kVrStreamId;
+                    fb.lastCompleteFrame = uint32_t(i);
+                    fb.lastGoodFrame = uint32_t(i);
+                    fb.queueDelayMs = float(TimelineAt(fbQueue, sec, -1.0));
+                    const double loss = std::clamp(TimelineAt(fbLoss, sec, 0.0), 0.0, 0.99);
+                    fb.fragmentsReceived = 1000;
+                    fb.fragmentsLost = uint32_t(loss * 1000.0 / (1.0 - loss));
+                    sender->OnFeedback(fb);
+                    nextFbNs = fbNow + int64_t(fbEveryMs) * 1'000'000LL;
+                }
+            }
             // 同步 Send：铺发在调用线程内完成，时间线与真流一致。
             netFrameBytes.push_back(sizes.back());
             encStartNs.push_back(t0);
