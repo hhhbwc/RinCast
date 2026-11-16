@@ -1,5 +1,5 @@
 // Shared plumbing for desktop and VR streams: packetizing, keyframe requests,
-// adaptive bitrate (AIMD on loss / queuing delay) and statistics.
+// pacing and statistics. Rate adaptation is min(queue guard, loss brake).
 #pragma once
 
 #include <algorithm>

@@ -557,7 +557,12 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
     HeadsetSettings& s = app.Settings();
     bool changed = false;
     const float gap = 44, w = (body.w - gap) / 2;
-    Column l{body.x, body.y, w};
+    // This page grew with the quality-profile and enhancement rows and no longer
+    // fits on one screen - the lower controls were unreachable with the remote.
+    // Same stick-only scroll as the General page (the trigger pull cancels a drag).
+    static float contentBottom = 0;
+    const float scroll = ui.BeginScroll("vr-quality", body, std::max(0.f, contentBottom - body.y), false);
+    Column l{body.x, body.y - scroll, w};
     // 画质档位放在最上面：VR 用户最常改的就是它，改完电脑端也同步（最后一次改动生效）。
     Section(ui, l, Tr("vr.profileSection"));
     const std::vector<std::string> profiles = {Tr("profile.latency"), Tr("profile.balanced"), Tr("profile.quality")};
@@ -621,7 +626,7 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
     changed |= CheckRow(ui, l, "upscaling", Tr("vr.upscaling"), s.upscaling, Tr("vr.upscalingHint"));
     changed |= CheckRow(ui, l, "framegen", Tr("vr.frameGen"), s.frameGeneration, Tr("vr.frameGenHint"));
 
-    Column c{body.x + w + gap, body.y, w};
+    Column c{body.x + w + gap, body.y - scroll, w};
     Section(ui, c, Tr("vr.bitrateSection"));
     const bool usePc = s.vrBitrateMbps == 0;
     // The PC tells what its own limit is once connected.
@@ -665,6 +670,9 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
         changed |= CheckRow(ui, c, "face", Tr("vr.faceTracking"), s.faceTracking, device.FaceHint());
     changed |= CheckRow(ui, c, "foveated", Tr("vr.foveated"), s.gazeFoveation,
                         Tr(app.GazeSupported() ? "vr.foveatedHint" : "vr.foveatedFixedHint"));
+    // Hand the measured content height to the next frame for the scroll range.
+    contentBottom = std::max(l.y, c.y) + scroll;
+    ui.EndScroll();
     return changed;
 }
 

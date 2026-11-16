@@ -89,26 +89,10 @@ struct Settings {
     void FromJson(const json& j);
 };
 
-// The fovea's full-density share the Best-picture profile asks for when it may
-// drive video settings (rcs::Settings::profileControlsVideo). Pure arithmetic so
-// the offline core tests check the same number the session feeds
-// Foveator::EncodedSize; the headset stretches whatever size it is sent, so the
-// share and the encoded size can never disagree (see client_session.cpp).
+// The Best-picture profile's full-density centre share (0.8), used by the
+// per-profile floor below. The headset stretches whatever size it is sent, so
+// the share and the encoded size can never disagree (see client_session.cpp).
 constexpr float kQualityProfileFovea = 0.8f;
-constexpr float QualityProfileFovea(float current, bool profileControlsVideo, bool qualityProfile) {
-    return profileControlsVideo && qualityProfile && current < kQualityProfileFovea ? kQualityProfileFovea
-                                                                                    : current;
-}
-
-// When the Best-picture profile may drive video settings, it also asks NVENC for a
-// QP map: fewer bits towards the lens edges, so the centre keeps more of the same
-// ceiling. Only ever raises - a map the user enabled themselves stays on. The map is
-// computed from the field of view and needs no geometric squeeze; the stream still
-// runs it only on unsqueezed pictures (vr_stream.cpp gates it with !job.foveated),
-// see DEVIATIONS D-007 for what that means when the headset's own squeeze is on.
-constexpr bool QualityProfileQpMap(bool current, bool profileControlsVideo, bool qualityProfile) {
-    return current || (profileControlsVideo && qualityProfile);
-}
 
 // Per-profile fovea floors (the share of each eye that stays full-density). The
 // gradient 0.6 / 0.7 / 0.8 is what makes the three profiles differ where it always

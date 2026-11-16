@@ -104,12 +104,8 @@ public:
         m_target = 0;
     }
 
-    uint32_t Target() const { return m_target; }
-    uint64_t SumWire() const { return m_sumWire; }
-    uint64_t SumEncoded() const { return m_sumEnc; }
     size_t Entries() const { return m_window.size(); }
     double Overhead() const { return m_sumEnc ? double(m_sumWire) / double(m_sumEnc) : 1.0; }
-    uint32_t Breaches() const { return m_breaches; }
 
     // The quota in bytes per second, for callers that want to compare against it.
     static uint64_t QuotaBytes(uint32_t wireCeilingKbps) { return uint64_t(wireCeilingKbps) * 1275 / 10; }

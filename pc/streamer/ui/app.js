@@ -638,12 +638,20 @@ function renderDependents() {
   // clickable on every profile.
   const tunable = ["nvenc", "amf"].includes(state.system.encoder.backend);
   setOff($("#aqRow"), !tunable);
+  // The QP map is the user's own NVENC switch, no longer forced by a profile. It
+  // cannot share a frame with the headset's geometric squeeze, so grey it out (and
+  // say why) whenever that squeeze is on or the encoder doesn't support it.
+  const nvenc = state.system.encoder.backend === "nvenc";
+  const squeeze = !!state.session?.headsetGazeFoveation;
+  $("#foveatedRow input").checked = !!state.settings.foveatedEncoding;
+  setOff($("#foveatedRow"), !nvenc || squeeze);
   // Two-pass is the user's own switch. A profile no longer forces it on (the old
   // Best-picture behaviour surprised users who had left it off), so the checkbox
   // simply mirrors the setting and is only greyed when the encoder can't do it.
   $("#twoPassRow input").checked = !!state.settings.twoPassEncoding;
   setOff($("#twoPassRow"), !tunable);
-  setOff($("#cbrRow"), profile !== 2);
+  // CBR only takes effect when the profile is allowed to drive video settings too.
+  setOff($("#cbrRow"), profile !== 2 || !state.settings.profileControlsVideo);
   setOff($("#playOnPcRow"), !state.settings.streamAudio);
   setOff($("#micRow"), state.settings.audioDevices === "system");
 }

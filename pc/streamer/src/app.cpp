@@ -233,6 +233,9 @@ json App::StateJson() {
     };
     if (auto session = m_server.ActiveSession()) {
         state["session"] = session->StatusJson();
+        // Show the synced values that are actually in effect: headset-owned keys
+        // come from the live session, not the PC's saved settings. Read-only.
+        for (auto& [key, value] : session->SyncedSettingsForUi().items()) state["settings"][key] = value;
     } else {
         state["session"] = nullptr;
     }

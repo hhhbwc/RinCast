@@ -94,6 +94,9 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     rc::VideoCodec ChooseCodec(bool forVr) const;
     ClientCaps Caps();
     ClientStreamSettings StreamSettings();
+    // The synced values the PC UI should show: PC-owned keys come from the saved
+    // settings, headset-owned keys from this session. Never writes anything back.
+    json SyncedSettingsForUi();
 
    private:
     void OnControl(const std::string& text);

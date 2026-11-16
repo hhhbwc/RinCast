@@ -82,7 +82,7 @@
           <label class="check spaced" id="profileVideoRow">
             <input type="checkbox" data-setting="profileControlsVideo">
             <span data-i18n="video.profileVideo">Adjust video settings with the profile</span>
-            <small id="profileVideoHint" data-i18n="video.profileVideoHint">Each profile floors the always-sharp centre in its own way: low latency 0.6 (the fixed squeeze), balanced 0.7 (+13% pixels), Best picture 0.8 with two-pass encoding and the QP map (+25% pixels). Never lowers your or the headset's choice. Applies after switching the profile or reconnecting; the centre gradient needs foveated encoding on.</small>
+            <small id="profileVideoHint" data-i18n="video.profileVideoHint">Each profile sets a sharper full-density centre (latency 0.6, balanced 0.7, best 0.8); never lowers your choice. Two-pass stays your own switch.</small>
           </label>
           <p class="note" id="overrideNote"></p>
         </div>
@@ -99,6 +99,7 @@
           <label class="check" id="pcBitrateRow"><input type="checkbox" data-setting="pcBitrateWins"><span data-i18n="video.pcBitrate">Use this PC's bitrate limit</span><small data-i18n="video.pcBitrateHint">The headset sends its own limit and it wins by default - it plans its buffers around that number. Turning this on makes the PC's number apply anyway.</small></label>
           <label class="check spaced" id="tenBitRow"><input type="checkbox" data-setting="tenBit"><span data-i18n="video.tenBit">10-bit color</span><small id="tenBitHint" hidden data-i18n="video.tenBitHint">Needs HEVC or AV1</small></label>
           <label class="check" id="aqRow"><input type="checkbox" data-setting="adaptiveQuantization"><span data-i18n="video.aq">Adaptive quantization</span><small data-i18n="video.aqHint">More bits for flat areas like skies, where blocks show first. NVIDIA and AMD</small></label>
+          <label class="check" id="foveatedRow"><input type="checkbox" data-setting="foveatedEncoding"><span data-i18n="video.foveated">Sharper center in VR</span><small id="foveatedHint" data-i18n="video.foveatedHint">Fewer bits at the lens edges. NVIDIA only; not used while the headset's own sharp-center squeeze is on.</small></label>
           <label class="check" id="twoPassRow"><input type="checkbox" data-setting="twoPassEncoding"><span data-i18n="video.twoPass">Two-pass encoding in VR</span><small data-i18n="video.twoPassHint">Spreads bits better in fast motion, but each frame takes longer to encode. Desktop always uses it. NVIDIA and AMD</small></label>
           <label class="check" id="cbrRow"><input type="checkbox" data-setting="qualityProfileCbr"><span data-i18n="video.cbr">Constant bitrate for Best picture</span><small data-i18n="video.cbrHint">Every frame costs exactly the limit - measured +7.5% on still pictures vs capped VBR. Simple frames then fill the queue instead of staying small; the congestion guard carries it, but leave this off unless you want the ceiling spent on every frame. Needs "Adjust video settings with the profile" and Best picture. NVIDIA and AMD</small></label>
         </div>

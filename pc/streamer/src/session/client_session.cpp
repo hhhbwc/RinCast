@@ -141,6 +141,29 @@ ClientStreamSettings ClientSession::StreamSettings() {
     return m_settings;
 }
 
+json ClientSession::SyncedSettingsForUi() {
+    const Settings s = SettingsStore::Get().Snapshot();
+    // What the PC still owns -> its saved value; what the headset took back ->
+    // this session's live value. Read-only: a headset's temporary pick must never
+    // become a permanent PC setting.
+    json out = json::object();
+    out[rc::synced::kCodec] = s.codec;
+    out[rc::synced::kTenBit] = s.tenBit;
+    out[rc::synced::kAdaptiveBitrate] = s.adaptiveBitrate;
+    out[rc::synced::kDesktopFps] = s.desktopFps;
+    out[rc::synced::kStreamProfile] = s.streamProfile;
+    std::lock_guard lock(m_mutex);
+    for (const char* key : rc::synced::kAll) {
+        if (m_ownedSettings.count(key)) continue;  // PC still owns it
+        if (std::string(key) == rc::synced::kCodec) out[key] = m_settings.codec;
+        else if (std::string(key) == rc::synced::kTenBit) out[key] = m_settings.tenBit;
+        else if (std::string(key) == rc::synced::kAdaptiveBitrate) out[key] = m_settings.adaptiveBitrate;
+        else if (std::string(key) == rc::synced::kDesktopFps) out[key] = m_settings.desktopFps;
+        else if (std::string(key) == rc::synced::kStreamProfile) out[key] = m_settings.streamProfile;
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 
 void ClientSession::OnControl(const std::string& text) {
@@ -399,6 +422,13 @@ void ClientSession::HandleMessage(const json& m) {
             RestartVideoForProfile();
             App::Get().PushUi(App::Get().StateJson());
         }
+        // The other synced keys (codec, 10-bit, adaptive bitrate, desktop fps) live
+        // only in the session. Refresh the PC page so it shows what actually took
+        // effect, without writing a headset's pick into the PC's saved settings.
+        const bool syncedChanged = before.codec != after.codec || before.tenBit != after.tenBit ||
+                                   before.adaptiveBitrate != after.adaptiveBitrate ||
+                                   before.desktopFps != after.desktopFps;
+        if (syncedChanged) App::Get().PushUi(App::Get().StateJson());
         return;
     }
     if (type == rc::msg::kStartDesktop) return StartDesktop(m);
@@ -882,8 +912,11 @@ void ClientSession::StartVr() {
     cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate);  // see above
     cfg.profile = rc::ProfileFromId(pc.streamProfile);
     if (m_slowPath) cfg.startBitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 12000);
-    cfg.foveated = rcs::QualityProfileQpMap(pc.foveatedEncoding, pc.profileControlsVideo && !match && !m_slowPath,
-                                            cfg.profile == rc::StreamProfile::Quality);
+    // QP map is the user's own switch, just like two-pass. A profile no longer
+    // turns it on behind their back. The encoder runs it only when the headset's
+    // geometric squeeze is off (vr_stream.cpp gates it on !job.foveated) - the two
+    // cannot share a frame - so the page says so when that squeeze is on.
+    cfg.foveated = pc.foveatedEncoding;
     cfg.adaptiveQuant = pc.adaptiveQuantization;
     // Two-pass is the user's own switch, never forced by a profile. The Best-picture
     // profile used to turn it on by itself (and the page greyed it out), which
@@ -1112,6 +1145,9 @@ json ClientSession::StatusJson() {
     // What the headset chose itself, which goes before this PC's settings.
     j["headsetBitrateMbps"] = m_settings.vrBitrateMbps;
     j["headsetCodec"] = m_settings.codec;
+    // The headset's geometric squeeze and the PC's QP map cannot share a frame,
+    // so the page greys the QP map switch out when this is on.
+    j["headsetGazeFoveation"] = m_settings.gazeFoveation;
     j["vrState"] = m_vrState;
     j["vrProducer"] = m_vrProducer;
     j["vrApp"] = m_vrApp;
