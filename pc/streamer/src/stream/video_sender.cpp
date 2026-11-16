@@ -155,13 +155,20 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
             m_lastStatsLogNs = now;
             // Datagrams the socket refused never reached the path: they look like loss on
             // the headset and like nothing at all here. Worth showing in the regular line.
+            // G10.4: the trailing network triad makes the picture complete on one
+            // timeline - effective encoder target, queue the headset reports, and
+            // measured loss. Leading fields stay byte-for-byte for the log parsers.
             const uint32_t refused = m_packetizer.SendFailures();
+            const uint32_t effectiveTarget = TargetBitrateKbps();
+            const uint32_t wireCap = m_wireCapKbps.load(std::memory_order_relaxed);
             if (refused) {
-                RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps, %u datagrams refused",
-                        m_streamId, m_stats.mbps, m_stats.fps, m_targetKbps.load(), refused);
+                RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps, %u datagrams refused, effective %u kbps, wireCap %u kbps, queue %.0f ms, loss %.1f%%",
+                        m_streamId, m_stats.mbps, m_stats.fps, m_targetKbps.load(), refused,
+                        effectiveTarget, wireCap, m_queueMs, m_lossAvg * 100);
             } else {
-                RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps", m_streamId, m_stats.mbps,
-                        m_stats.fps, m_targetKbps.load());
+                RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps, effective %u kbps, wireCap %u kbps, queue %.0f ms, loss %.1f%%",
+                        m_streamId, m_stats.mbps, m_stats.fps, m_targetKbps.load(),
+                        effectiveTarget, wireCap, m_queueMs, m_lossAvg * 100);
             }
         }
         m_windowFrames = 0;

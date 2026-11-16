@@ -348,25 +348,31 @@ class NvencEncoder final : public VideoEncoder {
                     m_statFrames++;
                     m_qpStats.Add(lock.frameAvgQP, rc::MaxValidQp(int(m_config.codec)));
                     m_statBytes += lock.bitstreamSizeInBytes;
+                    if (m_statFrames == 1 || lock.bitstreamSizeInBytes < m_statBytesMin) m_statBytesMin = lock.bitstreamSizeInBytes;
+                    if (m_statFrames == 1 || lock.bitstreamSizeInBytes > m_statBytesMax) m_statBytesMax = lock.bitstreamSizeInBytes;
                     const int64_t elapsed = now - m_statStartNs;
                     if (elapsed >= 5 * 1000 * 1000 * 1000LL) {
                         const double secs = double(elapsed) / 1e9;
                         // qp is the mean of VALID samples only (-1.0 = no valid sample),
                         // so a garbage NVENC field can no longer drag it into the billions.
                         // The trailing fields are additive: log parsers key on the leading
-                        // fixed-width part; diagnostics get the raw rejected value.
-                        RC_LOGI("ENC 5s: %.0f fps, qp %.1f, %.1f KB/frame, %.1f Mbps (ceiling %u), submit %.1f ms, gpu wait %.1f ms, qpValid %u/%u, qpFirstBad %u",
+                        // fixed-width part; diagnostics get the raw rejected value and the
+                        // min..max spread (a steady mean can hide quality pumping).
+                        RC_LOGI("ENC 5s: %.0f fps, qp %.1f, %.1f KB/frame, %.1f Mbps (ceiling %u), submit %.1f ms, gpu wait %.1f ms, qpValid %u/%u, qpFirstBad %u, qpRange %u-%u, kbRange %.1f-%.1f",
                                 m_statFrames / secs, m_qpStats.Mean(),
                                 double(m_statBytes) / m_statFrames / 1024.0,
                                 double(m_statBytes) * 8.0 / secs / 1e6, m_config.bitrateKbps / 1000,
                                 double(m_statSubmitNs) / m_statFrames / 1e6,
                                 double(m_statGpuWaitNs) / m_statFrames / 1e6,
                                 m_qpStats.valid, m_qpStats.valid + m_qpStats.rejected,
-                                m_qpStats.firstBadRaw);
+                                m_qpStats.firstBadRaw, m_qpStats.min, m_qpStats.max,
+                                double(m_statBytesMin) / 1024.0, double(m_statBytesMax) / 1024.0);
                         m_statStartNs = now;
                         m_statFrames = 0;
                         m_qpStats.Reset();
                         m_statBytes = 0;
+                        m_statBytesMin = 0;
+                        m_statBytesMax = 0;
                         m_statSubmitNs = 0;
                         m_statGpuWaitNs = 0;
                     }
@@ -567,6 +573,9 @@ class NvencEncoder final : public VideoEncoder {
     uint32_t m_statFrames = 0;
     rc::QpStats m_qpStats;
     uint64_t m_statBytes = 0;
+    // Per-frame byte spread in the same 5 s window: a steady mean with a wide
+    // min..max is the signature of frame-to-frame quality pumping.
+    uint32_t m_statBytesMin = 0, m_statBytesMax = 0;
     // Where the encode time actually goes: nvEncEncodePicture (the submit) versus
     // nvEncLockBitstream (waiting for the GPU to finish). The gap is the diagnosis
     // for "the engine is at 13% but the frame took 10 ms".

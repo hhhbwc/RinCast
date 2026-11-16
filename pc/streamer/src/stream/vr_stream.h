@@ -153,6 +153,14 @@ class VrStream {
     std::atomic<uint32_t> m_flowGiven{0}, m_flowReplacedBridge{0}, m_flowReplacedQueue{0}, m_flowEncoded{0};
     std::atomic<int64_t> m_flowConvertNs{0}, m_flowEncodeNs{0}, m_flowHeldNs{0};
     int64_t m_flowSinceNs = 0;
+    // G10.1 diagnostics (observation only). halfRate lives in Run(); publish it so the
+    // once-a-second timeline can show whether frame skipping coincided with the swings.
+    std::atomic<bool> m_halfRateActive{false};
+    int64_t m_diagSinceNs = 0;          // the 1 s unified timeline
+    int64_t m_diagArrivalPrevNs = 0;    // last game frame we saw, for arrival jitter
+    uint32_t m_diagGapMin = 0, m_diagGapMax = 0;  // arrival gaps (ms) in this window
+    uint32_t m_diagLockSamples = 0;
+    int64_t m_diagLockSumNs = 0, m_diagLockMaxNs = 0;  // keyed-mutex acquire wait
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_streaming{false};
     std::atomic<bool> m_paused{false};

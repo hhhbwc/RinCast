@@ -1711,6 +1711,8 @@ static void TestQpStatisticsValidity() {
     for (uint32_t q : {10u, 20u, 30u, 40u}) all.Add(q, rc::kMaxValidQpH264Hevc);
     CHECK(all.valid == 4 && all.rejected == 0);
     CHECK(std::fabs(all.Mean() - 25.0f) < 1e-3f);
+    // G10.1: min/max expose the spread the mean hides (10..40 here).
+    CHECK(all.min == 10 && all.max == 40);
 
     // Mixed: the massive values seen on device (432586644, 2109808503) must not
     // enter the mean; first raw value is retained for diagnosis.
@@ -1722,6 +1724,8 @@ static void TestQpStatisticsValidity() {
     CHECK(mixed.valid == 2 && mixed.rejected == 2);
     CHECK(std::fabs(mixed.Mean() - 14.0f) < 1e-3f);
     CHECK(mixed.firstBadRaw == 432586644u);
+    // Garbage samples must not corrupt min/max either (valid range 12..16 only).
+    CHECK(mixed.min == 12 && mixed.max == 16);
 
     // All invalid: unknown (-1), never a normal-looking QP and never 0.
     rc::QpStats none;
@@ -1748,6 +1752,7 @@ static void TestQpStatisticsValidity() {
     // Window reset (reconnect / new 5 s window) clears everything.
     mixed.Reset();
     CHECK(mixed.valid == 0 && mixed.rejected == 0 && mixed.firstBadRaw == 0);
+    CHECK(mixed.min == 0 && mixed.max == 0);
     CHECK(mixed.Mean() < 0.0f);
 }
 

@@ -152,6 +152,19 @@ static const char* ProducerName(rcvr::ProducerKind k) {
 }
 
 void VrStream::LogFrameFlow(int64_t now) {
+    // G10.1: a once-a-second line that puts every key quantity on ONE clock. The other
+    // logs each run their own 5/10 s window with a different start, so they never line up;
+    // this one is for correlating "when it pumped, what were target/queue/half-rate doing".
+    if (!m_diagSinceNs) m_diagSinceNs = now;
+    if (now - m_diagSinceNs >= 1'000'000'000LL) {
+        m_diagSinceNs = now;
+        const VideoSenderStats s = m_sender.Stats();
+        RC_LOGI("rc diag 1s: game %.0f/s enc %.0f/s drop %.0f/s, halfRate %s, target %u kbps, wire %.1f Mbps, "
+                "queue %.0f ms, qp %.1f, %ux%u",
+                s.gameFps, s.encFps, s.droppedFps, m_halfRateActive.load(std::memory_order_relaxed) ? "ON" : "OFF",
+                m_sender.TargetBitrateKbps(), s.mbps, s.queueMs, s.qp, s.encWidth, s.encHeight);
+    }
+
     if (!m_flowSinceNs) m_flowSinceNs = now;
     if (now - m_flowSinceNs < 10'000'000'000LL) return;
     const double secs = double(now - m_flowSinceNs) / 1e9;
@@ -166,11 +179,23 @@ void VrStream::LogFrameFlow(int64_t now) {
     m_lastGameFps.store(double(given) / secs, std::memory_order_relaxed);
     m_lastEncFps.store(double(encoded) / secs, std::memory_order_relaxed);
     m_lastDroppedFps.store(double(queue) / secs, std::memory_order_relaxed);
+    // G10.3: arrival-gap and keyed-mutex wait spread, reset each 10 s window.
+    const uint32_t gapMin = m_diagGapMin, gapMax = m_diagGapMax;
+    const uint32_t lockN = m_diagLockSamples;
+    const double lockAvgMs = lockN ? double(m_diagLockSumNs) / lockN / 1e6 : 0.0;
+    const double lockMaxMs = double(m_diagLockMaxNs) / 1e6;
+    m_diagGapMin = 0;
+    m_diagGapMax = 0;
+    m_diagLockSamples = 0;
+    m_diagLockSumNs = 0;
+    m_diagLockMaxNs = 0;
     RC_LOGI("VR frames: %.0f/s from the game, %.0f/s encoded; %.0f/s replaced before conversion, %.0f/s while "
-            "the encoder was busy; conversion %.1f ms, encoding %.1f ms, held for the encoder %.1f ms",
+            "the encoder was busy; conversion %.1f ms, encoding %.1f ms, held for the encoder %.1f ms, "
+            "arrivalGap %u-%u ms, lockWait avg %.1f/max %.1f ms (%u)",
             given / secs, encoded / secs, bridge / secs, queue / secs,
             converted ? double(convertNs) / converted / 1e6 : 0.0, encoded ? double(encodeNs) / encoded / 1e6 : 0.0,
-            converted ? double(heldNs) / converted / 1e6 : 0.0);
+            converted ? double(heldNs) / converted / 1e6 : 0.0,
+            gapMin, gapMax, lockAvgMs, lockMaxMs, lockN);
 }
 
 void VrStream::WaitForEncoder(int64_t convertAvgNs) {
@@ -285,6 +310,14 @@ void VrStream::Run() {
             const uint64_t given = fs.frameIndex - lastFrameIndex;
             m_flowGiven += uint32_t(given);
             m_flowReplacedBridge += uint32_t(given - 1);
+            // G10.3: arrival gap distribution. A steady fps with a bimodal gap is
+            // hidden by the mean; min..max in the 10 s line makes it visible.
+            if (m_diagArrivalPrevNs) {
+                const uint32_t gapMs = uint32_t((now - m_diagArrivalPrevNs) / 1'000'000);
+                if (m_diagGapMin == 0 || gapMs < m_diagGapMin) m_diagGapMin = gapMs;
+                if (gapMs > m_diagGapMax) m_diagGapMax = gapMs;
+            }
+            m_diagArrivalPrevNs = now;
         }
 
         if (m_paused) {
@@ -339,7 +372,18 @@ void VrStream::Run() {
         }
         ComPtr<IDXGIKeyedMutex> mutex;
         tex->QueryInterface(IID_PPV_ARGS(&mutex));
-        if (mutex && !rcvr::AcquireKeyed(mutex.Get(), 100)) {
+        // G10.3: time the keyed-mutex acquire (observation only - timeout and the
+        // success/failure decision are untouched). A long acquire is the direct sign
+        // the driver still holds the shared texture, which used to be invisible.
+        const int64_t lockWaitStart = rc::NowNs();
+        const bool lockOk = !mutex || rcvr::AcquireKeyed(mutex.Get(), 100);
+        if (mutex) {
+            const int64_t waited = rc::NowNs() - lockWaitStart;
+            ++m_diagLockSamples;
+            m_diagLockSumNs += waited;
+            if (waited > m_diagLockMaxNs) m_diagLockMaxNs = waited;
+        }
+        if (!lockOk) {
             WarnEvery5s("VR frame dropped: the driver kept the frame locked for over 100 ms");
             InterlockedExchange(&fs.state, rcvr::kSlotFree);
             continue;
@@ -354,6 +398,8 @@ void VrStream::Run() {
         if (halfRate != halfRateBefore)
             RC_LOGI("VR half-rate %s: effective target %u kbps, bpp %.4f (%ux%u @ %.0f nominal fps)",
                     halfRate ? "ON" : "OFF", target, bitsPerPixel, encWidth, encHeight, double(m_config.fps));
+        // Publish for the 1 s timeline; this is a copy of the existing decision, not a new one.
+        m_halfRateActive.store(halfRate, std::memory_order_relaxed);
         skipNext = halfRate && !skipNext;
         if (skipNext) {
             if (mutex) mutex->ReleaseSync(0);

@@ -167,10 +167,15 @@ struct QpStats {
     uint32_t valid = 0;
     uint32_t rejected = 0;
     uint32_t firstBadRaw = 0;   // first rejected raw value, kept for diagnosis
+    // Min/max of VALID samples: the mean alone hides the swings that look like
+    // "breathing". 0 when there is no usable sample (see Mean() for unknown).
+    uint32_t min = 0, max = 0;
 
     void Add(uint32_t raw, uint32_t maxValid) {
         if (raw <= maxValid) {
             sum += raw;
+            if (valid == 0 || raw < min) min = raw;
+            if (valid == 0 || raw > max) max = raw;
             ++valid;
         } else {
             ++rejected;
@@ -179,7 +184,7 @@ struct QpStats {
     }
     // -1 = unknown when there is no usable sample (matches VideoSender's qp=-1).
     float Mean() const { return valid ? float(double(sum) / valid) : -1.0f; }
-    void Reset() { sum = 0; valid = 0; rejected = 0; firstBadRaw = 0; }
+    void Reset() { sum = 0; valid = 0; rejected = 0; firstBadRaw = 0; min = 0; max = 0; }
 };
 
 }  // namespace rc
