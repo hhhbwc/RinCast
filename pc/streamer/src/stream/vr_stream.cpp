@@ -158,7 +158,7 @@ void VrStream::LogFrameFlow(int64_t now) {
     if (!m_diagSinceNs) m_diagSinceNs = now;
     if (now - m_diagSinceNs >= 1'000'000'000LL) {
         m_diagSinceNs = now;
-        const VideoSenderStats s = m_sender.Stats();
+        const VideoSenderStats s = Stats();
         RC_LOGI("rc diag 1s: game %.0f/s enc %.0f/s drop %.0f/s, halfRate %s, target %u kbps, wire %.1f Mbps, "
                 "queue %.0f ms, qp %.1f, %ux%u",
                 s.gameFps, s.encFps, s.droppedFps, m_halfRateActive.load(std::memory_order_relaxed) ? "ON" : "OFF",
