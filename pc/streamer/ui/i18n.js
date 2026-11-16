@@ -1054,7 +1054,7 @@ const STRINGS = {
     "video.pcBitrate": "Diese PC-Bitratenbegrenzung verwenden",
     "video.pcBitrateHint": "Das Headset nutzt standardmäßig seine eigene Grenze; schalte dies ein, um die PC-Zahl zu verwenden.",
     "video.cbr": "Konstante Bitrate für Bestes Bild",
-    "video.cbrHint": "Jedes Bild nutzt das Limit; einfache Bilder füllen die Warteschlange. Aus lassen, außer du willst das. Braucht Bestes Bild."
+    "video.cbrHint": "Jedes Bild nutzt das Limit; einfache Bilder füllen die Warteschlange. Aus lassen, außer du willst das. Braucht Bestes Bild.",
     "video.image": "Bild",
     "video.codec": "Video-Codec",
     "video.codecAuto": "Automatisch",
@@ -1374,7 +1374,7 @@ const STRINGS = {
     "video.pcBitrate": "Usar el límite de bitrate de este PC",
     "video.pcBitrateHint": "El casco usa su propio límite por defecto; actívalo para usar el número del PC.",
     "video.cbr": "Bitrate constante para Mejor imagen",
-    "video.cbrHint": "Cada fotograma gasta el límite; las imágenes sencillas llenan la cola. Déjalo apagado salvo que quieras eso. Necesita Mejor imagen."
+    "video.cbrHint": "Cada fotograma gasta el límite; las imágenes sencillas llenan la cola. Déjalo apagado salvo que quieras eso. Necesita Mejor imagen.",
     "video.image": "Imagen",
     "video.codec": "Códec de vídeo",
     "video.codecAuto": "Automático",
@@ -1694,7 +1694,7 @@ const STRINGS = {
     "video.pcBitrate": "Utiliser la limite de débit de ce PC",
     "video.pcBitrateHint": "Le casque utilise sa propre limite par défaut; activez ceci pour utiliser le chiffre du PC.",
     "video.cbr": "Débit constant pour Meilleure image",
-    "video.cbrHint": "Chaque image dépense le plafond; les images simples remplissent la file. Laissez désactivé sauf si vous voulez cela. Nécessite Meilleure image."
+    "video.cbrHint": "Chaque image dépense le plafond; les images simples remplissent la file. Laissez désactivé sauf si vous voulez cela. Nécessite Meilleure image.",
     "video.image": "Image",
     "video.codec": "Codec vidéo",
     "video.codecAuto": "Automatique",
@@ -2014,7 +2014,7 @@ const STRINGS = {
     "video.pcBitrate": "この PC のビットレート上限を使用",
     "video.pcBitrateHint": "ヘッドセットはデフォルトで自前の上限を使用;PC の数値を使うにはこれをオンに。",
     "video.cbr": "最高画質の固定ビットレート",
-    "video.cbrHint": "各フレームが上限を使い切る;単純な画像はキューを満たす。それが望みでなければオフに。最高画質が必要。"
+    "video.cbrHint": "各フレームが上限を使い切る;単純な画像はキューを満たす。それが望みでなければオフに。最高画質が必要。",
     "video.image": "画質",
     "video.codec": "動画コーデック",
     "video.codecAuto": "自動",
