@@ -2023,7 +2023,7 @@ const STRINGS = {
     "video.foveated": "VR で中心をより鮮明に",
     "video.foveatedHint": "見る場所が鮮明。NVIDIA のみ対応。",
     "video.aq": "詳細をスマートに配分",
-    "video.aqHint": "空などの平坦な領域の色块を減らします。",
+    "video.aqHint": "空などの平坦な領域のブロックノイズを減らします。",
     "video.twoPass": "VR で 2 パスエンコード",
     "video.twoPassHint": "動きに強いですが、少し遅くなります。",
     "video.res": "デスクトップ解像度",
