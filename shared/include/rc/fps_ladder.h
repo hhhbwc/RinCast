@@ -145,4 +145,41 @@ bool ApplyEncoderRateTransaction(EncoderRateState& state, const EncoderRatePlan&
     return true;
 }
 
+// QP telemetry validity. NVENC reports frameAvgQP as uint32_t. A real quantiser
+// lives in a small codec-specific domain; a garbage value (adjacent-field leak,
+// sign extension, uninitialised memory) is typically hundreds of millions. We
+// do NOT guess why a value is wrong or clamp it into a plausible QP - we reject
+// samples outside the codec's domain and keep the first raw value for diagnosis.
+// This is display/telemetry only; it never feeds rate control.
+//
+// Domains are deliberately per-codec, not one shared ceiling: H.264/HEVC use
+// 0..51, AV1 uses 0..255.
+constexpr uint32_t kMaxValidQpH264Hevc = 51;
+constexpr uint32_t kMaxValidQpAv1 = 255;
+
+constexpr uint32_t MaxValidQp(int codec) {
+    // rc::VideoCodec: H264=0, HEVC=1, AV1=2.
+    return codec == 2 ? kMaxValidQpAv1 : kMaxValidQpH264Hevc;
+}
+
+struct QpStats {
+    uint64_t sum = 0;           // sum of VALID samples only
+    uint32_t valid = 0;
+    uint32_t rejected = 0;
+    uint32_t firstBadRaw = 0;   // first rejected raw value, kept for diagnosis
+
+    void Add(uint32_t raw, uint32_t maxValid) {
+        if (raw <= maxValid) {
+            sum += raw;
+            ++valid;
+        } else {
+            ++rejected;
+            if (rejected == 1) firstBadRaw = raw;
+        }
+    }
+    // -1 = unknown when there is no usable sample (matches VideoSender's qp=-1).
+    float Mean() const { return valid ? float(double(sum) / valid) : -1.0f; }
+    void Reset() { sum = 0; valid = 0; rejected = 0; firstBadRaw = 0; }
+};
+
 }  // namespace rc

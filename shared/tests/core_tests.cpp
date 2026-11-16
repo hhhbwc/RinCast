@@ -1698,7 +1698,59 @@ static void TestRateScaleForLadder() {
                 rc::ScaleRateToRealFps(100000, 72, 90.0), s, rc::ScaleRateToRealFps(100000, 24, 90.0));
 }
 
-// D-034：码率计划冻结在标称（frameRateNum 不再跟随实时 fps 降档），仍验证事务门控。
+// G9.1: QP telemetry must stay trustworthy when NVENC emits a garbage sample.
+// qp is display/telemetry only; this tests the consumption logic, not the driver.
+static void TestQpStatisticsValidity() {
+    // Per-codec domains (not one shared ceiling).
+    CHECK(rc::MaxValidQp(0) == rc::kMaxValidQpH264Hevc);  // H264
+    CHECK(rc::MaxValidQp(1) == rc::kMaxValidQpH264Hevc);  // HEVC
+    CHECK(rc::MaxValidQp(2) == rc::kMaxValidQpAv1);       // AV1
+
+    // All valid: mean is exact, nothing rejected.
+    rc::QpStats all;
+    for (uint32_t q : {10u, 20u, 30u, 40u}) all.Add(q, rc::kMaxValidQpH264Hevc);
+    CHECK(all.valid == 4 && all.rejected == 0);
+    CHECK(std::fabs(all.Mean() - 25.0f) < 1e-3f);
+
+    // Mixed: the massive values seen on device (432586644, 2109808503) must not
+    // enter the mean; first raw value is retained for diagnosis.
+    rc::QpStats mixed;
+    mixed.Add(12, rc::kMaxValidQpH264Hevc);
+    mixed.Add(432586644u, rc::kMaxValidQpH264Hevc);
+    mixed.Add(2109808503u, rc::kMaxValidQpH264Hevc);
+    mixed.Add(16, rc::kMaxValidQpH264Hevc);
+    CHECK(mixed.valid == 2 && mixed.rejected == 2);
+    CHECK(std::fabs(mixed.Mean() - 14.0f) < 1e-3f);
+    CHECK(mixed.firstBadRaw == 432586644u);
+
+    // All invalid: unknown (-1), never a normal-looking QP and never 0.
+    rc::QpStats none;
+    none.Add(2109808503u, rc::kMaxValidQpH264Hevc);
+    none.Add(1201802785u, rc::kMaxValidQpH264Hevc);
+    CHECK(none.valid == 0 && none.rejected == 2);
+    CHECK(none.Mean() < 0.0f);
+
+    // Zero samples: unknown.
+    rc::QpStats empty;
+    CHECK(empty.Mean() < 0.0f);
+
+    // Boundary values are inclusive; just-over is rejected. AV1 allows 255.
+    rc::QpStats edge;
+    edge.Add(rc::kMaxValidQpH264Hevc, rc::kMaxValidQpH264Hevc);      // 51 valid
+    edge.Add(rc::kMaxValidQpH264Hevc + 1, rc::kMaxValidQpH264Hevc);  // 52 rejected
+    CHECK(edge.valid == 1 && edge.rejected == 1);
+    CHECK(std::fabs(edge.Mean() - float(rc::kMaxValidQpH264Hevc)) < 1e-3f);
+    rc::QpStats av1;
+    av1.Add(rc::kMaxValidQpAv1, rc::kMaxValidQpAv1);      // 255 valid for AV1
+    av1.Add(rc::kMaxValidQpAv1 + 1, rc::kMaxValidQpAv1);  // 256 rejected
+    CHECK(av1.valid == 1 && av1.rejected == 1);
+
+    // Window reset (reconnect / new 5 s window) clears everything.
+    mixed.Reset();
+    CHECK(mixed.valid == 0 && mixed.rejected == 0 && mixed.firstBadRaw == 0);
+    CHECK(mixed.Mean() < 0.0f);
+}
+
 static void TestEncoderRateTransaction() {
     constexpr int64_t second = 1'000'000'000LL;
     rc::EncoderRateTracker tracker;
@@ -1896,6 +1948,7 @@ int main() {
     TestPacingBurstShaping();
     TestWireCeilingBudget();
     TestRateScaleForLadder();
+    TestQpStatisticsValidity();
     TestEncoderRateTransaction();
     TestStreamProfile();
     TestProfileFoveaGradient();

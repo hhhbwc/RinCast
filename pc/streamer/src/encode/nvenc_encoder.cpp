@@ -84,7 +84,8 @@ class NvencEncoder final : public VideoEncoder {
 
     const char* Name() const override { return "NVENC"; }
     // The rolling 5 s window the ENC 5s line already summarises - read, never reset here.
-    float AverageQp() const override { return m_statFrames ? float(m_statQpSum) / m_statFrames : -1.0f; }
+    // Invalid NVENC samples never enter this mean; no valid sample => -1 (unknown).
+    float AverageQp() const override { return m_qpStats.Mean(); }
 
     bool Init(ID3D11Device* device, const EncoderConfig& config) override {
         m_config = config;
@@ -345,20 +346,26 @@ class NvencEncoder final : public VideoEncoder {
                     const int64_t now = rc::NowNs();
                     if (!m_statStartNs) m_statStartNs = now;
                     m_statFrames++;
-                    m_statQpSum += lock.frameAvgQP;
+                    m_qpStats.Add(lock.frameAvgQP, rc::MaxValidQp(int(m_config.codec)));
                     m_statBytes += lock.bitstreamSizeInBytes;
                     const int64_t elapsed = now - m_statStartNs;
                     if (elapsed >= 5 * 1000 * 1000 * 1000LL) {
                         const double secs = double(elapsed) / 1e9;
-                        RC_LOGI("ENC 5s: %.0f fps, qp %.1f, %.1f KB/frame, %.1f Mbps (ceiling %u), submit %.1f ms, gpu wait %.1f ms",
-                                m_statFrames / secs, double(m_statQpSum) / m_statFrames,
+                        // qp is the mean of VALID samples only (-1.0 = no valid sample),
+                        // so a garbage NVENC field can no longer drag it into the billions.
+                        // The trailing fields are additive: log parsers key on the leading
+                        // fixed-width part; diagnostics get the raw rejected value.
+                        RC_LOGI("ENC 5s: %.0f fps, qp %.1f, %.1f KB/frame, %.1f Mbps (ceiling %u), submit %.1f ms, gpu wait %.1f ms, qpValid %u/%u, qpFirstBad %u",
+                                m_statFrames / secs, m_qpStats.Mean(),
                                 double(m_statBytes) / m_statFrames / 1024.0,
                                 double(m_statBytes) * 8.0 / secs / 1e6, m_config.bitrateKbps / 1000,
                                 double(m_statSubmitNs) / m_statFrames / 1e6,
-                                double(m_statGpuWaitNs) / m_statFrames / 1e6);
+                                double(m_statGpuWaitNs) / m_statFrames / 1e6,
+                                m_qpStats.valid, m_qpStats.valid + m_qpStats.rejected,
+                                m_qpStats.firstBadRaw);
                         m_statStartNs = now;
                         m_statFrames = 0;
-                        m_statQpSum = 0;
+                        m_qpStats.Reset();
                         m_statBytes = 0;
                         m_statSubmitNs = 0;
                         m_statGpuWaitNs = 0;
@@ -558,7 +565,7 @@ class NvencEncoder final : public VideoEncoder {
     // it spend the ceiling" stops being a guess. Encoding thread only - no locks.
     int64_t m_statStartNs = 0;
     uint32_t m_statFrames = 0;
-    uint64_t m_statQpSum = 0;
+    rc::QpStats m_qpStats;
     uint64_t m_statBytes = 0;
     // Where the encode time actually goes: nvEncEncodePicture (the submit) versus
     // nvEncLockBitstream (waiting for the GPU to finish). The gap is the diagnosis
