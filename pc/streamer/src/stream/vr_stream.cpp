@@ -348,8 +348,12 @@ void VrStream::Run() {
         // them: the headset keeps reprojecting the last frame to the current head pose.
         const uint32_t target = m_sender.TargetBitrateKbps();
         const double bitsPerPixel = target * 1000.0 / (double(encWidth) * encHeight * m_config.fps);
+        const bool halfRateBefore = halfRate;
         if (bitsPerPixel < kHalfRateBelowBpp) halfRate = true;
         else if (bitsPerPixel > kFullRateAboveBpp) halfRate = false;
+        if (halfRate != halfRateBefore)
+            RC_LOGI("VR half-rate %s: effective target %u kbps, bpp %.4f (%ux%u @ %.0f nominal fps)",
+                    halfRate ? "ON" : "OFF", target, bitsPerPixel, encWidth, encHeight, double(m_config.fps));
         skipNext = halfRate && !skipNext;
         if (skipNext) {
             if (mutex) mutex->ReleaseSync(0);
