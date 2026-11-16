@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 
 #include "../app.h"
@@ -53,7 +54,11 @@ ClientSession::ClientSession(std::unique_ptr<rc::Connection> connection, const H
     m_connection->SetControlHandler([this](const std::string& text) { OnControl(text); });
     m_connection->SetPacketHandler(
         [this](rc::PacketType type, const uint8_t* p, size_t n) { OnPacket(type, p, n); });
-    if (hello.raw.contains("display") || hello.raw.contains("decoders")) ApplyClientInfo(hello.raw);
+    if (hello.raw.contains("display") || hello.raw.contains("decoders")) {
+        json initialInfo = hello.raw;
+        initialInfo.erase("_pcRevisions");
+        ApplyClientInfo(initialInfo);
+    }
     m_inputAllowed = SettingsStore::Get().Snapshot().desktopInput;
 }
 
@@ -119,10 +124,7 @@ void ClientSession::Tick(int64_t nowNs) {
     static thread_local int64_t lastStats = 0;
     if (nowNs - lastStats > 1'000'000'000LL) {
         lastStats = nowNs;
-        // Periodic work runs on the worker thread.
-        std::lock_guard lock(m_queueMutex);
-        m_queue.push_back(json{{"type", "_tick"}});
-        m_queueCv.notify_one();
+        Enqueue(json{{"type", "_tick"}});
     }
 }
 
@@ -142,17 +144,14 @@ ClientStreamSettings ClientSession::StreamSettings() {
 }
 
 json ClientSession::SyncedSettingsForUi() {
+    std::lock_guard lock(m_mutex);
     const Settings s = SettingsStore::Get().Snapshot();
-    // What the PC still owns -> its saved value; what the headset took back ->
-    // this session's live value. Read-only: a headset's temporary pick must never
-    // become a permanent PC setting.
-    json out = json::object();
+    json out = s.ToJson(true);
     out[rc::synced::kCodec] = s.codec;
     out[rc::synced::kTenBit] = s.tenBit;
     out[rc::synced::kAdaptiveBitrate] = s.adaptiveBitrate;
     out[rc::synced::kDesktopFps] = s.desktopFps;
     out[rc::synced::kStreamProfile] = s.streamProfile;
-    std::lock_guard lock(m_mutex);
     for (const char* key : rc::synced::kAll) {
         if (m_ownedSettings.count(key)) continue;  // PC still owns it
         if (std::string(key) == rc::synced::kCodec) out[key] = m_settings.codec;
@@ -165,23 +164,17 @@ json ClientSession::SyncedSettingsForUi() {
 }
 
 bool ClientSession::AdoptHeadsetOwnedSettings() {
-    // Persist the headset's picks for keys the encoder reads from the PC copy.
-    // Without this, cfg.profile/cfg.adaptive use the PC's saved value while the UI
-    // shows the session value - a silent "shows one thing, runs another".
-    int profile = 0;
-    bool adaptive = false;
-    {
-        std::lock_guard lock(m_mutex);
-        profile = m_settings.streamProfile;
-        adaptive = m_settings.adaptiveBitrate;
-    }
+    // Ownership and persistence share the PC edit's lock, so no newer PC write is overwritten.
+    std::lock_guard lock(m_mutex);
     const Settings pc = SettingsStore::Get().Snapshot();
-    const bool profileDiff = pc.streamProfile != profile;
-    const bool adaptiveDiff = pc.adaptiveBitrate != adaptive;
+    const bool profileDiff = !m_ownedSettings.count(rc::synced::kStreamProfile) &&
+                             pc.streamProfile != m_settings.streamProfile;
+    const bool adaptiveDiff = !m_ownedSettings.count(rc::synced::kAdaptiveBitrate) &&
+                              pc.adaptiveBitrate != m_settings.adaptiveBitrate;
     if (!profileDiff && !adaptiveDiff) return false;
     SettingsStore::Get().Update([&](Settings& s) {
-        if (profileDiff) s.streamProfile = profile;
-        if (adaptiveDiff) s.adaptiveBitrate = adaptive;
+        if (profileDiff) s.streamProfile = m_settings.streamProfile;
+        if (adaptiveDiff) s.adaptiveBitrate = m_settings.adaptiveBitrate;
     });
     return true;
 }
@@ -218,8 +211,49 @@ void ClientSession::OnControl(const std::string& text) {
         input::Text(Widen(m.value("text", "")));
         return;
     }
+    if (type.empty() || type.front() == '_') return;
+    m.erase("_pcRevisions");
+    if (m.contains("settings")) {
+        std::lock_guard lock(m_mutex);
+        m["_pcRevisions"] = json::object();
+        for (const char* key : rc::synced::kAll)
+            if (m["settings"].contains(key)) m["_pcRevisions"][key] = m_pcKeyRevisions[key];
+    }
+    Enqueue(std::move(m));
+}
+
+void ClientSession::Enqueue(json message) {
     std::lock_guard lock(m_queueMutex);
-    m_queue.push_back(std::move(m));
+    if (m_closed) return;
+    const auto coalesces = [](const std::string& type) {
+        return type == rc::msg::kUpdateSettings || type == "_profile" || type == "_serverInfo" ||
+               type == "_audio" || type == "_tick" || type == "_monitors";
+    };
+    const std::string type = message.value("type", "");
+    if (coalesces(type)) {
+        for (auto it = m_queue.rbegin(); it != m_queue.rend(); ++it) {
+            const std::string queuedType = it->value("type", "");
+            if (!coalesces(queuedType)) break;
+            if (queuedType != type) continue;
+            if (type == rc::msg::kUpdateSettings) {
+                if (!(*it)["settings"].is_object() || !message.value("settings", json::object()).is_object()) break;
+                (*it)["settings"].update(message.value("settings", json::object()));
+                if (message.contains("_pcRevisions")) (*it)["_pcRevisions"].update(message["_pcRevisions"]);
+            }
+            return;
+        }
+    }
+    m_queue.push_back(std::move(message));
+    m_queueCv.notify_one();
+}
+
+void ClientSession::ScheduleVideoRestart(bool vr, bool desktop) {
+    if (!vr && !desktop) return;
+    std::lock_guard lock(m_queueMutex);
+    m_restartVr |= vr;
+    m_restartDesktop |= desktop;
+    const int64_t now = rc::NowNs();
+    m_restartDueNs = std::max(now + 200'000'000LL, m_lastSettingsRestartNs + 3'000'000'000LL);
     m_queueCv.notify_one();
 }
 
@@ -354,10 +388,25 @@ void ClientSession::WorkerLoop() {
         json m;
         {
             std::unique_lock lock(m_queueMutex);
-            m_queueCv.wait(lock, [&] { return m_closed || !m_queue.empty(); });
+            while (!m_closed && m_queue.empty()) {
+                if (!m_restartDueNs) {
+                    m_queueCv.wait(lock);
+                } else {
+                    const int64_t remaining = m_restartDueNs - rc::NowNs();
+                    if (remaining <= 0) break;
+                    m_queueCv.wait_for(lock, std::chrono::nanoseconds(remaining));
+                }
+            }
             if (m_closed) break;
-            m = std::move(m_queue.front());
-            m_queue.pop_front();
+            if (!m_queue.empty()) {
+                m = std::move(m_queue.front());
+                m_queue.pop_front();
+            } else {
+                m = {{"type", "_rebuild"}, {"vr", m_restartVr}, {"desktop", m_restartDesktop}};
+                m_restartVr = m_restartDesktop = false;
+                m_restartDueNs = 0;
+                m_lastSettingsRestartNs = rc::NowNs();
+            }
         }
         try {
             HandleMessage(m);
@@ -401,7 +450,8 @@ void ClientSession::HandleMessage(const json& m) {
     }
     if (type == "_monitors") return SendMonitors();
     if (type == "_audio") return UpdateAudio();
-    if (type == "_profile") return RestartVideoForProfile();
+    if (type == "_profile") return ScheduleVideoRestart(true, true);
+    if (type == "_rebuild") return RestartVideoForProfile(m.value("vr", false), m.value("desktop", false));
     if (type == "_serverInfo") return SendServerInfo();
     if (type == rc::msg::kClientInfo) {
         ApplyClientInfo(m);
@@ -416,14 +466,10 @@ void ClientSession::HandleMessage(const json& m) {
     }
     if (type == rc::msg::kUpdateSettings) {
         ClientStreamSettings before = StreamSettings();
-        ApplyClientInfo(json{{"settings", m.value("settings", json::object())}});
+        ApplyClientInfo(m);
         ClientStreamSettings after = StreamSettings();
-        // 一体机端的档位与自动码率选择 → PC 落盘采纳（编码器从 PC 副本读取）。
-        // 必须在下面所有重建之前做，否则 RestartVr/RestartVideoForProfile 读到的
-        // 还是 PC 旧值，「最后一次改动生效」就落空。
-        const int pcProfileBefore = SettingsStore::Get().Snapshot().streamProfile;
         AdoptHeadsetOwnedSettings();
-        const int pcProfileAfter = SettingsStore::Get().Snapshot().streamProfile;
+        const bool profileChanged = before.streamProfile != after.streamProfile;
         const bool videoChanged = before.codec != after.codec || before.tenBit != after.tenBit ||
                                   before.vrQuality != after.vrQuality || before.vrScale != after.vrScale ||
                                   before.matchSteamVr != after.matchSteamVr || before.gazeFoveation != after.gazeFoveation ||
@@ -431,30 +477,17 @@ void ClientSession::HandleMessage(const json& m) {
                                   before.frameGeneration != after.frameGeneration || before.refreshRate != after.refreshRate ||
                                   before.vrBitrateMbps != after.vrBitrateMbps ||
                                   before.adaptiveBitrate != after.adaptiveBitrate;
-        if (videoChanged) RestartVr();
-        if (before.codec != after.codec || before.tenBit != after.tenBit || before.desktopFps != after.desktopFps ||
-            before.desktopBitrateMbps != after.desktopBitrateMbps) {
-            json monitors = json::array();
-            {
-                std::lock_guard lock(m_mutex);
-                for (auto& [id, d] : m_desktop) monitors.push_back(d->Monitor().id);
-            }
-            if (!monitors.empty()) {
-                StopDesktop();
-                StartDesktop(json{{"monitors", monitors}});
-            }
-        }
-        if (before.streamAudio != after.streamAudio || before.micPassthrough != after.micPassthrough) UpdateAudio();
-        if (pcProfileAfter != pcProfileBefore) {
-            RestartVideoForProfile();
-            App::Get().PushUi(App::Get().StateJson());
-        }
-        // The other synced keys (codec, 10-bit, adaptive bitrate, desktop fps) live
-        // only in the session. Refresh the PC page so it shows what actually took
-        // effect, without writing a headset's pick into the PC's saved settings.
+        const bool desktopChanged = before.codec != after.codec || before.tenBit != after.tenBit ||
+                                    before.desktopFps != after.desktopFps ||
+                                    before.desktopBitrateMbps != after.desktopBitrateMbps ||
+                                    before.adaptiveBitrate != after.adaptiveBitrate;
+        // A profile change and its video changes share one restart per stream.
+        ScheduleVideoRestart(videoChanged || profileChanged, desktopChanged || profileChanged);
+        if (before.streamAudio != after.streamAudio || before.micPassthrough != after.micPassthrough)
+            Enqueue(json{{"type", "_audio"}});
         const bool syncedChanged = before.codec != after.codec || before.tenBit != after.tenBit ||
                                    before.adaptiveBitrate != after.adaptiveBitrate ||
-                                   before.desktopFps != after.desktopFps;
+                                   before.desktopFps != after.desktopFps || profileChanged;
         if (syncedChanged) App::Get().PushUi(App::Get().StateJson());
         return;
     }
@@ -548,7 +581,11 @@ void ClientSession::ApplyClientInfo(const json& m) {
         m_caps.maxDecodeHeight = d.value("maxHeight", 4096u);
     }
     if (m.contains("settings")) {
-        const auto& s = m["settings"];
+        auto s = m["settings"];
+        const auto revisions = m.value("_pcRevisions", json::object());
+        // A headset snapshot queued before a PC edit must not undo that edit later.
+        for (const char* key : rc::synced::kAll)
+            if (revisions.value(key, uint64_t(0)) < m_pcKeyRevisions[key]) s.erase(key);
         m_settings.codec = s.value("codec", m_settings.codec);
         m_settings.tenBit = s.value("tenBit", m_settings.tenBit);
         m_settings.vrQuality = s.value("vrQuality", m_settings.vrQuality);
@@ -681,19 +718,22 @@ json ClientSession::OwnedSettingsJson() {
     return out;
 }
 
-// The PC changed these settings: it owns them now and pushes them to the headset, so
-// the headset shows the same choice. The headset takes a key back by changing it there.
-void ClientSession::OwnSyncedSettings(const json& changed) {
-    const Settings s = SettingsStore::Get().Snapshot();
-    json values = json::object();
-    values[rc::synced::kCodec] = s.codec;
-    values[rc::synced::kTenBit] = s.tenBit;
-    values[rc::synced::kAdaptiveBitrate] = s.adaptiveBitrate;
-    values[rc::synced::kDesktopFps] = s.desktopFps;
-    values[rc::synced::kStreamProfile] = s.streamProfile;
+void ClientSession::OwnSyncedSettings(const json& changed, const std::function<void()>& save) {
     std::lock_guard lock(m_mutex);
-    for (const char* key : rc::synced::kAll)
-        if (changed.contains(key)) m_ownedSettings[key] = values[key];
+    save();
+    const Settings s = SettingsStore::Get().Snapshot();
+    const json values = s.ToJson(true);
+    ++m_pcRevision;
+    for (const char* key : rc::synced::kAll) {
+        if (!changed.contains(key)) continue;
+        m_ownedSettings[key] = values[key];
+        m_pcKeyRevisions[key] = m_pcRevision;
+    }
+    if (changed.contains(rc::synced::kCodec)) m_settings.codec = s.codec;
+    if (changed.contains(rc::synced::kTenBit)) m_settings.tenBit = s.tenBit;
+    if (changed.contains(rc::synced::kAdaptiveBitrate)) m_settings.adaptiveBitrate = s.adaptiveBitrate;
+    if (changed.contains(rc::synced::kDesktopFps)) m_settings.desktopFps = s.desktopFps;
+    if (changed.contains(rc::synced::kStreamProfile)) m_settings.streamProfile = s.streamProfile;
 }
 
 void ClientSession::SendMonitors() {
@@ -715,46 +755,39 @@ void ClientSession::SendMonitors() {
 }
 
 void ClientSession::OnMonitorsChanged() {
-    std::lock_guard lock(m_queueMutex);
-    m_queue.push_back(json{{"type", "_monitors"}});
-    m_queueCv.notify_one();
+    Enqueue(json{{"type", "_monitors"}});
 }
 
-void ClientSession::OnSettingsChanged() {
-    ApplyInputSetting(true);
-    std::lock_guard lock(m_queueMutex);
-    m_queue.push_back(json{{"type", rc::msg::kUpdateSettings}, {"settings", json::object()}});
-    m_queue.push_back(json{{"type", "_audio"}});
-    m_queue.push_back(json{{"type", "_serverInfo"}});  // 把可同步设置推到一体机端
-    m_queueCv.notify_one();
+void ClientSession::OnSettingsChanged(const json& changed) {
+    if (changed.contains("desktopInput")) ApplyInputSetting(true);
+    if (changed.contains("streamAudio") || changed.contains("micPassthrough") ||
+        changed.contains("audioDevices") || changed.contains("playOnPcToo") || changed.contains("switchDefaultAudio"))
+        Enqueue(json{{"type", "_audio"}});
+    Enqueue(json{{"type", "_serverInfo"}});
 }
 
 void ClientSession::OnStreamProfileChanged() {
-    // Queued rather than restarting here: this comes from the WebView thread, while
-    // the streams are owned by the session worker (same path as kUpdateSettings).
-    std::lock_guard lock(m_queueMutex);
-    m_queue.push_back(json{{"type", "_profile"}});
-    m_queueCv.notify_one();
+    Enqueue(json{{"type", "_profile"}});
 }
 
-void ClientSession::RestartVideoForProfile() {
-    // The QP floor, VBV size and the guard's queue budget are chosen at stream start.
-    // Rebuild only streams that are actually running, so switching a profile while
-    // idle doesn't start VR behind the user's back.
-    if (m_vr) RestartVr();
+void ClientSession::RestartVideoForProfile(bool vr, bool desktop) {
+    const bool hadVr = vr && bool(m_vr);
+    if (hadVr) RestartVr();
     json monitors = json::array();
-    {
+    if (desktop) {
         std::lock_guard lock(m_mutex);
         for (auto& [id, d] : m_desktop) monitors.push_back(d->Monitor().id);
     }
-    if (!monitors.empty()) {
-        StopDesktop();
-        StartDesktop(json{{"monitors", monitors}});
-    }
-    RC_LOGI("Stream profile changed: rebuilt %s%s", m_vr ? "VR" : "", monitors.empty() ? "" : " and desktop streams");
+    if (!monitors.empty()) StartDesktop(json{{"monitors", monitors}});
+    RC_LOGI("Settings batch: rebuilt vr=%d desktop=%zu", int(hadVr), monitors.size());
 }
 
 void ClientSession::StartDesktop(const json& m) {
+    {
+        std::lock_guard lock(m_queueMutex);
+        m_restartDesktop = false;
+        if (!m_restartVr) m_restartDueNs = 0;
+    }
     StopDesktop();
     const Settings pc = SettingsStore::Get().Snapshot();
     std::vector<MonitorInfo> monitors = EnumerateMonitors();
@@ -847,6 +880,11 @@ void ClientSession::StartVr() {
     if (m_vr) {
         m_vr->SetPaused(false);
         return;
+    }
+    {
+        std::lock_guard lock(m_queueMutex);
+        m_restartVr = false;
+        if (!m_restartDesktop) m_restartDueNs = 0;
     }
     const Settings pc = SettingsStore::Get().Snapshot();
     ClientCaps caps;

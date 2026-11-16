@@ -195,11 +195,13 @@ void App::OnVrStateChanged(const std::string& state, const std::string& producer
 }
 
 json App::SettingsForUi() {
-    json out = SettingsStore::Get().Snapshot().ToJson(true);
-    // What the PC still owns -> its saved value; what the headset took back ->
-    // the live session value. Read-only: never writes a headset pick to disk.
-    if (auto session = m_server.ActiveSession())
-        for (auto& [key, value] : session->SyncedSettingsForUi().items()) out[key] = value;
+    static std::mutex snapshotMutex;
+    static uint64_t revision = 0;
+    std::lock_guard lock(snapshotMutex);
+    auto session = m_server.ActiveSession();
+    json out = session ? session->SyncedSettingsForUi() : SettingsStore::Get().Snapshot().ToJson(true);
+    // WebView snapshots can finish delivery out of order; this number never goes on the headset wire.
+    out["_revision"] = ++revision;
     return out;
 }
 
@@ -311,9 +313,7 @@ std::string App::ApplySettingSideEffects(const json& changed) {
     }
     if (changed.contains("pcName") || changed.contains("allowRemote") || changed.contains("cloudUrl")) m_cloud.Wake();
     if (auto session = m_server.ActiveSession()) {
-        session->OnSettingsChanged();
-        // PC 改了可同步项 → 推给一体机端，两边显示同一个选择（一体机改了会把所有权拿回去）。
-        session->OwnSyncedSettings(changed);
+        session->OnSettingsChanged(changed);
         // PC 视频参数在建流时读取；复用 session worker，只重建已有流。
         // 同一批设置只排入一次重建，避免 profile 与其他视频键重复触发。
         if (changed.contains("streamProfile") || changed.contains("codec") || changed.contains("tenBit") ||
@@ -349,14 +349,18 @@ void App::HandleUiMessage(const std::string& text) {
         PushUi(s);
     } else if (type == "setSettings") {
         const json changes = m.value("settings", json::object());
-        SettingsStore::Get().Update([&](Settings& s) {
-            json merged = s.ToJson(false);
-            for (auto& [k, v] : changes.items()) {
-                if (k == "serverId" || k == "cloudRefreshTokenProtected" || k == "trustedDevices") continue;
-                merged[k] = v;
-            }
-            s.FromJson(merged);
-        });
+        auto save = [&] {
+            SettingsStore::Get().Update([&](Settings& s) {
+                json merged = s.ToJson(false);
+                for (auto& [k, v] : changes.items()) {
+                    if (k == "serverId" || k == "cloudRefreshTokenProtected" || k == "trustedDevices") continue;
+                    merged[k] = v;
+                }
+                s.FromJson(merged);
+            });
+        };
+        if (auto session = m_server.ActiveSession()) session->OwnSyncedSettings(changes, save);
+        else save();
         const std::string error = ApplySettingSideEffects(changes);
         // Same overlay as StateJson: headset-owned keys must not snap back to the
         // PC's saved values just because the user toggled an unrelated setting.

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -82,10 +83,8 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     // Called by the VR stream when the producer state changes.
     void NotifyVrState(const std::string& state, const std::string& producer, const std::string& app,
                        const std::string& error = {});
-    void OnSettingsChanged();  // PC-side settings changed in the UI
-    // Settings the PC changed and the headset has not overridden since: the PC pushes
-    // these so the headset shows them too. The headset's own change takes a key back.
-    void OwnSyncedSettings(const json& changed);
+    void OnSettingsChanged(const json& changed);
+    void OwnSyncedSettings(const json& changed, const std::function<void()>& save);
     // The three-way preference is baked into the encoder and the queue guard when a
     // stream starts, so switching it has to rebuild the live streams to take effect.
     void OnStreamProfileChanged();
@@ -103,6 +102,8 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     void OnPacket(rc::PacketType type, const uint8_t* payload, size_t size);
     void WorkerLoop();
     void HandleMessage(const json& m);
+    void Enqueue(json message);
+    void ScheduleVideoRestart(bool vr, bool desktop);
 
     void SendServerInfo();
     void SendMonitors();
@@ -111,7 +112,7 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     void StartVr();
     void StopVr();
     void RestartVr();
-    void RestartVideoForProfile();
+    void RestartVideoForProfile(bool vr, bool desktop);
     void LaunchSteamVr();
     void UpdateAudio();
     void ApplyClientInfo(const json& m);
@@ -145,6 +146,8 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     std::mutex m_queueMutex;
     std::condition_variable m_queueCv;
     std::deque<json> m_queue;
+    bool m_restartVr = false, m_restartDesktop = false;
+    int64_t m_restartDueNs = 0, m_lastSettingsRestartNs = 0;
 
     std::mutex m_mutex;  // protects everything below
     ClientCaps m_caps;
@@ -152,6 +155,8 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     // The synced settings the PC currently owns (key -> the value it pushed). The
     // headset takes a key back by sending a different value for it.
     std::map<std::string, json> m_ownedSettings;
+    uint64_t m_pcRevision = 0;
+    std::map<std::string, uint64_t> m_pcKeyRevisions;
     std::vector<MonitorInfo> m_monitors;
     std::map<uint8_t, std::unique_ptr<DesktopStream>> m_desktop;  // by stream id
     std::unique_ptr<VrStream> m_vr;

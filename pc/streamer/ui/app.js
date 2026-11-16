@@ -22,10 +22,12 @@ function send(msg) {
   else mock(msg);
 }
 // Resolves with the reply, or with { ok: false } if the app doesn't answer in time.
-function request(msg, timeoutMs = 30000) {
+function request(msg, timeoutMs = 30000, onTimeout) {
   const requestId = String(nextId++);
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
+      // A timeout does not cancel native work: keep a settings key in flight until its reply.
+      if (onTimeout) { onTimeout(); return; }
       pending.delete(requestId);
       resolve({ ok: false, error: t("err.noResponse") });
     }, timeoutMs);
@@ -45,7 +47,22 @@ if (native) native.addEventListener("message", (e) => receive(typeof e.data === 
 
 // ---------------------------------------------------------------- state and notices
 let state = null;
+let confirmedSettings = null;
+let settingsRevision = -1;
+const settingIntents = new Map();
 const history = [];
+
+function acceptSettings(settings) {
+  if (settings._revision < settingsRevision) return false;
+  settingsRevision = settings._revision;
+  confirmedSettings = settings;
+  return true;
+}
+function overlaySettings() {
+  if (!state) return;
+  state.settings = { ...confirmedSettings };
+  for (const [key, intent] of settingIntents) state.settings[key] = intent.value;
+}
 
 function toast(text) {
   const el = $("#toast");
@@ -80,12 +97,15 @@ function confirmAction(title, text, action, danger = true) {
 listeners.push((msg) => {
   switch (msg.type) {
     case "state":
+      if (!acceptSettings(msg.settings)) break;
       state = msg;
+      overlaySettings();
       renderAll();
       break;
     case "stats":
       if (state) state.session = msg.session;
       if (msg.session) countPoor(msg.session);
+      if (state) renderDependents();
       renderHome();
       renderStatus();
       break;
@@ -182,16 +202,31 @@ function commitSetting(el) {
     return;
   }
   settingError(el, "");
-  request({ type: "setSettings", settings: { [key]: value } }).then((r) => {
-    if (r.ok === false || !r.settings) {
-      settingError(el, r.error || t("err.save"));
-      if (state) bindSettings();  // back to what actually applies
-      return;
-    }
-    if (state) state.settings = r.settings;
-    // A getState reply can land while a save is in flight and re-bind the controls
-    // to the older snapshot. Re-bind to the settings the app just confirmed, so the
-    // selected radio is always the value that actually applies.
+  const intent = settingIntents.get(key);
+  if (intent) {
+    intent.value = value;
+    intent.el = el;
+    intent.generation++;
+  } else {
+    settingIntents.set(key, { value, el, generation: 0 });
+    submitSetting(key);
+  }
+  overlaySettings();
+  if (state) renderDependents();
+}
+function submitSetting(key) {
+  const intent = settingIntents.get(key);
+  const sent = intent.value;
+  const generation = intent.generation;
+  request({ type: "setSettings", settings: { [key]: sent } }, 30000,
+    () => settingError(intent.el, t("err.noResponse"))).then((r) => {
+    if (r.settings) acceptSettings(r.settings);
+    const failed = r.ok === false || !r.settings;
+    settingError(intent.el, failed ? r.error || t("err.save") : "");
+    if (intent.value !== sent || (intent.generation !== generation && confirmedSettings[key] !== intent.value)) submitSetting(key);
+    else settingIntents.delete(key);
+    overlaySettings();
+    if (!state) return;
     bindSettings();
     renderDependents();
     renderAudio();
@@ -935,9 +970,10 @@ function mock(msg) {
     pendingApproval: demo === "approval" ? { deviceId: "x", deviceName: "Quest 3", model: "Meta Quest 3", address: "192.168.1.42" } : null,
   };
   setTimeout(() => {
-    if (msg.type === "getState") receive({ ...base, requestId: msg.requestId });
-    else if (msg.type === "setSettings") { Object.assign(base.settings, msg.settings); receive({ type: "reply", requestId: msg.requestId, ok: true, settings: base.settings }); }
-    else if (msg.requestId) receive({ type: "reply", requestId: msg.requestId, ok: true, settings: base.settings });
+    if (msg.type === "setSettings") Object.assign(base.settings, msg.settings);
+    base.settings._revision = (base.settings._revision || 0) + 1;
+    if (msg.type === "getState") receive(structuredClone({ ...base, requestId: msg.requestId }));
+    else if (msg.requestId) receive({ type: "reply", requestId: msg.requestId, ok: true, settings: structuredClone(base.settings) });
   }, 30);
   if (!mock.timer && base.session) {
     for (let i = 0; i < 40; i++) history.push(base.session.vr.mbps * (0.86 + Math.random() * 0.14));
