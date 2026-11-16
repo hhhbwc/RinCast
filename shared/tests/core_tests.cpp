@@ -1118,8 +1118,8 @@ static void TestStreamProfile() {
         CHECK(b.vbvBufferSize > 0);
         CHECK(b.vbvBufferSize >= b.averageBitrate / fps);  // the bucket still holds a frame
         // The preference is monotonic: latency-first has the highest (cheapest) QP
-        // floor, quality-first has none at all (0 = off) and tolerates the deepest
-        // queue and the biggest burst. A zero floor must not break monotonicity.
+        // floor (24), balanced sits at 16, quality-first keeps the lowest (12) and
+        // tolerates the deepest queue and the biggest burst.
         CHECK(q.minQp <= lastMinQp);   // a floor never rises across the gradient
         CHECK(b.vbvBufferSize >= lastVbv);
         CHECK(q.targetQueueMs > lastQueue);
@@ -1131,10 +1131,10 @@ static void TestStreamProfile() {
                     double(b.vbvBufferSize) / 1e6);
     }
 
-    // "Best picture" really means no QP floor: without this the quality profile is
-    // just a slightly less aggressive saving profile, which is what the user saw
-    // on a real VRChat stream (bitrate stuck well under the 140 Mbps ceiling).
-    CHECK(rc::ProfileParams(rc::StreamProfile::Quality).minQp == 0);
+    // Quality keeps a mild floor since 2026-11-17: with none, the real device
+    // swung QP 3-25 / 9-29 and the user read it as strong "breathing"; 12 cuts
+    // the near-lossless spikes while keeping the sharpness edge over Balanced 16.
+    CHECK(rc::ProfileParams(rc::StreamProfile::Quality).minQp == 12);
     // The floors are the point: with Balanced's at 20 the real device pinned the QP
     // at exactly 20.0 and 35 of a 100 Mbps ceiling; off, the same content swung
     // 4.7-25 and read as "breathing" (2026-11-17 real device). 16 is a middle guess

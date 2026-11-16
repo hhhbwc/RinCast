@@ -36,11 +36,13 @@ struct StreamProfileParams {
     // QP floor, 0 = off (rate control may spend the whole ceiling on ANY picture).
     // Higher = fewer bits on easy content = lower latency. With the ceiling at
     // 110 Mbps, QP 20 took a still menu from 49 KB/frame to 2.3 KB/frame.
-    // Quality uses 0: a picture the user paid 140 Mbps for should not be held back
-    // by a floor. Measured on a real VRChat stream the floor left frames at
-    // 150-168 KB when the per-frame budget was ~194 KB - the encoder wanted a
-    // lower QP and was not allowed to. Noisy synthetic clips hide this (their QP
-    // is naturally above any floor), which is why the offline A/B looked flat.
+    // Quality keeps a mild floor (12): measured 2026-11-17 on a real device, no
+    // floor at all swung the QP 3-25 and the user read it as strong "breathing" -
+    // they want stable sharpness, not the smallest QP number. A floor that is too
+    // high is equally bad: floor 20 pinned the QP at exactly 20.0 and left frames
+    // at 150-168 KB when the per-frame budget was ~194 KB. Noisy synthetic clips
+    // hide all of this (their QP is naturally above any floor), which is why the
+    // offline A/B looked flat.
     uint32_t minQp = 20;
     // VBV size as a percentage of ONE frame at the ceiling (150 = 1.5 frames).
     // Small VBV = smaller bursts = less queueing; large VBV lets a keyframe breathe.
@@ -59,10 +61,13 @@ constexpr StreamProfileParams ProfileParams(StreamProfile p) {
             // what makes this profile latency-first, not an undersized buffer.
             return {15.0, 6.0, 15.0, 100, 24, 150};
         case StreamProfile::Quality:
-            // No QP floor at all. "Best picture" must actually be allowed to spend
-            // the ceiling; the other two profiles keep their savings. Latency-first
-            // and balanced still bracket it on the queue side (15 / 45 / 60 ms).
-            return {60.0, 12.0, 30.0, 100, 0, 200};
+            // 2026-11-17 real device: with no floor this profile swung QP 3-25
+            // (light load) / 9-29 (pressure map) and the user read it as strong
+            // "breathing" - what they want is stable sharpness, not the lowest QP
+            // number. 12 is a mild floor: it cuts the near-lossless spikes while
+            // keeping the sharpness edge over Balanced (16). Initial guess from
+            // the measured QP distribution, pending real-device re-measure.
+            return {60.0, 12.0, 30.0, 100, 12, 200};
         case StreamProfile::Balanced:
         default:
             // Keep the guard's current, measured numbers: changing the default
