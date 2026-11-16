@@ -73,7 +73,7 @@ constexpr StreamProfileParams ProfileParams(StreamProfile p) {
             // 100 ceiling; floor off, the same content spent 100.8) - spending less
             // on simple frames is the latency profile's job now, and the queue
             // budget plus the guard stay responsible for the safety.
-            return {45.0, 12.0, 25.0, 100, 0, 150};
+            return {45.0, 12.0, 25.0, 100, 16, 150};
     }
 }
 

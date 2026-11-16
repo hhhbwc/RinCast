@@ -1136,10 +1136,12 @@ static void TestStreamProfile() {
     // on a real VRChat stream (bitrate stuck well under the 140 Mbps ceiling).
     CHECK(rc::ProfileParams(rc::StreamProfile::Quality).minQp == 0);
     // The floors are the point: with Balanced's at 20 the real device pinned the QP
-    // at exactly 20.0 and 35 of a 100 Mbps ceiling; off, the same content spent 100.8.
-    CHECK(rc::ProfileParams(rc::StreamProfile::Balanced).minQp == 0);
+    // at exactly 20.0 and 35 of a 100 Mbps ceiling; off, the same content swung
+    // 4.7-25 and read as "breathing" (2026-11-17 real device). 16 is a middle guess
+    // pending real-link re-measure (ROUND15 / TASKBOOK-ROUND15 §3.3).
+    CHECK(rc::ProfileParams(rc::StreamProfile::Balanced).minQp == 16);
     CHECK(rc::ProfileParams(rc::StreamProfile::LowLatency).minQp == 24);
-    CHECK(rc::ProfileParams(rc::StreamProfile::Balanced).minQp == 0);
+    CHECK(rc::ProfileParams(rc::StreamProfile::Balanced).minQp == 16);
 
     // A one-frame VBV cannot hold NVENC's VBR rate control. Measured 2026-11-15
     // (encode-bench --synthetic, 3488x1744 @90): LowLatency with 100 % sent
