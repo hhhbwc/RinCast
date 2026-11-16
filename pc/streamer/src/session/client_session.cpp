@@ -164,6 +164,28 @@ json ClientSession::SyncedSettingsForUi() {
     return out;
 }
 
+bool ClientSession::AdoptHeadsetOwnedSettings() {
+    // Persist the headset's picks for keys the encoder reads from the PC copy.
+    // Without this, cfg.profile/cfg.adaptive use the PC's saved value while the UI
+    // shows the session value - a silent "shows one thing, runs another".
+    int profile = 0;
+    bool adaptive = false;
+    {
+        std::lock_guard lock(m_mutex);
+        profile = m_settings.streamProfile;
+        adaptive = m_settings.adaptiveBitrate;
+    }
+    const Settings pc = SettingsStore::Get().Snapshot();
+    const bool profileDiff = pc.streamProfile != profile;
+    const bool adaptiveDiff = pc.adaptiveBitrate != adaptive;
+    if (!profileDiff && !adaptiveDiff) return false;
+    SettingsStore::Get().Update([&](Settings& s) {
+        if (profileDiff) s.streamProfile = profile;
+        if (adaptiveDiff) s.adaptiveBitrate = adaptive;
+    });
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 
 void ClientSession::OnControl(const std::string& text) {
@@ -383,6 +405,9 @@ void ClientSession::HandleMessage(const json& m) {
     if (type == "_serverInfo") return SendServerInfo();
     if (type == rc::msg::kClientInfo) {
         ApplyClientInfo(m);
+        // First connect: adopt the headset's profile/bitrate picks before StartVr
+        // builds cfg from the PC copy, so the page and the encoder agree from frame 1.
+        AdoptHeadsetOwnedSettings();
         SendServerInfo();
         SendMonitors();
         StartVr();
@@ -393,6 +418,12 @@ void ClientSession::HandleMessage(const json& m) {
         ClientStreamSettings before = StreamSettings();
         ApplyClientInfo(json{{"settings", m.value("settings", json::object())}});
         ClientStreamSettings after = StreamSettings();
+        // 一体机端的档位与自动码率选择 → PC 落盘采纳（编码器从 PC 副本读取）。
+        // 必须在下面所有重建之前做，否则 RestartVr/RestartVideoForProfile 读到的
+        // 还是 PC 旧值，「最后一次改动生效」就落空。
+        const int pcProfileBefore = SettingsStore::Get().Snapshot().streamProfile;
+        AdoptHeadsetOwnedSettings();
+        const int pcProfileAfter = SettingsStore::Get().Snapshot().streamProfile;
         const bool videoChanged = before.codec != after.codec || before.tenBit != after.tenBit ||
                                   before.vrQuality != after.vrQuality || before.vrScale != after.vrScale ||
                                   before.matchSteamVr != after.matchSteamVr || before.gazeFoveation != after.gazeFoveation ||
@@ -414,11 +445,7 @@ void ClientSession::HandleMessage(const json& m) {
             }
         }
         if (before.streamAudio != after.streamAudio || before.micPassthrough != after.micPassthrough) UpdateAudio();
-        // 一体机端选了画质档位 → PC 也用这个档位（PC 页面随之更新），并重建流让档位真的生效。
-        // 这是「最后一次改动生效」：一体机改了，PC 的这一项所有权就归它，PC 不再推回去。
-        const int pcProfile = SettingsStore::Get().Snapshot().streamProfile;
-        if (after.streamProfile != pcProfile) {
-            SettingsStore::Get().Update([&](Settings& s) { s.streamProfile = after.streamProfile; });
+        if (pcProfileAfter != pcProfileBefore) {
             RestartVideoForProfile();
             App::Get().PushUi(App::Get().StateJson());
         }
@@ -1148,6 +1175,10 @@ json ClientSession::StatusJson() {
     // The headset's geometric squeeze and the PC's QP map cannot share a frame,
     // so the page greys the QP map switch out when this is on.
     j["headsetGazeFoveation"] = m_settings.gazeFoveation;
+    // Read-only hints so the page can grey out CBR, which the encoder ignores when
+    // the headset follows SteamVR's resolution or the link is remote/slow.
+    j["matchSteamVr"] = m_settings.matchSteamVr;
+    j["slowPath"] = m_slowPath;
     j["vrState"] = m_vrState;
     j["vrProducer"] = m_vrProducer;
     j["vrApp"] = m_vrApp;

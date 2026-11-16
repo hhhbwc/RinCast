@@ -55,6 +55,10 @@ class App {
     std::function<void()> ShowWindowRequest;
 
    private:
+    // Settings as the UI should show them: saved values plus the headset-owned
+    // overrides actually in effect. Shared by StateJson and the setSettings reply
+    // so both paths show the same thing.
+    json SettingsForUi();
     std::string ApplySettingSideEffects(const json& changed);  // what went wrong, if anything
     void RunAsync(std::function<void()> fn);
 

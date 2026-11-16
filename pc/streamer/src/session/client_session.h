@@ -115,6 +115,11 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     void LaunchSteamVr();
     void UpdateAudio();
     void ApplyClientInfo(const json& m);
+    // The headset's picks for these PC-backed synced keys (profile, adaptive bitrate)
+    // win: persist them so the encoder, which reads the PC copy, runs what the UI shows.
+    // Used on both first connect (kClientInfo) and later changes (kUpdateSettings).
+    // Returns true if either value was written back.
+    bool AdoptHeadsetOwnedSettings();
     void MeasurePoseWait(int64_t receivedNs);
     json OwnedSettingsJson();
 

@@ -194,6 +194,15 @@ void App::OnVrStateChanged(const std::string& state, const std::string& producer
     PushUi({{"type", "vrState"}, {"state", state}, {"producer", producer}, {"app", app}});
 }
 
+json App::SettingsForUi() {
+    json out = SettingsStore::Get().Snapshot().ToJson(true);
+    // What the PC still owns -> its saved value; what the headset took back ->
+    // the live session value. Read-only: never writes a headset pick to disk.
+    if (auto session = m_server.ActiveSession())
+        for (auto& [key, value] : session->SyncedSettingsForUi().items()) out[key] = value;
+    return out;
+}
+
 json App::StateJson() {
     const Settings s = SettingsStore::Get().Snapshot();
     const auto drv = audio::QueryDriver(audio::DeviceSet::RinCast);
@@ -208,7 +217,7 @@ json App::StateJson() {
         {"version", Version()},
         {"downloadUrl", rc::kDownloadUrl},
         {"downloadSite", rc::kDownloadSite},
-        {"settings", s.ToJson(true)},
+        {"settings", SettingsForUi()},
         {"cloud", m_cloud.StatusJson()},
         {"system",
          {{"gpu", m_gpu.name},
@@ -233,9 +242,6 @@ json App::StateJson() {
     };
     if (auto session = m_server.ActiveSession()) {
         state["session"] = session->StatusJson();
-        // Show the synced values that are actually in effect: headset-owned keys
-        // come from the live session, not the PC's saved settings. Read-only.
-        for (auto& [key, value] : session->SyncedSettingsForUi().items()) state["settings"][key] = value;
     } else {
         state["session"] = nullptr;
     }
@@ -352,7 +358,9 @@ void App::HandleUiMessage(const std::string& text) {
             s.FromJson(merged);
         });
         const std::string error = ApplySettingSideEffects(changes);
-        reply({{"ok", error.empty()}, {"error", error}, {"settings", SettingsStore::Get().Snapshot().ToJson(true)}});
+        // Same overlay as StateJson: headset-owned keys must not snap back to the
+        // PC's saved values just because the user toggled an unrelated setting.
+        reply({{"ok", error.empty()}, {"error", error}, {"settings", SettingsForUi()}});
     } else if (type == "approve" || type == "deny") {
         const std::string id = m.value("deviceId", "");
         if (type == "approve")

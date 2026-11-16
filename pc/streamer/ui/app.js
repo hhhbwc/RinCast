@@ -487,6 +487,7 @@ function renderStages(s) {
 
 // Live numbers while connected, for the pages that don't have them already.
 function renderStatus() {
+  if (!state) return;  // push can arrive before the first getState reply
   const el = $("#status");
   const s = state.session;
   const onHome = $("#nav [aria-current]")?.dataset.page === "home";
@@ -597,7 +598,9 @@ function renderDependents() {
   setOff($("#audioSteam"), !(a.steam?.speaker || a.steam?.microphone));
   // What the connected headset chose goes first, so here it's only for show.
   const session = state.session;
-  const fromHeadset = session?.headsetBitrateMbps > 0;
+  // "Use this PC's limit" wins: the headset's number only takes over when that
+  // switch is off, matching EffectiveVrBitrate() on the server.
+  const fromHeadset = !state.settings.pcBitrateWins && session?.headsetBitrateMbps > 0;
   setOff($("#vrBitrateBar"), !!fromHeadset);
   // "actual / ceiling": the throughput the encoder really managed, next to the cap,
   // so "set 140, got 90" is visible without opening the logs. Only while a stream
@@ -650,8 +653,10 @@ function renderDependents() {
   // simply mirrors the setting and is only greyed when the encoder can't do it.
   $("#twoPassRow input").checked = !!state.settings.twoPassEncoding;
   setOff($("#twoPassRow"), !tunable);
-  // CBR only takes effect when the profile is allowed to drive video settings too.
-  setOff($("#cbrRow"), profile !== 2 || !state.settings.profileControlsVideo);
+  // CBR only takes effect when the profile drives video settings, the headset isn't
+  // following SteamVR's resolution, and the link isn't remote/slow (server-side gates).
+  const cbrBlockedByLink = !!session && (!!session.matchSteamVr || !!session.slowPath);
+  setOff($("#cbrRow"), profile !== 2 || !state.settings.profileControlsVideo || cbrBlockedByLink);
   setOff($("#playOnPcRow"), !state.settings.streamAudio);
   setOff($("#micRow"), state.settings.audioDevices === "system");
 }
@@ -719,6 +724,7 @@ async function choosePublicNetworks(on) {
 }
 
 function renderFirewall() {
+  if (!state) return;  // push can arrive before the first getState reply
   const fw = state.system.firewall || {};
   const box = $("#allowPublic");
   box.checked = !!fw.publicAllowed;
