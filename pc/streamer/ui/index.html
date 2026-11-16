@@ -81,8 +81,8 @@
           <p class="note" id="profileNote"></p>
           <label class="check spaced" id="profileVideoRow">
             <input type="checkbox" data-setting="profileControlsVideo">
-            <span data-i18n="video.profileVideo">Adjust video settings with the profile</span>
-            <small id="profileVideoHint" data-i18n="video.profileVideoHint">Each profile sets a sharper full-density centre (latency 0.6, balanced 0.7, best 0.8); never lowers your choice. Two-pass stays your own switch.</small>
+            <span data-i18n="video.profileVideo">Let profiles adjust picture quality</span>
+            <small id="profileVideoHint" data-i18n="video.profileVideoHint">Only ever sharper, never worse.</small>
           </label>
           <p class="note" id="overrideNote"></p>
         </div>
@@ -96,12 +96,12 @@
             <label><input type="radio" name="codec" data-setting="codec" value="h264"><span>H.264</span></label>
           </div>
 
-          <label class="check" id="pcBitrateRow"><input type="checkbox" data-setting="pcBitrateWins"><span data-i18n="video.pcBitrate">Use this PC's bitrate limit</span><small data-i18n="video.pcBitrateHint">The headset sends its own limit and it wins by default - it plans its buffers around that number. Turning this on makes the PC's number apply anyway.</small></label>
-          <label class="check spaced" id="tenBitRow"><input type="checkbox" data-setting="tenBit"><span data-i18n="video.tenBit">10-bit color</span><small id="tenBitHint" hidden data-i18n="video.tenBitHint">Needs HEVC or AV1</small></label>
-          <label class="check" id="aqRow"><input type="checkbox" data-setting="adaptiveQuantization"><span data-i18n="video.aq">Adaptive quantization</span><small data-i18n="video.aqHint">More bits for flat areas like skies, where blocks show first. NVIDIA and AMD</small></label>
-          <label class="check" id="foveatedRow"><input type="checkbox" data-setting="foveatedEncoding"><span data-i18n="video.foveated">Sharper center in VR</span><small id="foveatedHint" data-i18n="video.foveatedHint">Fewer bits at the lens edges. NVIDIA only; not used while the headset's own sharp-center squeeze is on.</small></label>
-          <label class="check" id="twoPassRow"><input type="checkbox" data-setting="twoPassEncoding"><span data-i18n="video.twoPass">Two-pass encoding in VR</span><small data-i18n="video.twoPassHint">Spreads bits better in fast motion, but each frame takes longer to encode. Desktop always uses it. NVIDIA and AMD</small></label>
-          <label class="check" id="cbrRow"><input type="checkbox" data-setting="qualityProfileCbr"><span data-i18n="video.cbr">Constant bitrate for Best picture</span><small data-i18n="video.cbrHint">Every frame costs exactly the limit - measured +7.5% on still pictures vs capped VBR. Simple frames then fill the queue instead of staying small; the congestion guard carries it, but leave this off unless you want the ceiling spent on every frame. Needs "Adjust video settings with the profile" and Best picture. NVIDIA and AMD</small></label>
+          <label class="check" id="pcBitrateRow"><input type="checkbox" data-setting="pcBitrateWins"><span data-i18n="video.pcBitrate">Use this PC's quality limit</span><small data-i18n="video.pcBitrateHint">Default follows the headset; on uses this PC.</small></label>
+          <label class="check spaced" id="tenBitRow"><input type="checkbox" data-setting="tenBit"><span data-i18n="video.tenBit">10-bit color</span><small id="tenBitHint" hidden data-i18n="video.tenBitHint">Needs HEVC or AV1.</small></label>
+          <label class="check" id="aqRow"><input type="checkbox" data-setting="adaptiveQuantization"><span data-i18n="video.aq">Smart detail placement</span><small data-i18n="video.aqHint">Fewer blocks in flat areas like skies.</small></label>
+          <label class="check" id="foveatedRow"><input type="checkbox" data-setting="foveatedEncoding"><span data-i18n="video.foveated">Sharper center in VR</span><small id="foveatedHint" data-i18n="video.foveatedHint">Sharp where you look, lighter at edges. NVIDIA only.</small></label>
+          <label class="check" id="twoPassRow"><input type="checkbox" data-setting="twoPassEncoding"><span data-i18n="video.twoPass">Two-pass encoding in VR</span><small data-i18n="video.twoPassHint">Steadier in motion, a little slower to encode.</small></label>
+          <label class="check" id="cbrRow"><input type="checkbox" data-setting="qualityProfileCbr"><span data-i18n="video.cbr">Best picture: use full limit every frame</span><small data-i18n="video.cbrHint">Steadier picture, but uses the full link every frame.</small></label>
         </div>
       </div>
       <div class="cols">
@@ -123,7 +123,7 @@
             <label><input type="radio" name="fecPercent" data-setting="fecPercent" value="10"><span data-i18n="video.fecStrong">Strong</span></label>
             <label><input type="radio" name="fecPercent" data-setting="fecPercent" value="20"><span data-i18n="video.fecMax">Maximum</span></label>
           </div>
-          <p class="note" id="fecNote" data-i18n="video.fecNote">Stronger repair uses more of the bitrate</p>
+          <p class="note" id="fecNote" data-i18n="video.fecNote">Stronger repair uses more of the bitrate.</p>
         </div>
       </div>
     </section>
@@ -180,9 +180,9 @@
       <h2 class="first" data-i18n="devices.allowed">Always allowed</h2>
       <ul class="devices" id="devices"></ul>
       <h2 data-i18n="devices.new">New headsets</h2>
-      <label class="check"><input type="checkbox" data-setting="requireApproval"><span data-i18n="devices.requireApproval">Ask before a new headset connects</span><small data-i18n="devices.requireApprovalHint">Without this, anyone on this network can control your PC</small></label>
+      <label class="check"><input type="checkbox" data-setting="requireApproval"><span data-i18n="devices.requireApproval">Ask before a new headset connects</span><small data-i18n="devices.requireApprovalHint">Without this, anyone on this network can control your PC.</small></label>
       <h2 data-i18n="devices.desktop">On the desktop</h2>
-      <label class="check"><input type="checkbox" data-setting="desktopInput"><span data-i18n="devices.desktopInput">Let headsets use the mouse and keyboard</span><small data-i18n="devices.desktopInputHint">Turn off to only watch your screens from the headset. VR games still get the controllers</small></label>
+      <label class="check"><input type="checkbox" data-setting="desktopInput"><span data-i18n="devices.desktopInput">Let headsets use the mouse and keyboard</span><small data-i18n="devices.desktopInputHint">Turn off to only watch your screens from the headset. VR games still get the controllers.</small></label>
     </section>
 
     <!-- Account -->
