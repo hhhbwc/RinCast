@@ -2151,6 +2151,17 @@ void App::LatchVideo(const FrameState& frame, bool late) {
                            : (m_desktopStreams.empty() ? "" : names[int(m_desktopStreams.begin()->second.codec) % 3]);
         m_stats.width = vr ? m_vrEyeWidth : (m_desktopStreams.empty() ? 0 : m_desktopStreams.begin()->second.width);
         m_stats.height = vr ? m_vrEyeHeight : (m_desktopStreams.empty() ? 0 : m_desktopStreams.begin()->second.height);
+
+        // Diagnostics only: the headset's display side on a one-second clock, so the
+        // "rc vr rx 1s" receive line and this line can be read against the PC's
+        // "rc diag 1s" at the same second. All values are computed above for the overlay.
+        if (vr) {
+            RC_LOGI("rc vr diag 1s: %d shown, %d repeated, %d late of %d displays (flow window), %d generated; "
+                    "latency %.1f ms, pipeline %.1f ms, decode %.1f ms, rtt %.1f ms, stages %s",
+                    m_flowShown, m_flowDisplays - m_flowShown, m_flowLate, m_flowDisplays, uint32_t(m_generatedFrames),
+                    m_stats.latencyMs, m_pipelineLatencyMs, m_stats.decodeMs, m_stats.rttMs,
+                    stages.empty() ? "NA" : stages.dump().c_str());
+        }
         m_client.SendControl({{"type", rc::msg::kStats},
                               {"stats", {{"fps", m_stats.fps}, {"latencyMs", m_stats.latencyMs}, {"decodeMs", m_stats.decodeMs}, {"latencyStages", stages}}}});
     }

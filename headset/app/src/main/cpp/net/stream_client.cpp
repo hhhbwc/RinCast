@@ -412,10 +412,10 @@ void StreamClient::OnPacket(rc::PacketType type, const uint8_t* payload, size_t 
 }
 
 void StreamClient::SendFeedback() {
+    const int64_t now = rc::NowNs();  // shared by the feedback window and the 1 s diagnostic log
     std::vector<rc::VideoFeedbackPayload> feedback;
     {
         std::lock_guard lock(m_streamsMutex);
-        const int64_t now = rc::NowNs();
         const int64_t windowNs = std::max<int64_t>(now - m_lastFeedbackNs, 1'000'000);
         m_lastFeedbackNs = now;
         for (auto& [id, s] : m_streams) {
@@ -437,6 +437,21 @@ void StreamClient::SendFeedback() {
             fb.networkMs = st.framesComplete ? float(st.spreadMsSum / st.framesComplete) : 0.f;
             fb.totalLatencyMs = float(s.latencyMs);
             fb.receivedKbps = uint32_t(st.bytesReceived * 8 * 1000 / uint64_t(windowNs / 1000));  // bits/ms = kbps
+
+            // Diagnostics only: fold this feedback window into the VR receive-side totals.
+            // All values come from st/fb that already exist; nothing here changes what is sent.
+            if (id == rc::kVrStreamId) {
+                m_rxDiagBytes += st.bytesReceived;
+                m_rxDiagFragRecv += st.fragmentsReceived;
+                m_rxDiagFragRecovered += st.fragmentsRecovered;
+                m_rxDiagFragLost += st.fragmentsLost;
+                m_rxDiagFramesLost += st.framesLost;
+                m_rxDiagQueueMs += std::max(0.f, fb.queueDelayMs);   // -1 = not measured; count as 0
+                m_rxDiagDecodeMs += fb.decodeMs;
+                m_rxDiagNetworkMs += fb.networkMs;
+                m_rxDiagLatencyMs += fb.totalLatencyMs;
+                ++m_rxDiagSamples;
+            }
             feedback.push_back(fb);
         }
         for (auto& [id, pending] : m_pendingKeyframe) {
@@ -450,6 +465,25 @@ void StreamClient::SendFeedback() {
             }
         }
     }
+
+    // Once per second: log the VR receive side locally, so logcat alone is a complete chain.
+    if (m_rxDiagSamples && now - m_rxDiagStartNs >= 1'000'000'000LL) {
+        const double secs = double(now - m_rxDiagStartNs) / 1e9;
+        const uint32_t n = m_rxDiagSamples;
+        const uint32_t fragTotal = m_rxDiagFragRecv + m_rxDiagFragRecovered + m_rxDiagFragLost;
+        const double lossPct = fragTotal ? double(m_rxDiagFragLost) * 100.0 / fragTotal : 0.0;
+        RC_LOGI("rc vr rx 1s: %.1f Mbps in, loss %.1f%% (%u frags lost of %u, FEC recovered %u), "
+                "%u frames lost/s, queue %.1f ms, decode %.1f ms, net spread %.1f ms, total latency %.1f ms",
+                double(m_rxDiagBytes) * 8.0 / secs / 1e6, lossPct,
+                m_rxDiagFragLost, fragTotal, m_rxDiagFragRecovered,
+                uint32_t(double(m_rxDiagFramesLost) / secs),
+                m_rxDiagQueueMs / n, m_rxDiagDecodeMs / n, m_rxDiagNetworkMs / n, m_rxDiagLatencyMs / n);
+        m_rxDiagStartNs = now;
+        m_rxDiagBytes = m_rxDiagFragRecv = m_rxDiagFragRecovered = m_rxDiagFragLost = 0;
+        m_rxDiagFramesLost = m_rxDiagSamples = 0;
+        m_rxDiagQueueMs = m_rxDiagDecodeMs = m_rxDiagNetworkMs = m_rxDiagLatencyMs = 0;
+    }
+
     std::lock_guard lock(m_mutex);
     if (!m_connection) return;
     for (const auto& fb : feedback) m_connection->Send(rc::PacketType::VideoFeedback, &fb, sizeof(fb));

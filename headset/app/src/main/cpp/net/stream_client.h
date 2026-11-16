@@ -179,6 +179,15 @@ class StreamClient {
     std::atomic<bool> m_feedbackNow{false};  // a loss: tell the PC without waiting for the next tick
     int64_t m_lastFeedbackNs = 0;  // start of the current feedback window
 
+    // Diagnostics only: one-second local log of what the VR stream actually received.
+    // Accumulated from the same feedback windows already computed for the PC, so the
+    // headset's logcat alone shows the receive side. No wire or control change.
+    int64_t m_rxDiagStartNs = 0;
+    uint64_t m_rxDiagBytes = 0;  // bytes need 64 bits for a 1 s high-rate window
+    uint32_t m_rxDiagFragRecv = 0, m_rxDiagFragLost = 0, m_rxDiagFragRecovered = 0;
+    uint32_t m_rxDiagFramesLost = 0, m_rxDiagSamples = 0;
+    double m_rxDiagQueueMs = 0, m_rxDiagDecodeMs = 0, m_rxDiagNetworkMs = 0, m_rxDiagLatencyMs = 0;
+
    public:
     // Reported by the app for the feedback packets.
     void ReportDecode(uint8_t streamId, double decodeMs, double latencyMs);
