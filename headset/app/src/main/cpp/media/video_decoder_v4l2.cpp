@@ -142,7 +142,7 @@ bool VideoDecoder::Init(rc::VideoCodec codec, int width, int height, float fps) 
     m_codec = codec;
     m_width = width;
     m_height = height;
-    m_fps = fps > 1 ? fps : 90;
+    m_fps = fps > 1 ? fps : 72;  // ROUND18 L4 fallback
     glGenTextures(1, &m_texture);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_texture);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);

@@ -89,6 +89,16 @@ DecoderCaps VideoDecoder::Capabilities() {
     const bool quest1 = !strcmp(device, "monterey");
     caps.maxWidth = quest1 ? 4096 : 8192;
     caps.maxHeight = quest1 ? 2160 : 4096;
+    // ROUND18 L3: report a frame-rate ceiling for devices where we MEASURED a
+    // decode wall (our own PICO 4: HEVC 2688x2688 topped out near 45 fps). This is
+    // a hint, not a hard cap; the PC only warns. Unknown devices stay at 0 = no
+    // report. Detection reuses the same props the XR loader uses (PHOENIX/A8110).
+    char model[PROP_VALUE_MAX] = {};
+    __system_property_get("ro.product.model", model);
+    const bool pico4 = !strcmp(model, "Phoenix") || !strcmp(model, "A8110") || !strcmp(model, "A8110 Pro") ||
+                       !strncmp(model, "PICO 4", 6);
+    if (pico4) caps.maxFpsAtMaxRes = 45;
+    RC_LOGI("Decoder caps: %dx%d, max fps at max res %d", caps.maxWidth, caps.maxHeight, caps.maxFpsAtMaxRes);
     return caps;
 }
 
@@ -97,7 +107,7 @@ bool VideoDecoder::Init(rc::VideoCodec codec, int width, int height, float fps) 
     m_codec = codec;
     m_width = width;
     m_height = height;
-    m_fps = fps > 1 ? fps : 90;
+    m_fps = fps > 1 ? fps : 72;  // ROUND18 L4 fallback
     const media_status_t st = AImageReader_newWithUsage(width, height, AIMAGE_FORMAT_PRIVATE,
                                                         AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 8, &m_reader);
     if (st != AMEDIA_OK) {
@@ -302,7 +312,11 @@ void VideoDecoder::HandOver() {
     // A picture handed over but never taken (the reader dropped it): don't wait for it forever.
     if (m_inReaderSinceNs && now - m_inReaderSinceNs > 100'000'000LL) m_inReaderSinceNs = 0;
     if (m_inReaderSinceNs || m_held.empty()) return;
-    while (m_held.size() > 2) {
+    // ROUND18 L5: the depth at which the oldest decoded pictures are dropped.
+    // Configurable; default 2 = the behaviour before this field. Dropping from the
+    // OUTPUT side (already-decoded pictures) cannot break the reference chain, so
+    // it never smears the picture - the cost is only a skipped/held frame.
+    while (m_held.size() > StaleDropThreshold()) {
         AMediaCodec_releaseOutputBuffer(m_codecHandle, m_held.front(), false);
         m_held.pop_front();
         m_skipped++;

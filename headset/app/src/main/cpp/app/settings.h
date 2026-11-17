@@ -27,7 +27,7 @@ struct HeadsetSettings {
     bool matchSteamVr = false;          // stream at the resolution SteamVR renders at instead
     bool gazeFoveation = false;         // foveated encoding: full detail only where the eyes look
     std::string vrQuality = "high";     // the preset nearest vrScale, for PCs before 1.1.0
-    float refreshRate = 90;
+    float refreshRate = 72;  // ROUND18 L4: conservative default; saved settings win on load
     std::string codec = "auto";         // auto | hevc | av1 | h264
     bool tenBit = false;
     int vrBitrateMbps = 0;              // 0 = PC default

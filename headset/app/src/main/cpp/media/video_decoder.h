@@ -30,6 +30,12 @@ namespace rv {
 struct DecoderCaps {
     bool h264 = true, hevc = true, hevc10 = false, av1 = false, av110 = false;
     int maxWidth = 4096, maxHeight = 4096;
+    // ROUND18 L3: the safe frame-rate ceiling at (or near) maxWidth x maxHeight.
+    // 0 = unknown (don't report, don't guess). Measured on our own PICO 4: HEVC at
+    // 2688x2688 could not sustain more than ~45 fps; the PC uses this as a warning
+    // only - it never changes the frame rate or render size from it (that needs a
+    // real-device A/B and the user's call).
+    int maxFpsAtMaxRes = 0;
 };
 
 struct DecodedFrameInfo {
@@ -86,6 +92,10 @@ class VideoDecoder {
     uint32_t DecodedFrames() const { return m_decoded; }
     // Decoded pictures never shown: skipped to catch up, or more waiting than a display can take.
     uint32_t SkippedFrames() const { return m_skipped; }
+    // ROUND18 L5: how many decoded pictures may wait before the oldest are dropped.
+    // Default 2 keeps today's behaviour; set large (e.g. 64) to effectively disable.
+    void SetStaleDropThreshold(uint32_t n) { m_staleDropThreshold.store(n ? n : 2, std::memory_order_relaxed); }
+    uint32_t StaleDropThreshold() const { return m_staleDropThreshold.load(std::memory_order_relaxed); }
     // Until then (rc::NowNs), Latch skips no waiting picture to catch up: whoever calls has
     // another way to let them run out, or a reason to keep one waiting.
     void HoldCatchUp(int64_t untilNs) { m_catchUpHeldUntilNs = untilNs; }
@@ -98,7 +108,7 @@ class VideoDecoder {
 
     rc::VideoCodec m_codec = rc::VideoCodec::HEVC;
     int m_width = 0, m_height = 0;
-    float m_fps = 90;
+    float m_fps = 72;  // ROUND18 L4 default (was 90)
 #ifdef __ANDROID__
     void ReleaseImage(AImage* image, EGLImageKHR egl);
     AMediaCodec* m_codecHandle = nullptr;
@@ -137,6 +147,7 @@ class VideoDecoder {
     std::atomic<bool> m_needKeyframe{false};
     std::atomic<uint32_t> m_decoded{0};
     std::atomic<uint32_t> m_skipped{0};
+    std::atomic<uint32_t> m_staleDropThreshold{2};  // ROUND18 L5; 2 = today's behaviour
     std::atomic<int64_t> m_catchUpHeldUntilNs{0};
     void Warn(const char* what);  // at most every 5 s per reason
 
