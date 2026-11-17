@@ -1308,11 +1308,11 @@ json ClientSession::StatusJson() {
                    {"qp", s.qp}, {"encWidth", s.encWidth}, {"encHeight", s.encHeight},
                    {"gameFps", s.gameFps}, {"encFps", s.encFps}, {"droppedFps", s.droppedFps}};
         // ROUND19 T3: read-only ladder level for the page (null when the switch is off).
-        {
-            std::lock_guard lock(m_mutex);
-            j["vr"]["autoscaleLevel"] =
-                SettingsStore::Get().Snapshot().l7Autoscale ? json(m_autoscale.Pct()) : json(nullptr);
-        }
+        // No lock here: StatusJson already holds m_mutex (taken at the top), and re-locking
+        // it on the same thread throws resource_deadlock_would_occur - the streamer died
+        // exactly this way on the first UI tick after a session started (ROUND20 L16).
+        j["vr"]["autoscaleLevel"] =
+            SettingsStore::Get().Snapshot().l7Autoscale ? json(m_autoscale.Pct()) : json(nullptr);
     }
     json desk = json::array();
     for (auto& [id, d] : m_desktop) {
