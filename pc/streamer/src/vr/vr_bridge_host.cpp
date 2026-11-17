@@ -41,7 +41,7 @@ bool VrBridgeHost::Start() {
             rcvr::DisplayConfig c{};
             c.eyeWidth = j.value("eyeWidth", 0u);
             c.eyeHeight = j.value("eyeHeight", 0u);
-            c.refreshRate = j.value("refreshRate", 90.f);
+            c.refreshRate = j.value("refreshRate", 72.f);  // ROUND18 L4; saved value wins
             c.ipd = j.value("ipd", 0.063f);
             const auto fov = j.value("fov", json::array());
             for (int e = 0; e < 2 && e < int(fov.size()); e++)

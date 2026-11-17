@@ -89,7 +89,7 @@ inline EncoderRatePlan PlanEncoderRate(uint32_t kbps, double nominal, bool deskt
     (void)startup;
     (void)tracker;
     (void)currentRateNum;
-    nominal = std::isfinite(nominal) && nominal >= 1.0 ? std::min(nominal, 1000.0) : 90.0;
+    nominal = std::isfinite(nominal) && nominal >= 1.0 ? std::min(nominal, 1000.0) : 72.0;  // ROUND18 L4 fallback
     const uint32_t rateNum = uint32_t(nominal * 1000.0);
     const uint32_t scaled = kbps;
     auto budget = ComputeCappedVbr(scaled, 1, averagePercent, vbvFramesPercent);

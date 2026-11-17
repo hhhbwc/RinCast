@@ -552,7 +552,7 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
     explicit Hmd(const rcvr::DisplayConfig& cfg) : m_cfg(cfg) {
         m_serial = cfg.headsetSerial[0] ? std::string("RINCAST-") + std::string(cfg.headsetSerial).substr(0, 12)
                                         : "RINCAST-HMD";
-        m_vsyncPeriodNs = int64_t(1e9 / (cfg.refreshRate > 1 ? cfg.refreshRate : 90.f));
+        m_vsyncPeriodNs = int64_t(1e9 / (cfg.refreshRate > 1 ? cfg.refreshRate : 72.f));  // ROUND18 L4 fallback
         m_vsyncEpochNs = rcvr::QpcNowNs();
     }
 
