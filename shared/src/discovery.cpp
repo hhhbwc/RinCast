@@ -25,7 +25,7 @@ std::vector<uint8_t> BuildAnnounce(const DiscoveryAnnounce& a) {
     json j{{"serverId", a.serverId},   {"name", a.name},
            {"version", a.version},     {"os", a.os},
            {"gpu", a.gpu},             {"port", a.streamPort},
-           {"accountLinked", a.accountLinked}, {"accountName", a.accountName},
+           {"accountLinked", a.accountLinked},  // ROUND20 T1 (B1): the account name no longer leaves the PC
            {"busy", a.busy},           {"nonce", a.nonce}};
     return Build(DiscoveryType::Announce, j.dump());
 }

@@ -25,7 +25,9 @@ struct DiscoveryAnnounce {
     std::string gpu;
     uint16_t streamPort = kStreamPort;
     bool accountLinked = false;
-    std::string accountName;  // shown in the headset when linked
+    std::string accountName;  // deprecated (ROUND20 T1, B1): the PC no longer sends
+    // it anywhere - the announce only carries accountLinked; the field stays so the
+    // headset's own parser keeps compiling, and old announcers still parse via j.value.
     bool busy = false;        // another headset is connected
     uint32_t nonce = 0;       // echoes the probe
 };

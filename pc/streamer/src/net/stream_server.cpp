@@ -311,8 +311,7 @@ void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAd
         {"name", settings.pcName},
         {"version", App::Get().Version()},
         {"nonce", hs.serverNonce},
-        {"accountName", settings.cloudUserName},
-        {"remote", !connectSecret.empty()},
+        {"remote", !connectSecret.empty()},  // ROUND20 T1 (B1): dead accountName key removed
     };
     if (!connectSecret.empty()) welcomeJson["proof"] = rc::WelcomeProof(connectSecret, hs.serverKeys.publicKey, hello.publicKey);
     rc::HandshakePacket welcome;
@@ -397,7 +396,8 @@ std::vector<uint8_t> StreamServer::MakeAnnounce(uint32_t nonce) {
     a.gpu = App::Get().Gpu().name;
     a.streamPort = m_socket.LocalPort();
     a.accountLinked = !s.cloudUserName.empty();
-    a.accountName = s.cloudUserName;
+    // ROUND20 T1 (B1): the account name stays on this PC - the announce only says
+    // whether an account is linked, not what it is.
     a.busy = ActiveSession() != nullptr;
     a.nonce = nonce;
     return rc::BuildAnnounce(a);
