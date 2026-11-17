@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -159,10 +160,48 @@ void VrStream::LogFrameFlow(int64_t now) {
     if (now - m_diagSinceNs >= 1'000'000'000LL) {
         m_diagSinceNs = now;
         const VideoSenderStats s = Stats();
+        // ROUND19 T1: frame-level identity + encode-time distribution for the window just
+        // ended (telemetry only; reads the counters the send path keeps above).
+        const uint32_t end = m_diagEncIdx.load(std::memory_order_relaxed);
+        const uint32_t count = std::min<uint32_t>(m_diagEncCount.exchange(0, std::memory_order_relaxed), uint32_t(kDiagRing));
+        std::vector<std::pair<uint32_t, double>> frames;  // (seq, encodeMs), window order
+        frames.reserve(count);
+        for (uint32_t i = end - count; i < end; i++)
+            frames.emplace_back(m_diagSeqRing[i % kDiagRing].load(std::memory_order_relaxed),
+                                m_diagEncUs[i % kDiagRing].load(std::memory_order_relaxed) / 1000.0);
+        const uint32_t seqMin = m_diagSeqMin.exchange(0, std::memory_order_relaxed);
+        const uint32_t seqMax = m_diagSeqMax.exchange(0, std::memory_order_relaxed);
+        std::vector<double> encSorted;
+        encSorted.reserve(frames.size());
+        for (auto& f : frames) encSorted.push_back(f.second);
+        std::sort(encSorted.begin(), encSorted.end());
+        const double p50 = encSorted.empty() ? 0.0 : encSorted[size_t((encSorted.size() - 1) * 50 / 100)];
+        const double p95 = encSorted.empty() ? 0.0 : encSorted[size_t((encSorted.size() - 1) * 95 / 100)];
+        const double periodMs = m_config.fps > 0 ? 1000.0 / m_config.fps : 0.0;
+        char seqPart[32];
+        if (seqMax) snprintf(seqPart, sizeof(seqPart), ", seq %u-%u", seqMin, seqMax);
+        else snprintf(seqPart, sizeof(seqPart), ", seq -");
         RC_LOGI("rc diag 1s: game %.0f/s enc %.0f/s drop %.0f/s, halfRate %s, target %u kbps, wire %.1f Mbps, "
-                "queue %.0f ms, qp %.1f, %ux%u",
+                "queue %.0f ms, qp %.1f, render %ux%u enc %ux%u%s, enc p50/p95 %.1f/%.1f ms",
                 s.gameFps, s.encFps, s.droppedFps, m_halfRateActive.load(std::memory_order_relaxed) ? "ON" : "OFF",
-                m_sender.TargetBitrateKbps(), s.mbps, s.queueMs, s.qp, s.encWidth, s.encHeight);
+                m_sender.TargetBitrateKbps(), s.mbps, s.queueMs, s.qp, s.srcWidth, s.srcHeight, s.encWidth, s.encHeight,
+                seqPart, p50, p95);
+        // ROUND19 T1: sparse slow-frame trace, only under pressure, at most 8 per window.
+        if ((s.droppedFps > 0.0 || (periodMs > 0 && p95 > periodMs)) && !frames.empty()) {
+            std::vector<std::pair<uint32_t, double>> worst(frames);
+            std::sort(worst.begin(), worst.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            if (worst.size() > 8) worst.resize(8);
+            std::string seqs, encs;
+            char part[48];
+            for (auto& f : worst) {
+                snprintf(part, sizeof(part), "%s%u", seqs.empty() ? "" : ",", f.first);
+                seqs += part;
+                snprintf(part, sizeof(part), "%s%.1f", encs.empty() ? "" : ",", f.second);
+                encs += part;
+            }
+            RC_LOGI("slow-frames seq=%s enc=%s ms", seqs.c_str(), encs.c_str());
+        }
     }
 
     if (!m_flowSinceNs) m_flowSinceNs = now;
@@ -350,8 +389,20 @@ void VrStream::Run() {
         if (!convertersReady || srcWidth != (desc.Width & ~1u) || srcHeight != (desc.Height & ~1u)) {
             srcWidth = desc.Width & ~1u;
             srcHeight = desc.Height & ~1u;
-            encWidth = foveated ? m_config.foveatedEyeWidth * 2 : srcWidth;
-            encHeight = foveated ? m_config.foveatedEyeHeight : srcHeight;
+            // ROUND18 L2: encWidth/Height are what the ENCODER sees; srcWidth/Height
+            // stay the render size (displayed on the headset, and logged separately).
+            // encodeScale is applied to the final encode size, after foveation, so a
+            // single rule covers both paths. NV12/P010 need even dimensions.
+            {
+                const uint32_t baseW = foveated ? m_config.foveatedEyeWidth * 2 : srcWidth;
+                const uint32_t baseH = foveated ? m_config.foveatedEyeHeight : srcHeight;
+                // ROUND18 L2-FIX2: same helper as the foveation/coded-size metadata,
+                // so what we tell the headset is byte-for-byte what the encoder sees.
+                encWidth = rc::ScaledEncodeSize(baseW, m_config.encodeScale);
+                encHeight = rc::ScaledEncodeSize(baseH, m_config.encodeScale);
+            }
+            m_statSrcW.store(srcWidth, std::memory_order_relaxed);
+            m_statSrcH.store(srcHeight, std::memory_order_relaxed);
             convertersReady = false;
             if (foveated && !foveator.Init(device, srcWidth / 2, srcHeight, encWidth / 2, encHeight, m_config.foveaSize)) {
                 WarnEvery5s("VR frame dropped: foveated encoding didn't start");
@@ -613,6 +664,7 @@ void VrStream::RunEncoder() {
         send.meta = std::move(frameMeta);
         send.flags = rc::kVideoHasPose | (m_config.tenBit ? rc::kVideoHdr10 : 0);
         send.encodeMs = rc::NsToMs(encEnd - encStart);
+        send.frameIndex = job.frameIndex;  // ROUND19 T1: pass the existing counter through
         send.recovery = recovery;
         {
             // The one before still going out (a paced send): wait, a dropped frame would break
@@ -649,6 +701,17 @@ void VrStream::RunSender() {
         }
         m_sendCv.notify_all();
         m_sender.Send(send.frame, send.meta.data(), uint16_t(send.meta.size()), send.flags, send.encodeMs, send.recovery);
+        // ROUND19 T1: feed the diag window (telemetry only; relaxed stores, the same cost
+        // class as the flow counters). The CAS makes the window's first seq its minimum.
+        {
+            uint32_t expected = 0;
+            m_diagSeqMin.compare_exchange_strong(expected, send.frameIndex, std::memory_order_relaxed);
+            m_diagSeqMax.store(send.frameIndex, std::memory_order_relaxed);
+            const uint32_t idx = uint32_t(m_diagEncIdx.fetch_add(1, std::memory_order_relaxed) % kDiagRing);
+            m_diagEncUs[idx].store(uint32_t(send.encodeMs * 1000.0 + 0.5), std::memory_order_relaxed);
+            m_diagSeqRing[idx].store(send.frameIndex, std::memory_order_relaxed);
+            m_diagEncCount.fetch_add(1, std::memory_order_relaxed);
+        }
         if (!firstSent) {
             firstSent = true;
             RC_LOGI("VR: frames are reaching the headset");

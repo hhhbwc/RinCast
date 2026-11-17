@@ -2,6 +2,7 @@
 // sends them with their render pose so the headset can reproject.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -25,7 +26,7 @@ struct VrStreamConfig {
     bool tenBit = false;
     uint32_t eyeWidth = 0;
     uint32_t eyeHeight = 0;
-    float fps = 90;
+    float fps = 72;  // ROUND18 L4 default (was 90)
     uint32_t bitrateKbps = 150000;
     int fecPercent = 5;
     bool adaptive = true;
@@ -45,6 +46,10 @@ struct VrStreamConfig {
     uint32_t foveatedEyeWidth = 0;
     uint32_t foveatedEyeHeight = 0;
     float foveaSize = 0.45f;  // the full-detail share of each eye (Foveator)
+    // ROUND18 L2: encode resolution as a fraction of the render size. 1.0 = encode
+    // exactly what the game renders. Applied to the final encode size (after any
+    // foveation squeeze); the headset always stretches the result back to the panel.
+    float encodeScale = 1.0f;
 };
 
 class VrStream {
@@ -76,6 +81,8 @@ class VrStream {
         s.qp = m_statQp.load(std::memory_order_relaxed);
         s.encWidth = m_statEncW.load(std::memory_order_relaxed);
         s.encHeight = m_statEncH.load(std::memory_order_relaxed);
+        s.srcWidth = m_statSrcW.load(std::memory_order_relaxed);
+        s.srcHeight = m_statSrcH.load(std::memory_order_relaxed);
         s.gameFps = m_lastGameFps.load(std::memory_order_relaxed);
         s.encFps = m_lastEncFps.load(std::memory_order_relaxed);
         s.droppedFps = m_lastDroppedFps.load(std::memory_order_relaxed);
@@ -112,6 +119,7 @@ class VrStream {
         uint8_t flags = 0;
         double encodeMs = 0;
         bool recovery = false;
+        uint32_t frameIndex = 0;  // ROUND19 T1: the producer's frame counter, for the diag seq field
     };
 
     void Run();
@@ -146,6 +154,7 @@ class VrStream {
     // Live encoder truth for the stats path (the encoder itself is local to RunEncoder).
     std::atomic<float> m_statQp{-1.0f};
     std::atomic<uint32_t> m_statEncW{0}, m_statEncH{0};
+    std::atomic<uint32_t> m_statSrcW{0}, m_statSrcH{0};  // render size before encodeScale (ROUND18 L2)
     std::atomic<double> m_lastGameFps{0}, m_lastEncFps{0}, m_lastDroppedFps{0};
     // Frame flow since the last report: given by the game, replaced in the bridge before
     // conversion, replaced while waiting for the encoder, encoded; conversion and encoding time,
@@ -153,6 +162,15 @@ class VrStream {
     std::atomic<uint32_t> m_flowGiven{0}, m_flowReplacedBridge{0}, m_flowReplacedQueue{0}, m_flowEncoded{0};
     std::atomic<int64_t> m_flowConvertNs{0}, m_flowEncodeNs{0}, m_flowHeldNs{0};
     int64_t m_flowSinceNs = 0;
+    // ROUND19 T1: the diag window's encode-time distribution and frame-seq range. A small
+    // lock-free ring the sender thread writes (two relaxed stores per frame, the same cost
+    // class as the flow counters above); the once-a-second diag tick reads and resets it.
+    static constexpr size_t kDiagRing = 512;
+    std::atomic<uint32_t> m_diagSeqMin{0}, m_diagSeqMax{0};   // 0 = none seen this window
+    std::atomic<uint32_t> m_diagEncIdx{0};                    // ring cursor, monotonic
+    std::atomic<uint32_t> m_diagEncCount{0};                  // entries since the last diag tick
+    std::array<std::atomic<uint32_t>, kDiagRing> m_diagEncUs{};   // encode cost, microseconds
+    std::array<std::atomic<uint32_t>, kDiagRing> m_diagSeqRing{}; // the seq of each entry
     // G10.1 diagnostics (observation only). halfRate lives in Run(); publish it so the
     // once-a-second timeline can show whether frame skipping coincided with the swings.
     std::atomic<bool> m_halfRateActive{false};
