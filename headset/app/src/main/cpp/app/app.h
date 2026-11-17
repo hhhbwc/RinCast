@@ -299,6 +299,8 @@ class App {
     uint32_t m_generatedFrames = 0, m_generatedSkipped = 0;
     int64_t m_generatedLogNs = 0;
     uint32_t m_vrFrames = 0;
+    uint32_t m_seqWindowMin = 0;  // ROUND20 T4: decoded-frame seq range for the diag line
+    uint32_t m_seqWindowMax = 0;
 
     // Tracking / latency
     double m_pipelineLatencyMs = 45;
@@ -317,6 +319,11 @@ class App {
     int64_t m_vrLatchNs = 0;
     double m_timingWakeLeadNs = 0, m_timingLatchNs = 0, m_timingSubmitNs = 0, m_timingGpuNs = 0;
     int m_timingFrames = 0, m_timingGpuFrames = 0;
+    int64_t m_submitNs = 0;           // ROUND18 L8-TELEM: when xrEndFrame returned for the frame being logged
+    double m_submitLitSumMs = 0;      // ROUND18 L8-TELEM: submit->lit per 1 s window, summed for the diag line
+    uint32_t m_submitLitFrames = 0;
+    int m_displayDeltaFile = 0;       // ROUND19 E1 probe: files/display_delta.txt, clamped to [-3, 0] frames
+    int m_displayDeltaApplied = 0;    // ROUND19 E1 probe: the delta the last EndFrame committed with (0 off-VR)
     // Where the stream's frames went in the same 5 s: displays, the ones with a new picture,
     // pictures decoded after the late latch, and the decoder's count when the window began.
     // Each controller's last tracked pose, kept for SteamVR while it sleeps (UpdateTracking).
@@ -325,6 +332,7 @@ class App {
     int m_flowDisplays = 0, m_flowShown = 0, m_flowLate = 0;
     uint32_t m_flowDecodedStart = 0;
     double m_flowDecodeMaxMs = 0;
+    uint32_t m_statsDropStale = 0, m_statsSkippedPrev = 0;  // ROUND18 L5: stale frames dropped per 1 s
     int64_t m_timingLogNs = 0;
     GLuint m_vrTimer = 0;
     bool m_vrTimerChecked = false, m_vrTimerRunning = false, m_vrTimerPending = false;

@@ -79,13 +79,16 @@ class XrContext {
     void BindEye(int eye);
     void EndFrame(const FrameState& frame, const std::vector<const XrCompositionLayerBaseHeader*>& underlays,
                   bool projectionHasAlpha, const std::vector<const XrCompositionLayerBaseHeader*>& overlays,
-                  bool eyeLayer = true);
+                  bool eyeLayer = true, int displayDeltaFrames = 0);
 
     bool CreateSwapchain(int width, int height, int64_t format, int arraySize, bool withDepth, XrSwapchainGl& out,
                          int mipCount = 1);
     void DestroySwapchain(XrSwapchainGl& sc);
     GLuint AcquireImage(XrSwapchainGl& sc);   // returns FBO
     void ReleaseImage(XrSwapchainGl& sc);
+    // ROUND18 L8-TELEM: image count of the swapchain CreateSwapchain made last (the VR stream's
+    // queue depth, when read right after its swapchain is built).
+    uint32_t SwapchainImages() const { return m_swapchainImages; }
 
     bool LocateSpace(XrSpace space, XrTime time, Pose& pose, Vec3* linVel = nullptr, Vec3* angVel = nullptr);
 
@@ -152,6 +155,7 @@ class XrContext {
     std::string m_runtimeName;
     uint32_t m_recommendedWidth = 0, m_recommendedHeight = 0;
     XrSwapchainGl m_eyes[2];
+    uint32_t m_swapchainImages = 0;  // ROUND18 L8-TELEM: image count of the swapchain created last
     std::vector<float> m_refreshRates;
     float m_requestedHz = 0;
     float m_targetHz = 0;  // the supported rate nearest m_requestedHz

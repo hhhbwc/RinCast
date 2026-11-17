@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "../platform/jni_bridge.h"
@@ -255,6 +257,8 @@ void App::ApplyPcSettings(const json& info) {
 void App::ApplyStreamSettings() {
     SaveSettings();
     m_xr.SetRefreshRate(m_settings.refreshRate);
+    // ROUND18 L8-TELEM: the rate the display actually runs at with this config (0: could not read).
+    RC_LOGI("Stream config: %.0f Hz asked, %.0f Hz on the display", m_settings.refreshRate, m_xr.RefreshRate());
     m_audio.SetVolume(m_settings.volume);
     m_mic.SetGain(m_settings.micVolume);
     // A new rate gets its own chance before the PC is told the display is elsewhere.
@@ -337,7 +341,8 @@ static json HelloJson(XrContext& xr, const Headset& headset, const json& setting
               {"fov", fov}}},
             {"decoders",
              {{"h264", dec.h264}, {"hevc", dec.hevc}, {"hevc10", dec.hevc10}, {"av1", dec.av1}, {"av110", dec.av110},
-              {"maxWidth", dec.maxWidth}, {"maxHeight", dec.maxHeight}}},
+              {"maxWidth", dec.maxWidth}, {"maxHeight", dec.maxHeight},
+              {"maxFpsAtMaxRes", dec.maxFpsAtMaxRes}}},
             {"settings", settings}};
 }
 
@@ -1097,8 +1102,19 @@ void App::ConfigureVrStream(const json& s) {
             RC_LOGI("VR stream: foveated, %dx%d per eye shown at %dx%d", fw, fh, eyeW, eyeH);
         }
     }
+    // ROUND18 L2-FIX2: a plain (un-foveated) stream is also encoded below the render
+    // size now. Prefer the PC's reported per-eye coded size so the decoder matches the
+    // real frame; an old PC omits these keys, so fall back to the render size. Gated
+    // on !m_vrFoveated so a valid foveation block above keeps sole ownership.
+    if (!m_vrFoveated) {
+        const int cw = s.value("codedWidth", 0), ch = s.value("codedHeight", 0);
+        if (cw > 0 && ch > 0 && cw <= eyeW && ch <= eyeH) {
+            codedW = cw;
+            codedH = ch;
+        }
+    }
     auto dec = std::make_unique<VideoDecoder>();
-    dec->Init(codec, codedW * 2, codedH, s.value("fps", 90.f));
+    dec->Init(codec, codedW * 2, codedH, s.value("fps", 72.f));  // ROUND18 L4 fallback
     {
         std::lock_guard lock(m_decoderMutex);
         m_decoders[rc::kVrStreamId] = std::move(dec);
@@ -1122,6 +1138,9 @@ void App::CreateVrSwapchain() {
     const float s = m_vrUpscaled ? scale : 1.f;
     m_xr.DestroySwapchain(m_vrSwapchain);
     m_xr.CreateSwapchain(int(m_vrEyeWidth * s + 0.5f) * 2, int(m_vrEyeHeight * s + 0.5f), GL_SRGB8_ALPHA8, 1, false, m_vrSwapchain);
+    // ROUND18 L8-TELEM: the queue depth the runtime gave the stream's swapchain; read it
+    // against the submit->lit time in the diag line.
+    RC_LOGI("VR swapchain: %u images, %dx%d", m_xr.SwapchainImages(), m_vrSwapchain.width, m_vrSwapchain.height);
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,7 +1304,11 @@ void App::Frame() {
     if (m_mode == Mode::Vr && m_settings.frameGeneration && !m_vrLatched) GenerateFrame(frame);
     BuildLayers(frame);
     const bool alpha = m_xr.PassthroughActive() || !m_underlays.empty();
-    m_xr.EndFrame(frame, m_underlays, alpha, m_overlays, uiLayer);
+    // ROUND19 E1 probe: only VR frames may ask for an earlier display slot; every other commit
+    // passes 0, which multiplies out to the untouched displayTime.
+    m_displayDeltaApplied = m_mode == Mode::Vr ? m_displayDeltaFile : 0;
+    m_xr.EndFrame(frame, m_underlays, alpha, m_overlays, uiLayer, m_displayDeltaApplied);
+    m_submitNs = rc::NowNs();  // ROUND18 L8-TELEM: everything from here to the display time belongs to the runtime
     LogVrTiming(frame, wokeNs);
 }
 
@@ -1335,6 +1358,8 @@ void App::LogVrTiming(const FrameState& frame, int64_t wokeNs) {
         m_timingLogNs = now;
         m_timingFrames = m_timingGpuFrames = 0;
         m_timingWakeLeadNs = m_timingLatchNs = m_timingSubmitNs = m_timingGpuNs = 0;
+        m_submitLitSumMs = 0;
+        m_submitLitFrames = 0;
         m_flowDisplays = m_flowShown = m_flowLate = 0;
         m_flowDecodedStart = 0;
         m_flowDecodeMaxMs = 0;
@@ -1348,6 +1373,16 @@ void App::LogVrTiming(const FrameState& frame, int64_t wokeNs) {
         m_timingLatchNs += double(m_vrLatchNs - wokeNs);
         m_timingSubmitNs += double(now - m_vrLatchNs);
         m_timingFrames++;
+        // ROUND18 L8-TELEM: the runtime's own share, xrEndFrame's return to this frame's display
+        // time. Same drop bounds as AddStages: a small negative is a clock offset, beyond that
+        // the reading is worthless.
+        const double submitLitMs = double(m_xr.ToMonotonicNs(frame.predictedDisplayTime) - m_submitNs) / 1e6;
+        if (submitLitMs >= 0 && submitLitMs < 1000) {
+            m_submitLitSumMs += submitLitMs;
+            m_submitLitFrames++;
+        } else if (submitLitMs < 0 && submitLitMs > -2) {
+            m_submitLitFrames++;
+        }
     }
     m_flowDisplays++;
     if (m_vrLatched) m_flowShown++;
@@ -2016,6 +2051,10 @@ void App::LatchVideo(const FrameState& frame, bool late) {
             m_vrLatched = true;
             ReadMotion(info.metadata);
             m_vrFrames++;
+            // ROUND20 T4: the decoded-frame seq range this diag window covers (telemetry
+            // only; the PC logs its producer's own seq so logpair can pair the ends).
+            if (!m_seqWindowMin) m_seqWindowMin = m_vrFrames;
+            m_seqWindowMax = m_vrFrames;
             // Latency feedback: the frame was rendered for `trackingTimestampNs` and will be
             // shown at this frame's display time; steer our prediction toward reality.
             const int64_t displayNs = m_xr.ToMonotonicNs(frame.predictedDisplayTime);
@@ -2115,6 +2154,24 @@ void App::LatchVideo(const FrameState& frame, bool late) {
     if (now - m_statsWindowStart > 1'000'000'000LL) {
         const double secs = double(now - m_statsWindowStart) / 1e9;
         m_statsWindowStart = now;
+        // ROUND19 E1 probe: the displayTime delta switch, polled here once a second (no per-frame
+        // IO). Missing, empty or unparsable file reads as 0, i.e. the untouched behavior.
+        {
+            int probeDelta = 0;
+            std::FILE* f = std::fopen((Platform::FilesDir() + "/display_delta.txt").c_str(), "rb");
+            if (f) {
+                char buf[32] = {};
+                const size_t got = std::fread(buf, 1, sizeof(buf) - 1, f);
+                std::fclose(f);
+                char* end = nullptr;
+                const long parsed = std::strtol(buf, &end, 10);
+                if (got && end != buf) probeDelta = int(std::clamp(parsed, -3L, 0L));
+            }
+            if (probeDelta != m_displayDeltaFile) {
+                m_displayDeltaFile = probeDelta;
+                RC_LOGI("DisplayTime probe: delta=%d frames", probeDelta);
+            }
+        }
         const bool vr = m_mode == Mode::Vr || m_mode == Mode::LaunchingVr;
         m_stats.fps = m_statsFrames / secs / std::max<size_t>(1, vr ? 1 : m_desktopStreams.size());
         m_stats.latencyMs = m_latencyCount ? m_latencySum / m_latencyCount : 0;
@@ -2128,6 +2185,10 @@ void App::LatchVideo(const FrameState& frame, bool late) {
             m_stageSum[i] = 0;
             m_stageFrames[i] = 0;
         }
+        // ROUND18 L8-TELEM: the window's average submit->lit, -1 when no frame was measured.
+        const double submitLitMs = m_submitLitFrames ? m_submitLitSumMs / m_submitLitFrames : -1.0;
+        m_submitLitSumMs = 0;
+        m_submitLitFrames = 0;
         m_stats.rttMs = m_client.Stats().rttMs;
         double decode = 0;
         for (auto& [id, dec] : decoders) {
@@ -2139,6 +2200,16 @@ void App::LatchVideo(const FrameState& frame, bool late) {
             if ((id == rc::kVrStreamId) == vr) decode = std::max(decode, d);
         }
         m_stats.decodeMs = decode;
+        // ROUND18 L5: stale decoded frames dropped in this 1 s window (output-side
+        // protection, see VideoDecoder::HandOver / Latch). Counter is cumulative,
+        // so report the delta; a decoder swap can only lower it, guard against wrap.
+        {
+            uint32_t skippedNow = 0;
+            for (auto& [id, dec] : decoders)
+                if (dec) skippedNow += dec->SkippedFrames();
+            m_statsDropStale = skippedNow >= m_statsSkippedPrev ? skippedNow - m_statsSkippedPrev : 0;
+            m_statsSkippedPrev = skippedNow;
+        }
         if (vr && m_serverStats.contains("vr")) {
             m_stats.mbps = m_serverStats["vr"].value("mbps", 0.0);
         } else if (m_serverStats.contains("desktop")) {
@@ -2156,11 +2227,19 @@ void App::LatchVideo(const FrameState& frame, bool late) {
         // "rc vr rx 1s" receive line and this line can be read against the PC's
         // "rc diag 1s" at the same second. All values are computed above for the overlay.
         if (vr) {
-            RC_LOGI("rc vr diag 1s: %d shown, %d repeated, %d late of %d displays (flow window), %d generated; "
-                    "latency %.1f ms, pipeline %.1f ms, decode %.1f ms, rtt %.1f ms, stages %s",
+            char seqPart[32];
+            if (m_seqWindowMin) snprintf(seqPart, sizeof(seqPart), ", seq %u-%u", m_seqWindowMin, m_seqWindowMax);
+            else snprintf(seqPart, sizeof(seqPart), ", seq -");
+            RC_LOGI("rc vr diag 1s: %d shown, %d repeated, %d late of %d displays (flow window), %d generated, "
+                    "%u stale dropped; "
+                    "latency %.1f ms, pipeline %.1f ms, decode %.1f ms, rtt %.1f ms, stages %s, submit->lit %.1f ms, "
+                    "dt-probe %d%s",
                     m_flowShown, m_flowDisplays - m_flowShown, m_flowLate, m_flowDisplays, uint32_t(m_generatedFrames),
+                    m_statsDropStale,
                     m_stats.latencyMs, m_pipelineLatencyMs, m_stats.decodeMs, m_stats.rttMs,
-                    stages.empty() ? "NA" : stages.dump().c_str());
+                    stages.empty() ? "NA" : stages.dump().c_str(), submitLitMs, m_displayDeltaApplied, seqPart);
+            m_seqWindowMin = 0;
+            m_seqWindowMax = 0;
         }
         m_client.SendControl({{"type", rc::msg::kStats},
                               {"stats", {{"fps", m_stats.fps}, {"latencyMs", m_stats.latencyMs}, {"decodeMs", m_stats.decodeMs}, {"latencyStages", stages}}}});

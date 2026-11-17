@@ -311,6 +311,10 @@ bool XrContext::CreateSession(bool preferStage) {
                     "whatever this app asks for", forced.c_str());
     }
     if (m_refreshRates.empty()) m_refreshRates = {72.f};
+    // ROUND18 L8-TELEM: one line naming every rate the runtime honors, the 72 Hz fallback included.
+    std::string supported;
+    for (float r : m_refreshRates) supported += (supported.empty() ? "" : ", ") + std::to_string(int(std::lround(r)));
+    RC_LOGI("Supported refresh rates: %s Hz", supported.c_str());
 
     if (HasExtension(XR_FB_COLOR_SPACE_EXTENSION_NAME)) {
         // Content is authored in sRGB/Rec.709; let the runtime convert to the panel.
@@ -496,6 +500,7 @@ bool XrContext::CreateSwapchain(int width, int height, int64_t format, int array
         for (auto& i : imgs) i.type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
 #endif
     xrEnumerateSwapchainImages(out.handle, n, &n, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+    m_swapchainImages = n;  // ROUND18 L8-TELEM: how many buffers the runtime queues this swapchain with
     out.width = width;
     out.height = height;
     if (withDepth) {
@@ -619,7 +624,7 @@ void XrContext::BindEye(int eye) {
 
 void XrContext::EndFrame(const FrameState& frame, const std::vector<const XrCompositionLayerBaseHeader*>& underlays,
                          bool projectionHasAlpha, const std::vector<const XrCompositionLayerBaseHeader*>& overlays,
-                         bool eyeLayer) {
+                         bool eyeLayer, int displayDeltaFrames) {
     for (int eye = 0; eye < 2; eye++)
         if (frame.shouldRender && eyeLayer) ReleaseImage(m_eyes[eye]);
 
@@ -650,7 +655,11 @@ void XrContext::EndFrame(const FrameState& frame, const std::vector<const XrComp
         layers.insert(layers.end(), overlays.begin(), overlays.end());
     }
     XrFrameEndInfo fei{XR_TYPE_FRAME_END_INFO};
-    fei.displayTime = frame.predictedDisplayTime;
+    // ROUND19 E1 probe: a negative delta asks the compositor to light this frame that many frame
+    // periods earlier than the predicted slot; 0 multiplies out to +0, bit-identical to the old
+    // assignment.
+    const int delta = std::clamp(displayDeltaFrames, -3, 0);
+    fei.displayTime = frame.predictedDisplayTime + (int64_t)delta * frame.period;
     fei.environmentBlendMode = m_passthroughActive && m_alphaBlend && !m_passthroughLayer ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
                                                                                          : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     fei.layerCount = uint32_t(layers.size());
