@@ -102,6 +102,17 @@
           <label class="check" id="foveatedRow"><input type="checkbox" data-setting="foveatedEncoding"><span data-i18n="video.foveated">Sharper center in VR</span><small id="foveatedHint" data-i18n="video.foveatedHint">Sharp where you look, lighter at edges. NVIDIA only.</small></label>
           <label class="check" id="twoPassRow"><input type="checkbox" data-setting="twoPassEncoding"><span data-i18n="video.twoPass">Two-pass encoding in VR</span><small data-i18n="video.twoPassHint">Steadier in motion, a little slower to encode.</small></label>
           <label class="check" id="cbrRow"><input type="checkbox" data-setting="qualityProfileCbr"><span data-i18n="video.cbr">Best picture: use full limit every frame</span><small data-i18n="video.cbrHint">Steadier picture, but uses the full link every frame.</small></label>
+          <h3 id="l-enc-scale" data-i18n="video.encScale">VR picture size</h3>
+          <div class="options" role="radiogroup" aria-labelledby="l-enc-scale" aria-describedby="encScaleNote">
+            <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="0"><span data-i18n="video.encScaleAuto">Automatic</span></label>
+            <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="100"><span data-i18n="video.encScaleFull">Full</span></label>
+            <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="85"><span>85%</span></label>
+            <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="67"><span>67%</span></label>
+            <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="50"><span>50%</span></label>
+          </div>
+          <p class="note" id="encScaleNote" data-i18n="video.encScaleHint">Smaller sends fewer pixels to the headset. The picture still fills the view.</p>
+          <label class="check spaced" id="l7Row"><input type="checkbox" data-setting="l7Autoscale"><span data-i18n="video.l7Autoscale">Ease encode size when decoding struggles</span><small data-i18n="video.l7AutoscaleHint">Steps 100 → 85 → 67 → 50 while the headset decodes too slowly; only the reset climbs back.</small></label>
+          <p class="note" id="l7LevelLine" hidden><span data-i18n="video.l7Level">Current eased size</span>: <b id="l7Level">—</b> <button id="l7Reset" data-i18n="video.l7Reset">Reset to 100%</button></p>
         </div>
       </div>
       <div class="cols">

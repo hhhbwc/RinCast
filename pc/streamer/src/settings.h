@@ -54,6 +54,19 @@ struct Settings {
     // 2026-11-15). The queue risk that retired CBR is back with it - the congestion
     // guard carries fixed bitrate, but the switch stays opt-in and off by default.
     bool qualityProfileCbr = false;
+    // VR encode resolution as a percentage of what the game renders (ROUND18 L2).
+    // 0 = follow the selected profile's value (all 100 today); >0 = user override,
+    // clamped to [50, 100]. Stored as an int so the settings UI radio values bind
+    // directly. Lower = the GPU scales the capture down before the encoder, so the
+    // headset decodes fewer pixels without asking the game to render less. 0 by
+    // default: existing installs keep encoding exactly as before.
+    int encodeScalePct = 0;
+    // ROUND19 T3: the decode-side autoscale ladder (rc/autoscale.h). When on, the
+    // ladder may step the ENCODE scale down 100 -> 85 -> 67 -> 50 (multiplied onto
+    // the base above, so it never raises anything) while decode pressure holds;
+    // only the user's manual reset climbs back. Default off: the streamer then
+    // never intervenes, exactly like the builds before it.
+    bool l7Autoscale = false;
     // When the user lets the Best-picture profile drive video settings, it may raise
     // video-side choices on its own (right now: the fovea's full-density share, see
     // QualityProfileFovea below). It only ever raises; a higher choice of the user's

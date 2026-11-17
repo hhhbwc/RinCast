@@ -554,6 +554,25 @@ void ClientSession::HandleMessage(const json& m) {
     if (type == rc::msg::kStats) {
         std::lock_guard lock(m_mutex);
         m_clientStats = m.value("stats", json::object());
+        // ROUND19 T3: the decode-side autoscale ladder (default off). The headset's
+        // decode average arrives here at ~1 Hz - the natural tick. A missing decodeMs
+        // reads as no pressure (the ladder is conservative on absent signals), the
+        // PC's own dropped-frame average and the handshake's decode-fps hint fill the
+        // rest in. A step rebuilds the VR stream on the existing hot path, at most
+        // once per cooldown - never the rebuild storm of 513f150.
+        if (SettingsStore::Get().Snapshot().l7Autoscale) {
+            rc::L7Autoscale::Config c;
+            const double hintMs = m_caps.maxFpsAtMaxRes > 0 ? 1000.0 / m_caps.maxFpsAtMaxRes : 0.0;
+            c.decodeBudgetMs = hintMs > 0 ? hintMs * 0.8 : 20.0;
+            m_autoscale.Configure(c);
+            const double decodeMs = m_clientStats.value("decodeMs", -1.0);
+            const double dropped = m_vr ? double(m_vr->Stats().droppedFps) : -1.0;
+            const auto r = m_autoscale.Update(decodeMs, dropped, rc::NowNs());
+            if (r.changed)
+                RC_LOGI("L7 autoscale: encode scale -> %d%% (decode %.1f ms vs budget %.1f ms, dropped %.1f fps)",
+                        m_autoscale.Pct(), decodeMs, c.decodeBudgetMs, dropped);
+            if (r.changed) OnStreamProfileChanged();
+        }
         return;
     }
 }
@@ -579,6 +598,9 @@ void ClientSession::ApplyClientInfo(const json& m) {
         m_caps.av110 = d.value("av110", false);
         m_caps.maxDecodeWidth = d.value("maxWidth", 4096u);
         m_caps.maxDecodeHeight = d.value("maxHeight", 4096u);
+        // ROUND18 L3: optional fps ceiling. 0/missing = old headset, no warning.
+        // Reject malformed values via the shared validator (also unit-tested).
+        m_caps.maxFpsAtMaxRes = rc::ValidateDecodeFpsHint(d.value("maxFpsAtMaxRes", 0u));
     }
     if (m.contains("settings")) {
         auto s = m["settings"];
@@ -770,6 +792,15 @@ void ClientSession::OnStreamProfileChanged() {
     Enqueue(json{{"type", "_profile"}});
 }
 
+void ClientSession::ResetAutoscale() {
+    {
+        std::lock_guard lock(m_mutex);
+        m_autoscale.Reset();
+    }
+    RC_LOGI("L7 autoscale: reset to 100% by the user");
+    OnStreamProfileChanged();
+}
+
 void ClientSession::RestartVideoForProfile(bool vr, bool desktop) {
     const bool hadVr = vr && bool(m_vr);
     if (hadVr) RestartVr();
@@ -943,6 +974,17 @@ void ClientSession::StartVr() {
         std::find(caps.refreshRates.begin(), caps.refreshRates.end(), rate) == caps.refreshRates.end())
         rate = caps.refreshRates.back();
     dc.refreshRate = rate;
+    // ROUND18 L3: warn when the requested rate is above the headset's measured
+    // decode ceiling at large sizes. Informational only - we deliberately do NOT
+    // change the rate or the render size here (that needs a real-device A/B and the
+    // user's call). The hint surfaces in this one warning at stream start (and is
+    // kept in the caps snapshot for later rebuilds); it is NOT part of the 1 s
+    // telemetry - the "rc diag 1s" line carries rate-control stats only.
+    if (caps.maxFpsAtMaxRes && rate > float(caps.maxFpsAtMaxRes)) {
+        RC_LOGW("Headset decode hint: this device managed about %u fps at large sizes, "
+                "stream requests %.0f fps - consider a lower resolution or frame rate",
+                caps.maxFpsAtMaxRes, rate);
+    }
     dc.ipd = caps.ipd;
     std::memcpy(dc.fovTan, caps.fovTan, sizeof(dc.fovTan));
     strncpy_s(dc.headsetModel, m_hello.model.empty() ? "Quest" : m_hello.model.c_str(), _TRUNCATE);
@@ -976,6 +1018,17 @@ void ClientSession::StartVr() {
     cfg.pace = cfg.pacingMode != 1;
     cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate);  // see above
     cfg.profile = rc::ProfileFromId(pc.streamProfile);
+    // ROUND18 L2: the user's encode scale overrides the profile's value (both 1.0
+    // today). 0 = follow the profile. The percentage is stored as an int for the UI.
+    cfg.encodeScale = pc.encodeScalePct > 0 ? rc::ClampEncodeScale(pc.encodeScalePct / 100.0f)
+                                            : rc::ProfileParams(cfg.profile).encodeScale;
+    // ROUND19 T3: the autoscale ladder multiplies the base above (never raises it);
+    // the level survives until the user's manual reset. The frame size itself still
+    // comes out of ScaledEncodeSize, the one formula shared with the foveation config.
+    if (pc.l7Autoscale) {
+        std::lock_guard lock(m_mutex);
+        cfg.encodeScale = rc::ClampEncodeScale(cfg.encodeScale * m_autoscale.Pct() / 100.0f);
+    }
     if (m_slowPath) cfg.startBitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 12000);
     // QP map is the user's own switch, just like two-pass. A profile no longer
     // turns it on behind their back. The encoder runs it only when the headset's
@@ -991,7 +1044,13 @@ void ClientSession::StartVr() {
     cfg.cappedVbr = !rcs::QualityProfileCbr(pc.qualityProfileCbr, pc.profileControlsVideo && !match && !m_slowPath,
                                             cfg.profile == rc::StreamProfile::Quality);
     cfg.motionField = st.frameGeneration;
-    if (st.gazeFoveation) {
+    // ROUND18 L2-FIX2: the real encoded PER-EYE size after encodeScale. One value
+    // feeds the foveation metadata, the coded-size hint and the log, so the headset
+    // can never undo foveation with a different density than the encoder used.
+    // Start from the plain (un-foveated) base; the foveated block overrides it.
+    uint32_t codedEyeW = rc::ScaledEncodeSize(cfg.eyeWidth * 2, cfg.encodeScale) / 2;
+    uint32_t codedEyeH = rc::ScaledEncodeSize(cfg.eyeHeight, cfg.encodeScale);
+    if (st.gazeFoveation && cfg.encodeScale >= 1.0f) {
         cfg.foveaSize = st.eyesTracked ? Foveator::kFoveaSize : Foveator::kFixedFoveaSize;
         // When the user lets the profiles drive video settings, each one floors the
         // full-density centre at its own share (latency 0.6, balanced 0.7, quality 0.8)
@@ -1002,8 +1061,19 @@ void ClientSession::StartVr() {
                                                int(cfg.profile));
         cfg.foveatedEyeWidth = Foveator::EncodedSize(cfg.eyeWidth, cfg.foveaSize);
         cfg.foveatedEyeHeight = Foveator::EncodedSize(cfg.eyeHeight, cfg.foveaSize);
-        RC_LOGI("VR stream: foveated %s, encoding %ux%u per eye", st.eyesTracked ? "where the eyes look" : "at the lens centre",
-                cfg.foveatedEyeWidth, cfg.foveatedEyeHeight);
+        codedEyeW = rc::ScaledEncodeSize(cfg.foveatedEyeWidth * 2, cfg.encodeScale) / 2;
+        codedEyeH = rc::ScaledEncodeSize(cfg.foveatedEyeHeight, cfg.encodeScale);
+        RC_LOGI("VR stream: foveated %s, encoding %ux%u per eye (scaled from %ux%u)",
+                st.eyesTracked ? "where the eyes look" : "at the lens centre",
+                codedEyeW, codedEyeH, cfg.foveatedEyeWidth, cfg.foveatedEyeHeight);
+    } else if (st.gazeFoveation) {
+        // ROUND18 L2-FIX3: the user still has foveation on, but a scaled frame
+        // cannot carry it. The full-density centre needs F*eye pixels; below that
+        // s = (encEye/eye - F)/(1-F) goes negative and both shaders fold back,
+        // stretching the periphery. Keep the eye sizes at 0 so PlaceFovea,
+        // the squeeze job, the metadata and the headset inverse all switch off
+        // together; codedEyeW/H above already hold the plain scaled size.
+        RC_LOGI("VR stream: foveation paused at encode scale %.2f - plain scaled frame", cfg.encodeScale);
     }
     const char* profileName = cfg.profile == rc::StreamProfile::LowLatency ? "latency-first"
                               : cfg.profile == rc::StreamProfile::Quality  ? "quality-first"
@@ -1017,6 +1087,7 @@ void ClientSession::StartVr() {
             cfg.cappedVbr ? "capped VBR" : "CBR",
             cfg.cappedVbr ? qpText.c_str() : "n/a",
             cfg.startBitrateKbps ? (", starting at " + std::to_string(cfg.startBitrateKbps) + " kbps").c_str() : "");
+    RC_LOGI("VR stream: encode scale %.2f of render size", cfg.encodeScale);
 
     std::weak_ptr<ClientSession> weak = shared_from_this();
     auto vr = std::make_unique<VrStream>(m_connection.get(), &bridge, cfg,
@@ -1027,12 +1098,20 @@ void ClientSession::StartVr() {
     json vrStream = {{"streamId", rc::kVrStreamId},
                      {"eyeWidth", cfg.eyeWidth},
                      {"eyeHeight", cfg.eyeHeight},
+                     // ROUND18 L2-FIX2: the size the encoder actually produced, so the
+                     // headset builds its AImageReader for the real frame. These are
+                     // PER-EYE sizes: the headset does codedWidth x2 for the full width
+                     // (same as it does for foveation.eyeWidth), then Init(full, height).
+                     {"codedWidth", codedEyeW},
+                     {"codedHeight", codedEyeH},
                      {"fps", cfg.fps},
                      {"codec", int(cfg.codec)},
                      {"tenBit", cfg.tenBit}};
-    // See rc::VrFoveationMetadata.
+    // See rc::VrFoveationMetadata. Sizes are the SCALED per-eye encode size: the
+    // headset derives density s from these, so they must match what foveator.Init
+    // in vr_stream.cpp used (both come from ScaledEncodeSize).
     if (cfg.foveatedEyeWidth)
-        vrStream["foveation"] = {{"eyeWidth", cfg.foveatedEyeWidth}, {"eyeHeight", cfg.foveatedEyeHeight}, {"size", cfg.foveaSize}};
+        vrStream["foveation"] = {{"eyeWidth", codedEyeW}, {"eyeHeight", codedEyeH}, {"size", cfg.foveaSize}};
     SendControl({{"type", rc::msg::kStreamConfig}, {"kind", "vr"}, {"streams", json::array({vrStream})}});
     vr->Start();
     {
@@ -1228,6 +1307,12 @@ json ClientSession::StatusJson() {
                    {"refreshRate", c.fps}, {"latencyMs", s.clientLatencyMs}, {"decodeMs", s.clientDecodeMs},
                    {"qp", s.qp}, {"encWidth", s.encWidth}, {"encHeight", s.encHeight},
                    {"gameFps", s.gameFps}, {"encFps", s.encFps}, {"droppedFps", s.droppedFps}};
+        // ROUND19 T3: read-only ladder level for the page (null when the switch is off).
+        {
+            std::lock_guard lock(m_mutex);
+            j["vr"]["autoscaleLevel"] =
+                SettingsStore::Get().Snapshot().l7Autoscale ? json(m_autoscale.Pct()) : json(nullptr);
+        }
     }
     json desk = json::array();
     for (auto& [id, d] : m_desktop) {

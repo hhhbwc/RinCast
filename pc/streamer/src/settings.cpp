@@ -30,6 +30,8 @@ json Settings::ToJson(bool forUi) const {
         {"profileControlsVideo", profileControlsVideo},
         {"videoPacingMode", videoPacingMode},
         {"qualityProfileCbr", qualityProfileCbr},
+        {"encodeScalePct", encodeScalePct},
+        {"l7Autoscale", l7Autoscale},
         {"pcBitrateWins", pcBitrateWins},
         {"fecPercent", fecPercent},
         {"foveatedEncoding", foveatedEncoding},
@@ -78,6 +80,8 @@ void Settings::FromJson(const json& j) {
     get("profileControlsVideo", profileControlsVideo);
     get("videoPacingMode", videoPacingMode);
     get("qualityProfileCbr", qualityProfileCbr);
+    get("encodeScalePct", encodeScalePct);
+    get("l7Autoscale", l7Autoscale);
     get("pcBitrateWins", pcBitrateWins);
     get("fecPercent", fecPercent);
     get("foveatedEncoding", foveatedEncoding);
@@ -115,6 +119,8 @@ void Settings::FromJson(const json& j) {
     desktopBitrateMbps = std::clamp(desktopBitrateMbps, 5, 200);
     fecPercent = std::clamp(fecPercent, 0, 25);
     streamProfile = std::clamp(streamProfile, 0, 2);
+    // 0 = follow the profile; otherwise clamp to the supported range.
+    encodeScalePct = encodeScalePct > 0 ? std::clamp(encodeScalePct, 50, 100) : 0;
     if (codec != "auto" && codec != "h264" && codec != "hevc" && codec != "av1") codec = "auto";
     if (openxrRuntime != "rincast" && openxrRuntime != "steamvr") openxrRuntime = "steamvr";
     if (audioDevices != "auto" && audioDevices != "rincast" && audioDevices != "steam" && audioDevices != "system")

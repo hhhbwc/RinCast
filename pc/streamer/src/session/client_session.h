@@ -16,6 +16,7 @@
 #include "../capture/monitors.h"
 #include "../net/stream_server.h"
 #include "../util.h"
+#include "rc/autoscale.h"
 #include "rc/connection.h"
 #include "rc/protocol.h"
 
@@ -29,6 +30,7 @@ class MicPlayer;
 struct ClientCaps {
     bool h264 = true, hevc = true, hevc10 = false, av1 = false, av110 = false;
     uint32_t maxDecodeWidth = 4096, maxDecodeHeight = 4096;
+    uint32_t maxFpsAtMaxRes = 0;  // ROUND18 L3: headset's measured fps ceiling at max size, 0 = unknown
     std::vector<float> refreshRates{72, 90};
     uint32_t recommendedEyeWidth = 1832, recommendedEyeHeight = 1920;  // 100% of the resolution: the panel (the runtime's recommended size before 1.2.0)
     float fovTan[2][4] = {{1.0f, 0.9f, 0.95f, 1.1f}, {0.9f, 1.0f, 0.95f, 1.1f}};
@@ -44,7 +46,7 @@ struct ClientStreamSettings {
     bool matchSteamVr = false;        // stream at the size SteamVR renders at
     bool gazeFoveation = false;       // foveated encoding around where the eyes look
     bool eyesTracked = true;          // false: the headset can't track them; fixed at the lens centre
-    float refreshRate = 90;
+    float refreshRate = 72;  // ROUND18 L4 default (was 90); 90 stays available
     int vrBitrateMbps = 0;            // 0 = PC default
     int desktopBitrateMbps = 0;
     int desktopFps = 0;
@@ -89,6 +91,9 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     // stream starts, so switching it has to rebuild the live streams to take effect.
     void OnStreamProfileChanged();
     void OnMonitorsChanged();
+    // ROUND19 T3: the user's manual reset is the only way the autoscale ladder
+    // climbs back to 100 %; the rebuilt stream picks the new level up on the hot path.
+    void ResetAutoscale();
 
     rc::VideoCodec ChooseCodec(bool forVr) const;
     ClientCaps Caps();
@@ -152,6 +157,7 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     std::mutex m_mutex;  // protects everything below
     ClientCaps m_caps;
     ClientStreamSettings m_settings;
+    rc::L7Autoscale m_autoscale;  // ROUND19 T3: stepped down by decode pressure, reset by hand
     // The synced settings the PC currently owns (key -> the value it pushed). The
     // headset takes a key back by sending a different value for it.
     std::map<std::string, json> m_ownedSettings;

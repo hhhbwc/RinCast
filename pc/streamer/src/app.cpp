@@ -322,7 +322,9 @@ std::string App::ApplySettingSideEffects(const json& changed) {
             changed.contains("videoPacingMode") || changed.contains("qualityProfileCbr") ||
             changed.contains("profileControlsVideo") || changed.contains("fecPercent") ||
             changed.contains("foveatedEncoding") || changed.contains("adaptiveQuantization") ||
-            changed.contains("twoPassEncoding") || changed.contains("desktopMaxHeight") || changed.contains("desktopFps"))
+            changed.contains("twoPassEncoding") || changed.contains("encodeScalePct") ||
+            changed.contains("l7Autoscale") ||
+            changed.contains("desktopMaxHeight") || changed.contains("desktopFps"))
             session->OnStreamProfileChanged();
     }
     return error;
@@ -365,6 +367,14 @@ void App::HandleUiMessage(const std::string& text) {
         // Same overlay as StateJson: headset-owned keys must not snap back to the
         // PC's saved values just because the user toggled an unrelated setting.
         reply({{"ok", error.empty()}, {"error", error}, {"settings", SettingsForUi()}});
+    } else if (type == "autoscaleReset") {
+        // ROUND19 T3: the user's manual reset - the ladder's only way back to 100 %.
+        if (auto session = m_server.ActiveSession()) {
+            session->ResetAutoscale();
+            reply({{"ok", true}});
+        } else {
+            reply({{"ok", false}, {"error", "no active session"}});
+        }
     } else if (type == "approve" || type == "deny") {
         const std::string id = m.value("deviceId", "");
         if (type == "approve")

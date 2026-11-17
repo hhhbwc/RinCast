@@ -108,6 +108,7 @@ listeners.push((msg) => {
       if (state) renderDependents();
       renderHome();
       renderStatus();
+      renderAutoscale();
       break;
     case "session":
       request({ type: "getState" });
@@ -245,6 +246,23 @@ function wireSetting(el) {
   });
 }
 $$("[data-setting]").forEach(wireSetting);
+
+// ROUND19 T3: the autoscale ladder's read-only level line, hidden while the switch
+// is off, and the manual reset - the only way the ladder climbs back to 100 %.
+function renderAutoscale() {
+  const line = $("#l7LevelLine");
+  if (!line) return;
+  const on = document.querySelector('[data-setting="l7Autoscale"]')?.checked;
+  line.hidden = !on;
+  const lvl = state?.session?.vr?.autoscaleLevel;
+  $("#l7Level").textContent = lvl != null ? lvl + "%" : "—";
+}
+document.querySelector('[data-setting="l7Autoscale"]')?.addEventListener("change", renderAutoscale);
+$("#l7Reset").addEventListener("click", async () => {
+  const r = await request({ type: "autoscaleReset" }, 10000);
+  if (r && !r.ok) toast(r.error || t("err.noResponse"));
+  renderAutoscale();
+});
 
 // ---------------------------------------------------------------- language
 const languageSelect = $("#language");
@@ -958,7 +976,7 @@ function mock(msg) {
   const audio = { speaker: false, microphone: false, microphoneFeed: false, steam: { speaker: !(demo === "problem"), microphone: !(demo === "problem") }, active: demo === "problem" ? {} : { speaker: "steam", microphone: "steam" } };
   const base = mock.base ||= {
     type: "state", version: "1.0.0", downloadUrl: "https://rincast.com/#download", downloadSite: "rincast.com",
-    settings: { pcName: "Studio PC", codec: "auto", tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, streamProfile: 1, profileControlsVideo: false, qualityProfileCbr: false, pcBitrateWins: false, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: "auto", autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: true, preventSleep: true, cloudUrl: "https://rincast.com", allowRemote: true,
+    settings: { pcName: "Studio PC", codec: "auto", tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, streamProfile: 1, profileControlsVideo: false, qualityProfileCbr: false, encodeScalePct: 0, pcBitrateWins: false, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: "auto", autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: true, preventSleep: true, cloudUrl: "https://rincast.com", allowRemote: true,
       trustedDevices: none ? [] : [{ id: "q3", name: "Quest 3", model: "Meta Quest 3", lastSeen: Date.now() / 1000 }] },
     cloud: demo === "signedout" || demo === "firstrun" ? { signedIn: false } : { signedIn: true, userName: "Sam", email: "sam@example.com", status: demo === "problem" ? "error" : "online", error: demo === "problem" ? "The server didn't answer." : "", allowRemote: true },
     system: { gpu: demo === "problem" ? "Microsoft Basic Display Adapter" : "NVIDIA GeForce RTX 5070 Ti", port: 38711, addresses: ["192.168.1.20"], vpnAddresses: demo === "vpn" ? [{ name: "Tailscale", address: "100.101.102.103" }] : [], firewall: { otherNetworksOpen: demo !== "problem", publicInUse: demo === "public", publicAllowed: false, publicUnguarded: false }, encoder: demo === "problem" ? {} : { backend: "nvenc", h264: true, hevc: true, av1: true, hevc10: true },
