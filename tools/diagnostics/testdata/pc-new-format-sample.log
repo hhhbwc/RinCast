@@ -1,0 +1,9 @@
+2026-11-16 22:40:01 INFO  RinCast Streamer 1.2.1 starting on Windows 11 (26300)
+2026-11-16 22:40:20 INFO  Headset PICO4 (PICO4) connected from 192.168.x.x:42492
+2026-11-16 22:40:20 INFO  VR stream: 2688x2688 per eye
+2026-11-16 22:40:20 INFO  VR stream: fixed bitrate, quality-first, ceiling 100000 kbps, CBR (QP floor n/a)
+2026-11-16 22:40:21 INFO  rc diag 1s: game 47/s enc 47/s drop 0/s, halfRate OFF, target 100000 kbps, wire 96.4 Mbps, queue 3.0 ms, qp 20.5, 2416x2416
+2026-11-16 22:40:22 INFO  ENC 5s: 47 fps, qp 20.5, 180.2 KB/frame, 96.4 Mbps (ceiling 100), submit 1.2 ms, gpu wait 4.1 ms, qpValid 90/92, qpFirstBad 47, qpRange 12-41, kbRange 44.6-210.3
+2026-11-16 22:40:23 INFO  Stream 0 throughput: 96.8 Mbps actual, 47 fps, target 100000 kbps, effective 98000 kbps, wireCap 108000 kbps, queue 2.0 ms, loss 0.1%
+2026-11-16 22:40:24 INFO  VR frames: 47/s from the game, 47/s encoded; 0/s replaced before conversion, 0/s while the encoder was busy; conversion 0.1 ms, encoding 6.2 ms, held for the encoder 0.1 ms, arrivalGap 9-22 ms, lockWait avg 0.9/max 3.1 ms (89)
+2026-11-16 22:40:25 INFO  rc diag 1s: game 88/s enc 88/s drop 1/s, halfRate ON, target 100000 kbps, wire 51.2 Mbps, queue 12.0 ms, qp 18.9, 2416x2416

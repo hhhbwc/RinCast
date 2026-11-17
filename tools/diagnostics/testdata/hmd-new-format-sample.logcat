@@ -1,0 +1,5 @@
+11-16 22:40:21.100 10176 10205 I RinCast : rc vr rx 1s: 95.8 Mbps in, loss 0.2% (3 frags lost of 1500, FEC recovered 3), 0 frames lost/s, queue 3.5 ms, decode 4.2 ms, net spread 0.9 ms, total latency 61.0 ms
+11-16 22:40:21.150 10176 10205 I RinCast : rc vr diag 1s: 88 shown, 2 repeated, 1 late of 90 displays (flow window), 89 generated; latency 62.5 ms, pipeline 10.2 ms, decode 4.2 ms, rtt 3.0 ms, stages {"uplinkMs": 1.2, "gameMs": 11.0, "encoderWaitMs": 0.4, "encodeMs": 6.2, "downlinkMs": 8.1, "decodeMs": 4.2, "nextFrameMs": 0.9, "compositorMs": 10.2}
+11-16 22:40:22.200 10176 10205 I RinCast : VR frame flow over 90 displays: 88 decoded, 88 shown, 0 never shown, 2 repeated, 1 after latch, slowest decode 8.4 ms
+11-16 22:40:22.250 10176 10205 I RinCast : VR prediction: 3 ms past the pose, 12 ms from the pose to the display; uplinkMs 1.2, gameMs 11.0, encoderWaitMs 0.4, encodeMs 6.2, downlinkMs 8.1, decodeMs 4.2
+11-16 22:40:23.300 10176 10205 I RinCast : VR frame arrival: p50 3.1 ms of margin, p90 0.8 ms, 4 frames waiting for the GPU, let 2 run to completion
