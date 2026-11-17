@@ -51,7 +51,39 @@ struct StreamProfileParams {
     // of a 20 / 30 / 40 Mbps ceiling and only 87 % of a 140 Mbps one, while 1.5 frames
     // brought every ceiling to 95-97 %. Never go below 150.
     uint32_t vbvFramesPercent = 150;
+    // Encode resolution as a fraction of the game's render resolution (ROUND18 L2).
+    // 1.0 = encode exactly what the game renders (the behaviour before this field).
+    // Lower values let the GPU scale the capture down before the encoder, without
+    // touching what SteamVR asks the game to render. The headset always stretches
+    // whatever it receives back to the panel. Range is clamped to [0.5, 1.0].
+    // Below 1.0 is an opt-in, pending real-device measurement: the offline tests
+    // cannot tell us whether 0.67/0.85 actually help the decoder wall.
+    float encodeScale = 1.0f;
 };
+
+// Clamp for the user-facing encode-scale setting (ROUND18 L2). Kept here so the
+// offline core tests exercise the exact same rule the streamer applies.
+constexpr float ClampEncodeScale(float scale) {
+    return scale < 0.5f ? 0.5f : (scale > 1.0f ? 1.0f : scale);
+}
+
+// ROUND18 L2-FIX2: one rule for the encoded frame size, shared by the streamer
+// (which sizes the encoder) and the config (which tells the headset what it got).
+// Truncate-then-even-down, exactly as vr_stream.cpp did inline. Keeping it here
+// means the foveation metadata can never drift from the real encoded dimensions
+// (a mismatch warps the picture: the headset undoes foveation with the wrong density).
+// base is a full-frame dimension (two eyes wide, one eye high); returns >= 2.
+inline uint32_t ScaledEncodeSize(uint32_t base, float scale) {
+    const uint32_t v = uint32_t(base * ClampEncodeScale(scale)) & ~1u;
+    return v < 2 ? 2 : v;
+}
+
+// ROUND18 L3: validate an optional head-reported decode-fps hint. 0/absent and
+// malformed values (outside a plausible 24..240 refresh range) become 0 = no hint,
+// so an old or buggy headset can never make the PC change behaviour.
+constexpr uint32_t ValidateDecodeFpsHint(uint32_t fps) {
+    return (fps >= 24u && fps <= 240u) ? fps : 0u;
+}
 
 constexpr StreamProfileParams ProfileParams(StreamProfile p) {
     switch (p) {
@@ -59,7 +91,7 @@ constexpr StreamProfileParams ProfileParams(StreamProfile p) {
             // 150, not 100: a one-frame VBV made capped VBR miss the ceiling in BOTH
             // directions (see the note on vbvFramesPercent). The 15 ms queue budget is
             // what makes this profile latency-first, not an undersized buffer.
-            return {15.0, 6.0, 15.0, 100, 24, 150};
+            return {15.0, 6.0, 15.0, 100, 24, 150, 1.0f};
         case StreamProfile::Quality:
             // 2026-11-17 real device: with no floor this profile swung QP 3-25
             // (light load) / 9-29 (pressure map) and the user read it as strong
@@ -67,7 +99,11 @@ constexpr StreamProfileParams ProfileParams(StreamProfile p) {
             // number. 12 is a mild floor: it cuts the near-lossless spikes while
             // keeping the sharpness edge over Balanced (16). Initial guess from
             // the measured QP distribution, pending real-device re-measure.
-            return {60.0, 12.0, 30.0, 100, 12, 200};
+            // encodeScale stays 1.0 here too: a candidate 0.67 (encode at the
+            // decoder's comfort zone) was sketched in the ROUND18 design notes
+            // (kept outside this repository) but needs real-device proof before
+            // it changes the default. No silent behaviour change.
+            return {60.0, 12.0, 30.0, 100, 12, 200, 1.0f};
         case StreamProfile::Balanced:
         default:
             // Keep the guard's current, measured numbers: changing the default
@@ -78,7 +114,7 @@ constexpr StreamProfileParams ProfileParams(StreamProfile p) {
             // 100 ceiling; floor off, the same content spent 100.8) - spending less
             // on simple frames is the latency profile's job now, and the queue
             // budget plus the guard stay responsible for the safety.
-            return {45.0, 12.0, 25.0, 100, 16, 150};
+            return {45.0, 12.0, 25.0, 100, 16, 150, 1.0f};
     }
 }
 

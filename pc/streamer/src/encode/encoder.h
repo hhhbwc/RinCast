@@ -17,7 +17,7 @@ struct EncoderConfig {
     rc::VideoCodec codec = rc::VideoCodec::HEVC;
     uint32_t width = 0;
     uint32_t height = 0;
-    float fps = 90;
+    float fps = 72;  // ROUND18 L4 default (was 90)
     uint32_t bitrateKbps = 100000;
     bool tenBit = false;
     // Desktop content: favour sharpness (more bits for I-frames, slower preset).

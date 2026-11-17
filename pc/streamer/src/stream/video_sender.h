@@ -30,6 +30,7 @@ struct VideoSenderStats {
     double queueMs = -1;  // queueing delay on the way to the headset, -1 = unknown
     float qp = -1;        // the encoder's rolling mean QP, -1 = unknown
     uint32_t encWidth = 0, encHeight = 0;  // what is actually being encoded, 0 = unknown
+    uint32_t srcWidth = 0, srcHeight = 0;  // what the game renders (before encodeScale), 0 = unknown
     double gameFps = 0, encFps = 0, droppedFps = 0;  // 10 s averages from the frame-flow log
 };
 
