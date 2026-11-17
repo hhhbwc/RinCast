@@ -205,3 +205,39 @@ RinCast is an independent project. It isn't affiliated with, endorsed by or
 sponsored by Meta, Oculus, PICO, ByteDance, Virtual Desktop Inc., Valve or Microsoft. Their names
 and product names are trademarks of their owners and are used here only to
 describe compatibility.
+
+
+## Verified setup and known limitations
+
+What has actually been verified (maintainers' bench, evidence graded):
+
+| item | status |
+|---|---|
+| GPU / encoder | NVIDIA GeForce RTX 4060 Laptop (NVENC HEVC/AV1) - [measured] |
+| headset | PICO 4 (serial family PA8110...), OpenXR runtime, 72/90 Hz - [measured]; 120 Hz is **not** supported (official spec lists 72/90, and the PC fps ladder has no 120 rung) |
+| link | home LAN Wi-Fi, up to ~100 Mbps wire - [measured] |
+| OS | Windows 11 (build 26300) - [measured] |
+
+Known limitations, all measured or code-verified:
+
+- The three quality profiles converge to the same encoder throughput under load:
+  that is the NVENC ceiling on this GPU class, not a bug (encoder-ceiling bench, 2026-11-15).
+- Decoding 2688x2688 per eye caps at roughly 45 fps on this headset (its own decode
+  hint says so, and the streamer warns when the requested fps exceeds it).
+- The display-side latency (25-36 ms depending on refresh rate) belongs to the headset
+  runtime's compositor pipeline; 72 Hz is the measured latency-optimal rate (63.9 ms
+  end to end vs 75.6 ms at 90 Hz, 2026-11-18 measurement session).
+- When decoding struggles, the optional autoscale ladder eases the encode size in
+  steps (100 -> 85 -> 67 -> 50, down only, manual reset) - off by default.
+
+
+## Security and trust (LAN streaming)
+
+The headset and the PC authenticate each other with a per-session key exchange before
+any stream data flows, and every session datagram is MAC-checked. A device that has
+passed that handshake and your approval is trusted with the full desktop: it can move
+the mouse and keyboard (if you enabled desktop input), change streamer settings, and
+launch games. Only connect headsets you own, and review the trusted-device list in the
+streamer settings. The LAN discovery beacon says whether a PC has a linked account -
+it deliberately stopped carrying the account name itself (ROUND20 B1). Details:
+`docs/ARCHITECTURE.md`, `docs/SETTINGS.md`.

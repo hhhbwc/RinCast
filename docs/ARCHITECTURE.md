@@ -115,3 +115,41 @@ A remote connection works like this:
 7. The headset has a long-lived identity key (Ed25519, in its settings) and signs each connection's temporary key with it. A PC only accepts headsets it has allowed, on every path, and pins that key the first time. A headset the PC doesn't know gets a prompt on the PC, even if its account is right. "Ask before a new headset connects" turns this off.
 
 Streaming sockets are dual-stack (IPv4 and IPv6). With DS-Lite or another carrier NAT at home, IPv6 is usually the direct path.
+
+
+## Frame lifecycle and latency segmentation (measured)
+
+Numbers are from the maintainers' measurement sessions (RTX 4060 Laptop + PICO 4, LAN,
+see the workspace analysis notes `ANALYSIS-2026-11-17`, `ROUND18-WIP-2026-11-17/RUN2/L8/AUDIT.md`
+and `ROUND19-WIP-2026-11-17/EXPERIMENT-A-72HZ.md` - not part of this repository).
+Evidence grade: [code] = file:line in this tree, [measured] = logged device data.
+
+A VR frame crosses five stages; each side logs its own segments once a second so the
+ends can be correlated (`tools/logpair.py` estimates the clock offset from bitrate steps):
+
+| stage | measured at 90 Hz | measured at 72 Hz (settled) | where the timer lives |
+|---|---|---|---|
+| PC: game renders + bridge hands off | game 13.9-33.2 ms across sessions | (in the PC segment below) | bridge -> stream job (`pc/streamer/src/stream/vr_stream.cpp`, encode job carries the producer's `frameIndex`) |
+| PC: encode (NVENC) | 7.5-18.5 ms | within PC segment | encode timing feeds `SendJob::encodeMs` (`vr_stream.cpp`), per-window p50/p95 in `rc diag 1s` |
+| wire + headset decode | 2.1-12.2 ms wire, decode 5.4-10.4 ms | decode 5.6 ms | headset `rc vr rx 1s` |
+| headset compositor queue (runtime) | submit->lit 35.2-35.8 ms | 25.3-25.8 ms | `xrEndFrame` return -> predicted display time; probe switch in `headset/app/src/main/cpp/xr/xr_context.cpp` (`fei.displayTime`), diag field `submit->lit` |
+| end to end (pose sampling -> photon) | ~75.6 ms | **63.9 ms** | headset `rc vr rx 1s: total latency` |
+
+The compositor segment belongs to the headset runtime, not to either codebase: the
+runtime wakes the app 36 ms before the predicted display time at 90 Hz and 27 ms at
+72 Hz (adaptive), and the app submits 0.7-0.8 ms after waking ([code]
+`headset/app/src/main/cpp/app/app.cpp`, `m_submitNs` right after `xrEndFrame`).
+**72 Hz is the measured latency-optimal display rate on this device** (75.6 -> 63.9 ms,
+[measured] 2026-11-18).
+
+## Diagnostics toolkit
+
+| tool | what it prints | exit codes |
+|---|---|---|
+| `rc diag 1s` (PC, `streamer.log`) | game/enc/drop fps, target/wire/queue/qp, encode scale, frame seq range, encode p50/p95, slow-frames | - |
+| `rc vr rx 1s` (headset logcat, tag `RinCast`) | rx Mbps/loss/queue/decode/net spread/total latency | - |
+| `rc vr diag 1s` (headset logcat) | shown/repeated/late, stale dropped, latency pipeline decode rtt, stage map, submit->lit, dt-probe | - |
+| `VR frame timing` (headset, 5 s) | wake lead, latch/hand-in gaps, GPU time, refresh rate | - |
+| `tools/logpair.py` | pairs PC log with a logcat dump, estimates the clock offset (unknown when anchors are too few), per-segment stats, side-by-side windows, anomalies | 0 ok, 1 selftest failure, 2 unparseable input |
+| ASan build | cmake `-DRINCAST_SANITIZE=address` (Debug config), run with the MSVC ASan runtime DLL directory on PATH | build 0 = ok |
+| `rincast-fuzz` | deterministic CPU-only drivers: `msg` / `fec` / `pacing` / `chunk` (the last drives the control-chunk reassembler through a compile-time test seam, `RINCAST_TEST_EXPOSE_REASSEMBLY`, which normal builds do not compile) | 0 ok, 1 CHECK failure, 2 usage |
