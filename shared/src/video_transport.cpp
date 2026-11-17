@@ -303,6 +303,10 @@ void VideoReassembler::HandleFragment(const uint8_t* payload, size_t size) {
     // Not only for a new assembly: a parity packet may have created it (reordering).
     a.codec = VideoCodec(h.codec);
     a.flags = h.frameFlags;
+    // The assembly may predate this fragment, created by a parity packet whose header
+    // claimed a different count: a fragment outside it is garbage, never a place to
+    // write into. (ROUND19 T2, found by the fuzzer: vector<bool> out of range.)
+    if (h.fragmentIndex >= a.fragmentCount) return;
     if (h.fragmentIndex == 0 || h.fragmentIndex + 1 < h.fragmentCount) a.fragmentPayload = std::max(a.fragmentPayload, len);
     if (a.present[h.fragmentIndex]) return;
     a.fragments[h.fragmentIndex].assign(data, data + len);
@@ -374,7 +378,9 @@ void VideoReassembler::TryComplete(uint32_t frameIndex) {
     // alone (single fragment groups never have parity) can't happen, so this is safe.
 
     std::vector<uint8_t> frame;
-    frame.reserve(a.frameSize);
+    // Cap the reservation hint at what insert() can actually add: a header with a lying
+    // frameSize must not turn into a multi-GB reservation. (ROUND19 T2, found by the fuzzer.)
+    frame.reserve(std::min<uint64_t>(a.frameSize, uint64_t(a.fragmentCount) * a.fragmentPayload));
     for (auto& f : a.fragments) frame.insert(frame.end(), f.begin(), f.end());
     if (frame.size() < 2) {
         m_pending.erase(it);
