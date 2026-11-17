@@ -1,10 +1,13 @@
 // RinCast Streamer entry point: single-instance Win32 shell with a tray icon
 // and a WebView2-hosted UI (pc/streamer/ui).
 #include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <wrl.h>
 
+#include <exception>
 #include <memory>
 #include <string>
 
@@ -277,8 +280,65 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
+// ROUND20 L16: the streamer died with 0xE06D7363 (an uncaught C++ exception, which
+// MSVC STL uses for std::errc::resource_deadlock_would_occur - a same-thread re-lock
+// of a non-recursive mutex). This vectored handler fires on the exception's first
+// chance and logs the throwing stack, so the two lock sites are named directly.
+namespace {
+LONG CALLBACK DeadlockStackHandler(PEXCEPTION_POINTERS info) {
+    if (info->ExceptionRecord->ExceptionCode != 0xE06D7363) return EXCEPTION_CONTINUE_SEARCH;
+    static volatile LONG inHandler = 0;
+    if (InterlockedExchange(&inHandler, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    void* frames[32];
+    const USHORT n = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
+    RC_LOGE("THROW STACK (%u frames, innermost first):", unsigned(n));
+    for (USHORT i = 0; i < n; i++) {
+        char name[128] = "?";
+        DWORD64 displacement = 0;
+        char buffer[sizeof(SYMBOL_INFO) + 128] {};
+        auto* sym = reinterpret_cast<SYMBOL_INFO*>(buffer);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 127;
+        DWORD64 address = reinterpret_cast<DWORD64>(frames[i]);
+        if (SymFromAddr(GetCurrentProcess(), address, &displacement, sym)) {
+            IMAGEHLP_MODULE64 mod{};
+            mod.SizeOfStruct = sizeof(mod);
+            SymGetModuleInfo64(GetCurrentProcess(), address, &mod);
+            _snprintf_s(name, sizeof(name), _TRUNCATE, "%s!%s+0x%llx", mod.ModuleName, sym->Name,
+                        (unsigned long long)displacement);
+        } else {
+            _snprintf_s(name, sizeof(name), _TRUNCATE, "0x%llx", (unsigned long long)address);
+        }
+        RC_LOGE("  #%u %s", unsigned(i), name);
+    }
+    InterlockedExchange(&inHandler, 0);
+    return EXCEPTION_CONTINUE_SEARCH;  // observe only: the normal unwind continues
+}
+
+}  // namespace
+
+static int RunStreamer(HINSTANCE instance, PWSTR cmdLine) {
     g_instance = instance;
+    g_instance = instance;
+    // ROUND20 L16 diagnostic: the streamer died with exit 0xE06D7363 (an uncaught C++
+    // exception) and no log, no WER event. Surface what was thrown before the fix lands.
+    AddVectoredExceptionHandler(1, DeadlockStackHandler);
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+    std::set_terminate([] {
+        if (std::exception_ptr held = std::current_exception()) {
+            try {
+                std::rethrow_exception(held);
+            } catch (const std::exception& ex) {
+                RC_LOGE("UNCAUGHT EXCEPTION: %s", ex.what());
+            } catch (...) {
+                RC_LOGE("UNCAUGHT EXCEPTION: not derived from std::exception");
+            }
+        } else {
+            RC_LOGE("TERMINATE called with no active exception");
+        }
+        std::abort();
+    });
     // The uninstaller: put back the default audio devices a killed streamer had switched.
     if (cmdLine && wcsstr(cmdLine, L"--restore-audio-defaults")) {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -347,4 +407,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     CoUninitialize();
     if (singleton) CloseHandle(singleton);
     return 0;
+}
+
+// ROUND20 L16 diagnostic: an uncaught C++ exception escaping here exits the process
+// with 0xE06D7363 and no log, no WER (the CRT's __except bypasses set_terminate for
+// GUI apps). Catch it at the boundary and surface what was thrown.
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
+    try {
+        return RunStreamer(instance, cmdLine);
+    } catch (const std::exception& ex) {
+        RC_LOGE("UNCAUGHT EXCEPTION escaping main: %s", ex.what());
+        return 3;
+    } catch (...) {
+        RC_LOGE("UNCAUGHT EXCEPTION escaping main: not derived from std::exception");
+        return 3;
+    }
 }

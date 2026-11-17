@@ -143,7 +143,11 @@ int main(int argc, char** argv) {
                  {"refreshRates", {72, 90, 120}},
                  {"ipd", 0.064},
                  {"fov", {{1.376, 0.839, 0.966, 1.191}, {0.839, 1.376, 0.966, 1.191}}}}},
-               {"decoders", {{"h264", true}, {"hevc", true}, {"hevc10", true}, {"av1", true}, {"maxWidth", 8192}, {"maxHeight", 4320}}}};
+               {"decoders", {{"h264", true}, {"hevc", true}, {"hevc10", true}, {"av1", true}, {"maxWidth", 8192}, {"maxHeight", 4320}}},
+               {"settings", {{"codec", "hevc"}, {"tenBit", true}, {"streamProfile", 2}, {"qualityProfileCbr", true},
+                             {"profileControlsVideo", true}, {"foveatedEncoding", false}, {"encodeScalePct", 100},
+                             {"adaptiveBitrate", true}, {"vrBitrateMbps", 100},
+                             {"gazeFoveation", true}}}};
     HandshakePacket hp;
     hp.type = PacketType::Hello;
     hp.publicKey = keys.publicKey;

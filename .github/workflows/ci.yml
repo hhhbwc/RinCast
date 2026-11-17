@@ -27,6 +27,37 @@ jobs:
       - name: Core tests
         run: build\pc\bin\Release\rincast-core-tests.exe
 
+  smoke:
+    name: Streamer smoke (stream + UI tick survival)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S pc -B build\smoke -G "Visual Studio 17 2022" -A x64 -DRINCAST_CORE_TESTS=ON
+      - run: cmake --build build\smoke --config Release --target rincast-streamer headset-sim --parallel
+      # ROUND20 L16 regression: the streamer must survive a client session with the UI
+      # status tick running (a mutex re-lock in StatusJson killed it here before).
+      - name: 10 s stream + UI tick smoke
+        shell: python
+        run: |
+          import subprocess, time, os, sys
+          bin_dir = os.path.join(os.getcwd(), "build/smoke/bin/Release")
+          log = os.path.join(bin_dir, "smoke-streamer.log")
+          p = subprocess.Popen([os.path.join(bin_dir, "RinCast Streamer.exe")],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=bin_dir)
+          time.sleep(3)
+          sim = subprocess.run([os.path.join(bin_dir, "headset-sim.exe"), "--pc", "127.0.0.1",
+                                "--vr", "--desktop", "--seconds", "10", "--codec", "hevc"],
+                               capture_output=True, cwd=bin_dir)
+          time.sleep(3)
+          alive = p.poll() is None
+          p.terminate()
+          try:
+              p.wait(timeout=10)
+          except Exception:
+              p.kill()
+          print("sim exit:", sim.returncode, "| streamer survived:", alive)
+          sys.exit(0 if alive else 1)
+
   audio-driver:
     name: Audio driver
     runs-on: windows-2022
