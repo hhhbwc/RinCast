@@ -57,6 +57,15 @@ class Connection {
     // authentic (wrong session or MAC failure).
     bool HandleDatagram(const uint8_t* data, size_t size, const NetAddress& from);
 
+#ifdef RINCAST_TEST_EXPOSE_REASSEMBLY
+    // ROUND19 T2, test-only seam (fuzz_drivers.cpp, compile-time macro, off by default):
+    // hands an ALREADY-AUTHENTICATED payload to the control-chunk reassembler so fuzzing
+    // can reach m_outOfOrder / m_assembly without forging a MAC. Normal builds never
+    // define the macro and are bit-for-bit unchanged; the real path still runs the MAC
+    // check (HandleDatagram) BEFORE this reassembler, and nothing here weakens it.
+    void HandleControlChunkForTest(const uint8_t* payload, size_t size) { HandleControlChunk(payload, size); }
+#endif
+
     // Drives retransmissions and keepalive pings. Call every few milliseconds.
     void Tick(int64_t nowNs);
 

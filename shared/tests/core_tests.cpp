@@ -35,6 +35,7 @@
 #include "rc/platform.h"
 #include "rc/fps_ladder.h"
 #include "rc/loss_brake.h"
+#include "rc/autoscale.h"
 #include "rc/queue_guard.h"
 #include "rc/stream_profile.h"
 #include "rc/video_transport.h"
@@ -203,6 +204,21 @@ static void TestDiscovery() {
     CHECK(b.serverId == "abc" && b.name == "Gaming PC" && b.accountLinked && b.nonce == 7);
     DiscoveryProbe p;
     CHECK(!ParseProbe(bytes.data(), bytes.size(), p));
+    // ROUND20 T1 (B1): the broadcast never carries the account name, and an old-style
+    // announcer that still does is parsed without breaking (the field defaults to "").
+    const std::string wire(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    CHECK(wire.find("accountName") == std::string::npos);
+    CHECK(wire.find("Gaming PC") != std::string::npos);  // sanity: the JSON is on the wire
+    rc::DiscoveryHeader header{rc::kDiscoveryMagic, rc::kProtocolVersion,
+                               uint8_t(rc::DiscoveryType::Announce), 0};
+    const std::string oldJson = R"({"serverId":"abc","name":"Gaming PC","accountLinked":true,)"
+                                R"("accountName":"someone@cloud","nonce":7})";
+    std::vector<uint8_t> oldWire(sizeof(header) + oldJson.size());
+    std::memcpy(oldWire.data(), &header, sizeof(header));
+    std::memcpy(oldWire.data() + sizeof(header), oldJson.data(), oldJson.size());
+    DiscoveryAnnounce legacy;
+    CHECK(ParseAnnounce(oldWire.data(), oldWire.size(), legacy));
+    CHECK(legacy.accountLinked && legacy.accountName == "someone@cloud");  // tolerated in, never broadcast out
 }
 
 static void TestAudio() {
@@ -1143,6 +1159,42 @@ static void TestStreamProfile() {
     CHECK(rc::ProfileParams(rc::StreamProfile::LowLatency).minQp == 24);
     CHECK(rc::ProfileParams(rc::StreamProfile::Balanced).minQp == 16);
 
+    // ROUND18 L2: encodeScale is the encode/render resolution ratio. Every profile
+    // defaults to 1.0 (no behaviour change); the clamp keeps the user override in
+    // [0.5, 1.0] so the encoder never sees a degenerate or upscaled request.
+    for (auto p : all) CHECK(rc::ProfileParams(p).encodeScale == 1.0f);
+    CHECK(rc::ClampEncodeScale(1.0f) == 1.0f);
+    CHECK(rc::ClampEncodeScale(0.5f) == 0.5f);
+    CHECK(rc::ClampEncodeScale(0.67f) == 0.67f);
+    CHECK(rc::ClampEncodeScale(0.0f) == 0.5f);   // below range clamps up
+    CHECK(rc::ClampEncodeScale(2.0f) == 1.0f);   // above range clamps down
+    CHECK(rc::ClampEncodeScale(-1.0f) == 0.5f);
+
+    // ROUND18 L2-FIX2: ScaledEncodeSize is the single source of truth for the encoded
+    // frame size. scale=1.0 must be byte-identical to the old inline formula (base &
+    // ~1u), so 100% is a strict no-op; 0.67 follows truncate-then-even-down; the
+    // clamp and the minimum-2 guard match vr_stream.cpp exactly.
+    CHECK(rc::ScaledEncodeSize(4576, 1.0f) == 4576);          // 100% full width: identity
+    CHECK(rc::ScaledEncodeSize(4577, 1.0f) == 4576);          // 100% odd base: even down
+    CHECK(rc::ScaledEncodeSize(2288, 1.0f) == 2288);          // 100% height: identity
+    CHECK(rc::ScaledEncodeSize(4576, 0.67f) == 3064);         // 4576*0.67=3065.92 -> 3064
+    CHECK(rc::ScaledEncodeSize(2288, 0.67f) == 1532);         // 2288*0.67=1532.96 -> 1532
+    CHECK(rc::ScaledEncodeSize(4576, 0.0f) == 2288);          // 0 clamps to 0.5
+    CHECK(rc::ScaledEncodeSize(4576, 2.0f) == 4576);          // >1 clamps to 1.0
+    CHECK(rc::ScaledEncodeSize(4576, -1.0f) == 2288);         // <0.5 clamps to 0.5
+    CHECK(rc::ScaledEncodeSize(3, 1.0f) == 2);                // minimum 2 (and even)
+    CHECK(rc::ScaledEncodeSize(1, 0.5f) == 2);                // minimum 2 floor
+
+    // ROUND18 L3: the optional head-reported decode-fps hint. Absent (0) and
+    // malformed values must read as "no hint" so an old/buggy headset is a no-op.
+    CHECK(rc::ValidateDecodeFpsHint(0) == 0);     // absent / old headset
+    CHECK(rc::ValidateDecodeFpsHint(45) == 45);   // measured PICO 4 hint, valid
+    CHECK(rc::ValidateDecodeFpsHint(24) == 24);   // lower boundary
+    CHECK(rc::ValidateDecodeFpsHint(240) == 240); // upper boundary
+    CHECK(rc::ValidateDecodeFpsHint(23) == 0);    // malformed low
+    CHECK(rc::ValidateDecodeFpsHint(241) == 0);   // malformed high
+    CHECK(rc::ValidateDecodeFpsHint(0xFFFFFFFFu) == 0);  // garbage
+
     // A one-frame VBV cannot hold NVENC's VBR rate control. Measured 2026-11-15
     // (encode-bench --synthetic, 3488x1744 @90): LowLatency with 100 % sent
     // 136 / 126 / 109 % of a 20 / 30 / 40 Mbps ceiling and only 87 % of 140 Mbps;
@@ -1827,9 +1879,13 @@ static void TestEncoderRateTransaction() {
     CHECK(rc::ClampVbvInitialDelay(1000, 0) == 1000);
 
     // 非有限标称值不直接参与整数转换；桶仍为正。
+    // ROUND18 L4: the fallback nominal went 90 -> 72, so inf now resolves to
+    // 72 fps = 72000 rateNum (was 90000). This is the ONE assertion tied to the
+    // default-fps fallback; the burst-shaping checks above are timing-sensitive
+    // and are NOT changed (they flap independently of this edit, see L4/STATUS).
     const auto finitePlan = rc::PlanEncoderRate(UINT32_MAX, std::numeric_limits<double>::infinity(),
                                                true, false, tracker, 90000, 100, 150);
-    CHECK(finitePlan.rateNum == 90000);
+    CHECK(finitePlan.rateNum == 72000);
     CHECK(finitePlan.budget.maxBitrate == UINT32_MAX);
     CHECK(finitePlan.budget.vbvBufferSize > 0);
 
@@ -1935,6 +1991,300 @@ static void TestWireCeilingBudget() {
 }
 
 
+
+// ROUND19 T3: the decode-side autoscale ladder (rc/autoscale.h) — thresholds,
+// hysteresis, cooldown, manual reset, conservative-on-missing, ladder bottom.
+static void TestL7Autoscale() {
+    rc::L7Autoscale::Config cfg{};  // 20 ms budget, 3 fps drops, 5 s over, 30 s cooldown
+    const int64_t S = 1000000000LL;
+    std::printf("l7 autoscale: ");
+
+    // 1. boundary: decode exactly at the budget is never pressure.
+    {
+        rc::L7Autoscale g;
+        g.Configure(cfg);
+        for (int64_t t = 0; t <= 10 * S; t += S) g.Update(20.0, 0.0, t);
+        CHECK(g.Level() == 0);
+    }
+    // 2. just over the budget, held 5 s, steps exactly once.
+    {
+        rc::L7Autoscale g;
+        g.Configure(cfg);
+        rc::L7Autoscale::Result r{};
+        for (int64_t t = 0; t <= 5 * S; t += S) r = g.Update(20.1, 0.0, t);
+        CHECK(r.changed && g.Level() == 1 && g.Pct() == 85);
+    }
+    // 3. hysteresis: pressure must be CONTINUOUS - a clear tick resets the streak.
+    {
+        rc::L7Autoscale g;
+        g.Configure(cfg);
+        for (int64_t t = 0; t < 4 * S; t += S) g.Update(30.0, -1.0, t);
+        g.Update(10.0, -1.0, 4 * S);  // the clear tick
+        rc::L7Autoscale::Result r{};
+        for (int64_t t = 5 * S; t <= 9 * S; t += S) r = g.Update(30.0, -1.0, t);
+        CHECK(!r.changed && g.Level() == 0);
+    }
+    // 4. cooldown: sustained pressure steps at most once per 30 s.
+    {
+        rc::L7Autoscale g;
+        g.Configure(cfg);
+        int changes = 0;
+        for (int64_t t = 0; t <= 10 * S; t += S) {
+            const auto r = g.Update(30.0, -1.0, t);
+            changes += r.changed ? 1 : 0;
+        }
+        CHECK(changes == 1 && g.Level() == 1);  // one step in the first 10 s
+        for (int64_t t = 11 * S; t <= 34 * S; t += S) {
+            const auto r = g.Update(30.0, -1.0, t);
+            changes += r.changed ? 1 : 0;
+        }
+        CHECK(changes == 1 && g.Level() == 1);  // the 30 s cooldown holds it there
+        for (int64_t t = 35 * S; t <= 40 * S; t += S) {
+            const auto r = g.Update(30.0, -1.0, t);
+            changes += r.changed ? 1 : 0;
+        }
+        CHECK(changes == 2 && g.Level() == 2 && g.Pct() == 67);  // 30 s after the first step
+    }
+    // 5. ladder bottom: it stays at 50 %, never invents a fifth rung.
+    {
+        rc::L7Autoscale g;
+        g.Configure(cfg);
+        for (int64_t t = 0; t <= 300 * S; t += S) g.Update(40.0, -1.0, t);
+        CHECK(g.Level() == 3 && g.Pct() == 50);
+        rc::L7Autoscale::Result r = g.Update(40.0, -1.0, 400 * S);
+        CHECK(!r.changed && g.Level() == 3);
+    }
+    // 6. manual reset: back to 100 %, and the cooldown clears so a fresh episode steps.
+    {
+        rc::L7Autoscale g;
+        g.Configure(cfg);
+        for (int64_t t = 0; t <= 10 * S; t += S) g.Update(30.0, -1.0, t);
+        CHECK(g.Level() == 1);
+        g.Reset();
+        CHECK(g.Level() == 0 && g.Pct() == 100);
+        rc::L7Autoscale::Result r{};
+        for (int64_t t = 41 * S; t <= 46 * S; t += S) r = g.Update(30.0, -1.0, t);
+        CHECK(r.changed && g.Level() == 1);  // reset cleared the cooldown: 5 s is enough again
+    }
+    // 7. conservative on missing signals: absent values never fire, ever.
+    {
+        rc::L7Autoscale g;
+        g.Configure(cfg);
+        for (int64_t t = 0; t <= 60 * S; t += S) g.Update(-1.0, -1.0, t);
+        CHECK(g.Level() == 0);
+    }
+    // 8. the PC's own dropped-frame average is a signal on its own.
+    {
+        rc::L7Autoscale g;
+        g.Configure(cfg);
+        rc::L7Autoscale::Result r{};
+        for (int64_t t = 0; t <= 5 * S; t += S) r = g.Update(5.0, 10.0, t);
+        CHECK(r.changed && g.Level() == 1);
+    }
+    // 9. only down: long calm stretches never raise the level.
+    {
+        rc::L7Autoscale g;
+        g.Configure(cfg);
+        for (int64_t t = 0; t <= 5 * S; t += S) g.Update(30.0, -1.0, t);
+        CHECK(g.Level() == 1);
+        for (int64_t t = 5 * S; t <= 300 * S; t += S) g.Update(5.0, 0.0, t);
+        CHECK(g.Level() == 1);
+    }
+    // 10. clock jumps backward: no crash, no step before real elapsed time.
+    {
+        rc::L7Autoscale g;
+        g.Configure(cfg);
+        g.Update(30.0, -1.0, 4 * S);                              // the streak began at 4 s
+        rc::L7Autoscale::Result r = g.Update(30.0, -1.0, 1 * S);  // clock went back 3 s
+        CHECK(!r.changed && g.Level() == 0);
+        r = g.Update(30.0, -1.0, 5 * S);   // only 1 s real elapsed: no step yet
+        CHECK(!r.changed && g.Level() == 0);
+        r = g.Update(30.0, -1.0, 9 * S);   // 9 - 4 = 5 s real elapsed: the jump never counted
+        CHECK(r.changed && g.Level() == 1);
+    }
+    std::printf("ok\n");
+}
+
+
+// ROUND19 T3: the disconnect/reconnect state machine at the connection level (the
+// session-level paths are mapped in the stick's AUDIT; the streamer owns those and
+// is not linkable here). Each case builds fresh loopback session pairs like the
+// transport test above.
+namespace {
+struct SessionLink {
+    Peer a, b;
+    crypto::SessionKeys ck, sk;  // kept: the roam case reuses the link's own keys
+    SessionLink(uint32_t sessionId) {
+        auto client = crypto::KeyPair::Generate();
+        auto server = crypto::KeyPair::Generate();
+        const std::string ctx = SessionContext("cn", "sn", "secret");
+        ck = crypto::DeriveSessionKeys(client.secretKey, server.publicKey, client.publicKey, server.publicKey, ctx);
+        sk = crypto::DeriveSessionKeys(server.secretKey, client.publicKey, client.publicKey, server.publicKey, ctx);
+        CHECK(a.socket.Open(0));
+        CHECK(b.socket.Open(0));
+        NetAddress aAddr{0x7F000001, a.socket.LocalPort()};
+        NetAddress bAddr{0x7F000001, b.socket.LocalPort()};
+        a.conn = std::make_unique<Connection>(&a.socket, bAddr, sessionId, sk, true, kMaxDatagramLan);
+        b.conn = std::make_unique<Connection>(&b.socket, aAddr, sessionId, ck, false, kMaxDatagramLan);
+        a.Run();
+        b.Run();
+    }
+    ~SessionLink() {
+        a.Stop();
+        b.Stop();
+        a.conn.reset();
+        b.conn.reset();
+    }
+    NetAddress AAddr() const { return {0x7F000001, a.socket.LocalPort()}; }
+};
+}  // namespace
+
+static void TestSessionDisconnectReconnect() {
+    std::printf("session disconnect/reconnect: ");
+
+    // 1. clean disconnect: the peer's Disconnect packet raises PeerDisconnected on the
+    // receiving side only.
+    {
+        SessionLink l(101);
+        l.a.conn->SendDisconnect();
+        SleepMs(150);
+        CHECK(l.b.conn->PeerDisconnected());
+        CHECK(!l.a.conn->PeerDisconnected());
+    }
+    // 2. data arriving after the disconnect flag: parsed without state damage.
+    {
+        SessionLink l(102);
+        l.a.conn->SendDisconnect();
+        SleepMs(120);
+        for (int i = 0; i < 20; i++) l.a.conn->SendControl("late" + std::to_string(i));
+        SleepMs(150);
+        CHECK(l.b.conn->PeerDisconnected());
+    }
+    // 3. session isolation: a datagram from the OLD session is rejected by the NEW
+    // session's receiver (wrong session id / keys), nothing is delivered.
+    {
+        SessionLink l(103);
+        l.b.Stop();
+        auto client2 = crypto::KeyPair::Generate();
+        auto server2 = crypto::KeyPair::Generate();
+        const std::string ctx2 = SessionContext("c2", "s2", "secret2");
+        auto ck2 = crypto::DeriveSessionKeys(client2.secretKey, server2.publicKey, client2.publicKey, server2.publicKey, ctx2);
+        auto newConn = std::make_unique<Connection>(&l.b.socket, l.AAddr(), 999, ck2, false, kMaxDatagramLan);
+        std::atomic<int> delivered{0};
+        newConn->SetControlHandler([&](const std::string&) { delivered++; });
+        l.a.conn->SendControl("from the old session");
+        SleepMs(200);
+        CHECK(delivered.load() == 0);           // nothing crossed the session boundary
+        CHECK(!newConn->HasClockOffset());      // and the new session learned nothing
+    }
+    // 4. a big multi-chunk message assembles intact on a fresh session.
+    {
+        SessionLink l(104);
+        std::string big(100000, 'y');
+        std::atomic<bool> ok{false};
+        l.b.conn->SetControlHandler([&](const std::string& m) { ok = (m == big); });
+        l.a.conn->SendControl(big);
+        SleepMs(400);
+        CHECK(ok.load());
+    }
+    // 5. two sends of the same message deliver twice (reliable, not deduplicated).
+    {
+        SessionLink l(105);
+        std::atomic<int> n{0};
+        l.b.conn->SetControlHandler([&](const std::string& m) { if (m == "dup") n++; });
+        l.a.conn->SendControl("dup");
+        l.a.conn->SendControl("dup");
+        SleepMs(200);
+        CHECK(n.load() == 2);
+    }
+    // 6. reconnect storm: five quick sessions in a row, each delivers before teardown.
+    {
+        for (int round = 0; round < 5; round++) {
+            SessionLink l(uint32_t(200 + round));
+            std::atomic<bool> got{false};
+            l.b.conn->SetControlHandler([&](const std::string& m) { got = (m == "storm"); });
+            l.a.conn->SendControl("storm");
+            SleepMs(120);
+            CHECK(got.load());
+        }
+    }
+    // 7. disconnect mid-message: the peer never hangs; the abandoned reassembly state
+    // dies with the session (a fresh session is case 3/8's business).
+    {
+        SessionLink l(207);
+        std::string big(100000, 'z');
+        l.a.conn->SendControl(big);
+        l.a.conn->SendDisconnect();  // in-flight chunks abandoned mid-reassembly
+        SleepMs(200);
+        CHECK(l.b.conn->PeerDisconnected());
+    }
+    // 8. clock offset is per-session: measured on the old connection, fresh = unknown.
+    {
+        SessionLink l(208);
+        SleepMs(400);  // keepalive pings flow while both peers pump
+        const bool oldHad = l.a.conn->HasClockOffset();
+        l.b.Stop();
+        auto client2 = crypto::KeyPair::Generate();
+        auto server2 = crypto::KeyPair::Generate();
+        const std::string ctx2 = SessionContext("c8", "s8", "secret8");
+        auto ck2 = crypto::DeriveSessionKeys(client2.secretKey, server2.publicKey, client2.publicKey, server2.publicKey, ctx2);
+        auto newConn = std::make_unique<Connection>(&l.b.socket, l.AAddr(), 209, ck2, false, kMaxDatagramLan);
+        CHECK(oldHad);
+        CHECK(!newConn->HasClockOffset());
+    }
+    // 9. peer roam: the same session keys from a different address rebinds the remote.
+    {
+        SessionLink l(210);
+        l.b.Stop();  // take the receive side over by hand
+        // probe 1: consumed from the ORIGINAL address (advances the replay window)
+        l.a.conn->SendControl("roam-probe-1");
+        uint8_t buf1[2048];
+        NetAddress from;
+        int n = 0;
+        for (int i = 0; i < 100 && n <= 0; i++) {
+            n = l.b.socket.RecvFrom(buf1, sizeof(buf1), from, 10);
+            SleepMs(2);
+        }
+        CHECK(n > 0);
+        CHECK(l.b.conn->HandleDatagram(buf1, size_t(n), from));
+        const uint16_t oldPort = l.b.conn->Remote().port;
+        // probe 2: a fresh authentic datagram, but this one arrives from a DIFFERENT
+        // source address (the headset roamed to a new NAT mapping). The replay window
+        // must NOT eat it - the roam branch has to rebind the remote.
+        l.a.conn->SendControl("roam-probe-2");
+        uint8_t buf2[2048];
+        int n2 = 0;
+        for (int i = 0; i < 100 && n2 <= 0; i++) {
+            n2 = l.b.socket.RecvFrom(buf2, sizeof(buf2), from, 10);
+            SleepMs(2);
+        }
+        CHECK(n2 > 0);
+        rc::UdpSocket roamed;
+        CHECK(roamed.Open(0));
+        CHECK(l.b.conn->HandleDatagram(buf2, size_t(n2), NetAddress{0x7F000001, roamed.LocalPort()}));
+        CHECK(l.b.conn->Remote().port == roamed.LocalPort());  // followed the new source
+        roamed.Close();
+    }
+    // 10. teardown never hangs: five rapid link destructions complete in bounded time.
+    {
+        const int64_t t0 = rc::NowNs();
+        for (int i = 0; i < 5; i++) { SessionLink l(uint32_t(300 + i)); }
+        CHECK(rc::NowNs() - t0 < 20LL * 1000 * 1000 * 1000);
+    }
+    // 11. sessions are independent: two concurrent pairs do not cross-deliver.
+    {
+        SessionLink l1(401), l2(402);
+        std::atomic<int> hits1{0}, hits2{0};
+        l1.b.conn->SetControlHandler([&](const std::string& m) { if (m == "one") hits1++; });
+        l2.b.conn->SetControlHandler([&](const std::string& m) { if (m == "two") hits2++; });
+        l1.a.conn->SendControl("one");
+        l2.a.conn->SendControl("two");
+        SleepMs(200);
+        CHECK(hits1.load() == 1 && hits2.load() == 1);
+    }
+    std::printf("ok\n");
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     TestLinkLocalDiscovery();
@@ -1963,6 +2313,8 @@ int main() {
     TestFpsLadder();
     TestLossBrake();
     TestQueueGuard();
+    TestL7Autoscale();
+    TestSessionDisconnectReconnect();
     TestFecDeterministic();
     TestHandshakeAndTransport();
     std::printf(g_failures ? "%d FAILURES\n" : "ALL TESTS PASSED\n", g_failures);

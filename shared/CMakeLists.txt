@@ -48,3 +48,46 @@ if(RINCAST_CORE_TESTS)
   add_executable(rincast-core-tests tests/core_tests.cpp)
   target_link_libraries(rincast-core-tests PRIVATE rincast-core)
 endif()
+
+# ROUND19 T2: CPU-only hardening options, all default off (release builds unaffected).
+#   RINCAST_SANITIZE=address -> MSVC /fsanitize=address on rincast-core and the test
+#   binaries. MSVC has no UBSan equivalent; use RINCAST_ANALYZE=ON for /analyze instead.
+#   RINCAST_FUZZ=ON          -> the deterministic fuzz drivers in tests/fuzz_drivers.cpp.
+set(RINCAST_SANITIZE "" CACHE STRING "Sanitizer: \"address\" (MSVC /fsanitize=address) or empty")
+option(RINCAST_ANALYZE "Add /analyze to rincast-core sources (MSVC)" OFF)
+option(RINCAST_FUZZ "Build the deterministic fuzz drivers" OFF)
+
+set(RC_HARDEN_FLAGS "")
+if(RINCAST_SANITIZE)
+  if(MSVC AND RINCAST_SANITIZE STREQUAL "address")
+    set(RC_HARDEN_FLAGS /fsanitize=address)
+    # /RTC (CMake default in Debug) is incompatible with /fsanitize=address.
+    string(REPLACE "/RTC1" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    string(REPLACE "/RTC1" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+  else()
+    message(WARNING "RINCAST_SANITIZE='${RINCAST_SANITIZE}' is not supported by this toolchain; ignored")
+  endif()
+endif()
+if(RINCAST_ANALYZE AND MSVC)
+  list(APPEND RC_HARDEN_FLAGS /analyze)
+endif()
+
+function(rc_harden target)
+  if(RC_HARDEN_FLAGS)
+    target_compile_options(${target} PRIVATE ${RC_HARDEN_FLAGS})
+    target_link_options(${target} PRIVATE ${RC_HARDEN_FLAGS})
+  endif()
+endfunction()
+
+rc_harden(rincast-core)
+if(TARGET rincast-core-tests)
+  rc_harden(rincast-core-tests)
+endif()
+if(RINCAST_FUZZ)
+  add_executable(rincast-fuzz tests/fuzz_drivers.cpp)
+  target_link_libraries(rincast-fuzz PRIVATE rincast-core)
+  # ROUND19 T2: the fuzz target is the ONLY place the reassembly test seam is compiled
+  # in; default builds (streamer, core-tests) never see it.
+  target_compile_definitions(rincast-fuzz PRIVATE RINCAST_TEST_EXPOSE_REASSEMBLY)
+  rc_harden(rincast-fuzz)
+endif()
