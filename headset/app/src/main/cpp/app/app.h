@@ -27,7 +27,9 @@
 #include "../keyboard/keyboard.h"
 #include "../xr/xr_context.h"
 #include "../xr/xr_input.h"
+#include "rc/link_policy.h"
 #include "rc/motion_field.h"
+#include "rc/percentile.h"
 #include "latency.h"
 #include "settings.h"
 
@@ -78,6 +80,10 @@ class App {
 
     // ---- used by the UI builders (screens.cpp) ----
     HeadsetSettings& Settings() { return m_settings; }
+    // A20 编译修正 (TASK-OPLOGIC-FIX-HMD-2026-11-22): read-only callers on a const App —
+    // the stats panel's frame-generation row (screens.cpp FrameGenStatus) — need this
+    // overload; mutable call sites keep binding to the non-const one above.
+    const HeadsetSettings& Settings() const { return m_settings; }
     kb::Keyboard& Kb() { return m_keyboard; }
     void SaveSettings();
     void ApplyStreamSettings();      // pushes streaming settings to the PC
@@ -128,6 +134,10 @@ class App {
 
     const json& ServerInfo() const { return m_serverInfo; }
     const json& ServerStats() const { return m_serverStats; }
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.1: the stats panel's "frame generation" line reads
+    // the pace-policy observation (mode + smoothed game rate) and the quota bit.
+    rc::LinkPolicyState LinkPolicy() const { return m_linkPolicy; }
+    bool GenCreditArmed() const { return m_genCredit; }
     std::vector<GameInfo>& Games() { return m_games; }
     void RequestGames();
     void RequestGameImage(GameInfo& g);
@@ -142,6 +152,11 @@ class App {
         double stageMs[kStageCount] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};  // -1: not measured
     };
     Stats CurrentStats() const { return m_stats; }
+    // A22 (TASK-LATENCY-EMA): the smoothed latency the panels show - an EMA over at most one
+    // latency sample per display frame, alpha 0.02 (VD's overlay lerp, PerformanceOverlay.cs
+    // :386). <0: no sample yet. The raw 1 s window average stays in Stats::latencyMs for the
+    // diagnostics (rc vr rx 1s, StatusJson, ReportDecode).
+    double LatencyDisplayMs() const { return m_latencyEma; }
     // A USB cable to the PC: the setting, and what the headset says about it.
     const Platform::UsbNetwork& UsbNetwork() const { return m_usbNetwork; }
     void SetUsbCable(bool on);
@@ -287,6 +302,8 @@ class App {
     bool m_vrHasFrame = false;
     float m_vrNoPicture = 0;  // seconds the PC has said "running" without a picture we could show
     rc::VrFrameMetadata m_vrMeta{};
+    rc::LinkPolicyState m_linkPolicy{};  // VD-OFFLINE: pace policy observation (log only, not wired)
+    int m_linkPolicyTicks = 0;  // VD-OBSERVE: 1 Hz ticks, log every 5th
     std::vector<int8_t> m_motionGrid;
     int m_motionWidth = 0, m_motionHeight = 0, m_motionBlock = 0;
     int64_t m_motionFrameNs = 0;   // time between the two frames it compares
@@ -296,6 +313,11 @@ class App {
     bool m_motionConsistent = true;  // ...and as one motion, not rotation or deformation
     int m_motionGateMoving = 0, m_motionGateMean = 0, m_motionGateSpread = 0, m_motionGateFar = 0;
     bool m_vrLatched = false;      // this display got a new VR frame
+    // TASK-QUOTA-GEN-2026-11-20 §1: a freshly decoded frame earns exactly one generated
+    // frame (the credit), spent by the first empty display slot that asks for one - the
+    // next empty slot repeats instead, so the extrapolation never reaches past ~1.
+    bool m_genCredit = false;
+    bool m_genQuotaAnnounced = false;  // the one-shot "quota armed" line was logged for this half-rate period
     uint32_t m_generatedFrames = 0, m_generatedSkipped = 0;
     int64_t m_generatedLogNs = 0;
     uint32_t m_vrFrames = 0;
@@ -324,12 +346,23 @@ class App {
     uint32_t m_submitLitFrames = 0;
     int m_displayDeltaFile = 0;       // ROUND19 E1 probe: files/display_delta.txt, clamped to [-3, 0] frames
     int m_displayDeltaApplied = 0;    // ROUND19 E1 probe: the delta the last EndFrame committed with (0 off-VR)
+    // ROUND20 L17: the diagnostics switch panel (files/ switches, polled once a second).
+    int m_forceEncodeScale = 0;       // force_encode_scale.txt: 0 off, else 50-100
+    int m_forceFoveation = 2;         // force_foveation.txt: 0 off, 1 on, 2 follow settings
+    int m_forceRefresh = 0;           // force_refresh.txt: 0 off, else 72/90
+    bool m_decodeQuantiles = false;   // decode_stats.txt: decode p50/p95 in the diag line
+    // TASK-DEC-PERCENTILE-2026-11-20 §1.3: per-frame decode costs from the VR decoder's
+    // output thread; Percentile() feeds the diag line's dec p50/p95 (no more -1.0/-1.0
+    // placeholder) and the debug-gated 1 Hz line. Reset rides the 5 s flow window.
+    rc::DecodeMsSamples m_decSamples;
     // Where the stream's frames went in the same 5 s: displays, the ones with a new picture,
     // pictures decoded after the late latch, and the decoder's count when the window began.
     // Each controller's last tracked pose, kept for SteamVR while it sleeps (UpdateTracking).
     rc::Pose m_controllerPose[2] = {};
     bool m_haveControllerPose[2] = {false, false};
     int m_flowDisplays = 0, m_flowShown = 0, m_flowLate = 0;
+    uint32_t m_flowGenerated = 0;  // TASK-POLICY-FIX-TESTS-2026-11-20 §B: this window's display slots drawn from an extrapolated frame
+    uint32_t m_genFramesPrevSlot = 0;  // m_generatedFrames as of the previous display slot (per-slot delta, see LogVrTiming)
     uint32_t m_flowDecodedStart = 0;
     double m_flowDecodeMaxMs = 0;
     uint32_t m_statsDropStale = 0, m_statsSkippedPrev = 0;  // ROUND18 L5: stale frames dropped per 1 s
@@ -428,6 +461,14 @@ class App {
     uint32_t m_statsFrames = 0;
     double m_latencySum = 0;
     uint32_t m_latencyCount = 0;
+    // A22 (TASK-LATENCY-EMA): the panels' latency display, an EMA over at most one latency
+    // sample per display frame, alpha 0.02 (VD's overlay lerp, PerformanceOverlay.cs:386).
+    // <0: no sample yet. The window average above keeps its raw sums for the diagnostics.
+    double m_latencyEma = -1.0;
+    // One display frame's staged latency sample: the VR latch's pose age when the pose hit,
+    // else a desktop latch's transport age; the EMA consumes it once, at the end of the late
+    // latch, so pose age and transport age can't take turns inside the same EMA update.
+    double m_frameLatencyMs = -1.0;
     double m_stageSum[kStageCount] = {};
     uint32_t m_stageFrames[kStageCount] = {};
     void AddStages(const double (&ms)[kStageCount]);

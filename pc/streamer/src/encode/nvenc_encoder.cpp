@@ -89,6 +89,7 @@ class NvencEncoder final : public VideoEncoder {
 
     bool Init(ID3D11Device* device, const EncoderConfig& config) override {
         m_config = config;
+        m_fillGate.Reset();
         m_device = device;
         auto& api = NvencLib::Get().api;
         m_encoder = OpenSession(device);
@@ -442,9 +443,16 @@ class NvencEncoder final : public VideoEncoder {
         const auto q = rc::ProfileParams(m_config.profile);
         const uint32_t avgPct = m_config.vbrAveragePercent ? m_config.vbrAveragePercent : q.vbrAveragePercent;
         const bool startup = !m_streamStartNs || now - m_streamStartNs < rc::kRateStartupNs;
+        // L17 fill branch gate: pressure only (fast EMA below 85% of nominal, VR, not
+        // startup); the gate owns the 5 s hold, 30 s cooldown and the only-down latch.
+        // The pure planner still does the rung math; VBV and scaled stay frozen D-034.
+        const double realFps = m_rateTracker.RealFps(m_config.fps);
+        const bool pressure = m_config.fillMode && !m_config.desktop && !startup && m_config.fps > 0 &&
+                              realFps < double(m_config.fps) * 0.85;
+        const bool fillOn = m_fillGate.Update(pressure, now);
         return rc::PlanEncoderRate(m_requestedKbps, m_config.fps, m_config.desktop, startup, m_rateTracker,
                                    m_rateState.applied.rateNum, m_cappedVbr ? avgPct : 100,
-                                   m_cappedVbr ? q.vbvFramesPercent : kLegacyVbvFramesPercent);
+                                   m_cappedVbr ? q.vbvFramesPercent : kLegacyVbvFramesPercent, fillOn);
     }
 
     static void ApplyBudget(NV_ENC_CONFIG& config, const rc::EncoderRatePlan& plan) {
@@ -564,6 +572,9 @@ class NvencEncoder final : public VideoEncoder {
     uint32_t m_requestedKbps = 0;
     rc::EncoderRateTracker m_rateTracker;
     rc::EncoderRateState m_rateState;
+    // L17 fill-mode hysteresis, encode thread only: 5 s sustained pressure before the
+    // rung may follow down, 30 s cooldown, latched on - a manual toggle climbs back.
+    mutable rc::FillModeGate m_fillGate;
     uint64_t m_lastIntraTs = 0;
 
     // Encoder-side truth, summarised every 5 s from the lock path below: the QP the

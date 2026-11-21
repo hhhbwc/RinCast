@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cmath>
 #include <mutex>
 #include <set>
@@ -25,7 +26,12 @@ bool IsExtended(unsigned short vk) {
     return false;
 }
 
-void Send(INPUT* inputs, UINT count) { SendInput(count, inputs, sizeof(INPUT)); }
+std::atomic<bool> g_blocked{false};
+
+void Send(INPUT* inputs, UINT count) {
+    const UINT sent = SendInput(count, inputs, sizeof(INPUT));
+    g_blocked.store(sent == 0, std::memory_order_relaxed);
+}
 
 }  // namespace
 
@@ -143,6 +149,8 @@ void ReleaseAll() {
     for (unsigned short k : keys) Key(k, false);
 }
 
+bool InputBlocked() { return g_blocked.load(std::memory_order_relaxed); }
+
 }  // namespace rcs::input
 
 namespace rcs::input {
@@ -155,7 +163,7 @@ void WakeDisplays() {
     ins[0].mi.dwFlags = MOUSEEVENTF_MOVE;
     ins[1].mi.dx = -1;
     ins[1].mi.dwFlags = MOUSEEVENTF_MOVE;
-    SendInput(2, ins, sizeof(INPUT));
+    Send(ins, 2);
 }
 
 }  // namespace rcs::input

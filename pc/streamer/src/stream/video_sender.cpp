@@ -6,11 +6,6 @@
 
 namespace rcs {
 
-// R4.1/R4.2: the instant-rate ceiling burst mode arms on the packetizer. 180 Mbps keeps
-// a single frame's datagrams spread evenly (no AP-buffer micro-burst) while still leaving
-// well inside the frame period; the packetizer's absolute kMaxBurstKbps=800000 is unchanged.
-constexpr uint32_t kBurstCeilingKbps = 180000;
-
 VideoSender::VideoSender(rc::Connection* connection, uint8_t streamId, rc::VideoCodec codec, uint32_t maxBitrateKbps,
                          int fecPercent, bool adaptive, rc::StreamProfile profile)
     : m_connection(connection),
@@ -57,13 +52,12 @@ void VideoSender::SetPacingMode(int mode, int64_t frameBudgetNs) {
     m_pacingMode.store(mode, std::memory_order_relaxed);
     m_pacingBudgetNs.store(frameBudgetNs, std::memory_order_relaxed);
     switch (mode) {
-        case 1: SetPacing(false); m_packetizer.SetPacingFrameBudgetNs(0); m_packetizer.SetBurstCeilingKbps(0); break;
+        case 1: SetPacing(false); m_packetizer.SetPacingFrameBudgetNs(0); break;
         case 3:
             SetPacing(true);
             m_packetizer.SetPacingFrameBudgetNs(frameBudgetNs);
-            m_packetizer.SetBurstCeilingKbps(kBurstCeilingKbps);
             break;
-        default: SetPacing(true); m_packetizer.SetPacingFrameBudgetNs(0); m_packetizer.SetBurstCeilingKbps(0); break;  // follow
+        default: SetPacing(true); m_packetizer.SetPacingFrameBudgetNs(0); break;  // follow
     }
     // The wire ceiling belongs to the burst mode only: leaving it behind would change
     // the follow modes' encoder target, and their behaviour must stay as it was.
@@ -117,13 +111,10 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
     if (paceMode == 3 && capKbps > 0) {
         const size_t fragPayload = m_connection->MaxPayload() - sizeof(rc::VideoFragmentHeader);
         const size_t total = 2 + metadataSize + frame.data.size();
-        const size_t count = fragPayload ? (total + fragPayload - 1) / fragPayload : 0;
         int fecPct = m_dynamicFec.load(std::memory_order_relaxed);
         if (fecPct < 0) fecPct = m_baseFecPercent;
-        const size_t group = fecPct > 0 ? size_t(std::clamp(100 / fecPct, 2, 64)) : 0;
-        const size_t nParity = group ? (count + group - 1) / group : 0;
-        frameWireBytes = total + count * sizeof(rc::VideoFragmentHeader) +
-                         nParity * (sizeof(rc::VideoParityHeader) + fragPayload);
+        // The one wire-byte formula, shared with the offline sweep (video_sender.h).
+        frameWireBytes = FrameWireBytes(fragPayload, total, fecPct);
     }
     m_packetizer.SendFrame(m_streamId, m_codec, flags, index, metadata, metadataSize, frame.data.data(),
                            frame.data.size());
@@ -345,6 +336,7 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
 VideoSenderStats VideoSender::Stats() {
     std::lock_guard lock(m_statsMutex);
     VideoSenderStats s = m_stats;
+    s.lossAvg = m_lossAvg;  // PLAN-AUTO-TUNE: the same read the throughput log already makes
     m_stats.framesLost = 0;
     return s;
 }

@@ -33,11 +33,6 @@ constexpr int64_t kPaceWaitThresholdNs = 200'000;
 constexpr int64_t kPaceMaxDebtNs = 600'000;
 // (better to send less than to repay a stall as one burst).
 constexpr int64_t kPaceIdleResetNs = 50'000'000;
-// The ceiling for the frame-budget pacing mode (PLAN-pacing-fix WP1): a local UDP
-// flood delivered 800 Mbps steadily (D-016), so bursts up to this rate are worth
-// trying on a LAN. This is a measurement of THIS machine's link, not a universal
-// capability - the remote path never arms the frame budget at all.
-constexpr uint32_t kMaxBurstKbps = 800000;
 }  // namespace
 
 VideoPacketizer::VideoPacketizer(Connection* connection) : m_connection(connection) {
@@ -168,35 +163,33 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
     // Every byte (headers and FEC parity included) takes wire time: this is that count.
     double nsPerByte = paced ? 8e6 / double(kbps) : 0.0;
     int64_t frameStartNs = 0;
-    // ROUND4 R4.1: with an instant-rate ceiling armed, cap effKbps at the ceiling and place
-    // each datagram at the computed sub-ms interval via the precise spin wait, so a frame
-    // never leaves as one ~22 KB micro-burst. The ceiling rate alone bounds the instant rate
-    // (packet bits / interval <= ceiling) for ANY frame size. An earlier revision also forced
-    // interval >= budgetNs/count ("spread across the budget"); that stretched small frames to
-    // fill the whole frame period and, via the measured-fps budget, spiralled 90->67 fps
-    // (submit->sent 6.24->36.44 ms, D-025). The anti-burst goal needs only the rate cap + spin,
-    // so the floor is gone. precisePace stays false when no ceiling is armed: the legacy
-    // budget timeline is then byte-for-byte unchanged.
-    bool precisePace = false;
+    // Token-bucket burst mode (frame budget armed, A10): the frame's datagrams leave
+    // BACK-TO-BACK - nothing inside the frame waits or spreads them - and the budget is
+    // kept BETWEEN frames: the frame bills its wire bytes at the average ceiling
+    // (m_pacingKbps, the user's setting x 1.08) and the NEXT frame may not start before
+    // that billing elapses. A frame that arrives under budget starts at once (no credit
+    // accumulates across idle, and none is needed); an over-budget one delays the next
+    // frame as a WHOLE - its natural frame-size/rate interval - never as a stretched-out
+    // frame. Sustained over-ceiling output is the encoder target's job (wire ceiling,
+    // adaptive bitrate, loss brake); the send layer only keeps the mean and never
+    // manufactures intra-frame delay. Frames are never dropped here: the wait sits at
+    // the frame boundary, in front of the first fragment, and a shutdown cancels it.
+    // The legacy clock (budget 0 - the desktop stream and remote paths) still spreads
+    // fragments at kbps below, byte-for-byte as before.
+    bool burstTokens = false;
     if (budgetNs > 0 && paced) {
-        // Frame-level budget: the clock restarts at every frame start (the continuous
-        // clock let one stretched frame push the next ones later and later), and the
-        // rate rises to whatever sends THIS frame inside the budget - wire bytes
-        // including headers and FEC parity, exactly what the loop below bills.
-        const int64_t now = NowNs();
-        m_nextSendNs = now;
-        frameStartNs = now;
+        burstTokens = true;
         const size_t nParity = group ? (count + group - 1) / group : 0;
         const size_t wireBytes = total + count * sizeof(VideoFragmentHeader) +
                                  nParity * (sizeof(VideoParityHeader) + fragPayload);
-        const double budgetKbps = double(wireBytes) * 8.0 * 1e6 / double(budgetNs);
-        double effKbps = std::min(double(kMaxBurstKbps), std::max(double(kbps), budgetKbps));
-        const uint32_t ceiling = m_burstCeilingKbps.load(std::memory_order_relaxed);
-        if (ceiling > 0) {
-            effKbps = std::min(effKbps, double(ceiling));
-            precisePace = true;
+        // The previous frame's billing may still be running: wait it out once, here at
+        // the frame boundary (RequestStop cancels it for shutdown), then send whole.
+        if (m_nextSendNs > NowNs() && !WaitDue(m_nextSendNs, false)) {
+            RC_LOGD("Video pacing: stopping before frame %u (token-bucket wait)", frameIndex);
+            return 0;
         }
-        nsPerByte = 8e6 / effKbps;
+        frameStartNs = NowNs();
+        m_nextSendNs = frameStartNs + int64_t(double(wireBytes) * nsPerByte);
     } else if (paced) {
         const int64_t now = NowNs();
         if (m_nextSendNs == 0 || m_nextSendNs < now - kPaceIdleResetNs) m_nextSendNs = now;
@@ -206,8 +199,8 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
         const size_t offset = i * fragPayload;
         const size_t len = std::min(fragPayload, total - offset);
         h.fragmentIndex = uint16_t(i);
-        if (paced) {
-            if (!WaitDue(m_nextSendNs, precisePace)) {
+        if (paced && !burstTokens) {
+            if (!WaitDue(m_nextSendNs, false)) {
                 RC_LOGD("Video pacing: stopping mid-frame (%zu of %zu datagrams sent)", sent, count);
                 return sent;
             }
@@ -218,7 +211,7 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
         }
         send(PacketType::Video, &h, sizeof(h), m_frame.data() + offset, len);
         sent++;
-        if (paced) m_nextSendNs += int64_t(double(sizeof(h) + len) * nsPerByte);
+        if (paced && !burstTokens) m_nextSendNs += int64_t(double(sizeof(h) + len) * nsPerByte);
         if (group) {
             for (size_t b = 0; b < len; b++) parity[b] ^= m_frame[offset + b];
             const bool groupEnd = ((i + 1) % group == 0) || (i + 1 == count);
@@ -235,8 +228,8 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
                 const size_t groupMembers = i - size_t(ph.groupIndex) * group + 1;
                 if (groupMembers > 1) {
                     // Parity packets cost the same wire time as data ones and go out at the same pace.
-                    if (paced) {
-                        if (!WaitDue(m_nextSendNs, precisePace)) {
+                    if (paced && !burstTokens) {
+                        if (!WaitDue(m_nextSendNs, false)) {
                             RC_LOGD("Video pacing: stopping mid-frame (%zu of %zu datagrams sent)", sent, count);
                             return sent;
                         }
@@ -245,19 +238,21 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
                     }
                     send(PacketType::VideoParity, &ph, sizeof(ph), parity.data(), fragPayload);
                     sent++;
-                    if (paced) m_nextSendNs += int64_t(double(sizeof(ph) + fragPayload) * nsPerByte);
+                    if (paced && !burstTokens) m_nextSendNs += int64_t(double(sizeof(ph) + fragPayload) * nsPerByte);
                 }
                 std::fill(parity.begin(), parity.end(), uint8_t(0));
             }
         }
     }
     if (frameStartNs) {
-        m_nextSendNs = NowNs();   // the next frame restarts its own clock anyway
+        // The token-bucket billing set at the frame boundary stands (the next frame's
+        // earliest start); only the burst DURATION is judged against the budget here:
+        // overruns mean the socket/path backed the burst up, not that the bucket is spent.
         const int64_t took = NowNs() - frameStartNs;
         const int64_t budget = m_frameBudgetNs.load(std::memory_order_relaxed);
         if (took > budget + 1'000'000LL) {
             m_budgetOverruns.fetch_add(1, std::memory_order_relaxed);
-            RC_LOGD("Video pacing: frame %u took %.1f ms for a %lld ms budget", frameIndex,
+            RC_LOGD("Video pacing: frame %u burst took %.1f ms for a %lld ms budget", frameIndex,
                     double(took) / 1e6, (long long)(budget / 1000000));
         }
     }

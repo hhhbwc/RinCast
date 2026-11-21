@@ -6,14 +6,59 @@
 // the Quest's compositor handles those itself. Most blocks don't move, so this stays small.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
 namespace rc {
 
 inline constexpr int kMotionUnitPixels = 4;
+
+// A18 (TASK-MOTION-HYSTERESIS-2026-11-22): block matching is at its worst on static text -
+// repeated high-contrast glyphs mismatch into their neighbours, and a still block comes out
+// with a bogus +-1 unit vector, +-3.4 px of displacement on the generated frame (x0.85xamount
+// in the headset's shader). That is the "static text jitters" report. A Schmidt hysteresis on
+// the quantized grid, per block and per component, keeps that noise out: a still block only
+// starts moving on real motion of kMotionEnterPx or more, and a +-1 unit block only settles
+// back to still once the motion falls under kMotionExitPx. Blocks already at 2+ units just
+// follow quantization - the hysteresis only guards the 0 <-> 1 boundary, where the noise lives.
+// The accepted trade: a slow pan of 2-4 px/frame can stay frozen out of the generated frame
+// (the real frames still pan correctly), so on slow pans the generated frame may disagree
+// with the real one by 2-4 px. Static text's 3.4 px jitter was the worse evil; a real-device
+// A/B decides.
+inline constexpr float kMotionEnterPx = 4.0f;  // 0 -> +-1 unit needs real motion >= 4 px/frame
+inline constexpr float kMotionExitPx = 2.0f;   // +-1 unit -> 0 once real motion < 2 px/frame
+
+// Quantizes `field` (pixels per frame) into `grid` (int8 units of kMotionUnitPixels) with that
+// hysteresis. `grid` doubles as the state: on the way in it holds the previous frame's values
+// (all zero on the first frame, after a reset, and wherever the grid was resized), on the way
+// out this frame's. Per component:
+//   prev == 0    : |field| >= kMotionEnterPx -> candidate; otherwise stays 0
+//   |prev| == 1  : |field| <  kMotionExitPx  -> 0; otherwise candidate
+//   |prev| >= 2  : candidate (large motion follows quantization, no hysteresis)
+//   candidate = clamp(lround(field / kMotionUnitPixels), -127, 127)
+// The wire format and the unit are untouched (old APKs decode this byte for byte): a block the
+// hysteresis keeps at exactly 0 simply falls into a still run, so the noise blocks that used
+// to shred the runs into moving ones disappear and the runs get longer.
+inline void ApplyMotionHysteresis(const std::vector<float>& field, std::vector<int8_t>& grid) {
+    const auto candidate = [](float px) {
+        return int8_t(std::clamp<long>(std::lround(px / kMotionUnitPixels), -127, 127));
+    };
+    grid.resize(field.size());  // new entries start at 0: the first frame / a reset sees an all-still grid
+    for (size_t i = 0; i < field.size(); i++) {
+        const float px = field[i];
+        const int prev = grid[i];
+        if (prev == 0)
+            grid[i] = std::fabs(px) >= kMotionEnterPx ? candidate(px) : int8_t(0);
+        else if (prev == 1 || prev == -1)
+            grid[i] = std::fabs(px) >= kMotionExitPx ? candidate(px) : int8_t(0);
+        else
+            grid[i] = candidate(px);
+    }
+}
 
 #pragma pack(push, 1)
 struct MotionHeader {

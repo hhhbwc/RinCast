@@ -50,9 +50,15 @@ class App {
     void PushUi(const json& message);
     json StateJson();
     void Tick();  // ~1 Hz from the UI thread
+    // The cached firewall status, as the web UI's health() reads it. Public because
+    // the session's server.info diagnosis short code (A19 audit #10) derives from
+    // the same facts.
+    json FirewallJson();
 
     // Requests the window to show itself (approval prompts).
     std::function<void()> ShowWindowRequest;
+    // Requests a graceful quit (elevation handoff).
+    std::function<void()> QuitRequest;
 
    private:
     // Settings as the UI should show them: saved values plus the headset-owned
@@ -67,9 +73,9 @@ class App {
     CloudClient m_cloud;
     std::mutex m_firewallMutex;
     firewall::Status m_firewall;
-    json FirewallJson();
     std::atomic<bool> m_firewallChecking{false};
     int m_firewallTicks = 0;
+    bool m_lastInputBlocked = false;
     void CheckFirewall();
     GameLibrary m_games;
     GpuInfo m_gpu;
@@ -82,6 +88,10 @@ class App {
     std::mutex m_eventMutex;
     std::vector<json> m_recentEvents;
     std::set<std::string> m_noRemember;  // approved once without "remember"
+    // A19 audit #13: devices whose approval the PC just granted. There is no session
+    // to the asking device yet (it is only polling Hello), so the answer rides the
+    // session that starts right after - OnSessionStarted sends the notice once.
+    std::set<std::string> m_approvedNotice;
 };
 
 }  // namespace rcs

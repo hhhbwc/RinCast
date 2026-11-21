@@ -10,7 +10,10 @@
 
 namespace rc {
 
-constexpr int kFpsLadder[] = {24, 30, 45, 54, 60, 72, 90};
+// 90 -> 120 for 120 Hz panels; 40/48/80 so the fill floor can land on a rung that
+// keeps ratio = vbvPct/100 * rung / nominal >= 1 at every supported refresh tier.
+constexpr int kFpsLadder[] = {24, 30, 40, 45, 48, 54, 60, 72, 80, 90, 120};
+constexpr int kLadderLast = int(sizeof(kFpsLadder) / sizeof(kFpsLadder[0])) - 1;
 
 // Picks the reconfigure target for a measured frame rate:
 //   - below 21 fps is treated as a stall (a load screen, a hang): the budget must
@@ -27,6 +30,11 @@ constexpr int QuantizeFps(double measured, int current) {
     int rung = kFpsLadder[0];
     for (int step : kFpsLadder)
         if (step <= measured + 1e-6) rung = step;
+    // S1b: a panel measures a couple of frames short of its top rate (117-119 on a
+    // 120 Hz panel). Without this the ladder tops out one rung lower after a dip and
+    // cannot climb back (|118-90| > 90*15%), leaving the fill rung at 90 and the wire
+    // at 118/90 = 1.31x the ceiling. 2% is inside panel clock tolerance.
+    if (measured >= double(kFpsLadder[kLadderLast]) * 0.98) rung = kFpsLadder[kLadderLast];
     if (current > 0 && std::fabs(measured - double(current)) <= double(current) * 0.15) return current;
     return rung;
 }
@@ -41,6 +49,73 @@ inline uint32_t ScaleRateToRealFps(uint32_t kbps, double rcFps, double realFps) 
 constexpr int64_t kRateStartupNs = 3'000'000'000LL;
 constexpr int64_t kRateRetryNs = 1'000'000'000LL;
 constexpr int64_t kRateGrowNs = 3'000'000'000LL;
+
+// L17 fill mode floor: the smallest ladder rung whose per-frame budget still fits the
+// VBV bucket. ratio = (vbvPct/100) * rung / nominal >= 1  <=>  rung >= nominal*100/vbvPct.
+// Derived, never hard-coded: 90 Hz + 200% -> 45 (ratio 1.00), 72 Hz + 150% -> 48 (1.00),
+// 120 Hz + 200% -> 60 (1.00), 72 Hz + 200% -> 40 (1.11). A rung below this overflows the
+// bucket (every frame larger than the bucket) - the D-034 QP-breathing root.
+constexpr int FillFloorRung(int nominal, int vbvPct) {
+    if (nominal <= 0 || vbvPct <= 0) return kFpsLadder[0];
+    const double need = double(nominal) * 100.0 / double(vbvPct);
+    for (int step : kFpsLadder)
+        if (double(step) + 1e-9 >= need) return step;
+    return kFpsLadder[kLadderLast];
+}
+constexpr bool LadderContainsStep(int step) {
+    for (int s : kFpsLadder)
+        if (s == step) return true;
+    return false;
+}
+static_assert(LadderContainsStep(FillFloorRung(90, 200)), "the fill floor must be a ladder rung");
+static_assert(FillFloorRung(90, 200) == 45, "90 Hz + 200% VBV must stay at 45 (the shipped default)");
+static_assert(FillFloorRung(72, 150) == 48, "72 Hz + 150% VBV (CBR) must be 48");
+static_assert(FillFloorRung(120, 200) == 60, "120 Hz + 200% VBV must be 60");
+
+// Encoder-side hysteresis for the fill branch. Pressure must hold kHoldNs
+// continuously before the branch turns on; once armed it stays armed for the
+// session (only an encoder re-init or a settings change resets it). The rung
+// itself still follows the slow EMA every call, clamped to [FillFloorRung(nominal, vbvPct), nominal]:
+// recovery therefore raises the rung and shrinks the per-frame budget again. The
+// cooldown is stamped once at arm time (Update's m_cooldownUntilNs = now +
+// kCooldownNs) and never throttles anything again: while armed the m_active
+// short-circuit returns before the cooldown is ever read, and Reset() clears
+// m_cooldownUntilNs together with the rest, so a re-arm after a reset walks a
+// fresh hold window with NO cooldown guard at all (A8 comment fix: the old
+// "cooldown only guards a re-arm after a reset" wording contradicted Reset();
+// behaviour pinned by the F4 case in core_tests.cpp TestFillModeGateEdges -
+// armed at 6S, Reset() at 20S inside the old 36S window, re-armed at 25S).
+// Pure state, so the core tests exercise it without the driver.
+struct FillModeGate {
+    static constexpr int64_t kHoldNs = 5'000'000'000LL;
+    // re-arm guard only (armed state is sticky, so this does not throttle rung changes)
+    static constexpr int64_t kCooldownNs = 30'000'000'000LL;
+
+    // pressure: real fps below nominal*0.85, non-desktop, switch on, past startup.
+    bool Update(bool pressure, int64_t now) {
+        if (m_active) return true;  // armed for the session; the rung keeps following the slow EMA (see above)
+        if (m_cooldownUntilNs && now < m_cooldownUntilNs) return false;
+        if (!pressure) {
+            m_holdSinceNs = 0;
+            return false;
+        }
+        if (!m_holdSinceNs) m_holdSinceNs = now;
+        if (now - m_holdSinceNs < kHoldNs) return false;
+        m_active = true;
+        m_cooldownUntilNs = now + kCooldownNs;
+        m_holdSinceNs = 0;
+        return true;
+    }
+
+    bool Active() const { return m_active; }
+    bool InCooldown(int64_t now) const { return m_cooldownUntilNs && now < m_cooldownUntilNs; }
+    void Reset() { m_active = false; m_holdSinceNs = 0; m_cooldownUntilNs = 0; }
+
+   private:
+    bool m_active = false;
+    int64_t m_holdSinceNs = 0;
+    int64_t m_cooldownUntilNs = 0;
+};
 
 // 重配置时候选桶可能小于已提交的 initial delay（降码率、升档都会缩小桶），
 // 而 initial delay 必须落在桶内。夹紧而不是重置，避免重新灌满桶造成突发。
@@ -80,17 +155,26 @@ inline bool SameRatePlan(const EncoderRatePlan& a, const EncoderRatePlan& b) {
 
 inline EncoderRatePlan PlanEncoderRate(uint32_t kbps, double nominal, bool desktop, bool startup,
                                       const EncoderRateTracker& tracker, uint32_t currentRateNum,
-                                      uint32_t averagePercent, uint32_t vbvFramesPercent) {
+                                      uint32_t averagePercent, uint32_t vbvFramesPercent,
+                                      bool fillMode = false) {
     // 帧率补偿已冻结（D-034）：不再让 frameRateNum 跟随实时 fps 降档。降档会把每帧预算放大
     // real/rung 倍（真机 38fps@30档 = 390KB/帧、124Mbps、190-215ms 的根因），再和标称 VBV 互相
     // 打架造成 QP「呼吸」。冻结在标称后：每帧预算 = kbps/nominal（恒定小帧），VBV = 标称线上
     // 时间上限，预算恒小于桶 → 既不爆队列也不泵。低帧率时码率自然降低，这是延迟优先的物理取舍。
-    (void)desktop;
     (void)startup;
-    (void)tracker;
-    (void)currentRateNum;
     nominal = std::isfinite(nominal) && nominal >= 1.0 ? std::min(nominal, 1000.0) : 72.0;  // ROUND18 L4 fallback
-    const uint32_t rateNum = uint32_t(nominal * 1000.0);
+    uint32_t rateNum = uint32_t(nominal * 1000.0);
+    // L17 opt-in fill branch (default off = byte-identical to the frozen path): only
+    // the frame-rate rung follows the slow fps EMA, floored at FillFloorRung(nominal, vbvPct) and never
+    // above nominal. `scaled` and the VBV formula below stay on the frozen D-034
+    // deep bucket - that is what keeps per-frame budget <= VBV at this rung.
+    if (fillMode && !desktop) {
+        const double slow = tracker.slowIntervalNs > 0 ? 1e9 / tracker.slowIntervalNs : nominal;
+        int rung = QuantizeFps(slow, int(currentRateNum / 1000));
+        const int lo = std::min(FillFloorRung(int(nominal + 0.5), int(vbvFramesPercent)), int(nominal));
+        rung = std::clamp(rung, lo, int(nominal));
+        rateNum = uint32_t(rung) * 1000u;
+    }
     const uint32_t scaled = kbps;
     auto budget = ComputeCappedVbr(scaled, 1, averagePercent, vbvFramesPercent);
     // 桶按标称帧率算，与档位无关：固定的线上时间上限（1.5 帧 = 16.7ms，2 帧 = 22ms），

@@ -30,7 +30,7 @@ constexpr UINT WM_APP_UI = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 2;
 constexpr UINT WM_APP_SHOW = WM_APP + 3;
 constexpr UINT kTrayId = 1;
-constexpr UINT kCmdOpen = 100, kCmdDisconnect = 101, kCmdQuit = 102;
+constexpr UINT kCmdOpen = 100, kCmdDisconnect = 101, kCmdQuit = 102, kCmdElevate = 103;
 const wchar_t* kWindowClass = L"RinCastStreamerWindow";
 
 HWND g_hwnd = nullptr;
@@ -222,6 +222,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     HMENU menu = CreatePopupMenu();
                     AppendMenuW(menu, MF_STRING, kCmdOpen, L"Open RinCast");
                     if (App::Get().Server().ActiveSession()) AppendMenuW(menu, MF_STRING, kCmdDisconnect, L"Disconnect headset");
+                    if (!IsElevated()) AppendMenuW(menu, MF_STRING, kCmdElevate, L"Restart as administrator");
                     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
                     AppendMenuW(menu, MF_STRING, kCmdQuit, L"Quit");
                     POINT pt;
@@ -237,6 +238,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             switch (LOWORD(wp)) {
                 case kCmdOpen: ShowMainWindow(); break;
                 case kCmdDisconnect: App::Get().HandleUiMessage(R"({"type":"disconnect"})"); break;
+                case kCmdElevate: App::Get().HandleUiMessage(R"({"type":"restartElevated"})"); break;
                 case kCmdQuit:
                     g_quitting = true;
                     DestroyWindow(hwnd);
@@ -347,8 +349,19 @@ static int RunStreamer(HINSTANCE instance, PWSTR cmdLine) {
     }
     HANDLE singleton = CreateMutexW(nullptr, TRUE, L"Local\\RinCast.Streamer.Singleton");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (HWND existing = FindWindowW(kWindowClass, nullptr)) PostMessageW(existing, WM_APP_SHOW, 0, 0);
-        return 0;
+        // Elevation handoff: the standard-privilege instance quits right after
+        // spawning us; wait for it to let go of the mutex (abandoned counts).
+        bool owned = false;
+        if (cmdLine && wcsstr(cmdLine, L"--elevated-handoff")) {
+            for (int i = 0; i < 100 && !owned; ++i) {
+                const DWORD w = WaitForSingleObject(singleton, 100);
+                owned = w == WAIT_OBJECT_0 || w == WAIT_ABANDONED;
+            }
+        }
+        if (!owned) {
+            if (HWND existing = FindWindowW(kWindowClass, nullptr)) PostMessageW(existing, WM_APP_SHOW, 0, 0);
+            return 0;
+        }
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -388,6 +401,7 @@ static int RunStreamer(HINSTANCE instance, PWSTR cmdLine) {
         if (!PostMessageW(g_hwnd, WM_APP_UI, 0, reinterpret_cast<LPARAM>(text))) delete text;
     });
     App::Get().ShowWindowRequest = [] { PostMessageW(g_hwnd, WM_APP_SHOW, 0, 0); };
+    App::Get().QuitRequest = [] { PostMessageW(g_hwnd, WM_COMMAND, kCmdQuit, 0); };
 
     const bool minimized = cmdLine && wcsstr(cmdLine, L"--minimized") != nullptr;
     InitWebView(g_hwnd);

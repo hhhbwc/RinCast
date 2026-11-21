@@ -2,6 +2,9 @@
 // PC times are moved onto the headset's clock with the offset the pings measure.
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
+
 namespace rv {
 
 enum LatencyStage {
@@ -33,5 +36,20 @@ inline constexpr LatencyStageInfo kLatencyStages[kStageCount] = {
     {"nextFrame", "Waiting for the next frame"},
     {"compositor", "Compositor and display"},
 };
+
+// TASK-LATENCY-METER-FIX-2026-11-22 §1.2: one frame's stage samples join the running
+// sums. Every stage counts every frame, so on the same frames the stages add up to
+// the total latency instead of falling short of it: a stage pushed below zero by a
+// slightly wrong clock offset counts as zero (a frame is kept, only a small stage
+// skews a little), and an extreme stage counts as a full second rather than
+// silently disappearing. Header-only and dependency-free so the core tests can
+// call it directly (same pattern as the settings helper they already include).
+inline void AddStageSamples(double (&sums)[kStageCount], uint32_t (&frames)[kStageCount],
+                            const double (&ms)[kStageCount]) {
+    for (int i = 0; i < kStageCount; i++) {
+        sums[i] += std::clamp(ms[i], 0.0, 1000.0);
+        frames[i]++;
+    }
+}
 
 }  // namespace rv

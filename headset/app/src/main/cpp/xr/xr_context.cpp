@@ -172,6 +172,20 @@ bool XrContext::CreateInstance(android_app* app, const std::vector<const char*>&
         }
     }
 #ifdef __ANDROID__
+    // The runtime's full list is the device-authoritative answer for extension decisions.
+    // logcat drops lines over 4 KB, so print ~25 names per line instead of one long line.
+    {
+        constexpr size_t kPerLine = 25;
+        const int segments = int((props.size() + kPerLine - 1) / kPerLine);
+        RC_LOGI("Runtime extensions: %zu total, %d segments", props.size(), segments);
+        std::string segment;
+        for (size_t i = 0; i < props.size(); ++i) {
+            if (i % kPerLine == 0) segment.clear();
+            segment += (segment.empty() ? "" : " ") + std::string(props[i].extensionName);
+            if (i % kPerLine == kPerLine - 1 || i + 1 == props.size())
+                RC_LOGI("Runtime extensions [%d/%d]: %s", int(i / kPerLine) + 1, segments, segment.c_str());
+        }
+    }
     if (!HasExtension(XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME)) {
         RC_LOGE("Runtime lacks XR_KHR_opengl_es_enable");
         return false;
@@ -295,26 +309,7 @@ bool XrContext::CreateSession(bool preferStage) {
         if (!CreateSwapchain(w, h, GL_SRGB8_ALPHA8, 1, true, m_eyes[eye])) return false;
     RC_LOGI("Eye buffers %dx%d (recommended %ux%u)", w, h, m_recommendedWidth, m_recommendedHeight);
 
-    if (HasExtension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) {
-        auto enumRates = GetProc<PFN_xrEnumerateDisplayRefreshRatesFB>(m_instance, "xrEnumerateDisplayRefreshRatesFB");
-        uint32_t rc = 0;
-        enumRates(m_session, 0, &rc, nullptr);
-        m_refreshRates.resize(rc);
-        enumRates(m_session, rc, &rc, m_refreshRates.data());
-        m_refreshRates.resize(rc);
-        std::string list;
-        for (float r : m_refreshRates) list += (list.empty() ? "" : ", ") + std::to_string(int(std::lround(r)));
-        if (m_refreshRates.empty()) RC_LOGW("Refresh rates: the headset listed none, so only 72 Hz is offered");
-        else RC_LOGI("Refresh rates: %s Hz", list.c_str());
-        if (const std::string forced = RefreshRateOverride(); !forced.empty())
-            RC_LOGW("Refresh rate: the developer setting debug.oculus.refreshRate = %s sets the display's rate, "
-                    "whatever this app asks for", forced.c_str());
-    }
-    if (m_refreshRates.empty()) m_refreshRates = {72.f};
-    // ROUND18 L8-TELEM: one line naming every rate the runtime honors, the 72 Hz fallback included.
-    std::string supported;
-    for (float r : m_refreshRates) supported += (supported.empty() ? "" : ", ") + std::to_string(int(std::lround(r)));
-    RC_LOGI("Supported refresh rates: %s Hz", supported.c_str());
+    EnumerateRefreshRates();
 
     if (HasExtension(XR_FB_COLOR_SPACE_EXTENSION_NAME)) {
         // Content is authored in sRGB/Rec.709; let the runtime convert to the panel.
@@ -429,6 +424,9 @@ void XrContext::HandleStateChange(XrSessionState state) {
         }
 #endif
         // Rate requests before the session runs may be ignored.
+        // R2: the swapchain-time enumeration may have run before the session was ready and
+        // come back empty (72 Hz fallback). With the session now running, ask once more.
+        if (m_running && m_refreshRates.size() <= 1) EnumerateRefreshRates();
         if (m_requestedHz > 0) SetRefreshRate(m_requestedHz);
         SetPerformanceLevels();
     } else if (state == XR_SESSION_STATE_STOPPING) {
@@ -691,6 +689,37 @@ void XrContext::SetPerformanceLevels() {
     RC_LOGI("Performance level: sustained low");
 }
 
+// ROUND20 L17 rework R2: the enumeration the swapchain setup used to inline. The XrResult
+// is checked now - a call made before the session is ready can come back empty, and the
+// READY handler asks again instead of silently living on the 72 Hz fallback.
+void XrContext::EnumerateRefreshRates() {
+    if (!HasExtension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) return;
+    auto enumRates = GetProc<PFN_xrEnumerateDisplayRefreshRatesFB>(m_instance, "xrEnumerateDisplayRefreshRatesFB");
+    if (!enumRates) return;
+    uint32_t rc = 0;
+    XrResult r = enumRates(m_session, 0, &rc, nullptr);
+    if (XR_SUCCEEDED(r) && rc) {
+        m_refreshRates.resize(rc);
+        r = enumRates(m_session, rc, &rc, m_refreshRates.data());
+        m_refreshRates.resize(XR_SUCCEEDED(r) ? rc : 0);
+    } else {
+        m_refreshRates.clear();
+    }
+    if (XR_FAILED(r)) RC_LOGW("Refresh rates: enumeration failed (%s)", XrResultString(r));
+    std::string list;
+    for (float rate : m_refreshRates) list += (list.empty() ? "" : ", ") + std::to_string(int(std::lround(rate)));
+    if (m_refreshRates.empty()) RC_LOGW("Refresh rates: the headset listed none, so only 72 Hz is offered");
+    else RC_LOGI("Refresh rates: %s Hz", list.c_str());
+    if (const std::string forced = RefreshRateOverride(); !forced.empty())
+        RC_LOGW("Refresh rate: the developer setting debug.oculus.refreshRate = %s sets the display's rate, "
+                "whatever this app asks for", forced.c_str());
+    if (m_refreshRates.empty()) m_refreshRates = {72.f};
+    // ROUND18 L8-TELEM: one line naming every rate the runtime honors, the 72 Hz fallback included.
+    std::string supported;
+    for (float rate : m_refreshRates) supported += (supported.empty() ? "" : ", ") + std::to_string(int(std::lround(rate)));
+    RC_LOGI("Supported refresh rates: %s Hz", supported.c_str());
+}
+
 void XrContext::SetRefreshRate(float hz) {
     if (!HasExtension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) return;
     m_requestedHz = hz;
@@ -703,7 +732,14 @@ void XrContext::SetRefreshRate(float hz) {
     if (set) {
         const XrResult r = set(m_session, best);
         if (XR_FAILED(r)) RC_LOGW("Refresh rate %.0f Hz refused: %s", best, XrResultString(r));
-        else RC_LOGI("Refresh rate: %.0f Hz asked for, %.0f Hz now", best, RefreshRate());
+        else if (std::fabs(best - hz) >= 0.5f) {
+            // R2 evidence: a clamped request names the whole supported list, so a logcat
+            // tail alone answers "does this runtime offer the rate at all".
+            std::string list;
+            for (float rate : m_refreshRates) list += (list.empty() ? "" : ", ") + std::to_string(int(std::lround(rate)));
+            RC_LOGW("Refresh rate: %.0f Hz asked for but only [%s] Hz supported, using %.0f Hz (now %.0f Hz)",
+                    hz, list.c_str(), best, RefreshRate());
+        } else RC_LOGI("Refresh rate: %.0f Hz asked for, %.0f Hz now", best, RefreshRate());
     }
 }
 

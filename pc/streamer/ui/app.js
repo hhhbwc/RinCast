@@ -120,6 +120,10 @@ listeners.push((msg) => {
       showApproval(msg);
       renderHome();
       break;
+    case "inputState":
+      if (state) state.system.inputBlocked = msg.blocked;
+      renderElevate();
+      break;
     case "firewall":
       if (state) state.system.firewall = msg.firewall;
       renderHome();
@@ -253,11 +257,14 @@ function renderAutoscale() {
   const line = $("#l7LevelLine");
   if (!line) return;
   const on = document.querySelector('[data-setting="l7Autoscale"]')?.checked;
-  line.hidden = !on;
+  // UI-SLIM keeps the whole ladder row hidden; a stats tick must not bring the level
+  // line back through here (A19 audit #11: it leaked into view with the switch on).
+  line.hidden = !on || !!$("#l7Row")?.hidden;
   const lvl = state?.session?.vr?.autoscaleLevel;
   $("#l7Level").textContent = lvl != null ? lvl + "%" : "—";
 }
 document.querySelector('[data-setting="l7Autoscale"]')?.addEventListener("change", renderAutoscale);
+
 $("#l7Reset").addEventListener("click", async () => {
   const r = await request({ type: "autoscaleReset" }, 10000);
   if (r && !r.ok) toast(r.error || t("err.noResponse"));
@@ -306,6 +313,10 @@ function sustained(name, poor) {
   return poorRuns[name] >= 5;
 }
 function streamTrouble(s) {
+  // A19 audit #2: a paused stream (headset on the desktop / in a menu) keeps the
+  // last numbers on the wire - frozen values must not blame the PC or the network.
+  // No trouble card while paused; back to normal on resume.
+  if (s.vr?.paused) return null;
   if (!numberCells(s).some((n) => n[3])) return null;
   // A slow picture with a busy encoder is the PC's doing; the rest is the network's.
   const { encodeMs } = liveNumbers(s);
@@ -477,6 +488,13 @@ function liveNumbers(s) {
 
 function countPoor(s) {
   const { vr, fps, mbps, latency } = liveNumbers(s);
+  // A19 audit #2: while the stream is paused its numbers freeze, so they must not
+  // feed the "poor" runs. The runs reset (nothing stays red), and counting starts
+  // fresh on resume.
+  if (s.vr?.paused) {
+    poorRuns.latency = poorRuns.fps = poorRuns.mbps = 0;
+    return;
+  }
   const wanted = vr?.refreshRate;
   sustained("latency", latency >= 80);
   sustained("fps", !!(wanted && fps && fps < wanted * 0.95));
@@ -496,10 +514,12 @@ function numberCells(s) {
 
 function renderLive(s) {
   const { vr, mbps, encodeMs } = liveNumbers(s);
+  const paused = !!s.vr?.paused;  // A19 audit #2: the headset is on the desktop / in a menu
   const numbers = $("#numbers");
   numbers.hidden = false;
   numbers.innerHTML = numberCells(s).map(([label, value, unit, poor]) => `<div><span>${esc(label)}</span><b class="${poor ? "poor" : ""}">${esc(value)}<small>${esc(unit)}</small></b></div>`).join("");
   setFacts($("#facts"), [
+    paused && [t("live.status"), t("live.paused")],
     vr && [t("home.video"), t("home.videoVr", { codec: vr.codec, w: vr.eyeWidth, h: vr.eyeHeight, hz: Math.round(vr.refreshRate) })],
     !vr && (s.desktop || []).length && [t("home.video"), s.desktop.map((d) => d.name).join(", ")],
     !vr && !(s.desktop || []).length && [t("home.video"), t("home.videoNothing")],
@@ -637,13 +657,35 @@ function setOff(row, off) {
   row.classList.toggle("off", off);
   row.querySelector("input").disabled = off;
 }
+// 撤出串流页：这些项头显端已有对应开关，PC 端是重复的一份。
+// 依据 UI-SLIM-DESIGN-2026-11-20 v3；只加 hidden，不删节点、不改设置值。
+const HIDDEN_ROWS = [
+  "adaptiveBitrateRow",                       // 自动码率 → 头显「自动调整码率」
+  "l-profile", "profileOptions", "profileNote", // 侧重 → 头显「画质档位」
+  "l-codec", "codecOptions",                  // 编码 → 头显「视频编码」
+  "l7Row", "l7LevelLine",                     // 解码慢时降尺寸（含状态行）
+  "profileVideoRow",                          // 画质随档位（元开关）
+  "cbrRow",                                   // 每帧用满码率
+  "pcBitrateRow",                             // 用电脑码率上限 → 头显「使用电脑的上限」
+  "tenBitRow",                                // 10-bit 色深 → 头显「10-bit 色深」
+  "foveatedRow",                              // VR 中心清晰 → 头显「Foveated encoding」
+  "autoTuneRow",                              // 自动调参 → 用户指令 2026-11-20：藏开关，设置值不动
+  "autoTuneBox",                              // 藏容器连空框，autoTune 行已藏于 A2.5
+];
+
+function applySlimLayout() {
+  for (const id of HIDDEN_ROWS) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = true;
+  }
+}
+applySlimLayout();   // 模块是 defer 执行的，此时 DOM 已就绪；放在顶层保证首帧不闪
 function renderDependents() {
   const enc = state.system.encoder;
   const offers = { auto: true, hevc: enc.hevc, av1: enc.av1, h264: enc.h264 };
   const unsupported = [];
   $$("#codecOptions label").forEach((l) => {
     const off = !offers[l.querySelector("input").value] && !!enc.backend;
-    setOff(l, off);
     if (off) unsupported.push(l.textContent.trim());
   });
   const a = state.system.audioDriver;
@@ -682,6 +724,12 @@ function renderDependents() {
     ? t("video.override", { list: chosen.join(t("misc.listSep")) })
     : t("video.overrideDefault");
   if (unsupported.length) $("#overrideNote").textContent += ` ${t("video.unsupported", { list: unsupported.join(t("misc.listSep")) })}`;
+  // A19 audit #14 (read-only tier): the headset owns frame generation, the PC has no
+  // switch for it - say its state where the other headset-owned picks are shown.
+  if (session?.headsetFrameGeneration != null)
+    $("#overrideNote").textContent += ` ${t("video.frameGenState", { state: session.headsetFrameGeneration ? t("video.frameGenOn") : t("video.frameGenOff") })}`;
+  // A19 audit #3: the switch that flips bitrate ownership back lives on the headset.
+  $("#overrideNote").textContent += ` ${t("video.overrideChangeHint")}`;
   // The three-way preference explains itself in words the user picked, not in
   // queue milliseconds. Only the neutral note is ours; save errors get their own node.
   const profile = Math.max(0, Math.min(2, Number(state.settings.streamProfile ?? 1)));
@@ -689,6 +737,15 @@ function renderDependents() {
   const h264 = state.settings.codec === "h264";
   setOff($("#tenBitRow"), h264);
   $("#tenBitHint").hidden = !h264;
+  // TASK-CAPS-GUARD: when the effective codec pick is H264 (the headset's choice
+  // first, this PC's setting when the headset follows "auto" - the same mirror
+  // ChooseCodec resolves) and the current tier would hand the encoder a frame wider
+  // than H264's 4096 px limit, the config layer rebuilds the stream on HEVC. The
+  // live stream's encoded width IS that frame (vr_stream.cpp sizes it exactly the
+  // way the guard measures it), so the hint says so where the codec is chosen.
+  const codecPick = session?.headsetCodec && session.headsetCodec !== "auto" ? session.headsetCodec : state.settings.codec;
+  const h264FrameW = session?.vr?.encWidth || 0;
+  $("#codecHint").hidden = !(codecPick === "h264" && h264FrameW > 4096);
   // All three profiles read profileControlsVideo (each floors the fovea at its own
   // share; only Best picture adds two-pass and the QP map), so the checkbox stays
   // clickable on every profile.
@@ -712,6 +769,7 @@ function renderDependents() {
   setOff($("#cbrRow"), profile !== 2 || !state.settings.profileControlsVideo || cbrBlockedByLink);
   setOff($("#playOnPcRow"), !state.settings.streamAudio);
   setOff($("#micRow"), state.settings.audioDevices === "system");
+  applySlimLayout();  // idempotent: state refreshes above may touch these rows
 }
 
 function renderAudio() {
@@ -821,6 +879,20 @@ $("#restartSteamVR").onclick = async () => {
   if (await confirmAction(t("confirm.restartSteamvr.title"), t("confirm.restartSteamvr.text"), t("confirm.restartSteamvr.action"))) { send({ type: "restartSteamVR" }); toast(t("toast.restartSteamvr")); }
 };
 $("#openLogs").onclick = () => send({ type: "openLogs" });
+function renderElevate() {
+  const sys = state && state.system;
+  $("#elevateRow").hidden = !sys || !!sys.elevated;
+  const blocked = !!(sys && sys.inputBlocked);
+  const note = $("#elevateNote");
+  note.textContent = blocked ? t("video.elevateBlocked") : t("video.elevateHint");
+  note.classList.toggle("warn", blocked);
+}
+$("#elevateBtn").onclick = async () => {
+  const yes = await confirmAction(t("video.elevate"), t("video.elevateConfirm"), t("video.elevate"), false);
+  if (!yes) return;
+  const r = await request({ type: "restartElevated" });
+  if (!r.ok && r.error !== "cancelled") showError(t("video.elevateFailed"));
+};
 
 function renderDevices() {
   const list = $("#devices");
@@ -958,6 +1030,7 @@ function renderAll() {
   renderDependents();
   renderAudio();
   renderVr();
+  renderElevate();
   renderDevices();
   renderAccount();
   renderRail();
@@ -976,14 +1049,14 @@ function mock(msg) {
   const audio = { speaker: false, microphone: false, microphoneFeed: false, steam: { speaker: !(demo === "problem"), microphone: !(demo === "problem") }, active: demo === "problem" ? {} : { speaker: "steam", microphone: "steam" } };
   const base = mock.base ||= {
     type: "state", version: "1.0.0", downloadUrl: "https://rincast.com/#download", downloadSite: "rincast.com",
-    settings: { pcName: "Studio PC", codec: "auto", tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, streamProfile: 1, profileControlsVideo: false, qualityProfileCbr: false, encodeScalePct: 0, pcBitrateWins: false, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: "auto", autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: true, preventSleep: true, cloudUrl: "https://rincast.com", allowRemote: true,
+    settings: { pcName: "Studio PC", codec: "auto", tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, autoTune: false, streamProfile: 1, profileControlsVideo: false, qualityProfileCbr: false, fillMode: false, encodeScalePct: 0, pcBitrateWins: false, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: "auto", autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: true, preventSleep: true, cloudUrl: "https://rincast.com", allowRemote: true,
       trustedDevices: none ? [] : [{ id: "q3", name: "Quest 3", model: "Meta Quest 3", lastSeen: Date.now() / 1000 }] },
     cloud: demo === "signedout" || demo === "firstrun" ? { signedIn: false } : { signedIn: true, userName: "Sam", email: "sam@example.com", status: demo === "problem" ? "error" : "online", error: demo === "problem" ? "The server didn't answer." : "", allowRemote: true },
     system: { gpu: demo === "problem" ? "Microsoft Basic Display Adapter" : "NVIDIA GeForce RTX 5070 Ti", port: 38711, addresses: ["192.168.1.20"], vpnAddresses: demo === "vpn" ? [{ name: "Tailscale", address: "100.101.102.103" }] : [], firewall: { otherNetworksOpen: demo !== "problem", publicInUse: demo === "public", publicAllowed: false, publicUnguarded: false }, encoder: demo === "problem" ? {} : { backend: "nvenc", h264: true, hevc: true, av1: true, hevc10: true },
       steamvr: { installed: true, running: false, driverRegistered: demo !== "problem" }, openxr: { rincastAvailable: false, rincastActive: false, steamvrActive: true },
-      audioDriver: audio },
-    session: demo === "connected" || demo === "lowbandwidth" ? { deviceName: "Quest 3", model: "Meta Quest 3", address: "192.168.1.42", remote: demo === "lowbandwidth", connectedSeconds: 1460, rttMs: demo === "lowbandwidth" ? 42.6 : 3.4, vrState: "running", vrApp: "Half-Life: Alyx",
-      headsetBitrateMbps: 0, headsetCodec: "auto", vr: { fps: demo === "lowbandwidth" ? 45 : 90, encodeMs: 3.1, mbps: demo === "lowbandwidth" ? 7 : 182, codec: "HEVC", eyeWidth: 1536, eyeHeight: 1632, refreshRate: 90, latencyMs: demo === "lowbandwidth" ? 96 : 38 }, desktop: [],
+      audioDriver: audio, elevated: demo === "elevated", inputBlocked: demo === "blocked" },
+    session: demo === "connected" || demo === "lowbandwidth" || demo === "paused" ? { deviceName: "Quest 3", model: "Meta Quest 3", address: "192.168.1.42", remote: demo === "lowbandwidth", connectedSeconds: 1460, rttMs: demo === "lowbandwidth" ? 42.6 : 3.4, vrState: "running", vrApp: "Half-Life: Alyx",
+      headsetBitrateMbps: 0, headsetCodec: "auto", headsetFrameGeneration: demo === "paused" ? true : undefined, vr: { fps: demo === "lowbandwidth" || demo === "paused" ? 45 : 90, encodeMs: demo === "paused" ? 18 : 3.1, mbps: demo === "lowbandwidth" || demo === "paused" ? 7 : 182, codec: "HEVC", eyeWidth: 1536, eyeHeight: 1632, refreshRate: 90, latencyMs: demo === "lowbandwidth" || demo === "paused" ? 96 : 38, paused: demo === "paused" }, desktop: [],
       client: { latencyStages: demo === "lowbandwidth" ? { uplink: 21.3, game: 12.1, encoderWait: 0.7, encode: 4.4, downlink: 41.8, decode: 4.6, nextFrame: 3.1, compositor: 8 } : { uplink: 1.7, game: 11.4, encoderWait: 0.6, encode: 4.1, downlink: 5.3, decode: 4.2, nextFrame: 2.9, compositor: 7.8 } } } : null,
     pendingApproval: demo === "approval" ? { deviceId: "x", deviceName: "Quest 3", model: "Meta Quest 3", address: "192.168.1.42" } : null,
   };
@@ -991,6 +1064,7 @@ function mock(msg) {
     if (msg.type === "setSettings") Object.assign(base.settings, msg.settings);
     base.settings._revision = (base.settings._revision || 0) + 1;
     if (msg.type === "getState") receive(structuredClone({ ...base, requestId: msg.requestId }));
+    else if (msg.type === "restartElevated") receive({ type: "reply", requestId: msg.requestId, ok: false, error: "cancelled" });
     else if (msg.requestId) receive({ type: "reply", requestId: msg.requestId, ok: true, settings: structuredClone(base.settings) });
   }, 30);
   if (!mock.timer && base.session) {

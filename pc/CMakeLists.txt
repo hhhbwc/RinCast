@@ -91,6 +91,17 @@ target_include_directories(encode-bench PRIVATE ../third_party)
 target_compile_definitions(encode-bench PRIVATE UNICODE _UNICODE)
 target_link_libraries(encode-bench PRIVATE rincast-core)
 
+# Developer tool: TASK-PERF-MATRIX-2026-11-21 (A14) measurement stick. Prices the
+# real encoder over the settings grid and drives the real VideoPacketizer over a
+# loopback Connection pair. Measurement only - no product behaviour in here.
+add_executable(a14-matrix ../tools/a14-matrix/main.cpp
+  streamer/src/encode/encoder.cpp streamer/src/encode/nvenc_encoder.cpp
+  streamer/src/encode/amf_encoder.cpp streamer/src/encode/mf_encoder.cpp
+  streamer/src/gpu.cpp streamer/src/util.cpp)
+target_include_directories(a14-matrix PRIVATE ../third_party)
+target_compile_definitions(a14-matrix PRIVATE UNICODE _UNICODE)
+target_link_libraries(a14-matrix PRIVATE rincast-core)
+
 # Developer tool: lists the virtual audio devices and how each setting resolves.
 add_executable(audio-check ../tools/audio-check/main.cpp streamer/src/audio/audio.cpp streamer/src/util.cpp)
 target_include_directories(audio-check PRIVATE streamer/src ../third_party)

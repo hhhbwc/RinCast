@@ -40,6 +40,8 @@ struct VrStreamConfig {
     // false = plain CBR: spend the ceiling exactly, even on still pictures. The quality
     // profile's opt-in mode; every other path leaves the encoder on capped VBR.
     bool cappedVbr = true;
+    // L17 fill mode (default off): pass through to the encoder; see EncoderConfig.
+    bool fillMode = false;
     bool motionField = false;       // for frame generation on the headset
     // Foveated encoding around where the eyes look (see Foveator): the size each eye is
     // encoded at, 0 = off. eyeWidth x eyeHeight stays the size the headset shows.
@@ -187,6 +189,12 @@ class VrStream {
     int64_t m_gazeNs = 0;
     float m_foveaStart[2][2] = {};  // encoding thread only
     bool m_foveaPlaced = false;
+    // A18: the motion grid of the frame before - the state of the quantizer's Schmidt
+    // hysteresis (rc::ApplyMotionHysteresis reads it as "was this block moving", writes the
+    // new values back). Run()'s thread only; empty, i.e. all still, on the first frame and
+    // whenever the estimator resets. The change's trade lives with the thresholds in
+    // rc/motion_field.h.
+    std::vector<int8_t> m_motionGridPrev;
 };
 
 }  // namespace rcs

@@ -112,11 +112,14 @@ class MfEncoder final : public VideoEncoder {
         }
 
         if (m_codecApi) {
+            // The rate numbers come from the shared pure derivation (encoder.h,
+            // TASK-COMBO-SWEEP-2026-11-21): same expressions the offline sweep checks.
+            const MfEncoderParams rate = DeriveMfParams(config);
             SetCodecValue(CODECAPI_AVLowLatencyMode, VARIANT_TRUE, VT_BOOL);
             SetCodecValue(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR, VT_UI4);
-            SetCodecValue(CODECAPI_AVEncCommonMeanBitRate, config.bitrateKbps * 1000, VT_UI4);
+            SetCodecValue(CODECAPI_AVEncCommonMeanBitRate, rate.meanBitRate, VT_UI4);
             // Even frame sizes for low latency, like the other encoders. Not all encoders take it.
-            SetCodecValue(CODECAPI_AVEncCommonBufferSize, uint32_t(config.bitrateKbps * 1000.0 / config.fps * (config.desktop ? 2 : 1)), VT_UI4);
+            SetCodecValue(CODECAPI_AVEncCommonBufferSize, rate.bufferSize, VT_UI4);
             SetCodecValue(CODECAPI_AVEncMPVDefaultBPictureCount, 0, VT_UI4);
             SetCodecValue(CODECAPI_AVEncMPVGOPSize, 0, VT_UI4);
             SetCodecValue(CODECAPI_AVEncCommonQualityVsSpeed, config.desktop ? 50 : 0, VT_UI4);
@@ -126,9 +129,10 @@ class MfEncoder final : public VideoEncoder {
         MFCreateMediaType(&outType);
         outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         outType->SetGUID(MF_MT_SUBTYPE, Subtype(config.codec));
-        outType->SetUINT32(MF_MT_AVG_BITRATE, config.bitrateKbps * 1000);
+        const MfEncoderParams rate = DeriveMfParams(config);
+        outType->SetUINT32(MF_MT_AVG_BITRATE, rate.meanBitRate);
         MFSetAttributeSize(outType.Get(), MF_MT_FRAME_SIZE, config.width, config.height);
-        MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE, UINT32(config.fps * 1000), 1000);
+        MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE, rate.frameRateNum, 1000);
         outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
         outType->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
         outType->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
@@ -147,7 +151,7 @@ class MfEncoder final : public VideoEncoder {
         inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         inType->SetGUID(MF_MT_SUBTYPE, config.tenBit ? MFVideoFormat_P010 : MFVideoFormat_NV12);
         MFSetAttributeSize(inType.Get(), MF_MT_FRAME_SIZE, config.width, config.height);
-        MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, UINT32(config.fps * 1000), 1000);
+        MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, rate.frameRateNum, 1000);
         inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
         hr = m_transform->SetInputType(0, inType.Get(), 0);
         if (FAILED(hr)) {

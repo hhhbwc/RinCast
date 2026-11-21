@@ -40,6 +40,9 @@ struct EncoderConfig {
     // CBR is kept only for A/B benchmarks and as a fallback when the driver says
     // it has no VBR. Production uses capped VBR, where bitrateKbps is a ceiling.
     bool cappedVbr = true;
+    // L17 fill mode: opt-in frame-rate-rung follow-down (floor 45). Default off:
+    // the frozen D-034 rate plan runs unchanged. See rc/fps_ladder.h.
+    bool fillMode = false;
     // QP floor: -1 = take the profile's value, 0 = off, >0 = override. This is
     // what makes a still picture cheap without starving a complex one.
     int vbrMinQp = -1;
@@ -60,6 +63,24 @@ struct EncodedFrame {
     bool keyframe = false;
     uint64_t timestamp = 0;  // encoder-side id, for InvalidateAfter
 };
+
+// The numbers the Media Foundation backend writes into its codec API and media type
+// (mf_encoder.cpp Init). Derived here, verbatim, so the offline config sweep
+// (TASK-COMBO-SWEEP-2026-11-21 §1.8) can construct them for every switch combination
+// without a device or an MFT.
+struct MfEncoderParams {
+    uint32_t meanBitRate = 0;   // CODECAPI_AVEncCommonMeanBitRate / MF_MT_AVG_BITRATE
+    uint32_t bufferSize = 0;    // CODECAPI_AVEncCommonBufferSize (one frame at the rate; desktop 2 frames)
+    uint32_t frameRateNum = 0;  // MF_MT_FRAME_RATE numerator (x1000; denominator fixed 1000)
+};
+
+inline MfEncoderParams DeriveMfParams(const EncoderConfig& c) {
+    MfEncoderParams p;
+    p.meanBitRate = c.bitrateKbps * 1000;
+    p.bufferSize = uint32_t(c.bitrateKbps * 1000.0 / c.fps * (c.desktop ? 2 : 1));
+    p.frameRateNum = uint32_t(c.fps * 1000);
+    return p;
+}
 
 class VideoEncoder {
    public:

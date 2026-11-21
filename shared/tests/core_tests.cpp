@@ -1,7 +1,10 @@
 // Loopback tests for the transport: handshake key agreement, reliable control
 // messages under loss, video FEC recovery and discovery parsing.
+// 策略类新用例必须：①输入来自真机日志形态；②先在旧实现上跑红留证，再修码变绿。
+// (TASK-POLICY-FIX-TESTS-2026-11-20 §3.4: a test must not mirror the implementation it exists to catch.)
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +26,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 #endif
 
 #include "rc/audio_codec.h"
@@ -36,6 +40,9 @@
 #include "rc/fps_ladder.h"
 #include "rc/loss_brake.h"
 #include "rc/autoscale.h"
+#include "rc/auto_tune.h"
+#include "rc/percentile.h"
+#include "rc/link_policy.h"
 #include "rc/queue_guard.h"
 #include "rc/stream_profile.h"
 #include "rc/video_transport.h"
@@ -45,10 +52,18 @@
 // relative include keeps the test target free of pc-side link dependencies: the
 // helper is constexpr and nothing else from this header is used here.
 #include "../../pc/streamer/src/settings.h"
+// TASK-COMBO-SWEEP-2026-11-21: the settings -> stream-config builders. Header-only
+// pure functions (no pc-side link dependency); the sweep below calls them directly.
+#include "../../pc/streamer/src/stream/stream_config.h"
+// TASK-LATENCY-METER-FIX-2026-11-22 §2: the headset's stage-sample accumulator.
+// Header-only and dependency-free (constants plus one inline function); the test
+// below calls it directly, the same way it calls the settings helpers above.
+#include "../../headset/app/src/main/cpp/app/latency.h"
 
 using namespace rc;
 
 static int g_failures = 0;
+static int g_skips = 0;
 #define CHECK(cond)                                                    \
     do {                                                               \
         if (!(cond)) {                                                 \
@@ -56,6 +71,42 @@ static int g_failures = 0;
             g_failures++;                                              \
         }                                                              \
     } while (0)
+
+// F1 (TASK-FIX 2026-11-19) -> TASK-FLAKE-ROBUST-2026-11-22 (2026-11-22): the two
+// real-clock pacing tests (TestPacingBursts, TestPacingBurstShaping - the latter also
+// gated together with TestPacingFrameBudget) used to fail deterministically under CPU
+// load (user streaming): fixed ms tolerances reported scheduling artifacts as failures,
+// so a live stream could never gate them ("skip under load / rerun for exemption" loop).
+// Since 2026-11-22 they self-calibrate: an independent unloaded-pacer + SleepMs probe
+// measures the host's jitter floor first (CalibrateTimingJitter), and assertion
+// tolerances adapt with a hard cap (kAdaptiveTolCapMs) - assertion semantics unchanged.
+// Evidence (forced-mode greens incl. under stream load): overnight/evidence/A7-receipt.md.
+// The pre-run guard in main() stays for UNFORCED runs (explicit counted SKIP line, the
+// checks themselves untouched); RINCAST_TEST_TIMING_SENSITIVE=1 forces the run
+// (byte-identical gates) and is part of the standard gate since 2026-11-22
+// (main-AI verification: forced 2 consecutive greens that day),
+// =0 always skips, unset = auto (skip only while the streamer is running).
+static bool TestHostBusy() {
+#ifdef _WIN32
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    bool busy = false;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (lstrcmpiW(pe.szExeFile, L"RinCast Streamer.exe") == 0) {
+                busy = true;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return busy;
+#else
+    return false;
+#endif
+}
 
 struct Peer {
     UdpSocket socket;
@@ -528,12 +579,125 @@ TimelineStats Analyze(std::vector<std::pair<int64_t, size_t>> arrivals, int64_t 
     return s;
 }
 
+// ---------------------------------------------------------------------------
+// TASK-FLAKE-ROBUST-2026-11-22（方案 b 自校准容差，主 AI 批准，带三条护栏）：
+// 固定 ms 容差对调度抢占过敏——负载（用户串流）下边界间隔被压缩/拉长，断言确定性失败。
+// 断言容差 = max(固定基线, min(实测抖动×安全系数, kAdaptiveTolCapMs))。
+// 护栏 1：容差必须有绝对上限。取 15 ms，依据：两个计时测试的计费间隔（TestPacingBursts
+// 35.0 ms / TestPacingBurstShaping ~30.3 ms）的一半——(1) 变异鉴别力：计费 ×10 错误把帧
+// 间隔压到 billing/10（~3 ms），容差上限 15 ms 时 billing - cap 仍远高于它，变异必然仍挂；
+// (2) 与测试自己的边界判定阈值（gap >= billing/2 才算边界）同尺度；(3) 吸收串流负载下
+// 10-15 ms 量级的收包停顿。没有上限的自校准会在负载下把断言变成永真式。
+// 护栏 3：实测抖动超过上限时断言照常失败并如实报——真故障浮出通道，不许静默豁免。
+constexpr double kJitterSafety = 3.0;       // 探针只采少数边界，max 低估尾部，×3 兜住
+constexpr double kAdaptiveTolCapMs = 15.0;  // 护栏 1：绝对上限（取值依据见上）
+
+struct PacingJitter {
+    double compressMs = 0;  // 边界间隔比计费短了多少（接收停顿把包挤到一起的幅度）
+    double stretchMs = 0;   // 边界间隔比计费长了多少（唤醒过冲/抢占的幅度）
+    double stallScaleMs = 0;  // 统一停顿幅度 = max(compress, stretch)，见 CalibrateTimingJitter
+};
+
+// 护栏 2：校准数据源必须独立于被断言的运行。这里跑一次独立的空载 pacer 采样（与
+// TestPacingBursts 同形：96 KB×8 帧 @ 24 Mbps，帧预算 8 ms，独立 socket/连接/帧），
+// 不许用被断言那批帧自己的延迟做校准——否则 pacer 本身坏了会把自己的症状校准掉
+// （自指陷阱）。变异污染探针时（计费 ×10），采样偏差会被护栏 1 的上限封住，断言仍挂。
+// 不用 SleepMs 过冲做信号源：测试进程没有 timeBeginPeriod，sleep_for 的唤醒量化在
+// 15.6 ms 的系统节拍上，量出的是定时器分辨率不是调度抢占（实测 ~13 ms 假信号），而
+// pacer 的等待走 SetWaitableTimerEx + 自旋，从不睡 SleepMs——pacer 采样本身就是对的
+// 拉伸信号源。
+static PacingJitter ProbePacingJitter() {
+    PacingJitter j;
+    RawReceiver rx;
+    UdpSocket tx;
+    if (!rx.Open() || !tx.Open(0)) return j;
+    tx.SetBuffers(16 << 20, 1 << 20);
+    auto keys = crypto::DeriveSessionKeys(crypto::KeyPair::Generate().secretKey, crypto::KeyPair::Generate().publicKey,
+                                          crypto::KeyPair::Generate().publicKey, crypto::KeyPair::Generate().publicKey,
+                                          "t");
+    Connection conn(&tx, NetAddress{0x7F000001, rx.sock.LocalPort()}, 1, keys, true, kMaxDatagramLan);
+    rx.Start();
+    VideoPacketizer pkt(&conn);
+    pkt.SetFecPercent(5);
+    pkt.SetPacingKbps(24000);
+    pkt.SetPacingFrameBudgetNs(8'000'000LL);
+    constexpr size_t kFrameBytes = 96 * 1024;
+    constexpr uint32_t kFrames = 8;  // 7 个边界样本：压缩事件稀疏，样本太少会低估尾部
+    std::vector<uint8_t> frame(kFrameBytes);
+    for (size_t i = 0; i < frame.size(); i++) frame[i] = uint8_t(i * 31);
+    VrFrameMetadata meta{};
+    meta.trackingTimestampNs = 12345;
+    const size_t fragPayload = conn.MaxPayload() - sizeof(VideoFragmentHeader);
+    const size_t total = 2 + sizeof(VrFrameMetadata) + kFrameBytes;
+    const size_t count = (total + fragPayload - 1) / fragPayload;
+    const size_t groupSize = size_t(std::clamp(100 / 5, 2, 64));
+    const size_t groups = (count + groupSize - 1) / groupSize;
+    const size_t lastMembers = count - (groups - 1) * groupSize;
+    const size_t nParity = groups - (lastMembers == 1 ? 1 : 0);
+    const size_t perFrame = count + nParity;
+    const double billingMs = double(total + count * sizeof(VideoFragmentHeader) +
+                                    groups * (sizeof(VideoParityHeader) + fragPayload)) * 8.0 /
+                             24000.0;
+    const DWORD_PTR mask = PinThread(0);
+    for (uint32_t f = 0; f < kFrames; f++)
+        pkt.SendFrame(kVrStreamId, VideoCodec::HEVC, 0, f + 1, &meta, sizeof(meta), frame.data(), frame.size());
+    UnpinThread(mask);
+    SleepMs(60);
+    rx.Stop();
+    const size_t n = std::min(rx.count.load(), rx.arrivals.size());
+    std::vector<std::pair<int64_t, size_t>> v;
+    for (size_t i = 0; i < n; i++)
+        if (rx.arrivals[i].second > 200) v.push_back(rx.arrivals[i]);
+    // 帧首片按已知每帧包数取位（回环不丢不重排）。采样不完整时保守放弃 pacer 部分
+    // （jitter 全零 → 容差落在固定基线）——宁紧勿松，不给断言静默放宽（护栏 3）。
+    if (perFrame > 0 && v.size() >= size_t(kFrames) * perFrame) {
+        double minGap = 1e9, maxGap = 0;
+        for (uint32_t f = 1; f < kFrames; f++) {
+            const double gapMs = NsToMs(v[size_t(f) * perFrame].first - v[size_t(f - 1) * perFrame].first);
+            minGap = std::min(minGap, gapMs);
+            maxGap = std::max(maxGap, gapMs);
+        }
+        j.compressMs = std::max(0.0, billingMs - minGap);
+        j.stretchMs = std::max(0.0, maxGap - billingMs);
+    }
+    return j;
+}
+
+// 护栏 2 的完整取数：独立 pacer 采样，打印留痕（如实报）。同一台机器的停顿总体既会
+// 打在发送侧（探针里表现为边界拉伸）也会打在接收侧（表现为边界压缩）——落在哪一侧
+// 是概率事件，不是两个独立尺度：探针量到 |X| 的拉伸，被断言的运行里同幅度的停顿完全
+// 可以表现为压缩。所以两侧统一到同一个停顿幅度 stallScale = max(compress, stretch)。
+static PacingJitter CalibrateTimingJitter() {
+    PacingJitter j = ProbePacingJitter();
+    j.stallScaleMs = std::max(j.compressMs, j.stretchMs);
+    std::printf("timing calib: pacer boundary compress %.2f / stretch %.2f ms -> stall scale %.2f ms "
+                "(safety x%.1f, cap %.1f ms)\n",
+                j.compressMs, j.stretchMs, j.stallScaleMs, kJitterSafety, kAdaptiveTolCapMs);
+    return j;
+}
+
+// 护栏 1 的公式：容差 = max(固定基线, min(实测抖动×安全系数, 绝对上限))。
+static double AdaptiveTol(double fixedBaselineMs, double jitterMs) {
+    return std::max(fixedBaselineMs, std::min(jitterMs * kJitterSafety, kAdaptiveTolCapMs));
+}
+
 }  // namespace
 
-// 局域网高码率的核心问题：一帧 150 Mbps @ 90 fps 约 208 KB，一口气打进 socket，
-// Wi-Fi 的浅队列直接溢出。这里验证：连续 pacing 下单批突发被压到几十 KB 以内、
-// 包间隔平滑、跨帧不出现整帧瞬时突发。（内容完整性在 TestFecDeterministic 里验。）
+// A10 (TASK-LATENCY-BURST-SEND 2026-11-21)：帧间预算 = 帧粒度令牌桶。每帧按线路字节在
+// 平均上限（pacing kbps）上计费，下一帧不得早于计费结束开始；帧内背靠背突发（窗口内
+// 的单帧突发形态由 TestPacingFrameBudget/TestPacingBurstShaping 验）。这里验证：连续 N
+// 帧无空隙地交给发送器时，帧首片间隔 >= 帧字节/上限（平均速率守上限，token 桶语义），
+// 一个包都不丢，发送循环真实等了计费而不是把等待摊进帧里。
+// TASK-FLAKE-ROBUST-2026-11-22：压缩侧容差（原固定 2.0 ms）改为自校准自适应（上限
+// 15 ms，护栏依据见 CalibrateTimingJitter 上方）；拉长侧不变——负载只会拉长
+// sendLoop/span、压低 avgMbps，那三个方向本来就是安全的。
 static void TestPacingBursts() {
+    const PacingJitter jitter = CalibrateTimingJitter();  // 护栏 2：独立采样
+    // 压缩侧固定基线 2.0 -> 4.0 ms：等待唤醒的定时器量化（±~1 ms/边界，两个边界的差分
+    // 可到 ~2 ms）加上收包侧小延迟差；空载实测底噪 1.4-2.7 ms（streamer 进程在跑）。
+    // 原固定 2.0 ms 对这个底噪过敏（本卡 §0 的问题本身）。拉长侧基线保持不变。
+    const double tolCompressMs = AdaptiveTol(4.0, jitter.stallScaleMs);  // 护栏 1 公式
+    const double tolSpanMs = AdaptiveTol(2.0, jitter.stallScaleMs);
     RawReceiver rx;
     UdpSocket tx;
     CHECK(rx.Open() && tx.Open(0));
@@ -545,80 +709,87 @@ static void TestPacingBursts() {
     Connection conn(&tx, NetAddress{0x7F000001, rx.sock.LocalPort()}, 1, keys, true, kMaxDatagramLan);
     rx.Start();
 
+    constexpr uint32_t kPaceKbps = 24000;      // 平均上限 24 Mbps
     VideoPacketizer pkt(&conn);
-    pkt.SetFecPercent(5);       // 组大小 20，让校验包也参与 pacing（要计入带宽）
-    pkt.SetPacingKbps(225000);  // 150 Mbps 目标 × 1.5
+    pkt.SetFecPercent(5);                      // 组大小 20：校验包参与计费（要计入带宽）
+    pkt.SetPacingKbps(kPaceKbps);
+    pkt.SetPacingFrameBudgetNs(8'000'000LL);   // 突发窗口 8 ms（每帧突发远小于它）
 
-    constexpr size_t kFrameBytes = 208 * 1024;  // 150 Mbps / 90 fps
-    constexpr uint32_t kFrames = 8;
+    constexpr size_t kFrameBytes = 96 * 1024;
+    constexpr uint32_t kFrames = 6;
     std::vector<uint8_t> frame(kFrameBytes);
     for (size_t i = 0; i < frame.size(); i++) frame[i] = uint8_t(i * 31);
     VrFrameMetadata meta{};
     meta.trackingTimestampNs = 12345;
+    // 每帧的数据报数与计费时长：与发送端同一套公式（分片头计入线路字节；末组只剩一个
+    // 成员时不发校验包）。
+    const size_t fragPayload = conn.MaxPayload() - sizeof(VideoFragmentHeader);
+    const size_t total = 2 + sizeof(VrFrameMetadata) + kFrameBytes;
+    const size_t count = (total + fragPayload - 1) / fragPayload;
+    const size_t groupSize = size_t(std::clamp(100 / 5, 2, 64));
+    const size_t groups = (count + groupSize - 1) / groupSize;
+    const size_t lastMembers = count - (groups - 1) * groupSize;
+    const size_t nParity = groups - (lastMembers == 1 ? 1 : 0);
+    const size_t perFrame = count + nParity;
+    const double billingMs = double(total + count * sizeof(VideoFragmentHeader) +
+                                    groups * (sizeof(VideoParityHeader) + fragPayload)) * 8.0 /
+                             double(kPaceKbps);
     const DWORD_PTR senderMask = PinThread(0);
-    // 单帧必须真的被铺开：208 KB / 225 Mbps = 7.4 ms。改前是整帧一次性打进去（~1 ms）。
-    int64_t oneFrameNs = 0;
-    {
-        const int64_t t = NowNs();
-        pkt.SendFrame(kVrStreamId, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), frame.data(), frame.size());
-        oneFrameNs = NowNs() - t;
-    }
-    for (uint32_t f = 1; f < kFrames; f++)
+    const int64_t t = NowNs();
+    for (uint32_t f = 0; f < kFrames; f++)
         pkt.SendFrame(kVrStreamId, VideoCodec::HEVC, 0, f + 1, &meta, sizeof(meta), frame.data(), frame.size());
+    const double sendLoopMs = NsToMs(NowNs() - t);
     UnpinThread(senderMask);
     SleepMs(150);
 
-    // 先量 paced 的时间线，再量一次 unpaced 的单帧突发作为「改前基线」。
-    const size_t pacedCount = std::min(rx.count.load(), rx.arrivals.size());
-    const std::vector<std::pair<int64_t, size_t>> pacedLine(rx.arrivals.begin(), rx.arrivals.begin() + pacedCount);
-    const TimelineStats paced = Analyze(pacedLine, 1'000'000);
+    const size_t n = std::min(rx.count.load(), rx.arrivals.size());
+    std::vector<std::pair<int64_t, size_t>> v;  // 只看视频包（几十字节的控制包不算）
+    for (size_t i = 0; i < n; i++)
+        if (rx.arrivals[i].second > 200) v.push_back(rx.arrivals[i]);
     // RINCAST_PACING_CSV=<path>：把原始到达时间线写出来，便于事后分析（不参与断言）。
     if (const char* csv = std::getenv("RINCAST_PACING_CSV")) {
         if (FILE* f = std::fopen(csv, "w")) {
             std::fprintf(f, "arrival_ns,bytes\n");
-            for (const auto& a : pacedLine) std::fprintf(f, "%lld,%zu\n", (long long)a.first, a.second);
+            for (const auto& a : v) std::fprintf(f, "%lld,%zu\n", (long long)a.first, a.second);
             std::fclose(f);
         }
     }
-    std::printf("paced: %zu datagrams, gap p50 %.2f ms p99 %.2f ms max %.2f ms, batch p50 %.1f KB p90 %.1f KB "
-                "max %.1f KB, one frame took %.2f ms, packet max %zu B\n",
-                paced.packets, paced.p50Ms, paced.p99Ms, paced.maxMs, double(paced.p50BatchBytes) / 1024,
-                double(paced.p90BatchBytes) / 1024, double(paced.batchBytes) / 1024, NsToMs(oneFrameNs),
-                paced.maxPacket);
+    const TimelineStats shape = Analyze(v, 1'000'000);
+    CHECK(!v.empty());
+    if (v.empty()) { rx.Stop(); return; }
+    const double spanMs = NsToMs(v.back().first - v.front().first);
+    // 帧边界 = 长空隙（一帧的突发 ~1-2 ms，计费间隔 ~35 ms）。断言方向取「只能更晚、
+    // 不能更早」的一侧：调度只会把间隔拉长，不会把它压到计费之下。
+    size_t boundaries = 0;
+    double minBoundaryGap = 1e9;
+    uint64_t totalBytes = v[0].second;
+    for (size_t i = 1; i < v.size(); i++) {
+        totalBytes += v[i].second;
+        const double gapMs = NsToMs(v[i].first - v[i - 1].first);
+        if (gapMs >= billingMs / 2) {
+            boundaries++;
+            if (gapMs < minBoundaryGap) minBoundaryGap = gapMs;
+        }
+    }
+    const double avgMbps = double(totalBytes) * 8.0 / spanMs / 1000.0;
+    std::printf("token bucket: %u x %.0f KB @ %u kbps, billing %.1f ms/frame; %zu datagrams (%zu expected), "
+                "span %.1f ms, sendLoop %.1f ms, boundaries %zu, min gap %.2f ms, avg %.1f Mbps, "
+                "gap p50 %.2f p99 %.2f ms, packet max %zu B, tol compress %.2f ms\n",
+                kFrames, double(kFrameBytes) / 1024, kPaceKbps, billingMs, v.size(), kFrames * perFrame,
+                spanMs, sendLoopMs, boundaries, minBoundaryGap, avgMbps, shape.p50Ms, shape.p99Ms,
+                shape.maxPacket, tolCompressMs);
 
-    VideoPacketizer unpaced(&conn);
-    unpaced.SetFecPercent(5);
-    unpaced.SetPacingKbps(0);
-    const int64_t t0 = NowNs();
-    unpaced.SendFrame(kVrStreamId, VideoCodec::HEVC, 0, 100, &meta, sizeof(meta), frame.data(), frame.size());
-    const double unpacedFrameMs = NsToMs(NowNs() - t0);
-    SleepMs(120);
-    // 基线只算 paced 那一段之后新到的包。
-    const size_t rawCount = std::min(rx.count.load(), rx.arrivals.size());
-    const std::vector<std::pair<int64_t, size_t>> rawLine(rx.arrivals.begin() + std::min(pacedCount, rawCount),
-                                                          rx.arrivals.begin() + rawCount);
-    const TimelineStats raw = Analyze(rawLine, 1'000'000);
-    std::printf("unpaced: batch %.1f KB, burst(1 ms) %.1f KB, one frame took %.2f ms\n",
-                double(raw.batchBytes) / 1024, double(raw.burstBytes) / 1024, unpacedFrameMs);
-
-    CHECK(paced.packets > 1000);
-    CHECK(paced.maxPacket <= kMaxDatagramLan);
-    CHECK(paced.p99Ms <= 3.0);  // 包间隔 p99 ≤ 3 ms
-    // 单帧发送时长：pacing 把它铺到 ~7.4 ms，改前是整帧 ~1 ms 一次打完。
-    CHECK(NsToMs(oneFrameNs) > 5.0);
-    CHECK(unpacedFrameMs < NsToMs(oneFrameNs));
-    // 单批突发的物理下限 = 定时器唤醒精度 × pacing 速率。本机实测高精度定时器只有 1 ms
-    // 精度（测 0.5 ms 要等 ~1.0 ms，周期定时器也是 1.0 ms 一拍，见 output/timerbench.log），
-    // 所以单批下限 ≈ 1 ms × 225 Mbps ≈ 28 KB，下降倍数最优也只有 ~8 倍（基线 226 KB），
-    // 而不是设计时按 0.5 ms 精度估的 15 倍。这里用中位批断 32 KB（收包侧偶发停顿会把
-    // 相邻两批挤成一批，把 max 拖到 50 KB 以上，那是测量假象，不当作发送端的突发）。
-    // 批中位数对系统负载敏感：接收线程被挪一下，相邻两批就并成一批（28KB→56KB）。
-    // 64KB 容忍两批合并，相对 unpaced 的整帧 1.4MB 仍有 20 倍以上的区分度。
-    CHECK(paced.p50BatchBytes <= 64 * 1024);
-    // 基线批的大小对调度敏感（发送循环里一次抢占就把一批劈成两半），断言用比例和
-    // 间隙比为主，绝对值放宽到"哪怕被劈一刀也该在"的下限。
-    CHECK(raw.batchBytes >= 60 * 1024);  // 基线确实是整帧突发（被抢占劈开也远大于 paced 批）
-    CHECK(double(raw.batchBytes) >= double(paced.p50BatchBytes) * 2);
+    CHECK(v.size() == kFrames * perFrame);  // 一个包都不丢（回环 + 大缓冲，没有丢弃路径）
+    CHECK(shape.maxPacket <= kMaxDatagramLan);
+    CHECK(sendLoopMs >= double(kFrames - 1) * billingMs - 2.0);  // 发送侧真实等了计费（只会被负载拉长，方向安全）
+    CHECK(spanMs >= double(kFrames - 1) * billingMs - tolSpanMs);  // 令牌桶把帧隔开了（压缩=接收停顿假象，容差自适应）
+    // 窗口内平均速率守上限：N 帧挤进 (N-1) 个计费间隔，理论上限是 N/(N-1) 倍平均上限，
+    // 再留 15% 给突发的分摊（更紧就等于在断言定时器精度了）。
+    CHECK(avgMbps <= double(kPaceKbps) * double(kFrames) / double(kFrames - 1) * 1.15 / 1000.0);
+    // 结构精确时的硬检查：每个帧间隔都达到计费。边界多了说明主机在帧内停顿过（那是
+    // 测量假象，span 检查仍然兜底），这时不对单个间隔下硬断言。容差自适应但封顶
+    // （kAdaptiveTolCapMs）：抖动超上限 = 真故障，照常失败浮出（护栏 3）。
+    if (boundaries == kFrames - 1) CHECK(minBoundaryGap >= billingMs - tolCompressMs);
     rx.Stop();
 }
 
@@ -864,6 +1035,117 @@ static void TestMotionRuns() {
     CHECK(stillRuns.size() < 16);
     CHECK(!rc::DecodeMotionRuns(runs.data(), runs.size() - 1, 1000, back));
     CHECK(!rc::DecodeMotionRuns(runs.data(), runs.size(), 999, back));
+}
+
+// A18 (TASK-MOTION-HYSTERESIS-2026-11-22): the Schmidt hysteresis that keeps block-matching
+// noise - static text's bogus +-1 units, +-3.4 px on the generated frame - out of the motion
+// field. Pure function on rc/motion_field.h; the grid doubles as the previous frame's state,
+// the way VrStream's m_motionGridPrev feeds it.
+static void TestMotionHysteresis() {
+    // H1/H2/H3 in one stream of frames on one grid, the way the streamer runs it: noise on
+    // the first frame must stay all-still, real motion must enter at one unit, and the unit
+    // must leave again once the motion drops under the exit threshold.
+    {
+        std::vector<float> field;
+        std::vector<int8_t> grid;
+        for (int i = 0; i < 64; i++) field.push_back(i % 2 ? 2.5f : -2.5f);
+        // H1: prev all zero, +-2.5 px of block-matching noise -> everything stays 0. The old
+        // quantizer carried every one of these as a moving +-1 unit (lround(2.5/4) = 1).
+        rc::ApplyMotionHysteresis(field, grid);
+        bool nonzero = false;
+        for (const int8_t v : grid) nonzero = nonzero || v != 0;
+        CHECK(!nonzero);
+        // H2: prev still all zero, real motion of 5 px -> +-1 unit (enter threshold 4 px),
+        // and exactly 4 px enters too (>=, not >).
+        std::fill(field.begin(), field.end(), 4.0f);
+        rc::ApplyMotionHysteresis(field, grid);
+        for (const int8_t v : grid) CHECK(v == 1);
+        for (size_t i = 0; i < field.size(); i++) field[i] = i % 2 ? -5.0f : 5.0f;
+        rc::ApplyMotionHysteresis(field, grid);
+        for (size_t i = 0; i < grid.size(); i++) CHECK(grid[i] == (i % 2 ? -1 : 1));
+        // H3: prev +-1 (restore the alternating state a previous frame would have left),
+        // motion down to 1 px -> back to 0 (exit threshold 2 px).
+        for (size_t i = 0; i < grid.size(); i++) grid[i] = i % 2 ? int8_t(-1) : int8_t(1);
+        std::fill(field.begin(), field.end(), 1.0f);
+        rc::ApplyMotionHysteresis(field, grid);
+        bool nonzeroH3 = false;
+        for (const int8_t v : grid) nonzeroH3 = nonzeroH3 || v != 0;
+        CHECK(!nonzeroH3);
+        // From prev 0, exactly 2 px is still under the 4 px enter threshold; from prev +-1
+        // exactly 2 px HOLDS the unit (only < 2 px exits; lround(2/4) = lround(0.5) = 1,
+        // away from zero), and 1.9 px lets it go.
+        std::fill(field.begin(), field.end(), 2.0f);
+        rc::ApplyMotionHysteresis(field, grid);
+        bool nonzeroH3a = false;
+        for (const int8_t v : grid) nonzeroH3a = nonzeroH3a || v != 0;
+        CHECK(!nonzeroH3a);
+        for (size_t i = 0; i < grid.size(); i++) grid[i] = i % 2 ? int8_t(-1) : int8_t(1);
+        rc::ApplyMotionHysteresis(field, grid);
+        for (const int8_t v : grid) CHECK(v == 1);
+        std::fill(field.begin(), field.end(), 1.9f);
+        rc::ApplyMotionHysteresis(field, grid);
+        bool nonzeroH3b = false;
+        for (const int8_t v : grid) nonzeroH3b = nonzeroH3b || v != 0;
+        CHECK(!nonzeroH3b);
+    }
+    // H4: 40 px of real motion quantizes to 10 units whatever the previous state was - the
+    // hysteresis only guards the 0 <-> 1 boundary, large motion follows plain quantization.
+    {
+        std::vector<float> field(8, 40.0f);
+        std::vector<int8_t> grid;
+        rc::ApplyMotionHysteresis(field, grid);  // prev: all still -> enters at 10
+        for (const int8_t v : grid) CHECK(v == 10);
+        rc::ApplyMotionHysteresis(field, grid);  // prev: 10 (|prev| >= 2, no hysteresis) -> 10
+        for (const int8_t v : grid) CHECK(v == 10);
+        std::vector<int8_t> ones(8);
+        for (size_t i = 0; i < ones.size(); i++) ones[i] = i % 2 ? int8_t(-1) : int8_t(1);
+        grid = ones;  // prev: +-1, the guarded boundary itself
+        std::fill(field.begin(), field.end(), -40.0f);
+        rc::ApplyMotionHysteresis(field, grid);
+        for (const int8_t v : grid) CHECK(v == -10);
+    }
+    // H5: a hysteresis-produced grid survives the run-length round trip byte for byte, its
+    // still/moving classification is exactly where the motion is, and a field the hysteresis
+    // holds at zero encodes as still runs only (the bandwidth win - the same field used to
+    // come out all-moving).
+    {
+        constexpr size_t kBlocks = 1000;
+        std::vector<float> field(2 * kBlocks, 0.0f);
+        for (size_t b = 400; b < 800; b++) field[2 * b] = 9.0f;  // 9 px -> 2 units
+        std::vector<int8_t> grid;
+        rc::ApplyMotionHysteresis(field, grid);
+        std::vector<uint8_t> runs;
+        rc::EncodeMotionRuns(grid.data(), kBlocks, runs);
+        std::vector<int8_t> back;
+        CHECK(rc::DecodeMotionRuns(runs.data(), runs.size(), kBlocks, back));
+        CHECK(back == grid);
+        for (size_t b = 0; b < kBlocks; b++)
+            CHECK((back[2 * b] != 0 || back[2 * b + 1] != 0) == (b >= 400 && b < 800));
+        // An all-zero grid - here the +-2.5 px noise field the hysteresis kept at zero -
+        // encodes as still runs only.
+        for (size_t i = 0; i < field.size(); i++) field[i] = i % 2 ? -2.5f : 2.5f;
+        std::vector<int8_t> still;
+        rc::ApplyMotionHysteresis(field, still);
+        bool nonzeroStill = false;
+        for (const int8_t v : still) nonzeroStill = nonzeroStill || v != 0;
+        CHECK(!nonzeroStill);
+        std::vector<uint8_t> stillRuns;
+        rc::EncodeMotionRuns(still.data(), kBlocks, stillRuns);
+        std::vector<int8_t> stillBack;
+        CHECK(rc::DecodeMotionRuns(stillRuns.data(), stillRuns.size(), kBlocks, stillBack));
+        CHECK(stillBack == still);
+        bool moving = false;
+        for (size_t at = 0; at < stillRuns.size(); at += 2) moving = moving || stillRuns[at + 1] != 0;
+        CHECK(!moving);
+        CHECK(stillRuns.size() < 16);
+        // And the literal all-zero field does the same.
+        std::vector<float> zero(2 * kBlocks, 0.0f);
+        std::vector<int8_t> zeroGrid;
+        rc::ApplyMotionHysteresis(zero, zeroGrid);
+        std::vector<uint8_t> zeroRuns;
+        rc::EncodeMotionRuns(zeroGrid.data(), kBlocks, zeroRuns);
+        CHECK(zeroRuns.size() < 16);
+    }
 }
 
 // An Ogg Opus file of a stereo sine, built the way an encoder lays it out (no CRCs: the
@@ -1534,17 +1816,181 @@ static void TestFpsLadder() {
     CHECK(rc::QuantizeFps(25.0, 30) == 24);
     CHECK(rc::QuantizeFps(15.0, 45) == 24);   // a stall must not inflate the budget
     CHECK(rc::QuantizeFps(60.0, 45) == 60);   // measured above current: follow it up
-    std::printf("fps ladder: 24/30/45/54/60/72/90, +-15%% hold, stalls floor at 24");
+    std::printf("fps ladder: 24/30/40/45/48/54/60/72/80/90/120, +-15%% hold, stalls floor at 24");
 }
 
-// The frame-budget pacing mode (PLAN-pacing-fix WP1): a 208 KB frame leaves within
-// its 8 ms frame period even though the average pacing rate is only 8 Mbit/s, and
-// it is genuinely spread (not one burst). The legacy clock would take ~220 ms.
+// D: the fill floor is derived from the refresh tier and the VBV percentage, never a
+// constant. ratio = vbvPct/100 * rung / nominal must be >= 1 at every supported tier.
+static void TestFillFloorByTier() {
+    struct Case { int nominal, pct, floor; };
+    const Case cases[] = {
+        {90, 200, 45}, {72, 200, 40}, {120, 200, 60}, {60, 200, 30}, {24, 200, 24},
+        {90, 150, 60}, {72, 150, 48}, {120, 150, 80},
+    };
+    for (const auto& c : cases) {
+        const int f = rc::FillFloorRung(c.nominal, c.pct);
+        CHECK(f == c.floor);
+        CHECK(rc::LadderContainsStep(f));
+        // the floor must fit the bucket ...
+        const double ratio = double(c.pct) / 100.0 * double(f) / double(c.nominal);
+        CHECK(ratio >= 1.0 - 1e-9);
+        // ... and the rung one step below must NOT (that is what makes it the floor)
+        int prev = 0;
+        for (int s : rc::kFpsLadder) if (s < f) prev = s;
+        if (prev > 0) CHECK(double(c.pct) / 100.0 * double(prev) / double(c.nominal) < 1.0);
+    }
+    // S1b: 118 fps on a 120 Hz panel snaps to the top rung instead of sticking at 90.
+    CHECK(rc::QuantizeFps(118.0, 90) == 120);
+    CHECK(rc::QuantizeFps(117.0, 90) == 90);    // 120*0.98 = 117.6 -> 117 is below the snap window
+    CHECK(rc::QuantizeFps(116.0, 90) == 90);    // same, one frame further out
+    std::printf("fill floor by tier: 90/200->45, 72/150->48, 120/200->60, 120Hz snap 117.6+\n");
+}
+
+// TASK-DEC-PERCENTILE-2026-11-20 §1.2: the DecodeMsSamples ring behind the diag line's
+// dec p50/p95 (was a -1.0/-1.0 placeholder). Pure logic - no clock, no I/O, no timing
+// sensitivity - so no TestHostBusy guard is needed.
+static void TestPercentile() {
+    // P1: 空采样器 - 哨兵 -1.0f，Count 0。
+    {
+        rc::DecodeMsSamples s;
+        CHECK(s.Count() == 0);
+        CHECK(s.Percentile(50.f) == -1.0f);
+        CHECK(s.Percentile(95.f) == -1.0f);
+    }
+    // P2: 单样本 12.5 - p50 与 p95 都直取它（rank = ceil(p/100*1) = 1）。
+    {
+        rc::DecodeMsSamples s;
+        s.Push(12.5f);
+        CHECK(s.Count() == 1);
+        CHECK(s.Percentile(50.f) == 12.5f);
+        CHECK(s.Percentile(95.f) == 12.5f);
+    }
+    // P3: 1..100 递增 push 100 个 - nearest-rank ceil 在 n=100 时 rank50/rank95 直取。
+    {
+        rc::DecodeMsSamples s;
+        for (int i = 1; i <= 100; ++i) s.Push(float(i));
+        CHECK(s.Count() == 100);
+        CHECK(s.Percentile(50.f) == 50.f);  // rank = ceil(0.50*100) = 50
+        CHECK(s.Percentile(95.f) == 95.f);  // rank = ceil(0.95*100) = 95
+    }
+    // P4: 3 个样本 {10,20,30} - ceil 在 0.5 步进处可见。
+    {
+        rc::DecodeMsSamples s;
+        s.Push(10.f);
+        s.Push(20.f);
+        s.Push(30.f);
+        CHECK(s.Percentile(50.f) == 20.f);  // rank = ceil(1.5) = 2
+        CHECK(s.Percentile(95.f) == 30.f);  // rank = ceil(2.85) = 3
+    }
+    // P5: 非法输入 - Push 忽略非有限/<=0 的值；Percentile 的 p 出域或 NaN 时 -1.0f。
+    {
+        rc::DecodeMsSamples s;
+        s.Push(12.5f);
+        const int before = s.Count();
+        s.Push(std::numeric_limits<float>::quiet_NaN());
+        s.Push(-1.f);
+        s.Push(std::numeric_limits<float>::infinity());
+        CHECK(s.Count() == before);
+        CHECK(s.Percentile(0.f) == -1.0f);
+        CHECK(s.Percentile(101.f) == -1.0f);
+        CHECK(s.Percentile(std::numeric_limits<float>::quiet_NaN()) == -1.0f);
+    }
+    // P6: 环形覆盖 - 容量 512，push 600 个递增后样本集为后 512 个（89..600）；
+    // p50 的 rank = ceil(0.50*512) = 256，对应值 89+255 = 344（即第 344 个被 push 的样本）。
+    {
+        rc::DecodeMsSamples s;
+        for (int i = 1; i <= 600; ++i) s.Push(float(i));
+        CHECK(s.Count() == 512);
+        CHECK(s.Percentile(50.f) == 344.f);
+    }
+    // P7: Reset 后回到 P1 状态。
+    {
+        rc::DecodeMsSamples s;
+        for (int i = 1; i <= 100; ++i) s.Push(float(i));
+        s.Reset();
+        CHECK(s.Count() == 0);
+        CHECK(s.Percentile(50.f) == -1.0f);
+        CHECK(s.Percentile(95.f) == -1.0f);
+    }
+    std::printf("decode percentile: empty sentinel, single sample, 1..100 direct-rank, ceil on 3 samples, "
+                "invalid inputs ignored, 600->512 overwrite, reset\n");
+}
+
+// TASK-LATENCY-METER-FIX-2026-11-22 §2: the stage accumulator must not drop samples.
+// The user saw the panel's stages sum fall far short of the total latency: the old
+// AddStages filtered each stage on its own, so a clock-offset error pushing the game
+// stage below -2 removed it whole (and the >=1000 guard ate real stalls) while the
+// total kept counting every frame. Frames here carry the real VR branch's shape: the
+// stages sum to the frame's total exactly (the clock offsets cancel algebraically),
+// totals sit in the 80-129 ms the headset reports (one 1600 ms stall spike), and the
+// edge samples (-3, -0.5, 1500) ride on that shape. On the old implementation the
+// frame-count assertions below run red: it dropped those frames' stages.
+static void TestLatencyStageAccumulation() {
+    const int kFrames = 2000;
+    const double kEpsilon = 1e-6;
+    double sums[rv::kStageCount] = {};
+    uint32_t frames[rv::kStageCount] = {};
+    double latencySum = 0;
+    for (int f = 0; f < kFrames; f++) {
+        double ms[rv::kStageCount] = {};
+        ms[rv::kStageUplink] = 4.0;        // half the round trip, as the branch feeds it
+        ms[rv::kStageGame] = 24.0;         // the game's share before the clock wobbles
+        ms[rv::kStageEncoderWait] = 0.7;
+        ms[rv::kStageEncode] = 6.0;
+        ms[rv::kStageDownlink] = 8.0;
+        ms[rv::kStageDecode] = 5.0;
+        ms[rv::kStageNextFrame] = 18.0;
+        ms[rv::kStageCapture] = -1.0;      // the desktop-only stage's sentinel, as in VR
+        double total = 80.0 + (f % 50);    // the usual pose age, no spike today
+        if (f == 100) ms[rv::kStageGame] = -3.0;        // clock offset error, the real dip
+        if (f == 200) ms[rv::kStageNextFrame] = -0.5;   // a small jitter dip
+        if (f == 300) {
+            ms[rv::kStageDownlink] = 1500.0;            // a real stall, capped at 1000
+            total = 1600.0;
+        }
+        // The compositor closes the identity, the way displayNs - latchNs does: the
+        // stages of every frame sum to its total latency exactly. The capture sentinel
+        // sits outside that identity, as in the real VR branch (the desktop-only stage
+        // has no share of a VR frame's time).
+        double rest = 0;
+        for (int i = 0; i < rv::kStageCount; i++)
+            if (i != rv::kStageCompositor && i != rv::kStageCapture) rest += ms[i];
+        ms[rv::kStageCompositor] = total - rest;
+        latencySum += total;
+        rv::AddStageSamples(sums, frames, ms);
+    }
+    // L1: every stage counts every frame - no sample is dropped any more (the capture
+    // sentinel counts too). The old filter lost frames here.
+    for (int i = 0; i < rv::kStageCount; i++) CHECK(frames[i] == uint32_t(kFrames));
+    // L2: negatives count as zero (the frame stays, the value contributes nothing).
+    CHECK(std::fabs(sums[rv::kStageGame] - 24.0 * (kFrames - 1)) < kEpsilon);
+    CHECK(std::fabs(sums[rv::kStageNextFrame] - 18.0 * (kFrames - 1)) < kEpsilon);
+    CHECK(std::fabs(sums[rv::kStageCapture]) < kEpsilon);
+    // L3: an extreme value counts as a full second instead of vanishing.
+    CHECK(std::fabs(sums[rv::kStageDownlink] - (8.0 * (kFrames - 1) + 1000.0)) < kEpsilon);
+    // L4: on the same frames the stages add up to the total within the clock-jitter
+    // margin - the panel's stages sum tracks the panel's total again.
+    double stageSum = 0;
+    for (int i = 0; i < rv::kStageCount; i++) stageSum += sums[i];
+    const double stagesAvg = stageSum / kFrames, latencyAvg = latencySum / kFrames;
+    CHECK(std::fabs(stagesAvg - latencyAvg) <= 2.0);
+    std::printf("latency stages: no sample dropped, negatives as zero, extremes capped at 1000, "
+                "stages sum tracks the total within 2 ms\n");
+}
+
+// A10 (TASK-LATENCY-BURST-SEND 2026-11-21): with the frame-granularity token bucket,
+// a single frame's datagrams leave BACK-TO-BACK as one burst - even though the average
+// pacing rate (8 Mbit/s) is far below what this 208 KB frame needs - the budget no
+// longer spreads a frame inside itself. The budget now (a) bounds the burst window
+// (BudgetOverruns) and (b) bills the NEXT frame (asserted in TestPacingBursts /
+// TestPacingBurstShaping). The legacy clock (budget 0) still spreads the same frame
+// over ~208 ms: that is the desktop/remote path, byte-for-byte unchanged.
 static void TestPacingFrameBudget() {
     int64_t oneFrameNs = 0;
     double spreadMs = 0;
     uint32_t overruns = 0;
     size_t n = 0;
+    size_t expected = 0;
     double legacyMs = 0;
     {
         RawReceiver rx;
@@ -1566,13 +2012,28 @@ static void TestPacingFrameBudget() {
         for (size_t i = 0; i < frame.size(); i++) frame[i] = uint8_t(i * 31);
         VrFrameMetadata meta{};
         meta.trackingTimestampNs = 12345;
+        // The datagrams this frame must produce (data + parity), the sender's formulas.
+        const size_t fragPayload = conn.MaxPayload() - sizeof(VideoFragmentHeader);
+        const size_t total = 2 + sizeof(VrFrameMetadata) + kFrameBytes;
+        const size_t count = (total + fragPayload - 1) / fragPayload;
+        const size_t groupSize = size_t(std::clamp(100 / 5, 2, 64));
+        const size_t groups = (count + groupSize - 1) / groupSize;
+        const size_t nParity = groups - ((count - (groups - 1) * groupSize) == 1 ? 1 : 0);
+        expected = count + nParity;
         const int64_t t = NowNs();
         pkt.SendFrame(kVrStreamId, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), frame.data(), frame.size());
         oneFrameNs = NowNs() - t;
         SleepMs(150);
-        n = std::min(rx.count.load(), rx.arrivals.size());
+        int64_t firstNs = 0, lastNs = 0;
+        const size_t got = std::min(rx.count.load(), rx.arrivals.size());
+        for (size_t i = 0; i < got; i++) {
+            if (rx.arrivals[i].second <= 200) continue;
+            n++;
+            if (!firstNs) firstNs = rx.arrivals[i].first;
+            lastNs = rx.arrivals[i].first;
+        }
         overruns = pkt.BudgetOverruns();
-        if (n >= 2) { spreadMs = NsToMs(rx.arrivals[n - 1].first - rx.arrivals[0].first); }
+        if (firstNs) spreadMs = NsToMs(lastNs - firstNs);
         rx.Stop();
     }
     {
@@ -1598,40 +2059,41 @@ static void TestPacingFrameBudget() {
         legacyMs = NsToMs(NowNs() - t0);
         rx.Stop();
     }
-    std::printf("pacing budget: 208 KB in %.2f ms (legacy clock: %.1f ms), spread %.2f ms over %zu datagrams, overruns %u\n",
-                NsToMs(oneFrameNs), legacyMs, spreadMs, n, overruns);
-    CHECK(oneFrameNs <= 10'000'000LL);
-    CHECK(spreadMs >= 5.0);
-    CHECK(overruns == 0);
-    CHECK(legacyMs >= 150.0);
+    std::printf("pacing budget: 208 KB burst in %.2f ms, spread %.2f ms over %zu datagrams (%zu expected), "
+                "overruns %u; legacy clock: %.1f ms\n",
+                NsToMs(oneFrameNs), spreadMs, n, expected, overruns, legacyMs);
+    CHECK(oneFrameNs <= 6'000'000LL);  // 整帧一次突发打完（旧预算语义要铺 ~8 ms，老时钟 ~208 ms）
+    CHECK(spreadMs <= 7.0);            // 收包侧看到的是同一个突发
+    CHECK(n == expected);              // 每个分片和校验包都出了门（不丢帧）
+    CHECK(overruns == 0);              // 突发窗口在预算内
+    CHECK(legacyMs >= 150.0);          // 老时钟不变（桌面/远程路径逐字节保留）
 }
 
-// ROUND4 R4.1: a ~400 KB frame under a 15 ms budget with a 180 Mbps instant-rate ceiling
-// must leave spread evenly across the budget, not as one micro-burst. FEC is disabled so
-// the wire bytes (payload + fragment headers) stay under 180 Mbps x 18 ms / 8 ~= 405 KB and
-// the frame can physically finish inside budget x 1.2. The same frame is sent again with the
-// ceiling OFF (legacy budget, ~213 Mbps) as the unshaped control.
-//
-// Method note (D-025): the prescribed "budgetNs/count interval floor + token bucket" alone
-// cannot space fragments below the waitable timer's ~1 ms granularity (ROUND2 timerbench),
-// so they clump into ~36 KB micro-bursts. R4.1 therefore adds a precise sub-ms wait (timer
-// for the bulk of a long gap, spin the tail) when the ceiling is armed; legacy mode (ceiling
-// 0) keeps the exact pre-ROUND4 timer path. With it, gaps are p50 ~0.06 ms and the frame's
-// average rate is capped at the ceiling. Two literal taskbook bounds are physically
-// unachievable and are asserted in their achievable form, documented in D-025:
-//   * "max gap <= budget/count x 1.5" (~76 us): occasional OS scheduling stalls exceed it,
-//     so evenness is asserted as p99 <= p50 x 1.5 + 0.5 with a 2 ms outer bound instead.
-//   * "instant rate <= ceiling" on a 1 ms window: the window edge alone captures 17 vs 16.4
-//     packets (~186 Mbps floor), so the sustained frame-average <= ceiling x 1.05 is the hard
-//     guarantee and the 1 ms peak is bounded at ceiling x 1.5 (window edge + scheduler jitter).
-// No judge-script criterion is touched; this is a new test only.
+// A10 (TASK-LATENCY-BURST-SEND 2026-11-21): an OVER-BUDGET frame delays the next one as
+// a WHOLE - by its natural frame-bytes/rate interval - and never as a spread-out frame.
+// 400 KB @ 108 Mbps bills ~30 ms, past the 15 ms budget window (deliberately over
+// budget). Frame 1 and frame 2 are handed over back-to-back: frame 1 leaves as one
+// burst (no intra-frame flattening), frame 2's first fragment waits out the billing
+// and then frame 2 leaves as one burst too (whole-frame wait, not flattening).
+// The old R4.1 "instant-rate ceiling + even intra-frame spread" went away with the
+// intra-frame burst semantics: micro-burst shaping inside a frame is no longer a design
+// goal - the link's instantaneous rate is the link's business (TASK card §0/§1); the
+// send layer keeps only the average.
+// TASK-FLAKE-ROBUST-2026-11-22：容差自校准（上限 15 ms，护栏依据见 CalibrateTimingJitter
+// 上方），帧边界定位从「最大间隔启发式」改为按已知每帧包数取位——负载下帧内收包停顿
+// 可以超过计费间隔，最大间隔会被指到帧中间（测量假象被当成断言失败）。断言的量一个
+// 不变（帧 1 突发、计费边界 first-to-FIRST、帧 2 等待+突发、无丢包、无 overrun）。
 static void TestPacingBurstShaping() {
-    constexpr size_t kFrameBytes = 400000;  // ~400 KB, FEC off => wire < 405 KB
+    const PacingJitter jitter = CalibrateTimingJitter();  // 护栏 2：独立采样
+    // 压缩侧固定基线 4.0 ms（唤醒量化差分 + 收包小延迟差，依据见 TestPacingBursts）。
+    const double tolCompressMs = AdaptiveTol(4.0, jitter.stallScaleMs);  // 护栏 1 公式
+    constexpr size_t kFrameBytes = 400000;  // ~400 KB, FEC off => no parity packets
     constexpr int64_t kBudgetNs = 15'000'000LL;
-    constexpr uint32_t kCeilingKbps = 180000;
-    double shapedSpreadMs = 0, shapedInstantMbps = 0, shapedP50 = 0, shapedP99 = 0, shapedMax = 0;
-    size_t shapedBurst = 0, shapedPackets = 0, unshapedBurst = 0;
-    double shapedFrameMs = 0;
+    constexpr uint32_t kPaceKbps = 108000;  // production paceBase (100 Mbps x 1.08)
+    double frame1Ms = 0, frame2Ms = 0, spread1Ms = 0, spread2Ms = 0, boundaryGapMs = 0;
+    size_t got1 = 0, got2 = 0, expected = 0;
+    uint32_t overruns = 0;
+    double billingMs = 0;
     {
         RawReceiver rx;
         UdpSocket tx;
@@ -1645,74 +2107,68 @@ static void TestPacingBurstShaping() {
         rx.Start();
         VideoPacketizer pkt(&conn);
         pkt.SetFecPercent(0);
-        pkt.SetPacingKbps(108000);  // production paceBase (100 Mbps x 1.08)
+        pkt.SetPacingKbps(kPaceKbps);
         pkt.SetPacingFrameBudgetNs(kBudgetNs);
-        pkt.SetBurstCeilingKbps(kCeilingKbps);
         std::vector<uint8_t> frame(kFrameBytes);
         for (size_t i = 0; i < frame.size(); i++) frame[i] = uint8_t(i * 31);
         VrFrameMetadata meta{};
         meta.trackingTimestampNs = 12345;
+        const size_t fragPayload = conn.MaxPayload() - sizeof(VideoFragmentHeader);
+        const size_t total = 2 + sizeof(VrFrameMetadata) + kFrameBytes;
+        const size_t count = (total + fragPayload - 1) / fragPayload;
+        expected = count;  // FEC off: data fragments only
+        billingMs = double(total + count * sizeof(VideoFragmentHeader)) * 8.0 / double(kPaceKbps);
+        CHECK(billingMs > 15.0);  // precondition: this frame really is over the budget window
         const DWORD_PTR mask = PinThread(0);
-        const int64_t t = NowNs();
+        int64_t t = NowNs();
         pkt.SendFrame(kVrStreamId, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), frame.data(), frame.size());
-        shapedFrameMs = NsToMs(NowNs() - t);
+        frame1Ms = NsToMs(NowNs() - t);
+        t = NowNs();
+        pkt.SendFrame(kVrStreamId, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta), frame.data(), frame.size());
+        frame2Ms = NsToMs(NowNs() - t);  // wait out frame 1's billing + frame 2's own burst
         UnpinThread(mask);
-        SleepMs(150);
+        overruns = pkt.BudgetOverruns();
+        SleepMs(120);
         const size_t n = std::min(rx.count.load(), rx.arrivals.size());
-        const std::vector<std::pair<int64_t, size_t>> line(rx.arrivals.begin(), rx.arrivals.begin() + n);
-        const TimelineStats s = Analyze(line, 1'000'000);
-        shapedPackets = s.packets;
-        shapedBurst = s.burstBytes;
-        shapedP50 = s.p50Ms;
-        shapedP99 = s.p99Ms;
-        shapedMax = s.maxMs;
-        shapedInstantMbps = double(s.burstBytes) * 8.0 / 1000.0;  // max bytes in a 1 ms window -> Mbps
-        if (n >= 2) shapedSpreadMs = NsToMs(rx.arrivals[n - 1].first - rx.arrivals[0].first);
+        std::vector<std::pair<int64_t, size_t>> v;
+        for (size_t i = 0; i < n; i++)
+            if (rx.arrivals[i].second > 200) v.push_back(rx.arrivals[i]);
+        // TASK-FLAKE-ROBUST-2026-11-22: the boundary used to sit at the LARGEST observed
+        // gap - under load an intra-burst receiver stall can outgrow the billing gap and
+        // point the split into the middle of a frame (a measurement artifact the counts
+        // then report as a failure). Both frames are the same shape (FEC off, `expected`
+        // datagrams each) and loopback neither drops nor reorders, so the boundary sits
+        // at the KNOWN position: frame 1 = the first `expected` video packets. The
+        // boundary stays measured FIRST-to-FIRST (the card's t0 is when a frame's FIRST
+        // fragment leaves). The asserted quantities are unchanged; only the boundary
+        // LOCATING became deterministic.
+        got1 = std::min(v.size(), expected);
+        got2 = v.size() - got1;
+        if (v.size() > expected) boundaryGapMs = NsToMs(v[expected].first - v[0].first);
+        if (expected > 0 && v.size() >= expected) spread1Ms = NsToMs(v[expected - 1].first - v[0].first);
+        if (v.size() > expected) spread2Ms = NsToMs(v.back().first - v[expected].first);
+        std::printf("over-budget: billing %.1f ms; frame1 %.2f ms burst, spread %.2f ms, %zu/%zu pkts; "
+                    "boundary gap %.2f ms; frame2 %.2f ms (wait+burst), spread %.2f ms, %zu/%zu pkts; overruns %u, "
+                    "tol compress %.2f ms\n",
+                    billingMs, frame1Ms, spread1Ms, got1, expected, boundaryGapMs, frame2Ms, spread2Ms, got2,
+                    expected, overruns, tolCompressMs);
         rx.Stop();
     }
-    {
-        RawReceiver rx;
-        UdpSocket tx;
-        CHECK(rx.Open() && tx.Open(0));
-        tx.SetBuffers(16 << 20, 1 << 20);
-        auto keys = crypto::DeriveSessionKeys(crypto::KeyPair::Generate().secretKey, crypto::KeyPair::Generate().publicKey,
-                                              crypto::KeyPair::Generate().publicKey, crypto::KeyPair::Generate().publicKey,
-                                              "t");
-        Connection conn(&tx, NetAddress{0x7F000001, rx.sock.LocalPort()}, 1, keys, true, kMaxDatagramLan);
-        rx.Start();
-        VideoPacketizer unshaped(&conn);
-        unshaped.SetFecPercent(0);
-        unshaped.SetPacingKbps(108000);
-        unshaped.SetPacingFrameBudgetNs(kBudgetNs);  // ceiling OFF: legacy ~213 Mbps budget rate
-        std::vector<uint8_t> frame(kFrameBytes);
-        for (size_t i = 0; i < frame.size(); i++) frame[i] = uint8_t(i * 31);
-        VrFrameMetadata meta{};
-        meta.trackingTimestampNs = 12345;
-        unshaped.SendFrame(kVrStreamId, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta), frame.data(), frame.size());
-        SleepMs(150);
-        const size_t n = std::min(rx.count.load(), rx.arrivals.size());
-        const std::vector<std::pair<int64_t, size_t>> line(rx.arrivals.begin(), rx.arrivals.begin() + n);
-        unshapedBurst = Analyze(line, 1'000'000).burstBytes;
-        rx.Stop();
-    }
-    std::printf("burst shaping: 400 KB / 15 ms / 180 Mbps -> frame %.2f ms, spread %.2f ms over %zu pkts, "
-                "instant %.1f Mbps, gap p50 %.2f p99 %.2f max %.2f ms, 1ms-burst %zu B (unshaped %zu B)\n",
-                shapedFrameMs, shapedSpreadMs, shapedPackets, shapedInstantMbps, shapedP50, shapedP99,
-                shapedMax, shapedBurst, unshapedBurst);
-    CHECK(shapedPackets > 250);                          // the whole frame arrived (~296 fragments)
-    CHECK(shapedSpreadMs <= 18.0);                       // total <= budget x 1.2
-    CHECK(shapedSpreadMs >= 12.0);                       // fills >= 80% of budget: even, not front-loaded
-    // The sustained guarantee: the frame's average send rate is capped at the ceiling.
-    CHECK(double(kFrameBytes) * 8.0 / (shapedSpreadMs * 1000.0) <= 180.0 * 1.05);
-    // A sliding 1 ms window captures 17 packets at its edge vs 16.4 nominal (~186 Mbps floor
-    // even at perfect spacing), and OS scheduling stalls add catch-up clusters: the measured
-    // peak runs 224-235 Mbps (~31% over) while the frame-average stays at 179.9. The hard
-    // guarantee is the average above; the peak is bounded at ceiling x 1.5 as a gross-failure
-    // guard (unshaped peaks at 336+ Mbps), not the unachievable strict 180. D-025.
-    CHECK(shapedInstantMbps <= 180.0 * 1.5);
-    CHECK(shapedMax <= 2.0);                             // no gap beyond ~one timer wake (timer-realistic)
-    CHECK(shapedP99 <= shapedP50 * 1.5 + 0.5);           // even spread: no clumping outliers
-    CHECK(shapedBurst < unshapedBurst);                  // the ceiling actually shrinks the micro-burst
+    CHECK(got1 == expected);                   // frame 1 complete (nothing dropped)
+    CHECK(frame1Ms <= AdaptiveTol(10.0, jitter.stallScaleMs));   // frame 1 left as one burst (~296 datagrams), not spread
+    CHECK(spread1Ms <= AdaptiveTol(10.0, jitter.stallScaleMs));  // the receiver saw the same burst (receiver-side jitter adds a few ms)
+    CHECK(boundaryGapMs >= billingMs - tolCompressMs);  // token bucket: frame 2 may not start before the billing (adaptive, capped)
+    CHECK(boundaryGapMs <= billingMs + AdaptiveTol(12.0, jitter.stallScaleMs));  // postponement <= that frame's bytes / ceiling (whole wait)
+    // Sender-side whole-frame proof: frame 2's SendFrame = token wait + one burst, so its
+    // duration lands at the billing plus one burst's worth of slack - NOT at two billings
+    // (that would mean the wait spilled into frame 2's own send, i.e. flattening).
+    CHECK(frame2Ms <= billingMs + AdaptiveTol(10.0, jitter.stallScaleMs));
+    CHECK(got2 == expected);                   // frame 2 complete: waited, but never dropped
+    // spread2Ms: the fixed baseline (16 ms) already exceeds the 15 ms adaptive cap, so
+    // this one never widens (guardrail 1: the cap bounds the ADAPTIVE component only).
+    CHECK(spread2Ms <= AdaptiveTol(16.0, jitter.stallScaleMs));   // corroboration only (receiver jitter; a flattened
+                                                               // frame would spread ~billing = 30 ms and still fail)
+    CHECK(overruns == 0);                      // both bursts fit their budget window
 }
 
 
@@ -1922,6 +2378,143 @@ static void TestEncoderRateTransaction() {
     std::printf("encoder rate transaction: frozen-at-nominal plan, commit/retry/throttle, vbvInitialDelay clamp\n");
 }
 
+// L17 fill mode (opt-in, default on): with fillMode=false the D-034 frozen plan must
+// stay byte-identical; with it on, only the rung follows the slow EMA, floored at 45
+// and capped at nominal, while scaled and the VBV formula stay frozen so the budget
+// never overflows the bucket. New test only; existing assertions above are untouched.
+static void TestFillModePlan() {
+    constexpr int64_t second = 1'000'000'000LL;
+    rc::EncoderRateTracker tracker;
+    auto settle = [&](double fps) {
+        tracker = {};
+        for (int i = 0; i < 200; ++i) tracker.Observe(1e9 / fps);
+    };
+    auto plan = [&](double nominal, bool desktop, bool fill, uint32_t current = 90000) {
+        return rc::PlanEncoderRate(100000, nominal, desktop, false, tracker, current, 100, 200, fill);
+    };
+
+    // ① fill off: any tracker state leaves the plan frozen at nominal. VBV golden:
+    //    100000 kbps @90, vbv 200% -> 100000*1000*200/100/90 = 2'222'222 (bits).
+    settle(37);
+    const auto off = plan(90.0, false, false);
+    CHECK(off.rateNum == 90000);
+    CHECK(off.budget.maxBitrate == 100'000'000);
+    const uint32_t goldenVbv = uint32_t(double(100000) * 1000.0 * 200.0 / 100.0 / 90.0);
+    CHECK(std::abs(int64_t(off.budget.vbvBufferSize) - int64_t(goldenVbv)) <= 1);
+    // Desktop ignores the fill branch even when the switch is on.
+    CHECK(rc::SameRatePlan(plan(90.0, true, true), off));
+
+    // ② fill on, slow 40 fps @ nominal 90: the rung floors at 45 (30 would overflow
+    //    the bucket); VBV is the frozen deep bucket, budget <= VBV (ratio >= 1.0).
+    settle(40);
+    const auto fill = plan(90.0, false, true);
+    CHECK(fill.rateNum == 45000);
+    CHECK(fill.budget.maxBitrate == 100'000'000);
+    CHECK(fill.budget.vbvBufferSize == off.budget.vbvBufferSize);  // VBV formula untouched
+    // Per-frame budget = maxBitrate / (rateNum/1000) bits. vbvBufferSize is truncated
+    // to uint32, so allow 1 bit of slack; at rung 45 the two are equal by construction.
+    const double perFrame = double(fill.budget.maxBitrate) / (double(fill.rateNum) / 1000.0);
+    CHECK(perFrame <= double(fill.budget.vbvBufferSize) + 1.0);
+    // Counter-example that justifies the floor: a 30 rung would put the per-frame
+    // budget above the frozen bucket (the D-034 QP-breathing root). For this plan
+    // (90 Hz, 200% VBV) FillFloorRung(90, 200) = 45.
+    CHECK(double(fill.budget.maxBitrate) / 30.0 > double(fill.budget.vbvBufferSize) + 1.0);
+
+    // ③ nominal below the floor (30): the rung never crosses nominal; a measured rate
+    //    above nominal clamps back down to it.
+    settle(40);
+    CHECK(plan(30.0, false, true, 30000).rateNum == 30000);
+    settle(120);
+    CHECK(plan(30.0, false, true, 30000).rateNum == 30000);
+
+    // ④ gate: 5 s continuous pressure before arming; an interrupt clears the hold.
+    //    Once armed it stays armed for the session; the rung still follows the slow
+    //    EMA, clamped to [floor, nominal]. The 30 s cooldown only guards a re-arm
+    //    after a reset - it does not throttle rung changes.
+    rc::FillModeGate gate;
+    const int64_t t0 = 10 * second;
+    CHECK(!gate.Update(true, t0));
+    CHECK(!gate.Update(true, t0 + 4 * second));
+    CHECK(!gate.Update(false, t0 + 4 * second));   // interrupt: the hold restarts
+    CHECK(!gate.Update(true, t0 + 5 * second));
+    CHECK(gate.Update(true, t0 + 10 * second));     // 5 s after the restart
+    CHECK(gate.Active());
+    CHECK(gate.InCooldown(t0 + 10 * second + 29 * second));
+    CHECK(!gate.InCooldown(t0 + 10 * second + 30 * second));
+    CHECK(gate.Update(false, t0 + 11 * second));     // armed keeps: pressure drops leave it on; the rung tracks the EMA
+    std::printf("fill mode: off frozen, on floor-45 rung, vbv untouched; gate 5s hold / 30s re-arm cooldown / armed sticky, rung follows EMA\n");
+}
+
+// TASK-ROBUST-EDGES-2026-11-20 §1.2: the FillModeGate edge matrix
+// (rc/fps_ladder.h:82-111 - pure state, no driver). Expectations follow the
+// IMPLEMENTATION per the card; one documented comment/code tension
+// (:80-81 vs :105) is recorded in the A3 receipt, not "fixed" here.
+static void TestFillModeGateEdges() {
+    std::printf("fill mode gate edges: ");
+    constexpr int64_t S = 1'000'000'000LL;
+
+    // F1+F2+F3: one instance, one timeline. Fencepost note (A3 receipt):
+    // the card's table puts the arm at t=5S after pressure ticks 1S..4S, but
+    // fps_ladder.h:95-96 opens the hold window at the FIRST pressure tick
+    // (holdSince = 1S here) and arms when now - holdSince >= kHoldNs - so 5 s
+    // of held pressure complete at t=6S, not 5S (5 ticks at 1 Hz span 4 s;
+    // the holdSince==0 "unset" sentinel at :95 also rules out opening the
+    // window with a t=0S tick - it would be re-set at the next tick). Same
+    // fencepost as the pre-existing TestFillModePlan (arm at first tick +
+    // 5 s) and as the card's own F4 phase 2 (25S - 20S = 5S). Tick times
+    // below follow the implementation; every normative expectation of the
+    // card (arm exactly when kHoldNs is full, armed sticky, Reset clears the
+    // cooldown) is preserved unchanged.
+    rc::FillModeGate gate;
+    // F1. Pressure on at t=1S..4S: every tick sits inside the 5 s hold window
+    //     (:95-96, now - holdSince < kHoldNs) -> false, Active() false.
+    for (int64_t t = S; t <= 4 * S; t += S) {
+        CHECK(!gate.Update(true, t));
+        CHECK(!gate.Active());
+    }
+    // F2. t=5S: only 4 s held (5S - 1S = 4S < kHoldNs) -> still false (the
+    //     card's table placed the arm here; one-tick slip, see the fencepost
+    //     note above). t=6S: kHoldNs is exactly full (6S - 1S == 5S) -> arms,
+    //     cooldownUntil = 6S + 30S = 36S (:97-99), returns true. The cooldown
+    //     is live right after arming and expires exactly at 36S (:104).
+    CHECK(!gate.Update(true, 5 * S));
+    CHECK(gate.Update(true, 6 * S));
+    CHECK(gate.Active());
+    CHECK(gate.InCooldown(6 * S));
+    CHECK(!gate.InCooldown(36 * S));
+    // F3. t=7S..11S with pressure=false (the card's 6S..10S shifted by the
+    //     same one tick): armed is sticky for the session - the :89 active
+    //     check returns before pressure is even read - so every tick still
+    //     returns true and Active() stays true.
+    for (int64_t t = 7 * S; t <= 11 * S; t += S) {
+        CHECK(gate.Update(false, t));
+        CHECK(gate.Active());
+    }
+
+    // F4. Second instance: arm once (cooldownUntil = 36S), Reset(), then
+    //     re-pressurise at t=20S..25S - INSIDE where the old cooldown would
+    //     still be live (20S < 36S). Per the implementation (:105 Reset()
+    //     clears m_cooldownUntilNs together with the rest) the re-arm walks a
+    //     fresh 5 s hold window: t=20S..24S false, t=25S true (25S - 20S ==
+    //     kHoldNs). The :80-81 comment ("the cooldown only guards a re-arm
+    //     after a reset") implies the opposite (ticks blocked until >= 36S);
+    //     the card says follow the code and report the tension (A3 receipt,
+    //     "发现的问题").
+    rc::FillModeGate gate2;
+    for (int64_t t = S; t <= 6 * S; t += S) (void)gate2.Update(true, t);  // arms at 6S
+    CHECK(gate2.Active());
+    CHECK(gate2.InCooldown(20 * S));   // old cooldown (until 36S) still live at 20S
+    gate2.Reset();
+    CHECK(!gate2.Active());
+    CHECK(!gate2.InCooldown(20 * S));  // :105 - Reset() cleared the cooldown too
+    for (int64_t t = 20 * S; t <= 24 * S; t += S) {
+        CHECK(!gate2.Update(true, t));  // fresh hold window: 0..4 s of 5 s
+    }
+    CHECK(gate2.Update(true, 25 * S));  // 5 s held -> re-arms
+    CHECK(gate2.Active());
+    std::printf("ok\n");
+}
+
 static void TestWireCeilingBudget() {
     constexpr uint32_t kCeilingKbps = 100000;  // the user's ceiling, wire
     constexpr int kFps = 90;
@@ -2105,6 +2698,799 @@ static void TestL7Autoscale() {
     std::printf("ok\n");
 }
 
+// PLAN-AUTO-TUNE P2: the ordered classifier (DECISION-TABLE §2). First match
+// wins, missing signals never fire their rule, and the qp [16, 20) band at low
+// fill is a deliberate dead zone.
+static void TestAutoTuneClassify() {
+    std::printf("auto-tune classify: ");
+    // 1. all signals missing/at default -> Ok (nothing can fire).
+    CHECK(ClassifyBottleneck({}) == Bottleneck::Ok);
+    // 2. R1 decode-bound: over the L7 budget; also via dropped frames alone
+    //    with decode unknown (the missing-signal rule).
+    {
+        rc::BottleneckSignal s;
+        s.decodeMs = 25.0;
+        s.decodeBudgetMs = 20.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::DecodeBound);
+        s.decodeMs = -1.0;  // unknown decode: budget alone proves nothing
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.droppedFps = 3.1;  // the ladder's other pressure signal carries it
+        CHECK(ClassifyBottleneck(s) == Bottleneck::DecodeBound);
+        s.droppedFps = 3.0;  // exactly at the ladder's threshold is not pressure
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.decodeMs = 20.0;  // exactly at the budget is not pressure either
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+    }
+    // 3. R1 wins over R2: both over -> decode-bound (the ladder's class, the
+    //    cheapest signal path).
+    {
+        rc::BottleneckSignal s;
+        s.decodeMs = 30.0;
+        s.decodeBudgetMs = 20.0;
+        s.queueMs = 500.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::DecodeBound);
+    }
+    // 4. R2 link-bound: queue over 100 ms; loss over the brake's heavy 5%;
+    //    an unknown queue (-1) never fires on its own.
+    {
+        rc::BottleneckSignal s;
+        s.queueMs = 101.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::LinkBound);
+        s.queueMs = -1.0;
+        s.loss = 0.051;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::LinkBound);
+        s.loss = 0.05;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.queueMs = 100.0;  // exactly at the line is not congestion
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+    }
+    // 5. R3 rate-control: the frozen real-device signature (02:29 log line:
+    //    52.3 Mbps of a 98 Mbps ceiling at qp 23.8). Same fill at qp 15 is the
+    //    dead zone, not rate-control.
+    {
+        rc::BottleneckSignal s;
+        s.mbps = 52.3;
+        s.ceilingKbps = 98000;
+        s.qp = 23.8;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::RateControl);
+        s.qp = 19.9;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.qp = -1.0;  // unknown QP: the fill alone never accuses
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.qp = 23.8;
+        s.ceilingKbps = 0;  // no ceiling: fill is undefined, no fire
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+    }
+    // 6. R4 game-bound: slow game, cheap picture (40/72 at qp 10 - the Quest
+    //    evening's healthy-looking half). qp in [16, 20) is the dead zone.
+    {
+        rc::BottleneckSignal s;
+        s.gameFps = 40.0;
+        s.nominalFps = 72.0;
+        s.qp = 10.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::GameBound);
+        s.qp = 16.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.qp = -1.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.gameFps = 54.1;  // 0.75 x 72 = 54: just above is fine
+        s.qp = 10.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.nominalFps = 0;  // unknown nominal: no ratio to compare
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+    }
+    // 7. R3 beats R4: starving encoder with a slow game is rate-control.
+    {
+        rc::BottleneckSignal s;
+        s.gameFps = 40.0;
+        s.nominalFps = 72.0;
+        s.mbps = 52.3;
+        s.ceilingKbps = 98000;
+        s.qp = 23.8;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::RateControl);
+    }
+    std::printf("ok\n");
+}
+
+// TASK-ROBUST-EDGES-2026-11-20 §2: edge cases for the PURE classifier
+// (rc/auto_tune.h ClassifyBottleneck - the pure function behind the
+// classify surface and AutoTune::Update's call; the decide layer is
+// stateful, so the card's same-input-twice semantics live here). Three
+// categories per the card: NaN/infinity, same input twice, out-of-range.
+// A3 pinned the then-UNDEFENDED behaviour as exposure evidence (A3 receipt,
+// "发现的问题"); A8 (TASK-AUTOTUNE-ROBUST-2026-11-20) later hardened the
+// classifier with an isfinite gate (A8b) and loss/qp domain gates (A8c), so
+// the affected expectations below are FLIPPED to Unknown (Ok) and marked
+// "A8 post-fix semantics", with the pre-A8 value kept in the comment for the
+// mutation audit. droppedFps joined the gate in the A8 increment (main-AI
+// direction, A3 finding #3); mbps/gameFps/nominalFps stay comparison-guarded
+// only (outside the A8 gate scope).
+static void TestAutoTuneClassifyEdgeCases() {
+    std::printf("auto-tune classify edges: ");
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+
+    // 1. NaN in the R1/R2 fields cannot fire (per the :61 / :65 comparison
+    //    branches: every comparison against NaN is false; the :42-43 comment
+    //    "an unknown signal can never fire its rule" extends to NaN). A real
+    //    budget (:46) alone proves nothing either way.
+    {
+        rc::BottleneckSignal s;
+        s.decodeMs = nan;
+        s.decodeBudgetMs = 10.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.decodeBudgetMs = nan;  // NaN budget with decode unknown: same silence
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.droppedFps = nan;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.queueMs = nan;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.loss = nan;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+    }
+    // 2. NaN in the R3/R4 fields cannot fire (per the :70 mbps>=0 / qp>=20
+    //    guards and the :76 gameFps>0 / nominalFps>0 guards). The starving
+    //    background (5 of 20000 kbps, qp high) would fire R3 if the NaNs were
+    //    real numbers, so the guards themselves are what is under test.
+    {
+        rc::BottleneckSignal s;
+        s.ceilingKbps = 20000;
+        s.mbps = nan;
+        s.qp = 23.8;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.mbps = 5.0;
+        s.qp = nan;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.qp = 10.0;
+        s.gameFps = nan;      // R4 background: 72 nominal, cheap picture
+        s.nominalFps = 72.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.gameFps = 40.0;
+        s.nominalFps = nan;   // the ratio against NaN never fires
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+    }
+    // 3. +infinity in the A8b-gated fields (decodeMs/droppedFps/queueMs/loss/
+    //    qp) reads as garbage -> Unknown (Ok): the isfinite gate returns
+    //    before any rule, aligning +inf with NaN/-inf per the
+    //    EncoderRateTracker::Observe precedent (fps_ladder.h:125) - A8
+    //    post-fix semantics (these were pinned as FIRES before A8:
+    //    DecodeBound/DecodeBound/LinkBound/LinkBound/RateControl). droppedFps
+    //    joined the gate in the A8 increment (it feeds R1 exactly like
+    //    decodeMs); its +inf case below is flipped under "A8 increment
+    //    semantics" - before the increment it was the one remaining exposure.
+    {
+        rc::BottleneckSignal s;
+        s.decodeMs = inf;
+        s.decodeBudgetMs = 10.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);  // A8 post-fix semantics (was DecodeBound)
+        s = rc::BottleneckSignal{};
+        s.droppedFps = inf;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);  // A8 增量语义 (was DecodeBound: ungated before the increment)
+        s = rc::BottleneckSignal{};
+        s.queueMs = inf;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);  // A8 post-fix semantics (was LinkBound)
+        s = rc::BottleneckSignal{};
+        s.loss = inf;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);  // A8 post-fix semantics (was LinkBound)
+        s = rc::BottleneckSignal{};
+        s.ceilingKbps = 20000;
+        s.mbps = 5.0;         // fill 0.25 - starving
+        s.qp = inf;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);  // A8 post-fix semantics (was RateControl)
+    }
+    // 4. -infinity reads as "unknown / never" on every rule (per the :61
+    //    decodeMs>0 / droppedFps>3.0, :65 queueMs>=0 / loss>0.05, :70
+    //    mbps>=0 / qp>=20 and :76 gameFps>0 guards) - all silent at once.
+    {
+        rc::BottleneckSignal s;
+        s.decodeMs = -inf;
+        s.decodeBudgetMs = 10.0;
+        s.droppedFps = -inf;
+        s.queueMs = -inf;
+        s.loss = -inf;
+        s.ceilingKbps = 20000;
+        s.mbps = 5.0;
+        s.qp = -inf;
+        s.gameFps = -inf;
+        s.nominalFps = 72.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+    }
+    // 5. Same input twice -> the same answer, across three signatures (per
+    //    the :20-21 comment "the classifier itself is stateless - persistence
+    //    lives below": a pure function must be idempotent).
+    {
+        rc::BottleneckSignal link;
+        link.queueMs = 150.0;
+        rc::BottleneckSignal game;
+        game.gameFps = 40.0;
+        game.nominalFps = 72.0;
+        game.qp = 10.0;
+        const Bottleneck link1 = ClassifyBottleneck(link);
+        const Bottleneck game1 = ClassifyBottleneck(game);
+        const Bottleneck ok1 = ClassifyBottleneck({});
+        CHECK(link1 == Bottleneck::LinkBound);
+        CHECK(game1 == Bottleneck::GameBound);
+        CHECK(ok1 == Bottleneck::Ok);
+        CHECK(ClassifyBottleneck(link) == link1);
+        CHECK(ClassifyBottleneck(game) == game1);
+        CHECK(ClassifyBottleneck({}) == ok1);
+    }
+    // 6. loss outside its documented 0..1 domain (:54 "measured loss fraction
+    //    0..1") is invalid telemetry -> Unknown (Ok), NOT clamped into range
+    //    and not fired through - A8 post-fix semantics (5.0 was pinned as
+    //    LinkBound before the A8c domain gate; garbage must not be "repaired").
+    //    The negative case keeps its old answer (Ok), now via the same gate.
+    {
+        rc::BottleneckSignal s;
+        s.loss = 5.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);  // A8 post-fix semantics (was LinkBound)
+        s.loss = -0.5;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+    }
+    // 7. fill (:71) far above 1 (>100% of the ceiling) is the OPPOSITE of
+    //    starving -> not rate-control (per the :71 fill < 0.70 branch); a
+    //    negative mbps (域外 <0, :51 documents >=0) is blocked by the :70
+    //    mbps >= 0 guard even though its fill would satisfy < 0.70.
+    {
+        rc::BottleneckSignal s;
+        s.ceilingKbps = 20000;
+        s.mbps = 50000.0;  // fill = 2500, i.e. 250000% of the ceiling
+        s.qp = 22.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+        s.mbps = -5.0;     // fill -0.25 would be < 0.70, but mbps >= 0 fails first
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+    }
+    // 8. qp far outside any codec's QP domain (fps_ladder.h:226-239 documents
+    //    0..51 / 0..255 and says garbage is "typically hundreds of millions";
+    //    QpStats::Add :251-261 rejects it per frame): the A8c domain gate now
+    //    rejects the mean too -> Unknown (Ok), NOT clamped - A8 post-fix
+    //    semantics (5e8 was pinned as RateControl before A8). Negative garbage
+    //    keeps its old answer (Ok): qp < 0 is the field's documented unknown
+    //    sentinel (:50 "<0 unknown"), so it is not vetoed - it stays per-rule
+    //    silent and never suppresses the other fields' evidence.
+    {
+        rc::BottleneckSignal s;
+        s.ceilingKbps = 20000;
+        s.mbps = 5.0;
+        s.qp = 5e8;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);  // A8 post-fix semantics (was RateControl)
+        s.qp = -1e9;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);
+    }
+    // 9. A8: finite inputs exactly AT the domain boundary are valid - the
+    //    gates reject only loss outside [0, 1] or qp above the codec ceiling
+    //    (51 H.264/HEVC / 255 AV1). loss 1.0 still fires R2 (a valid boundary
+    //    pressure must not be swallowed) and loss 0.0 stays quiet; qp at both
+    //    codec ceilings still fires R3 with the starving fill, while 256 - one
+    //    step past the last codec family - is garbage -> Unknown.
+    {
+        rc::BottleneckSignal s;
+        s.loss = 1.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::LinkBound);  // boundary is in-domain
+        s.loss = 0.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);         // valid, no pressure
+        s.ceilingKbps = 20000;
+        s.mbps = 5.0;         // fill 0.25 - starving background
+        s.qp = 51.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::RateControl);  // H.264/HEVC ceiling is valid
+        s.qp = 255.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::RateControl);  // AV1 ceiling is valid
+        s.qp = 256.0;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);  // A8 post-fix semantics: past every codec family
+    }
+    // 10. A8: the isfinite gate covers -inf too, and unconditionally - one
+    //     non-finite field voids the whole tick, so valid pressure in another
+    //     gated field cannot fire through it (without the gate the first and
+    //     third CHECK would be LinkBound via queueMs).
+    {
+        rc::BottleneckSignal s;
+        s.queueMs = 150.0;   // would be LinkBound on its own
+        s.decodeMs = -inf;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);  // A8 post-fix semantics: -inf voids the tick
+        s.decodeMs = -1.0;   // back to the unknown sentinel: finite again
+        CHECK(ClassifyBottleneck(s) == Bottleneck::LinkBound);  // valid pressure classifies
+        s.loss = -inf;
+        CHECK(ClassifyBottleneck(s) == Bottleneck::Ok);  // -inf loss voids the tick too
+    }
+    std::printf("ok\n");
+}
+
+// PLAN-AUTO-TUNE P3: the decision layer - 5 s persistence, the 30 s cooldown
+// shared with the L7 ladder, manual locks, one-way actions, recovery logging
+// (DECISION-TABLE §3).
+static void TestAutoTuneDecide() {
+    rc::AutoTune::Config cfg{};  // defaults: 5 s over, 30 s cooldown
+    const int64_t S = 1000000000LL;
+    std::printf("auto-tune decide: ");
+
+    // 1. persistence: a rate-control tick held under 5 s never acts; at 5 s it
+    //    fires the first priority (CBR off, unlocked and effectively on).
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::BottleneckSignal s;
+        s.mbps = 52.3;
+        s.ceilingKbps = 98000;
+        s.qp = 23.8;
+        rc::AutoTuneInput in;
+        in.cbrOn = true;
+        rc::AutoTune::Result r;
+        for (int64_t t = 0; t < 5 * S; t += S) r = g.Update(s, in, t);
+        CHECK(r.action == rc::AutoAction::None);
+        r = g.Update(s, in, 5 * S);
+        CHECK(r.action == rc::AutoAction::CbrOff && r.cls == Bottleneck::RateControl);
+    }
+    // 2. cooldown: sustained rate-control fires CBR off once, then nothing for
+    //    30 s; at 30 s the next priority (fovea on) becomes eligible.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::BottleneckSignal s;
+        s.mbps = 52.3;
+        s.ceilingKbps = 98000;
+        s.qp = 23.8;
+        rc::AutoTuneInput in;
+        in.cbrOn = true;
+        for (int64_t t = 0; t <= 5 * S; t += S) g.Update(s, in, t);
+        CHECK(g.Update(s, in, 10 * S).action == rc::AutoAction::None);
+        CHECK(g.Update(s, in, 34 * S).action == rc::AutoAction::None);  // 29 s after the action
+        in.cbrOn = false;  // the CBR write landed: next priority
+        const auto r = g.Update(s, in, 35 * S);
+        CHECK(r.action == rc::AutoAction::FoveaOn);
+    }
+    // 3. the ladder's step counts against the same cooldown: the ladder stepped
+    //    at t = 1 s, so rate-control pressure from t = 0 may only act at 31 s.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::BottleneckSignal s;
+        s.mbps = 52.3;
+        s.ceilingKbps = 98000;
+        s.qp = 23.8;
+        rc::AutoTuneInput in;
+        in.cbrOn = true;
+        g.NoteLadderStep(1 * S);
+        for (int64_t t = 0; t <= 5 * S; t += S) g.Update(s, in, t);
+        CHECK(g.Update(s, in, 10 * S).action == rc::AutoAction::None);
+        CHECK(g.Update(s, in, 30 * S).action == rc::AutoAction::None);  // 29 s after the step
+        CHECK(g.Update(s, in, 31 * S).action == rc::AutoAction::CbrOff);
+    }
+    // 4. manual priority: a locked Cbr dimension is skipped and the next
+    //    priority (fovea) takes over.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::BottleneckSignal s;
+        s.mbps = 52.3;
+        s.ceilingKbps = 98000;
+        s.qp = 23.8;
+        rc::AutoTuneInput in;
+        in.cbrOn = true;
+        g.MarkManual(rc::AutoDim::Cbr);
+        rc::AutoTune::Result r{};
+        for (int64_t t = 0; t <= 5 * S; t += S) r = g.Update(s, in, t);
+        CHECK(r.action == rc::AutoAction::FoveaOn);
+    }
+    // 5. fovea impossible (the headset's gazeFoveation is off) and CBR already
+    //    effectively off: auto does not spend a rebuild on a no-op; the ceiling
+    //    hint fires instead, once, only above twice the observed wire peak.
+    {
+        rc::AutoTune h;
+        h.Configure(cfg);
+        rc::BottleneckSignal s;
+        s.mbps = 52.3;
+        s.ceilingKbps = 98000;
+        s.qp = 23.8;
+        rc::AutoTuneInput in2;
+        in2.cbrOn = false;        // capped VBR already runs: writing the key would rebuild for nothing
+        in2.foveaPossible = false;
+        rc::AutoTune::Result rh{};
+        for (int64_t t = 0; t <= 5 * S; t += S) rh = h.Update(s, in2, t);
+        CHECK(rh.action == rc::AutoAction::None);  // peak 52.3 x 2 = 104.6 > 98: no hint
+        s.ceilingKbps = 300000;                    // 300 Mbps ceiling vs a 52 Mbps peak
+        CHECK(h.Update(s, in2, 6 * S).action == rc::AutoAction::LogOnly);
+        CHECK(h.Update(s, in2, 7 * S).action == rc::AutoAction::None);  // logged once per episode
+    }
+    // 6. link-bound: profile down one rung, never below latency, never against
+    //    a lock or a headset-owned profile (profileId 0 = not auto's).
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::BottleneckSignal s;
+        s.queueMs = 500.0;
+        rc::AutoTuneInput in;
+        in.profileId = 2;
+        rc::AutoTune::Result r{};
+        for (int64_t t = 0; t <= 5 * S; t += S) r = g.Update(s, in, t);
+        CHECK(r.action == rc::AutoAction::ProfileDown && r.profileId == 1);
+        rc::AutoTune h;
+        h.Configure(cfg);
+        in.profileId = 0;  // latency, or the headset owns the key
+        for (int64_t t = 0; t <= 5 * S; t += S) r = h.Update(s, in, t);
+        CHECK(r.action == rc::AutoAction::None);
+        rc::AutoTune k;
+        k.Configure(cfg);
+        k.MarkManual(rc::AutoDim::Profile);
+        in.profileId = 2;
+        for (int64_t t = 0; t <= 5 * S; t += S) r = k.Update(s, in, t);
+        CHECK(r.action == rc::AutoAction::None);
+    }
+    // 7. game-bound: one explanation per episode, never an action.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::BottleneckSignal s;
+        s.gameFps = 40.0;
+        s.nominalFps = 72.0;
+        s.qp = 10.0;
+        rc::AutoTuneInput in;
+        rc::AutoTune::Result r{};
+        for (int64_t t = 0; t <= 5 * S; t += S) r = g.Update(s, in, t);
+        CHECK(r.action == rc::AutoAction::LogOnly && r.cls == Bottleneck::GameBound);
+        CHECK(g.Update(s, in, 60 * S).action == rc::AutoAction::None);  // quiet after the one line
+    }
+    // 8. a class change resets the 5 s streak; recovery logs exactly once.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::BottleneckSignal starve;
+        starve.mbps = 52.3;
+        starve.ceilingKbps = 98000;
+        starve.qp = 23.8;
+        rc::BottleneckSignal calm;  // healthy: at the ceiling, low qp
+        calm.mbps = 97.0;
+        calm.ceilingKbps = 98000;
+        calm.qp = 12.0;
+        rc::AutoTuneInput in;
+        in.cbrOn = true;
+        for (int64_t t = 0; t < 4 * S; t += S) g.Update(starve, in, t);
+        g.Update(calm, in, 4 * S);  // one clear tick resets the streak
+        rc::AutoTune::Result r{};
+        for (int64_t t = 5 * S; t <= 8 * S; t += S) r = g.Update(starve, in, t);
+        CHECK(r.action == rc::AutoAction::None);  // 4 s since the reset: not yet
+        r = g.Update(starve, in, 9 * S);
+        CHECK(r.action == rc::AutoAction::None);  // still 4 s of sustained pressure
+        r = g.Update(starve, in, 10 * S);
+        CHECK(r.action == rc::AutoAction::CbrOff);  // 5 s since the reset
+        rc::AutoTune::Result rec = g.Update(calm, in, 11 * S);
+        CHECK(rec.recovered && rec.action == rc::AutoAction::LogOnly);
+        CHECK(g.Update(calm, in, 12 * S).action == rc::AutoAction::None);  // no repeat
+    }
+    // 9. ClearLocks: re-enabling autoTune hands the untouched dimensions over.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::BottleneckSignal s;
+        s.mbps = 52.3;
+        s.ceilingKbps = 98000;
+        s.qp = 23.8;
+        rc::AutoTuneInput in;
+        in.cbrOn = true;
+        g.MarkManual(rc::AutoDim::Cbr);
+        rc::AutoTune::Result r{};
+        for (int64_t t = 0; t <= 5 * S; t += S) r = g.Update(s, in, t);
+        CHECK(r.action == rc::AutoAction::FoveaOn);  // locked Cbr skipped
+        g.ClearLocks();
+        rc::AutoTune::Result r2{};
+        for (int64_t t = 0; t <= 5 * S; t += S) r2 = g.Update(s, in, t);
+        CHECK(r2.action == rc::AutoAction::CbrOff);  // and available again
+    }
+    std::printf("ok\n");
+}
+
+// VD-OFFLINE (TASK 2026-11-20 §2.1): the full/half+generate pace policy. Pure
+// state machine - every case drives UpdateLinkPolicy directly with synthetic
+// 1 Hz ticks. The rule numbers in the comments refer to TASK-VD-OFFLINE §2.1.
+static void TestLinkPolicy() {
+    const int64_t S = 1000000000LL;
+    std::printf("link policy: ");
+    rc::LinkPolicyInput in;
+    rc::PaceMode m = rc::PaceMode::Full;
+
+    // 1. steady full rate: nothing to act on, every tick.
+    {
+        rc::LinkPolicyState s{};
+        in = {72.f, 72.f, 72.f, false};
+        for (int64_t t = S; t <= 10 * S; t += S) {
+            m = UpdateLinkPolicy(s, in, t);
+            CHECK(m == rc::PaceMode::Full);
+            CHECK(s.lastReason == rc::PaceReason::Ok);
+        }
+    }
+    // 2. the game really is slow ({72,36,36} every tick): entry lands on the
+    //    3rd consecutive low tick, not the first (TASK-POLICY-FIX-TESTS-
+    //    2026-11-20: raw-rate counters replaced the smoothed window gate).
+    {
+        rc::LinkPolicyState s{};
+        in = {72.f, 36.f, 36.f, false};
+        m = UpdateLinkPolicy(s, in, S);
+        CHECK(m == rc::PaceMode::Full);  // 1 low tick: hold
+        m = UpdateLinkPolicy(s, in, 2 * S);
+        CHECK(m == rc::PaceMode::Full);  // 2 low ticks: hold
+        for (int64_t t = 3 * S; t <= 10 * S; t += S) {
+            m = UpdateLinkPolicy(s, in, t);
+            CHECK(m == rc::PaceMode::HalfWithGeneration);  // t3: entered, stays
+        }
+        CHECK(s.lastReason == rc::PaceReason::GameSlow);
+    }
+    // 3. the LINK is slow but the game keeps pace: shortfall > 6 yet the game
+    //    frame interval is inside the window -> generation would not help, stay
+    //    full (rule 5's second factor; reason names the observation).
+    {
+        rc::LinkPolicyState s{};
+        in = {72.f, 72.f, 40.f, false};
+        for (int64_t t = S; t <= 6 * S; t += S) m = UpdateLinkPolicy(s, in, t);
+        CHECK(m == rc::PaceMode::Full && s.lastReason == rc::PaceReason::LinkSlow);
+    }
+    // 4. no flap on a single good sample after entering Half: one recovered
+    //    tick (1 < kExitTicks) must not undo the mode.
+    {
+        rc::LinkPolicyState s{};
+        UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, S);       // 1 low tick
+        UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, 2 * S);   // 2 low ticks
+        m = UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, 3 * S);  // 3rd low tick -> Half
+        CHECK(m == rc::PaceMode::HalfWithGeneration && s.lastReason == rc::PaceReason::GameSlow);
+        m = UpdateLinkPolicy(s, {72.f, 72.f, 72.f, false}, 4 * S);
+        CHECK(m == rc::PaceMode::HalfWithGeneration);  // recoveredTicks = 1 < 3: hold
+    }
+    // 5. exit: three consecutive ticks at the target walk recoveredTicks to the
+    //    exit threshold; 3 s since the entry switch pass the anti-flap guard;
+    //    reason says Recovered on the switching tick.
+    {
+        rc::LinkPolicyState s{};
+        UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, S);       // 1 low tick
+        UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, 2 * S);   // 2 low ticks
+        m = UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, 3 * S);  // -> Half at t = 3 s
+        CHECK(m == rc::PaceMode::HalfWithGeneration);
+        for (int64_t t = 4 * S; t <= 5 * S; t += S) {
+            m = UpdateLinkPolicy(s, {72.f, 72.f, 72.f, false}, t);
+            CHECK(m == rc::PaceMode::HalfWithGeneration);  // recoveredTicks 1, 2 < 3: hold
+        }
+        m = UpdateLinkPolicy(s, {72.f, 72.f, 72.f, false}, 6 * S);  // 3rd recovered tick; 6s-3s passes anti-flap
+        CHECK(m == rc::PaceMode::Full && s.lastReason == rc::PaceReason::Recovered);
+    }
+    // 6. AER: the app refuses generation - forced full regardless of pressure.
+    {
+        rc::LinkPolicyState s{};
+        in = {72.f, 36.f, 36.f, true};
+        m = UpdateLinkPolicy(s, in, S);
+        CHECK(m == rc::PaceMode::Full && s.lastReason == rc::PaceReason::AppRefusesGeneration);
+    }
+    // 7. missing signals: no crash, no NaN, no action (rule 9).
+    {
+        rc::LinkPolicyState s1{};
+        m = UpdateLinkPolicy(s1, {72.f, 0.f, 40.f, false}, S);
+        CHECK(m == rc::PaceMode::Full && s1.lastReason == rc::PaceReason::Ok);
+        rc::LinkPolicyState s2{};
+        m = UpdateLinkPolicy(s2, {0.f, 36.f, 36.f, false}, S);
+        CHECK(m == rc::PaceMode::Full && s2.lastReason == rc::PaceReason::Ok);
+    }
+    // 8. shortfall no longer gates entry (TASK-POLICY-FIX-TESTS-2026-11-20):
+    //    recv 66 pins shortfall at exactly 6, yet the game's 3 consecutive low
+    //    ticks enter Half. The old shortfall boundary survives in the reason
+    //    naming only: 72 - 66 = 6 is not > 6 (Ok), 72 - 65 = 7 is (LinkSlow).
+    {
+        rc::LinkPolicyState s{};
+        in = {72.f, 36.f, 66.f, false};  // 72 - 66 = 6 exactly
+        m = UpdateLinkPolicy(s, in, S);
+        CHECK(m == rc::PaceMode::Full);  // shortfall is irrelevant to entry now
+        m = UpdateLinkPolicy(s, in, 2 * S);
+        CHECK(m == rc::PaceMode::Full);
+        m = UpdateLinkPolicy(s, in, 3 * S);
+        CHECK(m == rc::PaceMode::HalfWithGeneration && s.lastReason == rc::PaceReason::GameSlow);
+        rc::LinkPolicyState reasonOk{};
+        for (int64_t t = S; t <= 5 * S; t += S) m = UpdateLinkPolicy(reasonOk, {72.f, 71.f, 66.f, false}, t);
+        CHECK(m == rc::PaceMode::Full && reasonOk.lastReason == rc::PaceReason::Ok);
+        rc::LinkPolicyState reasonSlow{};
+        for (int64_t t = S; t <= 5 * S; t += S) m = UpdateLinkPolicy(reasonSlow, {72.f, 71.f, 65.f, false}, t);
+        CHECK(m == rc::PaceMode::Full && reasonSlow.lastReason == rc::PaceReason::LinkSlow);
+    }
+    // 9. the smoothed frame-window gate is retired (raw-rate counters replaced
+    //    it): the 60-67 middle band must HOLD both counters - neither advance
+    //    nor clear - and never enter. First, pure band input {63,65,67} cycled
+    //    three times from a fresh state; then a seeded count (2 low ticks) must
+    //    survive 9 band ticks intact, provable from the mode alone: one more
+    //    low tick enters Half only if the band kept the count at 2.
+    {
+        rc::LinkPolicyState s{};
+        const float band[] = {63.f, 65.f, 67.f};
+        int64_t t = 0;
+        for (int round = 0; round < 3; round++)
+            for (int i = 0; i < 3; i++) {
+                m = UpdateLinkPolicy(s, {72.f, band[i], 72.f, false}, t += S);
+                CHECK(m == rc::PaceMode::Full);  // band: holds, never enters
+            }
+        m = UpdateLinkPolicy(s, {72.f, 38.f, 72.f, false}, t += S);  // seed: 1 low tick
+        m = UpdateLinkPolicy(s, {72.f, 38.f, 72.f, false}, t += S);  // seed: 2 low ticks
+        for (int round = 0; round < 3; round++)
+            for (int i = 0; i < 3; i++) {
+                m = UpdateLinkPolicy(s, {72.f, band[i], 72.f, false}, t += S);
+                CHECK(m == rc::PaceMode::Full);  // band keeps the seeded count intact
+            }
+        m = UpdateLinkPolicy(s, {72.f, 38.f, 72.f, false}, t += S);
+        CHECK(m == rc::PaceMode::HalfWithGeneration);  // 2 (held) + 1 = 3 -> enters
+    }
+    // 10. extreme values: tiny game rate, zero received - finite, and entry
+    //     still needs its 3 consecutive ticks (was: a first-tick switch).
+    {
+        rc::LinkPolicyState s{};
+        m = UpdateLinkPolicy(s, {72.f, 0.01f, 0.f, false}, S);
+        CHECK(m == rc::PaceMode::Full);  // 1st tick
+        m = UpdateLinkPolicy(s, {72.f, 0.01f, 0.f, false}, 2 * S);
+        CHECK(m == rc::PaceMode::Full);  // 2nd tick
+        m = UpdateLinkPolicy(s, {72.f, 0.01f, 0.f, false}, 3 * S);
+        CHECK(m == rc::PaceMode::HalfWithGeneration);
+        CHECK(s.smoothedGameFps > 0.f && s.smoothedGameFps < 1.f);
+    }
+    // 11. the anti-flap guard (rule 8, RinCast's own): a switch that comes due
+    //     within 2 s of the last REAL mode change is held with reason Dwelling.
+    //     Chain: 3 low ticks enter Half at t = 3 s, AER forces back to full at
+    //     t = 4 s (a real switch), the sustained slow game is due again at
+    //     t = 5 s - the guard holds it one more second; entry lands at t = 6 s.
+    {
+        rc::LinkPolicyState s{};
+        UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, S);           // 1 low tick
+        UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, 2 * S);       // 2 low ticks
+        m = UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, 3 * S);   // -> Half
+        CHECK(m == rc::PaceMode::HalfWithGeneration);
+        m = UpdateLinkPolicy(s, {72.f, 36.f, 36.f, true}, 4 * S);    // AER -> Full (real switch)
+        CHECK(m == rc::PaceMode::Full && s.lastReason == rc::PaceReason::AppRefusesGeneration);
+        m = UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, 5 * S);   // entry due, 1 s after
+        CHECK(m == rc::PaceMode::Full && s.lastReason == rc::PaceReason::Dwelling);
+        m = UpdateLinkPolicy(s, {72.f, 36.f, 36.f, false}, 6 * S);   // past the guard: enters
+        CHECK(m == rc::PaceMode::HalfWithGeneration && s.lastReason == rc::PaceReason::GameSlow);
+    }
+
+    // --- Sequence cases, derived from real-device log shapes
+    //     (TASK-POLICY-FIX-TESTS-2026-11-20 §3.2, 1 Hz ticks, target 72).
+    //     F1/F2/F5 ran RED on the pre-fix implementation and the failure mode
+    //     matched the card's prediction (evidence archived in
+    //     POLICY-FIX-NOTES-2026-11-20); F3 is a guardrail with no
+    //     discriminating power on either version.
+
+    // F1. Source: the 07:56:08 streamer line "half+generate (game-slow), game 70,
+    //     shown 35.0" - the game climbed out of a low phase (38->44->51) while the
+    //     link stayed short at 35. Raw-rate timeline: 3 low ticks enter Half, 3
+    //     recovered ticks leave it; the short link may name the reason afterwards
+    //     (LinkSlow) but must not steer the decision. The pre-fix code entered
+    //     Half on t1 and never left it (shortfall 37 blocks the exit forever).
+    {
+        rc::LinkPolicyState s{};
+        const float game[] = {38.f, 44.f, 51.f, 70.f, 70.f, 70.f, 70.f, 70.f, 70.f, 70.f};
+        int64_t t = 0;
+        for (int i = 0; i < 10; i++) {
+            m = UpdateLinkPolicy(s, {72.f, game[i], 35.f, false}, t += S);
+            if (i <= 1)
+                CHECK(m == rc::PaceMode::Full);  // t1,t2: counter filling (pre-fix: t1 already Half)
+            else if (i == 2)
+                CHECK(m == rc::PaceMode::HalfWithGeneration && s.lastReason == rc::PaceReason::GameSlow);  // t3: 3rd low tick
+            else if (i <= 4)
+                CHECK(m == rc::PaceMode::HalfWithGeneration);  // t4,t5: recovered 1, 2 < 3
+            else if (i == 5)
+                CHECK(m == rc::PaceMode::Full && s.lastReason == rc::PaceReason::Recovered);  // t6: 3rd recovered tick
+            else
+                CHECK(m == rc::PaceMode::Full && s.lastReason == rc::PaceReason::LinkSlow);  // t7-t10: shortfall 37 > 6
+        }
+    }
+    // F2. Source: second device round, the 33-36 fps jitter shape - game and link
+    //     deliver the same rate, so the GAME is the slow one. Entry on the 3rd
+    //     consecutive low tick; the jitter never reaches the exit line. The
+    //     pre-fix code entered Half on t1.
+    {
+        rc::LinkPolicyState s{};
+        const float game[] = {34.f, 36.f, 35.f, 36.f, 34.f, 36.f, 35.f, 36.f, 34.f, 36.f};
+        int64_t t = 0;
+        for (int i = 0; i < 10; i++) {
+            m = UpdateLinkPolicy(s, {72.f, game[i], game[i], false}, t += S);
+            if (i <= 1)
+                CHECK(m == rc::PaceMode::Full);  // t1,t2 (pre-fix: t1 already Half)
+            else
+                CHECK(m == rc::PaceMode::HalfWithGeneration);  // t3 entry, stays through t10
+        }
+    }
+    // F3. Source: first device round's link-starved stretches with the game
+    //     healthy (71). Guardrail - no discriminating power, both versions must
+    //     behave the same: the raw-rate counters never see a low tick, the
+    //     shortfall (72 - 35 = 37) only names the reason LinkSlow, mode stays Full.
+    {
+        rc::LinkPolicyState s{};
+        for (int64_t t = S; t <= 10 * S; t += S) {
+            m = UpdateLinkPolicy(s, {72.f, 71.f, 35.f, false}, t);
+            CHECK(m == rc::PaceMode::Full && s.lastReason == rc::PaceReason::LinkSlow);
+        }
+    }
+    // F5. Source: first device round's median shape - game == link == 51 for 20 s.
+    //     Entry on the 3rd tick, then generation holds: the game never comes
+    //     back. The pre-fix code entered Half on t1.
+    {
+        rc::LinkPolicyState s{};
+        for (int64_t t = S; t <= 20 * S; t += S) {
+            m = UpdateLinkPolicy(s, {72.f, 51.f, 51.f, false}, t);
+            if (t <= 2 * S)
+                CHECK(m == rc::PaceMode::Full);  // t1,t2 (pre-fix: t1 already Half)
+            else
+                CHECK(m == rc::PaceMode::HalfWithGeneration);  // t3 entry, steady after
+        }
+    }
+
+    // E1-E3 (TASK-ROBUST-EDGES-2026-11-20 §1.1): robustness edges - NaN game
+    // rate, an absurd target, a negative recv. Expectations are the task
+    // card's table; derivation cites point at link_policy.h.
+
+    // E1. gameFps = NaN, recv 40, 5 ticks. NaN > 0 is false, so rule 1
+    //     (:99-100) never touches the EMA and rule 9 (:103-106) treats the
+    //     tick as unknown: Full + reason Ok every tick, and the unknown tick
+    //     "advances and clears nothing" (the :102 comment) - both raw-rate
+    //     counters (:73-74) stay at 0. recv 40 >= 36 keeps slowSamples at 0
+    //     too (:110-111). Nothing is polluted by the NaN.
+    {
+        rc::LinkPolicyState s{};
+        const float nanF = std::numeric_limits<float>::quiet_NaN();
+        for (int64_t t = S; t <= 5 * S; t += S) {
+            m = UpdateLinkPolicy(s, {72.f, nanF, 40.f, false}, t);
+            CHECK(m == rc::PaceMode::Full);
+            CHECK(s.lastReason == rc::PaceReason::Ok);
+        }
+        CHECK(s.smoothedGameFps == 0.f);                 // the EMA never saw the NaN
+        CHECK(s.slowGameTicks == 0 && s.recoveredTicks == 0);  // counters untouched
+        CHECK(s.slowSamples == 0);
+    }
+    // E2. Illegal huge target (1e7): a fool-proofing case - no crash, no NaN,
+    //     predictable behaviour. The thresholds scale mechanically: 36 <
+    //     1e7-12 for 3 consecutive ticks (the :119 enter branch, raw rate)
+    //     enters Half at t3; t4 stays (the :136 branch needs mode == Full).
+    //     The EMA (:100) stays finite at 36 (非法输入防呆).
+    {
+        rc::LinkPolicyState s{};
+        for (int64_t t = S; t <= 4 * S; t += S) {
+            m = UpdateLinkPolicy(s, {1e7f, 36.f, 36.f, false}, t);
+            if (t <= 2 * S)
+                CHECK(m == rc::PaceMode::Full);  // t1,t2: counter filling
+            else
+                CHECK(m == rc::PaceMode::HalfWithGeneration);  // t3 entry, t4 holds
+        }
+        CHECK(s.lastReason == rc::PaceReason::GameSlow);
+        CHECK(std::isfinite(s.smoothedGameFps) && s.smoothedGameFps == 36.f);
+    }
+    // E3. Negative recv (-5), game healthy at 71, 5 ticks: shortfall =
+    //     72-(-5) = 77 > 6 only NAMES the tick LinkSlow (:107, :161) - it
+    //     drives nothing. The switch counters (:73-74) behave exactly as with
+    //     a valid recv: 71 >= 68 (the exit line) builds recoveredTicks, the
+    //     enter counter never moves, mode stays Full, and the EMA (:99-100)
+    //     never sees recv. The naming counter slowSamples does grow (rule 4,
+    //     :110: -5 < 36) - its only consumer is the same :161 naming, which
+    //     is the documented "names, does not steer" contract.
+    {
+        rc::LinkPolicyState s{};
+        for (int64_t t = S; t <= 5 * S; t += S) {
+            m = UpdateLinkPolicy(s, {72.f, 71.f, -5.f, false}, t);
+            CHECK(m == rc::PaceMode::Full);
+            CHECK(s.lastReason == rc::PaceReason::LinkSlow);
+        }
+        CHECK(s.slowGameTicks == 0);       // the enter counter unpolluted
+        CHECK(s.recoveredTicks == 5);      // the exit counter built normally
+        CHECK(s.smoothedGameFps == 71.f);  // recv never touches the EMA
+        CHECK(s.slowSamples == 5);         // naming-only growth (rule 4, :110)
+    }
+    std::printf("ok\n");
+}
+
+// VD-OFFLINE (TASK 2026-11-20 §2.4): the start-rate advice - largest ladder rung
+// at or under the device's own decode hint, snapped to zero when the hint is at
+// or within ~3% of the target (a panel measuring a couple of frames short must
+// not cause a fake downgrade).
+static void TestSuggestStartFps() {
+    std::printf("suggest start fps: ");
+    CHECK(SuggestStartFps(72.f, 45) == 45.f);
+    CHECK(SuggestStartFps(72.f, 72) == 0.f);
+    CHECK(SuggestStartFps(72.f, 70) == 0.f);  // 70 > 69.84 = 72 x 0.97: snapped
+    CHECK(SuggestStartFps(90.f, 45) == 45.f);
+    CHECK(SuggestStartFps(72.f, 0) == 0.f);
+    CHECK(SuggestStartFps(0.f, 45) == 0.f);
+    CHECK(SuggestStartFps(72.f, 20) == 24.f);  // below the ladder's bottom rung
+    std::printf("ok\n");
+}
+
 
 // ROUND19 T3: the disconnect/reconnect state machine at the connection level (the
 // session-level paths are mapped in the stick's AUDIT; the streamer owns those and
@@ -2285,11 +3671,892 @@ static void TestSessionDisconnectReconnect() {
     std::printf("ok\n");
 }
 
+// ===========================================================================
+// A12 (TASK-COMBO-SWEEP-2026-11-21): the full 14-boolean switch product x the
+// numeric pairwise rows, through the pure settings -> stream-config builders
+// (pc/streamer/src/stream/stream_config.h). Pure logic: no store, no bridge,
+// no device, no sockets. Every combination must yield a legal config:
+//   §1.1 no crash / no NaN-Inf; bitrate in [floor, ceiling]; sizes in domain
+//   §1.2 tenBit x codec: H264 never carries tenBit (the UI hint's config layer)
+//   §1.3 encodeScalePct x foveatedEncoding: a scaled frame never carries a fovea
+//        layout, and the lens QP map never runs on a squeezed frame
+//   §1.4 qualityProfileCbr x fillMode: CBR only on quality+takeover; the fill
+//        rung stays >= the VBV-percentage floor (per-frame budget <= bucket)
+//   §1.5 profileControlsVideo x qualityProfileCbr: one gate, no contradictory
+//        state whatever order the switches were set in (the builder is stateless
+//        and the sweep proves the two gates move together)
+//   §1.6 autoTune: the decision input agrees with the built config; locked or
+//        inapplicable dims never fire
+//   §1.7 fecPercent x pacer billing: parity counted into the wire bytes keeps
+//        the encoder target positive and inside the ceiling (probes below)
+//   §1.8 MF + NVENC consumable numbers construct for every combination (below)
+// Failures are aggregated (first 20 repros printed, one CHECK per test) so the
+// suite output stays readable; the exit code still reports them.
+// ===========================================================================
+
+namespace {
+
+struct A12Num {
+    int encodeScalePct, fecPercent, vrBitrateMbps, codecIdx, streamProfile, desktopBitrateMbps;
+};
+
+enum {
+    A12FillMode = 0, A12QualityProfileCbr, A12ProfileControlsVideo, A12L7Autoscale,
+    A12AdaptiveBitrate, A12PcBitrateWins, A12FoveatedEncoding, A12TenBit,
+    A12AdaptiveQuantization, A12TwoPassEncoding, A12AutoTune, A12DesktopInput,
+    A12StreamAudio, A12MicPassthrough,
+};
+
+const char* A12CodecName(int i) {
+    static const char* kNames[] = {"auto", "hevc", "av1", "h264"};
+    return kNames[i];
+}
+
+// The bool names in mask-bit order, for the repro lines.
+const char* A12BoolName(int i) {
+    static const char* kNames[] = {"fillMode", "qualityProfileCbr", "profileControlsVideo", "l7Autoscale",
+                                   "adaptiveBitrate", "pcBitrateWins", "foveatedEncoding", "tenBit",
+                                   "adaptiveQuantization", "twoPassEncoding", "autoTune", "desktopInput",
+                                   "streamAudio", "micPassthrough"};
+    return kNames[i];
+}
+
+// Self-implemented greedy pairwise generator over the six numeric parameters
+// (no third-party dependency). Every value pair of every parameter pair must be
+// covered by at least one generated row - verified by the caller.
+std::vector<A12Num> A12PairwiseRows() {
+    const int kValues[6][6] = {
+        {0, 50, 67, 85, 100, 0},  // encodeScalePct (5; 0 = follow the profile)
+        {0, 3, 5, 10, 20, 0},     // fecPercent (5)
+        {20, 100, 500, 0, 0},     // vrBitrateMbps (3; 20 = the lower-bound extreme)
+        {0, 1, 2, 3, 0, 0},       // codec: auto / hevc / av1 / h264 (4)
+        {0, 1, 2, 0, 0, 0},       // streamProfile: latency / balanced / quality (3)
+        {10, 150, 0, 0, 0, 0},    // desktopBitrateMbps (2)
+    };
+    const int kCount[6] = {5, 5, 3, 4, 3, 2};
+    struct Pair { int p1, v1, p2, v2; };
+    std::vector<Pair> uncovered;
+    for (int a = 0; a < 6; a++)
+        for (int b = a + 1; b < 6; b++)
+            for (int va = 0; va < kCount[a]; va++)
+                for (int vb = 0; vb < kCount[b]; vb++)
+                    uncovered.push_back({a, va, b, vb});
+    std::vector<A12Num> rows;
+    int idx[6];
+    while (!uncovered.empty()) {
+        // Seed with the first uncovered pair, then fill the remaining parameters
+        // greedily: the value that covers the most still-uncovered pairs against
+        // the parameters already assigned.
+        for (int p = 0; p < 6; p++) idx[p] = 0;
+        idx[uncovered[0].p1] = uncovered[0].v1;
+        idx[uncovered[0].p2] = uncovered[0].v2;
+        bool assigned[6] = {};
+        assigned[uncovered[0].p1] = assigned[uncovered[0].p2] = true;
+        for (int p = 0; p < 6; p++) {
+            if (assigned[p]) continue;
+            int best = 0, bestCov = -1;
+            for (int v = 0; v < kCount[p]; v++) {
+                int cov = 0;
+                for (const Pair& pr : uncovered)
+                    if ((pr.p1 == p && pr.v1 == v && assigned[pr.p2] && idx[pr.p2] == pr.v2) ||
+                        (pr.p2 == p && pr.v2 == v && assigned[pr.p1] && idx[pr.p1] == pr.v1))
+                        cov++;
+                if (cov > bestCov) {
+                    bestCov = cov;
+                    best = v;
+                }
+            }
+            idx[p] = best;
+            assigned[p] = true;
+        }
+        auto covers = [&](const Pair& pr) { return idx[pr.p1] == pr.v1 && idx[pr.p2] == pr.v2; };
+        uncovered.erase(std::remove_if(uncovered.begin(), uncovered.end(), covers), uncovered.end());
+        rows.push_back({kValues[0][idx[0]], kValues[1][idx[1]], kValues[2][idx[2]], kValues[3][idx[3]],
+                        kValues[4][idx[4]], kValues[5][idx[5]]});
+    }
+    return rows;
+}
+
+// Post-hoc pairwise coverage proof: for every parameter pair and every value pair,
+// some row carries both.
+bool A12PairwiseCovered(const std::vector<A12Num>& rows) {
+    const int kValues[6][6] = {
+        {0, 50, 67, 85, 100, 0}, {0, 3, 5, 10, 20, 0}, {20, 100, 500, 0, 0, 0},
+        {0, 1, 2, 3, 0, 0}, {0, 1, 2, 0, 0, 0}, {10, 150, 0, 0, 0, 0},
+    };
+    const int kCount[6] = {5, 5, 3, 4, 3, 2};
+    const int vals[6] = {0, 0, 0, 0, 0, 0};
+    for (int a = 0; a < 6; a++)
+        for (int b = a + 1; b < 6; b++)
+            for (int va = 0; va < kCount[a]; va++)
+                for (int vb = 0; vb < kCount[b]; vb++) {
+                    bool found = false;
+                    for (const A12Num& r : rows) {
+                        const int rv[6] = {r.encodeScalePct, r.fecPercent, r.vrBitrateMbps, r.codecIdx,
+                                           r.streamProfile, r.desktopBitrateMbps};
+                        if (rv[a] == kValues[a][va] && rv[b] == kValues[b][vb]) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return false;
+                }
+    (void)vals;
+    return true;
+}
+
+rcs::Settings A12PcSettings(const bool* b, const A12Num& n) {
+    rcs::Settings pc;  // defaults, then the swept switches
+    pc.fillMode = b[A12FillMode];
+    pc.qualityProfileCbr = b[A12QualityProfileCbr];
+    pc.profileControlsVideo = b[A12ProfileControlsVideo];
+    pc.l7Autoscale = b[A12L7Autoscale];
+    pc.adaptiveBitrate = b[A12AdaptiveBitrate];
+    pc.pcBitrateWins = b[A12PcBitrateWins];
+    pc.foveatedEncoding = b[A12FoveatedEncoding];
+    pc.tenBit = b[A12TenBit];
+    pc.adaptiveQuantization = b[A12AdaptiveQuantization];
+    pc.twoPassEncoding = b[A12TwoPassEncoding];
+    pc.autoTune = b[A12AutoTune];
+    pc.desktopInput = b[A12DesktopInput];
+    pc.streamAudio = b[A12StreamAudio];
+    pc.micPassthrough = b[A12MicPassthrough];
+    pc.encodeScalePct = n.encodeScalePct;
+    pc.fecPercent = n.fecPercent;
+    pc.vrBitrateMbps = n.vrBitrateMbps;
+    pc.codec = A12CodecName(n.codecIdx);
+    pc.streamProfile = n.streamProfile;
+    pc.desktopBitrateMbps = n.desktopBitrateMbps;
+    return pc;
+}
+
+// Field-by-field compare (memcmp would read padding bytes).
+bool A12SameVrConfig(const rcs::VrStreamConfig& a, const rcs::VrStreamConfig& c) {
+    return a.codec == c.codec && a.tenBit == c.tenBit && a.eyeWidth == c.eyeWidth && a.eyeHeight == c.eyeHeight &&
+           a.fps == c.fps && a.bitrateKbps == c.bitrateKbps && a.fecPercent == c.fecPercent && a.adaptive == c.adaptive &&
+           a.profile == c.profile && a.startBitrateKbps == c.startBitrateKbps && a.pace == c.pace &&
+           a.pacingMode == c.pacingMode && a.foveated == c.foveated && a.adaptiveQuant == c.adaptiveQuant &&
+           a.twoPass == c.twoPass && a.cappedVbr == c.cappedVbr && a.fillMode == c.fillMode &&
+           a.motionField == c.motionField && a.foveatedEyeWidth == c.foveatedEyeWidth &&
+           a.foveatedEyeHeight == c.foveatedEyeHeight && a.foveaSize == c.foveaSize && a.encodeScale == c.encodeScale;
+}
+
+std::vector<std::string> g_a12Fails;
+
+void A12Note(const char* assertion, const bool* b, const A12Num& n, bool gazeFovea, bool slowPath,
+             const std::string& detail) {
+    if (g_a12Fails.size() >= 20) return;
+    std::string mask;
+    for (int i = 13; i >= 0; i--) mask += b[i] ? '1' : '0';
+    std::string on;
+    for (int i = 0; i < 14; i++)
+        if (b[i]) {
+            if (!on.empty()) on += ",";
+            on += A12BoolName(i);
+        }
+    char line[320];
+    std::snprintf(line, sizeof(line),
+                  "[%s] %s: mask=%s(%s) scale=%d fec=%d vrMbps=%d codec=%s profile=%d dskMbps=%d gaze=%d slow=%d %s",
+                  assertion, "combo", mask.c_str(), on.c_str(), n.encodeScalePct, n.fecPercent, n.vrBitrateMbps,
+                  A12CodecName(n.codecIdx), n.streamProfile, n.desktopBitrateMbps, int(gazeFovea), int(slowPath),
+                  detail.c_str());
+    g_a12Fails.push_back(line);
+}
+
+#define A12_CHECK(cond, assertion, b, n, gaze, slow, detail)      \
+    do {                                                          \
+        if (!(cond)) A12Note(assertion, b, n, gaze, slow, detail); \
+    } while (0)
+
+}  // namespace
+
+// The full sweep itself (pure logic; timed; the card requires < 60 s).
+static void TestVrConfigComboSweep() {
+    g_a12Fails.clear();
+    const auto rows = A12PairwiseRows();
+    CHECK(A12PairwiseCovered(rows));
+    CHECK(rows.size() >= 25);  // the 5x5 encodeScale x fec pair alone needs 25 rows
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // Representative session inputs: the default desktop path (no SteamVR match),
+    // a 1664x1728 eye, 72 fps, the headset's own bitrate pick so pcBitrateWins
+    // has an observable effect.
+    constexpr uint32_t kEyeW = 1664, kEyeH = 1728;
+    constexpr float kFps = 72.f;
+    rcs::ClientCaps caps;  // defaults: 4096 decode, full codec set
+    rcs::EncoderCaps encFull;
+    encFull.h264 = encFull.hevc = encFull.av1 = encFull.hevc10 = encFull.av110 = true;
+
+    rcs::ClientStreamSettings st;
+    st.vrQuality = "high";
+    st.vrBitrateMbps = 123;   // the headset's own pick (wins unless pcBitrateWins)
+    st.refreshRate = kFps;
+    st.eyesTracked = true;
+    st.adaptiveBitrate = true;
+
+    long long combos = 0, vrBuilds = 0;
+    for (int mask = 0; mask < (1 << 14); mask++) {
+        bool b[14];
+        for (int i = 0; i < 14; i++) b[i] = ((mask >> i) & 1) != 0;
+        for (const A12Num& n : rows) {
+            const rcs::Settings pc = A12PcSettings(b, n);
+            // codec resolution: "auto" resolves through the extracted session rule
+            // with full-featured caps (HEVC preferred); explicit values pass through.
+            const rc::VideoCodec codec =
+                n.codecIdx == 0
+                    ? rcs::ChooseStreamCodec(encFull, caps, b[A12TenBit], pc.codec)
+                    : (n.codecIdx == 1 ? rc::VideoCodec::HEVC : n.codecIdx == 2 ? rc::VideoCodec::AV1
+                                                                               : rc::VideoCodec::H264);
+            for (int quadrant = 0; quadrant < 4; quadrant++) {
+                const bool gazeFovea = (quadrant & 1) != 0;
+                const bool slowPath = (quadrant & 2) != 0;
+                st.tenBit = b[A12TenBit];
+                st.gazeFoveation = gazeFovea;
+                const int autoscalePct = pc.l7Autoscale ? 85 : 100;  // a stepped ladder level
+                const rcs::VrStreamBuild build =
+                    rcs::BuildVrStreamConfig(pc, st, codec, slowPath, /*match=*/false, autoscalePct, kEyeW, kEyeH, kFps);
+                const rcs::VrStreamConfig& cfg = build.cfg;
+                vrBuilds++;
+                char detail[96];
+
+                // ---- §1.1: no crash (reaching here), no NaN/Inf, domains ----
+                A12_CHECK(std::isfinite(cfg.encodeScale) && cfg.encodeScale >= 0.5f && cfg.encodeScale <= 1.0f,
+                          "A1-domain", b, n, gazeFovea, slowPath, "encodeScale out of [0.5,1]");
+                A12_CHECK(std::isfinite(cfg.fps) && cfg.fps > 0, "A1-domain", b, n, gazeFovea, slowPath, "fps");
+                A12_CHECK(std::isfinite(cfg.foveaSize) && cfg.foveaSize >= rcs::Foveator::kFoveaSize - 1e-6f &&
+                              cfg.foveaSize <= 0.8f + 1e-6f,
+                          "A1-domain", b, n, gazeFovea, slowPath, "foveaSize out of [0.45,0.8]");
+                A12_CHECK(cfg.bitrateKbps >= 1000 && cfg.bitrateKbps <= 2'000'000, "A1-bitrate-bounds", b, n,
+                          gazeFovea, slowPath, "bitrateKbps outside [1e3,2e6] kbps");
+                if (slowPath)
+                    A12_CHECK(cfg.bitrateKbps <= 60000, "A1-bitrate-bounds", b, n, gazeFovea, slowPath,
+                              "slow path must cap at 60000");
+                A12_CHECK(cfg.startBitrateKbps == 0 || cfg.startBitrateKbps <= cfg.bitrateKbps, "A1-bitrate-bounds", b,
+                          n, gazeFovea, slowPath, "startBitrateKbps above the ceiling");
+                A12_CHECK(cfg.fecPercent >= 0 && cfg.fecPercent <= 100, "A1-domain", b, n, gazeFovea, slowPath,
+                          "fecPercent out of [0,100]");
+                if (slowPath)
+                    A12_CHECK(cfg.fecPercent >= 12, "A1-domain", b, n, gazeFovea, slowPath,
+                              "slow path must floor fec at 12");
+                A12_CHECK(cfg.pacingMode >= 1 && cfg.pacingMode <= 3 && cfg.pace == (cfg.pacingMode != 1),
+                          "A1-domain", b, n, gazeFovea, slowPath, "pacingMode/pace disagree");
+                A12_CHECK(cfg.eyeWidth == kEyeW && cfg.eyeHeight == kEyeH, "A1-domain", b, n, gazeFovea, slowPath,
+                          "eye size not passed through");
+                // The per-eye coded size may be ODD (ScaledEncodeSize/2): the headset
+                // doubles it back to the full width, which is the even dimension the
+                // encoder and the converters need. Height must stay even (NV12/P010).
+                A12_CHECK(build.codedEyeWidth >= 1 && build.codedEyeHeight >= 2 &&
+                              (build.codedEyeHeight & 1u) == 0 && ((build.codedEyeWidth * 2u) & 1u) == 0,
+                          "A1-domain", b, n, gazeFovea, slowPath, "coded eye size not in domain");
+
+                // ---- §1.2: tenBit x codec ----
+                A12_CHECK(!(codec == rc::VideoCodec::H264 && cfg.tenBit), "A2-tenBit-H264", b, n, gazeFovea,
+                          slowPath, "H264 carried tenBit");
+                if (codec != rc::VideoCodec::H264)
+                    A12_CHECK(cfg.tenBit == st.tenBit, "A2-tenBit-passthrough", b, n, gazeFovea, slowPath,
+                              "tenBit lost on a codec that supports it");
+
+                // ---- §1.3: encodeScale x foveation ----
+                const bool squeeze = cfg.foveatedEyeWidth > 0 && cfg.foveatedEyeHeight > 0;
+                if (cfg.encodeScale < 1.0f)
+                    A12_CHECK(!squeeze, "A3-scale-fovea", b, n, gazeFovea, slowPath,
+                              "scaled frame carries a fovea layout");
+                if (squeeze)
+                    A12_CHECK(gazeFovea && cfg.encodeScale >= 1.0f &&
+                                  cfg.foveatedEyeWidth == rcs::Foveator::EncodedSize(cfg.eyeWidth, cfg.foveaSize) &&
+                                  cfg.foveatedEyeHeight == rcs::Foveator::EncodedSize(cfg.eyeHeight, cfg.foveaSize),
+                              "A3-scale-fovea", b, n, gazeFovea, slowPath,
+                              "fovea layout inconsistent with Foveator::EncodedSize");
+                // The RunEncoder mapping (vr_stream.cpp): the lens bit budget assumes a
+                // picture that isn't squeezed, so a squeezed frame must not run it.
+                const bool jobFoveated = squeeze;
+                const bool ecFoveated = cfg.foveated && !jobFoveated;
+                if (cfg.foveated && jobFoveated)
+                    A12_CHECK(!ecFoveated, "A3-lens-budget", b, n, gazeFovea, slowPath,
+                              "lens QP map on a squeezed frame");
+                // The encoded size the bpp budget runs on (vr_stream.cpp Run()).
+                const uint32_t baseW = squeeze ? cfg.foveatedEyeWidth * 2 : kEyeW * 2;
+                const uint32_t baseH = squeeze ? cfg.foveatedEyeHeight : kEyeH;
+                const uint32_t encW = rc::ScaledEncodeSize(baseW, cfg.encodeScale);
+                const uint32_t encH = rc::ScaledEncodeSize(baseH, cfg.encodeScale);
+                A12_CHECK(encW > 0 && encH > 0 && (encW & 1u) == 0 && (encH & 1u) == 0, "A3-lens-budget", b, n,
+                          gazeFovea, slowPath, "encoded size not even/positive");
+                const double bpp = double(cfg.bitrateKbps) * 1000.0 / (double(encW) * encH * double(cfg.fps));
+                A12_CHECK(std::isfinite(bpp) && bpp > 0, "A3-lens-budget", b, n, gazeFovea, slowPath,
+                          "bits-per-pixel not finite/positive");
+
+                // ---- §1.4 + §1.5: CBR gate, one gate, fill floor ----
+                const bool gate = pc.profileControlsVideo && !slowPath;  // match=false in the sweep
+                const bool cbrExpected = pc.qualityProfileCbr && gate && cfg.profile == rc::StreamProfile::Quality;
+                A12_CHECK(cfg.cappedVbr == !cbrExpected, "A4-A5-cbr-gate", b, n, gazeFovea, slowPath,
+                          "CBR state disagrees with (cbr x takeover x quality)");
+                if (!cfg.cappedVbr)
+                    A12_CHECK(cfg.profile == rc::StreamProfile::Quality, "A4-A5-cbr-gate", b, n, gazeFovea, slowPath,
+                              "CBR outside the quality profile");
+                if (gazeFovea && cfg.encodeScale >= 1.0f) {
+                    const float base = st.eyesTracked ? rcs::Foveator::kFoveaSize : rcs::Foveator::kFixedFoveaSize;
+                    const float floor_ = int(cfg.profile) == 2 ? 0.8f : int(cfg.profile) == 1 ? 0.7f : 0.6f;
+                    const float expected = gate && floor_ > base ? floor_ : base;
+                    A12_CHECK(cfg.foveaSize == expected, "A5-fovea-floor", b, n, gazeFovea, slowPath,
+                              "fovea floor disagrees with the takeover gate");
+                } else {
+                    A12_CHECK(cfg.foveaSize == rcs::Foveator::kFoveaSize, "A5-fovea-floor", b, n, gazeFovea, slowPath,
+                              "foveaSize touched without the fovea path");
+                }
+                // CBR's budget mapping (nvenc RatePlan): CBR runs avg 100% / VBV 150%;
+                // capped VBR runs the profile's numbers. The fill rung must stay above
+                // the bucket floor either way: per-frame budget <= VBV buffer.
+                {
+                    const rc::StreamProfileParams q = rc::ProfileParams(cfg.profile);
+                    const uint32_t avgPct = cfg.cappedVbr ? q.vbrAveragePercent : 100u;
+                    const uint32_t vbvPct = cfg.cappedVbr ? q.vbvFramesPercent : 150u;
+                    rc::EncoderRateTracker tracker;
+                    tracker.Observe(1e9 / 45.0);  // sustained 45 fps: pressure
+                    const rc::EncoderRatePlan plan = rc::PlanEncoderRate(cfg.bitrateKbps, double(cfg.fps), false,
+                                                                         false, tracker, uint32_t(cfg.fps) * 1000u,
+                                                                         avgPct, vbvPct, cfg.fillMode);
+                    A12_CHECK(plan.budget.maxBitrate == cfg.bitrateKbps * 1000u, "A4-cbr-budget", b, n, gazeFovea,
+                              slowPath, "plan maxBitrate != ceiling");
+                    A12_CHECK(plan.budget.averageBitrate <= plan.budget.maxBitrate, "A4-cbr-budget", b, n, gazeFovea,
+                              slowPath, "plan average above the ceiling");
+                    A12_CHECK(plan.rateNum > 0 && plan.rateNum <= uint32_t(cfg.fps) * 1000u, "A4-cbr-budget", b, n,
+                              gazeFovea, slowPath, "fill rung above nominal");
+                    const double perFrame = double(plan.budget.maxBitrate) * 1000.0 / double(plan.rateNum);
+                    // one bit of slack: the bucket is a truncated uint32 of the exact
+                    // formula, and at the floor rung the two meet exactly.
+                    A12_CHECK(double(plan.budget.vbvBufferSize) >= perFrame - 1.0, "A4-fill-floor", b, n, gazeFovea,
+                              slowPath, "per-frame budget above the VBV bucket");
+                    if (cfg.fillMode)
+                        A12_CHECK(rc::LadderContainsStep(int(plan.rateNum / 1000u)), "A4-fill-floor", b, n, gazeFovea,
+                                  slowPath, "fill rung off the ladder");
+                }
+
+                // ---- §1.6: autoTune agreement (full) + decision probes (stride) ----
+                {
+                    const rc::AutoTuneInput in = rcs::BuildAutoTuneInput(pc, st, slowPath, /*pcOwnsProfile=*/true);
+                    A12_CHECK(in.cbrOn == !cfg.cappedVbr, "A6-autotune-input", b, n, gazeFovea, slowPath,
+                              "autoTune's CBR view disagrees with the built config");
+                    A12_CHECK(in.foveaOn == (pc.foveatedEncoding && gazeFovea), "A6-autotune-input", b, n, gazeFovea,
+                              slowPath, "autoTune's fovea view disagrees");
+                    A12_CHECK(in.foveaPossible == gazeFovea, "A6-autotune-input", b, n, gazeFovea, slowPath,
+                              "autoTune's fovea possibility disagrees");
+                    A12_CHECK(in.profileId == pc.streamProfile, "A6-autotune-input", b, n, gazeFovea, slowPath,
+                              "autoTune's profile view disagrees");
+                    if (mask % 3 == 0) {
+                        // RateControl pressure: CbrOff only when effective CBR is on and
+                        // unlocked; FoveaOn only when it is possible and not already on.
+                        rc::AutoTune tuner;
+                        rc::BottleneckSignal sig;
+                        sig.nominalFps = double(cfg.fps);
+                        sig.qp = 30.0;
+                        sig.mbps = 1.0;
+                        sig.ceilingKbps = cfg.bitrateKbps;
+                        sig.queueMs = 5.0;
+                        const rc::AutoTuneInput probe = in;
+                        (void)tuner.Update(sig, probe, 0);
+                        const auto r = tuner.Update(sig, probe, 6'000'000'000LL);
+                        if (r.action == rc::AutoAction::CbrOff)
+                            A12_CHECK(in.cbrOn, "A6-autotune-actions", b, n, gazeFovea, slowPath, "CbrOff without CBR");
+                        else if (r.action == rc::AutoAction::FoveaOn)
+                            A12_CHECK(!in.cbrOn && in.foveaPossible && !in.foveaOn, "A6-autotune-actions", b, n,
+                                      gazeFovea, slowPath, "FoveaOn while CBR still available/on");
+                        // The user's manual lock must silence the dim entirely.
+                        rc::AutoTune locked;
+                        locked.MarkManual(rc::AutoDim::Cbr);
+                        locked.MarkManual(rc::AutoDim::Fovea);
+                        locked.MarkManual(rc::AutoDim::Profile);
+                        (void)locked.Update(sig, probe, 0);
+                        const auto lr = locked.Update(sig, probe, 6'000'000'000LL);
+                        A12_CHECK(lr.action != rc::AutoAction::CbrOff && lr.action != rc::AutoAction::FoveaOn &&
+                                      lr.action != rc::AutoAction::ProfileDown,
+                                  "A6-autotune-actions", b, n, gazeFovea, slowPath, "a manual lock was overridden");
+                        // LinkBound: profile down only for a PC-owned profile.
+                        rc::AutoTune link;
+                        rc::BottleneckSignal linkSig;
+                        linkSig.queueMs = 150.0;
+                        linkSig.nominalFps = double(cfg.fps);
+                        const rc::AutoTuneInput owned = rcs::BuildAutoTuneInput(pc, st, slowPath, false);
+                        (void)link.Update(linkSig, owned, 0);
+                        const auto lr2 = link.Update(linkSig, owned, 6'000'000'000LL);
+                        if (owned.profileId > 0)
+                            A12_CHECK(lr2.action == rc::AutoAction::ProfileDown && lr2.profileId == owned.profileId - 1,
+                                      "A6-autotune-actions", b, n, gazeFovea, slowPath, "LinkBound did not step down");
+                        else
+                            A12_CHECK(lr2.action == rc::AutoAction::None, "A6-autotune-actions", b, n, gazeFovea,
+                                      slowPath, "headset-owned profile was moved");
+                        // DecodeBound: this layer never acts (the L7 ladder's class).
+                        rc::AutoTune dec;
+                        rc::BottleneckSignal decSig;
+                        decSig.decodeMs = 100.0;
+                        decSig.decodeBudgetMs = 20.0;
+                        decSig.nominalFps = double(cfg.fps);
+                        (void)dec.Update(decSig, probe, 0);
+                        const auto dr = dec.Update(decSig, probe, 6'000'000'000LL);
+                        A12_CHECK(dr.action == rc::AutoAction::None, "A6-autotune-actions", b, n, gazeFovea, slowPath,
+                                  "decision layer acted on a decode-bound tick");
+                    }
+                }
+
+                // ---- §1.7 (pure half): parity billed into the wire budget ----
+                if (mask % 3 == 0) {
+                    constexpr size_t kFragPayload = rc::kMaxDatagramLan - sizeof(rc::PacketHeader) - rc::kMacSize -
+                                                    sizeof(rc::VideoFragmentHeader);
+                    const size_t total = 2 + sizeof(rc::VrFrameMetadata) + size_t(64) * 1024;
+                    const size_t wire = rcs::FrameWireBytes(kFragPayload, total, cfg.fecPercent);
+                    A12_CHECK(wire > total, "A7-parity-billing", b, n, gazeFovea, slowPath,
+                              "wire bytes not above the payload");
+                    rc::WireCeiling wc;
+                    rc::WireCeiling::Snapshot snap;
+                    wc.OnFrame(0, wire, total, cfg.bitrateKbps, snap);
+                    wc.OnFrame(250'000'000LL, wire, total, cfg.bitrateKbps, snap);
+                    // The first frame moves the target off 0 (any candidate >= cap/2 and
+                    // the hysteresis band is below it at these ceilings), so after two
+                    // frames the published target is the parity-inclusive conversion.
+                    A12_CHECK(snap.encoderTargetKbps > 0 && snap.encoderTargetKbps <= cfg.bitrateKbps &&
+                                  snap.encoderTargetKbps >= cfg.bitrateKbps / 2,
+                              "A7-parity-billing", b, n, gazeFovea, slowPath,
+                              "wire ceiling target escaped [cap/2, cap]");
+                }
+
+                // ---- §1.8: the backends' consumable numbers ----
+                {
+                    rcs::EncoderConfig ec;
+                    ec.codec = cfg.codec;
+                    ec.width = encW;
+                    ec.height = encH;
+                    ec.fps = cfg.fps;
+                    ec.bitrateKbps = cfg.bitrateKbps;  // the ceiling the sender starts at
+                    ec.profile = cfg.profile;
+                    ec.tenBit = cfg.tenBit;
+                    ec.inputFormat = cfg.tenBit ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+                    ec.foveated = ecFoveated;
+                    ec.adaptiveQuant = cfg.adaptiveQuant;
+                    ec.twoPass = cfg.twoPass;
+                    ec.cappedVbr = cfg.cappedVbr;
+                    ec.fillMode = cfg.fillMode;
+                    A12_CHECK(ec.width > 0 && ec.height > 0 && ec.width <= 8192 && ec.height <= 8192, "A8-encoder", b,
+                              n, gazeFovea, slowPath, "encoder size out of domain");
+                    A12_CHECK(ec.bitrateKbps <= 4'000'000, "A8-encoder", b, n, gazeFovea, slowPath,
+                              "bitrate would overflow the MF UINT32 rate fields");
+                    const rcs::MfEncoderParams mf = rcs::DeriveMfParams(ec);
+                    A12_CHECK(mf.meanBitRate > 0 && mf.meanBitRate == ec.bitrateKbps * 1000u, "A8-encoder", b, n,
+                              gazeFovea, slowPath, "MF mean bitrate wrong/overflowed");
+                    A12_CHECK(mf.bufferSize > 0, "A8-encoder", b, n, gazeFovea, slowPath, "MF buffer size not positive");
+                    A12_CHECK(mf.frameRateNum == uint32_t(ec.fps * 1000.0f) && mf.frameRateNum > 0, "A8-encoder", b, n,
+                              gazeFovea, slowPath, "MF frame rate wrong");
+                    // MF's hardware caps ceiling (MfProbe): 4096 - a config above it could
+                    // never construct; the sweep's sizes stay inside it.
+                    A12_CHECK(ec.width <= 4096 && ec.height <= 4096, "A8-encoder", b, n, gazeFovea, slowPath,
+                              "size above the MF backend's 4096 cap");
+                    // NVENC's consumable budget (RatePlan -> ApplyBudget).
+                    const rc::StreamProfileParams q = rc::ProfileParams(ec.profile);
+                    const uint32_t avgPct = ec.cappedVbr ? q.vbrAveragePercent : 100u;
+                    const uint32_t vbvPct = ec.cappedVbr ? q.vbvFramesPercent : 150u;
+                    rc::EncoderRateTracker fresh;
+                    const rc::EncoderRatePlan plan = rc::PlanEncoderRate(ec.bitrateKbps, double(ec.fps), false, true,
+                                                                         fresh, uint32_t(ec.fps) * 1000u, avgPct,
+                                                                         vbvPct, ec.fillMode);
+                    A12_CHECK(plan.budget.maxBitrate == ec.bitrateKbps * 1000u && plan.budget.maxBitrate > 0,
+                              "A8-encoder", b, n, gazeFovea, slowPath, "NVENC plan maxBitrate wrong");
+                    A12_CHECK(plan.budget.vbvBufferSize > 0 && plan.rateNum > 0, "A8-encoder", b, n, gazeFovea,
+                              slowPath, "NVENC plan not positive");
+                }
+
+                // ---- isolation: audio/input switches never touch the video config ----
+                if (quadrant == 0) {
+                    bool b2[14];
+                    std::memcpy(b2, b, sizeof(b2));
+                    b2[A12StreamAudio] = !b2[A12StreamAudio];
+                    b2[A12MicPassthrough] = !b2[A12MicPassthrough];
+                    b2[A12DesktopInput] = !b2[A12DesktopInput];
+                    const rcs::Settings pc2 = A12PcSettings(b2, n);
+                    const rcs::VrStreamBuild build2 =
+                        rcs::BuildVrStreamConfig(pc2, st, codec, slowPath, false, autoscalePct, kEyeW, kEyeH, kFps);
+                    A12_CHECK(A12SameVrConfig(cfg, build2.cfg), "A-isolation", b, n, gazeFovea, slowPath,
+                              "audio/input switches changed the video config");
+                }
+
+                // ---- determinism (stride): the builder is stateless ----
+                if (mask % 101 == 0) {
+                    const rcs::VrStreamBuild again =
+                        rcs::BuildVrStreamConfig(pc, st, codec, slowPath, false, autoscalePct, kEyeW, kEyeH, kFps);
+                    A12_CHECK(A12SameVrConfig(cfg, again.cfg), "A-determinism", b, n, gazeFovea, slowPath,
+                              "builder not deterministic");
+                }
+
+                // ---- the desktop builder rides the same sweep ----
+                {
+                    rcs::MonitorInfo mon;
+                    mon.index = 0;
+                    mon.width = 2560;
+                    mon.height = 1440;
+                    const double totalPixels = double(mon.width) * mon.height;
+                    const rcs::DesktopStreamConfig dc =
+                        rcs::BuildDesktopStreamConfig(pc, st, codec, slowPath, /*vrInFlight=*/false, mon, totalPixels,
+                                                      1, caps);
+                    A12_CHECK(dc.width > 0 && dc.height > 0 && (dc.width & 1u) == 0 && (dc.height & 1u) == 0,
+                              "A-desktop", b, n, gazeFovea, slowPath, "desktop size not even/positive");
+                    A12_CHECK(dc.bitrateKbps >= 5000, "A-desktop", b, n, gazeFovea, slowPath,
+                              "desktop bitrate below the 5000 floor");
+                    A12_CHECK(dc.bitrateKbps == uint32_t(n.desktopBitrateMbps) * 1000u, "A-desktop", b, n, gazeFovea,
+                              slowPath, "desktop bitrate split wrong");
+                    A12_CHECK(dc.fps == std::clamp(kFps, 30.f, 120.f), "A-desktop", b, n, gazeFovea, slowPath,
+                              "desktop fps outside the clamp");
+                    A12_CHECK(dc.codec == codec && dc.tenBit == (st.tenBit && codec != rc::VideoCodec::H264),
+                              "A-desktop", b, n, gazeFovea, slowPath, "desktop codec/tenBit wrong");
+                    A12_CHECK(dc.profile == rc::ProfileFromId(pc.streamProfile) && dc.pace && !dc.cheapEncode &&
+                                  dc.adaptiveQuant == pc.adaptiveQuantization &&
+                                  dc.adaptive == (slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate)),
+                              "A-desktop", b, n, gazeFovea, slowPath, "desktop switch wiring wrong");
+                    if (slowPath)
+                        A12_CHECK(dc.startBitrateKbps == std::min<uint32_t>(dc.bitrateKbps, 8000), "A-desktop", b, n,
+                                  gazeFovea, slowPath, "desktop slow-path start bitrate wrong");
+                    else
+                        A12_CHECK(dc.startBitrateKbps == 0, "A-desktop", b, n, gazeFovea, slowPath,
+                                  "desktop start bitrate on a LAN path");
+                }
+                combos++;
+            }
+        }
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("A12 combo sweep: 16384 boolean combinations x %zu numeric pairwise rows x 4 session quadrants = "
+                "%lld VR configs (+ desktop) built and asserted in %.2f s\n",
+                rows.size(), combos, secs);
+    CHECK(secs < 60.0);  // the card's runtime budget: anything longer means hidden I/O
+    CHECK(g_a12Fails.empty());
+    for (const std::string& f : g_a12Fails) std::printf("A12 %s\n", f.c_str());
+}
+
+// §2: the known couplings, spelled out one by one (outside the product).
+static void TestConfigCouplingCases() {
+    g_a12Fails.clear();
+    rcs::ClientCaps caps;
+    rcs::ClientStreamSettings st;
+    st.vrQuality = "high";
+    st.refreshRate = 72;
+    st.eyesTracked = true;
+    st.adaptiveBitrate = true;
+    constexpr uint32_t kEyeW = 1664, kEyeH = 1728;
+
+    // 1. tenBit + H264: the config layer must degrade (tenBit dropped), never emit
+    //    an illegal NVENC/MF 10-bit H264 request. The UI hint ("Needs HEVC or AV1")
+    //    greys the row; the direct-settings path lands here.
+    {
+        rcs::Settings pc;
+        pc.tenBit = true;
+        st.tenBit = true;
+        rcs::EncoderCaps full;
+        full.h264 = full.hevc = full.av1 = full.hevc10 = full.av110 = true;
+        rcs::EncoderCaps h264OnlyCaps;
+        h264OnlyCaps.h264 = true;
+        rcs::ClientCaps decNo10;  // the default headset answer: hevc10/av1* = false
+        const auto codec = rcs::ChooseStreamCodec(full, decNo10, true, "h264");
+        CHECK(codec == rc::VideoCodec::H264);  // the explicit h264 preference is honoured
+        const auto build = rcs::BuildVrStreamConfig(pc, st, codec, false, false, 100, kEyeW, kEyeH, 72.f);
+        CHECK(!build.cfg.tenBit);  // ...and 10-bit is dropped at the config layer
+        // auto with tenBit and a Main10-capable headset: HEVC, never H264.
+        rcs::ClientCaps decFull;
+        decFull.h264 = decFull.hevc = decFull.hevc10 = true;
+        const auto autoCodec = rcs::ChooseStreamCodec(full, decFull, true, "auto");
+        CHECK(autoCodec == rc::VideoCodec::HEVC);
+        // auto with tenBit but a headset without Main10: H264 (the codec ok() gate
+        // refuses 10-bit HEVC) - tenBit dropped at the config layer, still legal.
+        const auto autoNo10 = rcs::ChooseStreamCodec(full, decNo10, true, "auto");
+        CHECK(autoNo10 == rc::VideoCodec::H264);
+        const auto buildNo10 = rcs::BuildVrStreamConfig(pc, st, autoNo10, false, false, 100, kEyeW, kEyeH, 72.f);
+        CHECK(!buildNo10.cfg.tenBit);
+        const auto h264Only = rcs::ChooseStreamCodec(h264OnlyCaps, caps, true, "auto");
+        CHECK(h264Only == rc::VideoCodec::H264);
+        const auto build2 = rcs::BuildVrStreamConfig(pc, st, h264Only, false, false, 100, kEyeW, kEyeH, 72.f);
+        CHECK(!build2.cfg.tenBit);
+        st.tenBit = false;
+        std::printf("A12 case 1: tenBit + H264 -> H264 chosen, tenBit dropped at the config layer (degraded, legal)\n");
+    }
+
+    // 2. encodeScale 85 + foveated on: the scaled frame pauses the fovea layout
+    //    (vr_stream.cpp L2-FIX3), keeps the plain scaled coded size, and the lens
+    //    bit budget applies to the unsqueezed frame.
+    {
+        rcs::Settings pc;
+        pc.encodeScalePct = 85;
+        pc.foveatedEncoding = true;
+        st.gazeFoveation = true;
+        const auto build = rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::HEVC, false, false, 100, kEyeW, kEyeH, 72.f);
+        CHECK(build.cfg.encodeScale == 0.85f);
+        CHECK(build.cfg.foveatedEyeWidth == 0 && build.cfg.foveatedEyeHeight == 0);
+        CHECK(build.codedEyeWidth == rc::ScaledEncodeSize(kEyeW * 2, 0.85f) / 2);
+        CHECK(build.codedEyeHeight == rc::ScaledEncodeSize(kEyeH, 0.85f));
+        CHECK(build.cfg.foveated);  // the lens QP map still runs - on the UNSQUEEZED frame
+        st.gazeFoveation = false;
+        std::printf("A12 case 2: scale 85%% + foveated -> fovea paused, plain scaled %ux%u, lens budget on the full frame\n",
+                    build.codedEyeWidth, build.codedEyeHeight);
+    }
+
+    // 3. CBR on + fillMode on + halfRate: three budget layers stack. CBR (quality +
+    //    takeover) runs avg 100% / VBV 150%; the fill rung must keep the per-frame
+    //    budget inside that smaller bucket; and at 20 Mbps the full-size frame really
+    //    sits below the half-rate trigger (kHalfRateBelowBpp = 0.03), so the stack
+    //    exists on real numbers (half rate doubles the per-frame budget by skipping;
+    //    the CBR plan above is what the encoder actually runs).
+    {
+        rcs::Settings pc;
+        pc.qualityProfileCbr = true;
+        pc.profileControlsVideo = true;
+        pc.streamProfile = 2;
+        pc.fillMode = true;
+        pc.vrBitrateMbps = 20;   // the lower-bound extreme
+        pc.pcBitrateWins = true;
+        st.tenBit = false;
+        constexpr uint32_t kBigEyeW = 2208, kBigEyeH = 2112;  // bpp lands under 0.03 at 20 Mbps
+        const auto build =
+            rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::HEVC, false, false, 100, kBigEyeW, kBigEyeH, 72.f);
+        CHECK(!build.cfg.cappedVbr);
+        CHECK(build.cfg.profile == rc::StreamProfile::Quality);
+        const uint32_t avgPct = 100u, vbvPct = 150u;  // the CBR mapping (nvenc RatePlan)
+        rc::EncoderRateTracker tracker;
+        tracker.Observe(1e9 / 45.0);
+        const auto plan =
+            rc::PlanEncoderRate(build.cfg.bitrateKbps, 72.0, false, false, tracker, 72000, avgPct, vbvPct, true);
+        CHECK(plan.budget.maxBitrate == 20'000'000u);
+        CHECK(plan.budget.averageBitrate == plan.budget.maxBitrate);  // CBR spends exactly the limit
+        const int rung = int(plan.rateNum / 1000u);
+        CHECK(rung >= rc::FillFloorRung(72, 150));
+        CHECK(rc::FillFloorRung(72, 150) >= rc::FillFloorRung(72, 200));  // CBR floors above capped-VBR's
+        const double perFrame = double(plan.budget.maxBitrate) * 1000.0 / double(plan.rateNum);
+        CHECK(double(plan.budget.vbvBufferSize) >= perFrame - 1.0);  // 1 bit: uint32 bucket truncation
+        // The half-rate trigger (vr_stream.cpp Run): bpp at the ceiling at this size.
+        const uint32_t encW = rc::ScaledEncodeSize(kBigEyeW * 2, 1.0f), encH = rc::ScaledEncodeSize(kBigEyeH, 1.0f);
+        const double bpp = 20'000'000.0 / (double(encW) * encH * 72.0);
+        CHECK(bpp > 0 && bpp < 0.03);  // below kHalfRateBelowBpp: half rate ON
+        std::printf("A12 case 3: CBR + fillMode + half-rate -> CBR avg==max, rung %d >= floor %d, "
+                    "per-frame %.0f kbit <= VBV %.0f kbit, bpp %.4f < 0.03\n",
+                    rung, rc::FillFloorRung(72, 150), perFrame / 1000.0, double(plan.budget.vbvBufferSize) / 1000.0,
+                    bpp);
+    }
+
+    // 4. autoTune on + a user hand-write: the manual lock wins for that dimension,
+    //    other dims stay auto's; a decode-bound tick moves nothing by hand.
+    {
+        rcs::Settings pc;
+        pc.autoTune = true;
+        pc.qualityProfileCbr = true;   // effective CBR on (below)
+        pc.profileControlsVideo = true;
+        pc.streamProfile = 2;
+        st.tenBit = false;
+        const auto in = rcs::BuildAutoTuneInput(pc, st, false, true);
+        CHECK(in.cbrOn);
+        CHECK(in.profileId == pc.streamProfile);
+        rc::AutoTune tuner;
+        tuner.MarkManual(rc::AutoDim::Cbr);  // the user hand-wrote CBR after enabling autoTune
+        rc::BottleneckSignal sig;
+        sig.qp = 30.0;
+        sig.mbps = 1.0;
+        sig.ceilingKbps = 20000;
+        sig.queueMs = 5.0;
+        sig.nominalFps = 72.0;
+        (void)tuner.Update(sig, in, 0);
+        const auto r = tuner.Update(sig, in, 6'000'000'000LL);
+        // CbrOff is locked out; with gaze foveation unavailable (the headset's switch)
+        // the layer falls through to the once-per-episode ceiling hint.
+        CHECK(r.action != rc::AutoAction::CbrOff);
+        CHECK(r.action == rc::AutoAction::LogOnly);
+        CHECK(std::strcmp(r.reason, "rate-control: CBR off (capped VBR, QP floor and deep VBV return)") != 0);
+        std::printf("A12 case 4: autoTune + manual CBR lock -> RateControl falls through (%s), CbrOff never fires\n",
+                    r.reason);
+    }
+
+    // 5. fecPercent=20 + bitrate 20 Mbps: the lowest-bandwidth budget with heavy
+    //    parity - the wire ceiling conversion stays positive and inside the ceiling,
+    //    and the packetizer really emits the parity the formula bills (probes below).
+    {
+        rcs::Settings pc;
+        pc.fecPercent = 20;
+        pc.vrBitrateMbps = 20;
+        pc.pcBitrateWins = true;
+        const auto build = rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::HEVC, false, false, 100, kEyeW, kEyeH, 72.f);
+        CHECK(build.cfg.fecPercent == 20);
+        CHECK(build.cfg.bitrateKbps == 20000);
+        constexpr size_t kFragPayload = rc::kMaxDatagramLan - sizeof(rc::PacketHeader) - rc::kMacSize -
+                                        sizeof(rc::VideoFragmentHeader);
+        const size_t total = 2 + sizeof(rc::VrFrameMetadata) + size_t(64) * 1024;
+        const size_t wire = rcs::FrameWireBytes(kFragPayload, total, 20);
+        CHECK(wire > total);
+        rc::WireCeiling wc;
+        rc::WireCeiling::Snapshot snap;
+        wc.OnFrame(0, wire, total, 20000, snap);
+        wc.OnFrame(13'888'888LL, wire, total, 20000, snap);  // 72 fps spacing
+        CHECK(snap.encoderTargetKbps > 0);
+        CHECK(snap.encoderTargetKbps <= 20000 && snap.encoderTargetKbps >= 10000);
+        std::printf("A12 case 5: fec 20%% + 20 Mbps -> wire %.1f KB, encoder target %u kbps in [10000, 20000]\n",
+                    wire / 1024.0, snap.encoderTargetKbps);
+    }
+
+    CHECK(g_a12Fails.empty());
+    for (const std::string& f : g_a12Fails) std::printf("A12 %s\n", f.c_str());
+}
+
+// TASK-CAPS-GUARD (A15): H264's NVENC encoder refuses full-frame widths above
+// 4096 px ("Frame Dimension greater than the maximum supported value", measured on
+// the A14 matrix; the MF fallback fails the same way), so a session built on such a
+// config never came up. The guarded synthesis (stream_config.h) moves such a config
+// onto HEVC - the same caps-fallback rule ChooseCodec uses - and every other field
+// is re-derived by the same formulas from the same inputs. The three card combos:
+// display tiers 2688 / 2144 at the encode scales that overflow the width cap.
+static void TestH264CapsFallback() {
+    rcs::ClientCaps caps;  // the default headset answer: h264 + hevc, no Main10/AV1
+    rcs::EncoderCaps encFull;
+    encFull.h264 = encFull.hevc = encFull.av1 = encFull.hevc10 = encFull.av110 = true;
+    rcs::ClientStreamSettings st;
+    st.vrQuality = "high";
+    st.refreshRate = 72;
+    st.eyesTracked = true;
+    st.adaptiveBitrate = true;
+    st.tenBit = false;
+
+    // Guard precision: below the cap nothing changes - the fallback only ever acts
+    // on a path that would otherwise have failed, so every config the plain builder
+    // could legally emit (and the whole A12 sweep's 1664-eye grid) passes through
+    // the guarded one bit-identical.
+    {
+        rcs::Settings pc;
+        pc.encodeScalePct = 85;
+        const auto plain =
+            rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::H264, false, false, 100, 2144, 2144, 72.f);
+        const auto guarded =
+            rcs::BuildVrStreamConfigGuarded(pc, st, rc::VideoCodec::H264, false, false, 100, 2144, 2144, 72.f,
+                                            encFull, caps);
+        CHECK(plain.cfg.codec == rc::VideoCodec::H264);
+        CHECK(plain.codedEyeWidth * 2 == 3644 && plain.codedEyeWidth * 2 <= 4096);
+        CHECK(!guarded.h264WidthFallback && guarded.h264RejectedWidth == 0);
+        CHECK(A12SameVrConfig(plain.cfg, guarded.cfg));
+        std::printf("A15 guard precision: 2144 eye at scale 85 encodes %u px - inside the cap, no fallback\n",
+                    plain.codedEyeWidth * 2);
+    }
+
+    // The three card combos: the H264 build's full-frame width exceeds NVENC's 4096 px
+    // cap, so the guarded synthesis rebuilds the same tier on HEVC. Assertions per the
+    // card: codec == HEVC, the config stays inside its codec's encoder width cap
+    // (H264 4096 / HEVC 8192 - the tier itself survives, that is the point of the
+    // fallback), and every field except the codec matches the H264 build it replaces.
+    {
+        struct TierCase {
+            uint32_t eyeW, eyeH;
+            int scalePct;
+        };
+        const TierCase tierCases[] = {{2688, 2688, 85}, {2688, 2688, 100}, {2144, 2144, 100}};
+        int caseNo = 0;
+        for (const TierCase& tc : tierCases) {
+            ++caseNo;
+            rcs::Settings pc;
+            pc.encodeScalePct = tc.scalePct;
+            const auto h264 =
+                rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::H264, false, false, 100, tc.eyeW, tc.eyeH, 72.f);
+            const uint32_t fullW = h264.codedEyeWidth * 2;
+            CHECK(h264.cfg.codec == rc::VideoCodec::H264);
+            CHECK(fullW > 4096);  // the trigger: this frame could never open on NVENC/MF H264
+            const auto guarded = rcs::BuildVrStreamConfigGuarded(pc, st, rc::VideoCodec::H264, false, false, 100,
+                                                                tc.eyeW, tc.eyeH, 72.f, encFull, caps);
+            CHECK(guarded.h264WidthFallback && guarded.h264RejectedWidth == fullW);
+            CHECK(guarded.cfg.codec == rc::VideoCodec::HEVC);
+            // Legal for the codec that now carries it, and nothing else moved.
+            const uint32_t capW = guarded.cfg.codec == rc::VideoCodec::H264 ? 4096u : 8192u;
+            CHECK(guarded.codedEyeWidth * 2 <= capW && guarded.codedEyeHeight <= capW);
+            rcs::VrStreamConfig asRebuilt = h264.cfg;
+            asRebuilt.codec = guarded.cfg.codec;
+            CHECK(A12SameVrConfig(asRebuilt, guarded.cfg));
+            std::printf("A15 case %d: H264 %ux%u eye at scale %d -> %u px frame would fail encoder init; the guarded "
+                        "synthesis carries the same tier on HEVC, rest of the config unchanged\n",
+                        caseNo, tc.eyeW, tc.eyeH, tc.scalePct, fullW);
+        }
+    }
+
+    // No HEVC to fall back to (an H264-only chain): the guard must not emit a config
+    // the decoder can't play - it returns the H264 config as-is and the encoder init
+    // reports the real problem, exactly as before the guard existed.
+    {
+        rcs::Settings pc;
+        pc.encodeScalePct = 100;
+        rcs::EncoderCaps h264Only;
+        h264Only.h264 = true;
+        const auto guarded =
+            rcs::BuildVrStreamConfigGuarded(pc, st, rc::VideoCodec::H264, false, false, 100, 2688, 2688, 72.f,
+                                            h264Only, caps);
+        CHECK(!guarded.h264WidthFallback);
+        CHECK(guarded.cfg.codec == rc::VideoCodec::H264);
+        std::printf("A15 no-HEVC: 2688 eye on an H264-only chain keeps the H264 config (nothing to fall back to)\n");
+    }
+}
+
+// §1.7 runtime half + the packetizer cross-check: what the packetizer puts on the
+// wire (datagram counts measured on a loopback pair) must equal what FrameWireBytes
+// bills into the wire ceiling, parity included; the token bucket keeps the budget
+// positive and never overflows.
+static void TestFecWireBillingLoopback() {
+    const int fecCases[] = {0, 3, 5, 10, 20, 100};  // 100: the clamp edge (group -> 2)
+    for (int fec : fecCases) {
+        LoopbackPair l;
+        CHECK(l.Open());
+        l.Start();
+        VideoPacketizer pkt(l.sendConn.get());
+        pkt.SetFecPercent(fec);
+        // Token bucket: the §2 case's pacer numbers (20 Mbps x 1.08, 72 fps budget).
+        pkt.SetPacingKbps(21600);
+        pkt.SetPacingFrameBudgetNs(13'888'888LL);
+        constexpr size_t kFrameBytes = 64 * 1024;
+        std::vector<uint8_t> frame(kFrameBytes, uint8_t(0xA5));
+        VrFrameMetadata meta{};
+        meta.trackingTimestampNs = 12345;
+        const size_t total = 2 + sizeof(VrFrameMetadata) + kFrameBytes;
+        const size_t fragPayload = l.sendConn->MaxPayload() - sizeof(VideoFragmentHeader);
+        const size_t dataFrags = fragPayload ? (total + fragPayload - 1) / fragPayload : size_t(0);
+        const size_t sent1 = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), frame.data(),
+                                           frame.size());
+        const size_t sent2 = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta), frame.data(),
+                                           frame.size());
+        l.Drain(150);
+        CHECK(sent1 == sent2);                 // same frame -> same datagram count
+        CHECK(sent1 > dataFrags || fec == 0);  // parity datagrams went out when FEC is on
+        const size_t parity = sent1 - dataFrags;
+        const int group = fec > 0 ? int(std::clamp(100 / fec, 2, 64)) : 0;
+        // The packetizer emits one parity datagram per group of >= 2 members: a FINAL
+        // group with a single fragment carries no parity (the shipped rule - it is the
+        // XOR of that one fragment, which adds nothing to recover with). The billing
+        // formula (ceil) can therefore over-count by at most one parity datagram.
+        const size_t expectedParity = group ? (dataFrags + group - 1) / group - (dataFrags % size_t(group) == 1 ? 1u : 0u)
+                                            : 0;
+        CHECK(parity == expectedParity);
+        // The billing formula must cover what actually left (never under-count) and
+        // miss it by at most that one parity datagram (FINDING A12-F2: the wire-ceiling
+        // and the token-bucket billing both use ceil; the packetizer may emit one
+        // parity datagram less when the final group has a single member - conservative
+        // direction, <= 1 datagram per frame).
+        const size_t billed = rcs::FrameWireBytes(fragPayload, total, fec);
+        const size_t actualBilled =
+            total + dataFrags * sizeof(VideoFragmentHeader) + parity * (sizeof(VideoParityHeader) + fragPayload);
+        CHECK(billed >= actualBilled);
+        CHECK(billed - actualBilled <= sizeof(VideoParityHeader) + fragPayload);
+        // The receiver saw every datagram (or the socket refused some - that escape
+        // hatch is what SendFailures tracks) and reassembled the frame.
+        CHECK(l.arrivals.size() >= sent1 + sent2 || pkt.SendFailures() > 0);
+        CHECK(!l.frames.empty() || pkt.SendFailures() > 0);
+        // Token bucket: a 64 KB frame bills ~24 ms at 21.6 Mbps (parity incl.) - two
+        // back-to-back frames complete, the budget stays positive, nothing overflows.
+        CHECK(pkt.BudgetOverruns() == 0);
+        l.Stop();
+        std::printf("A12 wire billing fec=%d%%: %zu data + %zu parity datagrams, billed %.1f KB/frame\n", fec,
+                    dataFrags, parity, billed / 1024.0);
+    }
+}
+
+#undef A12_CHECK
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     TestLinkLocalDiscovery();
     TestMusic();
     TestMotionRuns();
+    TestMotionHysteresis();  // A18 (TASK-MOTION-HYSTERESIS-2026-11-22)
     TestHandSkeleton();
     NetInit();
     TestAddresses();
@@ -2301,22 +4568,79 @@ int main() {
     TestPacing();
     TestPacingBursts();
     TestPacingStop();
-    TestPacingFrameBudget();
-    TestPacingBurstShaping();
+    // P5: TestPacingFrameBudget is also real-time scheduling sensitive
+    // (SleepMs-driven windows); same pre-run guard as TestPacingBurstShaping.
+    // The checks themselves stay untouched. Since TASK-FLAKE-ROBUST-2026-11-22
+    // (2026-11-22) the timing-sensitive pacing tests self-calibrate their tolerances
+    // (see CalibrateTimingJitter); RINCAST_TEST_TIMING_SENSITIVE=1 is a standard-gate
+    // item now (evidence: overnight/evidence/A7-receipt.md).
+    {
+        const char* force = std::getenv("RINCAST_TEST_TIMING_SENSITIVE");
+        if (force && std::strcmp(force, "1") == 0) {
+            TestPacingFrameBudget();
+        } else if ((force && std::strcmp(force, "0") == 0) || TestHostBusy()) {
+            g_skips++;
+            std::printf("SKIP TestPacingFrameBudget: timing-sensitive test, host busy "
+                        "(%s; set RINCAST_TEST_TIMING_SENSITIVE=1 to force)\n",
+                        force && std::strcmp(force, "0") == 0 ? "explicitly disabled via RINCAST_TEST_TIMING_SENSITIVE=0"
+                                                             : "RinCast Streamer.exe is running");
+        } else {
+            TestPacingFrameBudget();
+        }
+    }
+    // F1 (TASK-FIX 2026-11-19) -> TASK-FLAKE-ROBUST-2026-11-22 (2026-11-22): the
+    // pre-run guard for the timing-sensitive shaping test - see TestHostBusy above.
+    // The shaping test now self-calibrates its tolerances (capped), so forcing with =1
+    // is meaningful under load and is a standard-gate item (evidence:
+    // overnight/evidence/A7-receipt.md); =0 or a busy host still skips with an
+    // explicit counted line for unforced runs.
+    {
+        const char* force = std::getenv("RINCAST_TEST_TIMING_SENSITIVE");
+        if (force && std::strcmp(force, "1") == 0) {
+            TestPacingBurstShaping();
+        } else if ((force && std::strcmp(force, "0") == 0) || TestHostBusy()) {
+            g_skips++;
+            std::printf("SKIP TestPacingBurstShaping: timing-sensitive test, host busy "
+                        "(%s; set RINCAST_TEST_TIMING_SENSITIVE=1 to force)\n",
+                        force && std::strcmp(force, "0") == 0 ? "explicitly disabled via RINCAST_TEST_TIMING_SENSITIVE=0"
+                                                             : "RinCast Streamer.exe is running");
+        } else {
+            TestPacingBurstShaping();
+        }
+    }
     TestWireCeilingBudget();
     TestRateScaleForLadder();
     TestQpStatisticsValidity();
     TestEncoderRateTransaction();
+    TestFillModePlan();
+    TestFillModeGateEdges();  // TASK-ROBUST-EDGES-2026-11-20 §1.2
     TestStreamProfile();
     TestProfileFoveaGradient();
     TestBitrateSwitches();
+    // TASK-COMBO-SWEEP-2026-11-21: the full switch-combination sweep. Pure logic
+    // (no GPU, no real encode session); the card requires the sweep to finish in
+    // under 60 s, asserted inside the test itself.
+    TestVrConfigComboSweep();
+    TestConfigCouplingCases();
+    TestH264CapsFallback();  // TASK-CAPS-GUARD: the H264 width-cap fallback cases
+    TestFecWireBillingLoopback();
     TestFpsLadder();
+    TestFillFloorByTier();
+    TestPercentile();  // TASK-DEC-PERCENTILE-2026-11-20 §1.2
+    TestLatencyStageAccumulation();  // TASK-LATENCY-METER-FIX-2026-11-22 §2
     TestLossBrake();
     TestQueueGuard();
     TestL7Autoscale();
+    TestAutoTuneClassify();
+    TestAutoTuneClassifyEdgeCases();  // TASK-ROBUST-EDGES-2026-11-20 §2
+    TestAutoTuneDecide();
+    TestLinkPolicy();
+    TestSuggestStartFps();
     TestSessionDisconnectReconnect();
     TestFecDeterministic();
     TestHandshakeAndTransport();
-    std::printf(g_failures ? "%d FAILURES\n" : "ALL TESTS PASSED\n", g_failures);
+    if (g_failures) std::printf("%d FAILURES\n", g_failures);
+    else if (g_skips) std::printf("ALL TESTS PASSED (%d skipped)\n", g_skips);
+    else std::printf("ALL TESTS PASSED\n");
     return g_failures ? 1 : 0;
 }

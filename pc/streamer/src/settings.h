@@ -67,6 +67,19 @@ struct Settings {
     // only the user's manual reset climbs back. Default off: the streamer then
     // never intervenes, exactly like the builds before it.
     bool l7Autoscale = false;
+    // PLAN-AUTO-TUNE: the automatic tuner (rc/auto_tune.h). When on, it reads
+    // the existing signals (decode hint, queue, loss, wire fill, QP) and acts
+    // for the user on the dimensions they have not written themselves: the L7
+    // ladder, CBR off, foveation on, profile down. Default off: nothing runs,
+    // exactly like the builds before it. See AUTO-TUNE-2026-11-19/
+    // DECISION-TABLE.md for every threshold's evidence.
+    bool autoTune = false;
+    // L17 fill mode: when on, the encoder frame-rate rung may follow the slow fps
+    // EMA down (floor 45) so a low-fps heavy scene keeps its full per-frame budget.
+    // Default on: the real-device A/B (AUTO-TUNE-2026-11-19/ACCEPTANCE-C.md) held
+    // the same fps band at +56% bytes per frame, QP>=20 windows 11 -> 1, zero
+    // dropped frames. See L17-FILL-DESIGN-2026-11-19/DESIGN.md for the design.
+    bool fillMode = true;
     // When the user lets the Best-picture profile drive video settings, it may raise
     // video-side choices on its own (right now: the fovea's full-density share, see
     // QualityProfileFovea below). It only ever raises; a higher choice of the user's

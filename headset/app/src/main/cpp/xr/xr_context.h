@@ -157,6 +157,7 @@ class XrContext {
     XrSwapchainGl m_eyes[2];
     uint32_t m_swapchainImages = 0;  // ROUND18 L8-TELEM: image count of the swapchain created last
     std::vector<float> m_refreshRates;
+    void EnumerateRefreshRates();  // R2: swapchain-time ask, repeated at READY when it came back empty
     float m_requestedHz = 0;
     float m_targetHz = 0;  // the supported rate nearest m_requestedHz
     int64_t m_refreshCheckNs = 0;

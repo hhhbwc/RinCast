@@ -16,6 +16,7 @@
 #include "../capture/monitors.h"
 #include "../net/stream_server.h"
 #include "../util.h"
+#include "rc/auto_tune.h"
 #include "rc/autoscale.h"
 #include "rc/connection.h"
 #include "rc/protocol.h"
@@ -45,6 +46,7 @@ struct ClientStreamSettings {
     float vrScale = 0;                // pixels per eye against the headset's own; 0 = from vrQuality
     bool matchSteamVr = false;        // stream at the size SteamVR renders at
     bool gazeFoveation = false;       // foveated encoding around where the eyes look
+    int debugEncodeScalePct = 0;      // ROUND20 L17: the headset's force_encode_scale debug switch (0 off)
     bool eyesTracked = true;          // false: the headset can't track them; fixed at the lens centre
     float refreshRate = 72;  // ROUND18 L4 default (was 90); 90 stays available
     int vrBitrateMbps = 0;            // 0 = PC default
@@ -121,6 +123,12 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     void LaunchSteamVr();
     void UpdateAudio();
     void ApplyClientInfo(const json& m);
+    // PLAN-AUTO-TUNE P1: the one-per-session capability summary (read-only) and
+    // the decision layer behind Settings::autoTune (default off). RunAutoTune
+    // runs under m_mutex from the kStats handler; LogAutoCapability from the
+    // kClientInfo handler.
+    void LogAutoCapability();
+    void RunAutoTune();
     // The headset's picks for these PC-backed synced keys (profile, adaptive bitrate)
     // win: persist them so the encoder, which reads the PC copy, runs what the UI shows.
     // Used on both first connect (kClientInfo) and later changes (kUpdateSettings).
@@ -158,11 +166,16 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     ClientCaps m_caps;
     ClientStreamSettings m_settings;
     rc::L7Autoscale m_autoscale;  // ROUND19 T3: stepped down by decode pressure, reset by hand
+    rc::AutoTune m_autoTune;      // PLAN-AUTO-TUNE: dormant unless Settings::autoTune
+    int64_t m_autoSignalLogNs = 0;  // the 30 s AUTO: signals cadence
     // The synced settings the PC currently owns (key -> the value it pushed). The
     // headset takes a key back by sending a different value for it.
     std::map<std::string, json> m_ownedSettings;
     uint64_t m_pcRevision = 0;
     std::map<std::string, uint64_t> m_pcKeyRevisions;
+    // A19 audit #5: when each synced key last announced its ownership move; a key
+    // that just moved stays quiet for 10 s so a settings batch can't spam notices.
+    std::map<std::string, int64_t> m_ownershipNoticeNs;
     std::vector<MonitorInfo> m_monitors;
     std::map<uint8_t, std::unique_ptr<DesktopStream>> m_desktop;  // by stream id
     std::unique_ptr<VrStream> m_vr;

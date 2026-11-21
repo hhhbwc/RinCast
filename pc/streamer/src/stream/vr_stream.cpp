@@ -44,9 +44,11 @@ void HeadTurn(const rcvr::BridgePose& before, const rcvr::BridgePose& now, float
 
 void AppendMotion(const MotionEstimator& motion, const std::vector<float>& field, uint64_t previousTimestampNs,
                   std::vector<int8_t>& grid, std::vector<uint8_t>& out) {
-    grid.resize(field.size());
-    for (size_t i = 0; i < field.size(); i++)
-        grid[i] = int8_t(std::clamp<long>(std::lround(field[i] / rc::kMotionUnitPixels), -127, 127));
+    // A18: `grid` is the quantizer's hysteresis state - the caller keeps it across frames
+    // (all zero on the first frame and after every estimator reset), it comes in holding the
+    // previous frame's units and leaves with this frame's. The unit, the wire format and
+    // EncodeMotionRuns are untouched: old APKs decode this byte for byte as before.
+    rc::ApplyMotionHysteresis(field, grid);
     rc::MotionHeader h{};
     h.gridWidth = uint16_t(motion.GridWidth());
     h.gridHeight = uint16_t(motion.GridHeight());
@@ -298,7 +300,8 @@ void VrStream::Run() {
     rcvr::BridgePose motionPose{};
     uint64_t motionPreviousTimestamp = 0;
     std::vector<float> motionField;
-    std::vector<int8_t> motionGrid;
+    // A18: the quantized grid lives on in m_motionGridPrev (the hysteresis state) instead of
+    // a local, per the card: the cross-frame state belongs to VrStream.
 
     m_onState("waiting", "", "");
     bool firstFrameLogged = false;
@@ -364,6 +367,9 @@ void VrStream::Run() {
             lastFrameNs = now;
             InterlockedExchange(&fs.state, rcvr::kSlotFree);
             motion.Reset();
+            // A18: the hysteresis state follows the estimator's - the next frame compares
+            // against nothing, so every block starts over from still.
+            m_motionGridPrev.clear();
             if (!streaming) {
                 streaming = true;
                 m_streaming = true;
@@ -420,6 +426,9 @@ void VrStream::Run() {
             motionViews.clear();
             motionReady = m_config.motionField && motion.Init(device, srcWidth, srcHeight);
             if (m_config.motionField && !motionReady) RC_LOGW("Frame generation: the motion estimator didn't start");
+            // A18: a new estimator geometry invalidates the old grid's blocks - the hysteresis
+            // state restarts from all-still with it (the next AppendMotion resizes it fresh).
+            m_motionGridPrev.clear();
         }
         ComPtr<IDXGIKeyedMutex> mutex;
         tex->QueryInterface(IID_PPV_ARGS(&mutex));
@@ -521,7 +530,7 @@ void VrStream::Run() {
         // Read now, before the next frame's estimate replaces it. This waits for the GPU, but
         // only with frame generation on.
         if (motionValid && motion.Read(ctx.Get(), motionField))
-            AppendMotion(motion, motionField, motionPreviousTimestamp, motionGrid, job.motion);
+            AppendMotion(motion, motionField, motionPreviousTimestamp, m_motionGridPrev, job.motion);
         motionPreviousTimestamp = slotCopy.headsetTargetNs;
         const int64_t convertNs = rc::NowNs() - convertStart;
         m_flowConvertNs += convertNs;
@@ -597,6 +606,7 @@ void VrStream::RunEncoder() {
             ec.adaptiveQuant = m_config.adaptiveQuant;
             ec.twoPass = m_config.twoPass;
             ec.cappedVbr = m_config.cappedVbr;
+            ec.fillMode = m_config.fillMode;
             encoder = CreateEncoder(device, m_bridge->VendorId(), ec);
             // The stats path reads these from any thread; the encoder is local to
             // RunEncoder, so its QP and size travel out through atomics.

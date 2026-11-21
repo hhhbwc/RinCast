@@ -39,7 +39,19 @@ const Entry kEn[] = {
     {"stat.decoding", "Decoding"},
     {"stat.video", "Video"},
     {"stat.latency", "Latency"},
+    // TASK-LATENCY-METER-FIX-2026-11-22 §1.3: the performance panel's total says what it
+    // measures - the pose's age from sampling to display, SteamVR's prediction and the
+    // game's rendering included. The compact status bar keeps the short "stat.latency".
+    {"stat.latency.total", "Latency (pose → display)"},
     {"stat.fps", "Frame rate"},
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.1: the stats panel's frame-generation line, three
+    // states: off / full rate / half rate (the game rate it replaces → the panel refresh).
+    // The quota suffix shows only while the generation quota is armed.
+    {"stat.frameGen", "Frame generation"},
+    {"stat.frameGen.half", "Half rate {game}→{hmd}"},
+    {"stat.frameGen.armed", ", armed"},
+    {"stat.frameGen.full", "Full rate"},
+    {"stat.frameGen.off", "Off"},
     {"stat.bitrate", "Bitrate"},
     {"stat.connectedTo", "Connected to"},
     {"unit.roundTrip", "{ms} ms round trip"},
@@ -94,6 +106,21 @@ const Entry kEn[] = {
     {"computers.check2", "Check the firewall message in RinCast Streamer, or any security software on the PC."},
     {"computers.looking", "Looking for your PC"},
     {"computers.lookingHint", "Run RinCast Streamer on your PC, on the same network as this headset."},
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.3: the 30 s handshake timeout text, localizable now.
+    // The PC's optional "diagnosis" short code (server.info; A21 adds it PC-side) picks one of
+    // the "computers.diag.*" keys when it names a reason the PC knows about; without a code the
+    // text follows the path we tried (USB / VPN / LAN / remote). Unknown codes keep these.
+    {"computers.timeout.usb", "The PC didn't answer over the USB cable. Check RinCast Streamer on the PC for a firewall message."},
+    {"computers.timeout.vpn", "The PC didn't answer. Check that the VPN is on, on both devices."},
+    {"computers.timeout.lan", "The PC didn't answer. Check that both are on the same network."},
+    {"computers.timeout.remoteOffline", "The PC didn't respond. Make sure the RinCast Streamer is running and online."},
+    {"computers.timeout.remoteNoDirect",
+     "No direct connection was possible: both networks block incoming connections. Using the same Wi-Fi, IPv6, or allowing "
+     "automatic port sharing for the PC in its router helps."},
+    {"computers.diag.firewall", "The PC's firewall is blocking the connection. Check RinCast Streamer on the PC for a firewall message."},
+    {"computers.diag.steamvrDown", "SteamVR isn't running on the PC. Start it there, then connect again."},
+    {"computers.diag.usb", "The USB cable isn't passing the connection. Check the cable and the firewall message in RinCast Streamer on the PC."},
+    {"computers.diag.remoteDown", "The PC isn't online. Make sure the RinCast Streamer is running there and signed in."},
 
     {"pcDetail.usb", "USB cable"},
     {"pcDetail.vpn", "Through a VPN"},
@@ -311,6 +338,9 @@ const Entry kEn[] = {
     {"notice.cantShow", "Your PC is sending the game, but this headset can't show it. Try H.264 or a lower VR quality in Settings."},
     {"notice.vrError", "VR couldn't start on your PC. Check that SteamVR opens there."},
     {"notice.vrTimeout", "SteamVR took too long to start. Check that it opens on your PC."},
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.2: when the game goes away on its own the headset
+    // pulls itself back to the desktop; name the event instead of the silent yank.
+    {"notice.gameStopped", "The game has stopped"},
 
     {"launch.takeTime", "This can take a minute."},
     {"vrOverlay.hidePerf", "Hide performance"},
@@ -348,7 +378,15 @@ const Entry kZhCN[] = {
     {"stat.decoding", "解码"},
     {"stat.video", "视频"},
     {"stat.latency", "延迟"},
+    {"stat.latency.total", "延迟（头部动作→显示）"},
     {"stat.fps", "帧率"},
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.1：性能面板的帧生成行（关/全速/半速三态）。
+    // 字库图集内无「·」「武」二字，配额武装后缀写作「，已就绪」（A16 字库规则）。
+    {"stat.frameGen", "帧生成"},
+    {"stat.frameGen.half", "半速 {game}→{hmd}"},
+    {"stat.frameGen.armed", "，已就绪"},
+    {"stat.frameGen.full", "全速"},
+    {"stat.frameGen.off", "关"},
     {"stat.bitrate", "码率"},
     {"stat.connectedTo", "已连接到"},
     {"unit.roundTrip", "往返 {ms} ms"},
@@ -403,6 +441,18 @@ const Entry kZhCN[] = {
     {"computers.check2", "查看 RinCast Streamer 中的防火墙提示，以及电脑上的安全软件。"},
     {"computers.looking", "正在寻找你的电脑"},
     {"computers.lookingHint", "在电脑上运行 RinCast Streamer，并让它与头显处于同一网络。"},
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.3：握手 30 秒超时文案改走字符串表；PC 在 server.info 里
+    // 附可选 "diagnosis" 短码（A21 加 PC 侧）时用对应的 computers.diag.* 键，无短码按路径选择。
+    {"computers.timeout.usb", "电脑没有通过 USB 线应答。请在电脑上查看 RinCast Streamer 的防火墙提示。"},
+    {"computers.timeout.vpn", "电脑没有应答。请确认两台设备已开启 VPN。"},
+    {"computers.timeout.lan", "电脑没有应答。请确认两者在同一网络。"},
+    {"computers.timeout.remoteOffline", "电脑没有响应。请确认 RinCast Streamer 正在运行并已在线。"},
+    {"computers.timeout.remoteNoDirect",
+     "无法建立直连：两个网络不允许传入连接。同一 Wi-Fi、IPv6，或在路由器里允许电脑自动开端口，可能有帮助。"},
+    {"computers.diag.firewall", "电脑防火墙不允许连接。请在电脑上查看 RinCast Streamer 的防火墙提示。"},
+    {"computers.diag.steamvrDown", "SteamVR 没有在电脑上运行。请在电脑上启动 SteamVR 后再连接。"},
+    {"computers.diag.usb", "USB 线没有连好，或电脑没有通过 USB 线应答。请检查 USB 线和电脑上的防火墙提示。"},
+    {"computers.diag.remoteDown", "电脑不在线。请确认电脑上的 RinCast Streamer 正在运行并已登录。"},
 
     {"pcDetail.usb", "USB 线"},
     {"pcDetail.vpn", "经 VPN"},
@@ -620,6 +670,9 @@ const Entry kZhCN[] = {
     {"notice.cantShow", "电脑已发送游戏画面，但头显无法显示。请尝试 H.264 或在设置中调低 VR 画质。"},
     {"notice.vrError", "电脑上的 VR 无法启动，请确认 SteamVR 能正常打开。"},
     {"notice.vrTimeout", "SteamVR 启动超时，请确认它能在电脑上打开。"},
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.2：游戏自己结束时头显被拉回桌面，补一条说明。
+    // 字库图集内无「停」「止」二字，「已停止」写作「已退出」（A16 字库规则）。
+    {"notice.gameStopped", "游戏已退出"},
 
     {"launch.takeTime", "这可能需要一分钟。"},
     {"vrOverlay.hidePerf", "隐藏性能数据"},
@@ -657,7 +710,15 @@ const Entry kZhTW[] = {
     {"stat.decoding", "解碼"},
     {"stat.video", "影片"},
     {"stat.latency", "延遲"},
+    {"stat.latency.total", "延遲（頭部動作→顯示）"},
     {"stat.fps", "幀率"},
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.1：效能面板的幀生成行。圖集內無「·」「武」，
+    // 配額武裝後綴寫作「，已就緒」。
+    {"stat.frameGen", "幀生成"},
+    {"stat.frameGen.half", "半速 {game}→{hmd}"},
+    {"stat.frameGen.armed", "，已就緒"},
+    {"stat.frameGen.full", "全速"},
+    {"stat.frameGen.off", "關"},
     {"stat.bitrate", "位元率"},
     {"stat.connectedTo", "已連線到"},
     {"unit.roundTrip", "往返 {ms} ms"},
@@ -712,6 +773,17 @@ const Entry kZhTW[] = {
     {"computers.check2", "檢查 RinCast Streamer 中的防火牆訊息，以及電腦上的安全軟體。"},
     {"computers.looking", "正在尋找你的電腦"},
     {"computers.lookingHint", "在電腦上執行 RinCast Streamer，並讓它與頭戴裝置處於同一網路。"},
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.3：握手逾時文案與 diagnosis 短碼。
+    {"computers.timeout.usb", "電腦沒有透過 USB 線應答。請在電腦上查看 RinCast Streamer 的防火牆提示。"},
+    {"computers.timeout.vpn", "電腦沒有應答。請確認兩台裝置已開啟 VPN。"},
+    {"computers.timeout.lan", "電腦沒有應答。請確認兩者在同一網路。"},
+    {"computers.timeout.remoteOffline", "電腦沒有回應。請確認 RinCast Streamer 正在執行並已上線。"},
+    {"computers.timeout.remoteNoDirect",
+     "無法建立直連：兩個網路不允許傳入連線。同一 Wi-Fi、IPv6，或在路由器裡允許電腦自動開埠，可能有幫助。"},
+    {"computers.diag.firewall", "電腦防火牆不允許連線。請在電腦上查看 RinCast Streamer 的防火牆提示。"},
+    {"computers.diag.steamvrDown", "SteamVR 沒有在電腦上執行。請在電腦上啟動 SteamVR 後再連線。"},
+    {"computers.diag.usb", "USB 線沒有連好，或電腦沒有透過 USB 線應答。請檢查 USB 線和電腦上的防火牆提示。"},
+    {"computers.diag.remoteDown", "電腦離線。請確認電腦上的 RinCast Streamer 正在執行並已登入。"},
 
     {"pcDetail.usb", "USB 線"},
     {"pcDetail.vpn", "經 VPN"},
@@ -929,6 +1001,8 @@ const Entry kZhTW[] = {
     {"notice.cantShow", "電腦已傳送遊戲畫面，但頭戴裝置無法顯示。請嘗試 H.264 或在設定中調低 VR 畫質。"},
     {"notice.vrError", "電腦上的 VR 無法啟動，請確認 SteamVR 能正常開啟。"},
     {"notice.vrTimeout", "SteamVR 啟動逾時，請確認它能在電腦上開啟。"},
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.2：遊戲自己結束時的說明。
+    {"notice.gameStopped", "遊戲已退出"},
 
     {"launch.takeTime", "這可能需要一分鐘。"},
     {"vrOverlay.hidePerf", "隱藏效能資訊"},

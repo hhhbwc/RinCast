@@ -28,11 +28,28 @@ struct VideoSenderStats {
     double clientDecodeMs = 0;
     double clientLatencyMs = 0;
     double queueMs = -1;  // queueing delay on the way to the headset, -1 = unknown
+    double lossAvg = 0;   // measured loss fraction 0..1 (PLAN-AUTO-TUNE signal, read-only)
     float qp = -1;        // the encoder's rolling mean QP, -1 = unknown
     uint32_t encWidth = 0, encHeight = 0;  // what is actually being encoded, 0 = unknown
     uint32_t srcWidth = 0, srcHeight = 0;  // what the game renders (before encodeScale), 0 = unknown
     double gameFps = 0, encFps = 0, droppedFps = 0;  // 10 s averages from the frame-flow log
 };
+
+// R4.2 (TASK-COMBO-SWEEP-2026-11-21): the wire bytes one frame costs on the path -
+// its payload fragments, their per-fragment headers, and one parity datagram per FEC
+// group (exactly what the packetizer puts on the wire, headers and FEC included).
+// Extracted verbatim from VideoSender::Send so the wire-ceiling accounting and the
+// offline sweep use the one formula. `fragPayload` is the per-datagram payload
+// (Connection::MaxPayload() - sizeof(rc::VideoFragmentHeader)), `totalPayload` the
+// frame's [2-byte metadata size][metadata][bitstream] size, `fecPercent` the FEC the
+// packetizer currently runs.
+inline size_t FrameWireBytes(size_t fragPayload, size_t totalPayload, int fecPercent) {
+    const size_t count = fragPayload ? (totalPayload + fragPayload - 1) / fragPayload : 0;
+    const size_t group = fecPercent > 0 ? size_t(std::clamp(100 / fecPercent, 2, 64)) : 0;
+    const size_t nParity = group ? (count + group - 1) / group : 0;
+    return totalPayload + count * sizeof(rc::VideoFragmentHeader) +
+           nParity * (sizeof(rc::VideoParityHeader) + fragPayload);
+}
 
 class VideoSender {
    public:
@@ -80,9 +97,11 @@ class VideoSender {
     // 把每帧的包铺开在时间上发，而不是一口气打出去（局域网和互联网都用）：
     // Wi-Fi 的浅队列会被整帧突发打爆。必须在 Start 之前设好。
     void SetPacing(bool pace) { m_pace = pace; }
-    // Pacing mode (PLAN-pacing-fix): 0 auto (session resolves), 1 off, 2 follow the
-    // guard cap (the legacy self-locking behavior), 3 burst (frame budget: the user's
-    // ceiling drives the rate, an encoded frame leaves within its own frame period).
+    // Pacing mode (PLAN-pacing-fix, burst semantics A10): 0 auto (session resolves),
+    // 1 off, 2 follow the guard cap (the legacy self-locking behavior), 3 burst (frame
+    // budget: the frame's fragments leave back-to-back and the user's ceiling is kept
+    // BETWEEN frames as a frame-granularity token bucket - the next frame starts no
+    // earlier than the running frame's wire bytes at the ceiling).
     // frameBudgetNs > 0 is an explicit override (bench); 0 = the sender's measured fps.
     void SetPacingMode(int mode, int64_t frameBudgetNs);
     // Adaptive only: begin below the maximum and let the guard explore upward. The ceiling

@@ -276,6 +276,11 @@ json App::StreamSettingsForPc() {
     if (m_displayHzForPc > 0) s["refreshRate"] = m_displayHzForPc;
     // Without eye tracking, foveated encoding keeps a larger square fixed at the lens centre.
     s["eyesTracked"] = GazeSupported();
+    // ROUND20 L17: the diagnostics panel's armed overrides ride the same push.
+    if (m_forceFoveation != 2) s["gazeFoveation"] = m_forceFoveation == 1;
+    // Always sent, 0 included: the PC keeps the last parsed value when the key is absent,
+    // so omitting it at 0 would leave the override armed forever (ROUND20 L17 rework R1).
+    s["debugEncodeScalePct"] = m_forceEncodeScale;
     return s;
 }
 
@@ -447,6 +452,8 @@ void App::DisconnectNow() {
     m_vrLeftByUser = false;
     m_vrLastActive = -1e9f;
     m_serverInfo = json::object();
+    // The diagnosis short code lives and dies with the session's server.info (the line above).
+    m_client.SetDiagnosis("");
     m_games.clear();
     m_monitorsLaidOut = false;
     EnterMode(Mode::Home);
@@ -471,6 +478,9 @@ void App::ExitVr(bool byUser) {
     // EnterMode(LaunchingVr) and undo this). Leaving because the game ended is not a choice
     // and pins nothing.
     if (byUser) m_vrLeftByUser = true;
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.2: the pull-back itself is unchanged; leaving because
+    // the game ended just says so now, instead of returning to the desktop without a word.
+    if (!byUser) PostNotice(Tr("notice.gameStopped"));
     EnterMode(Mode::Desktop);
 }
 
@@ -958,6 +968,9 @@ void App::HandleControl(const json& m) {
                         m.value("frequency", 0.f) > 0 ? m.value("frequency", 0.f) : XR_FREQUENCY_UNSPECIFIED);
     } else if (type == rc::msg::kServerInfo) {
         m_serverInfo = m;
+        // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.3: the PC's optional diagnosis short code (A21
+        // adds it PC-side; absent on old PCs) is what connect-failure text keys off of.
+        m_client.SetDiagnosis(m.value("diagnosis", ""));
         ApplyPcSettings(m);  // 回填 PC 端改过的可同步设置（不回传）
     } else if (type == rc::msg::kMonitors) {
         m_monitors.clear();
@@ -1083,6 +1096,8 @@ void App::ConfigureVrStream(const json& s) {
     m_vrEyeWidth = eyeW;
     m_vrEyeHeight = eyeH;
     m_vrCodec = codec;
+    m_linkPolicy = {};      // VD-OBSERVE: a fresh stream starts judging from scratch
+    m_linkPolicyTicks = 0;
     // Foveated: the frames come smaller, and are stretched back to eyeWidth x eyeHeight.
     int codedW = eyeW, codedH = eyeH;
     const json f = s.value("foveation", json());
@@ -1114,6 +1129,13 @@ void App::ConfigureVrStream(const json& s) {
         }
     }
     auto dec = std::make_unique<VideoDecoder>();
+    // R3: per-frame decode costs feed the diagnostics quantiles (set before Init starts the threads).
+    // TASK-DEC-PERCENTILE-2026-11-20 §1.3: the same per-frame cost lands in the app's own
+    // sampler, whose percentiles the diag line reads (the client's copy stays switch-gated).
+    dec->SetDecodeSampleSink([this](double ms) {
+        m_decSamples.Push(float(ms));
+        m_client.FeedDecodeSample(ms);
+    });
     dec->Init(codec, codedW * 2, codedH, s.value("fps", 72.f));  // ROUND18 L4 fallback
     {
         std::lock_guard lock(m_decoderMutex);
@@ -1301,7 +1323,11 @@ void App::Frame() {
         const double lead = double(m_xr.ToMonotonicNs(frame.predictedDisplayTime) - m_lateLatchNs);
         if (lead > 0 && lead < 1e8) m_latchLeadNs = m_latchLeadNs > 0 ? m_latchLeadNs * 0.95 + lead * 0.05 : lead;
     }
-    if (m_mode == Mode::Vr && m_settings.frameGeneration && !m_vrLatched) GenerateFrame(frame);
+    // TASK-QUOTA-GEN-2026-11-20 §1: slot-driven "fill every empty display" became a
+    // 1:1 quota: only a slot whose decoded frame hasn't spent its generated one yet
+    // may draw one. The second empty slot in a row repeats plainly, so the
+    // extrapolation amount stays near 1 instead of rocking between 1 and 2.
+    if (m_mode == Mode::Vr && m_settings.frameGeneration && !m_vrLatched && m_genCredit) GenerateFrame(frame);
     BuildLayers(frame);
     const bool alpha = m_xr.PassthroughActive() || !m_underlays.empty();
     // ROUND19 E1 probe: only VR frames may ask for an earlier display slot; every other commit
@@ -1361,8 +1387,11 @@ void App::LogVrTiming(const FrameState& frame, int64_t wokeNs) {
         m_submitLitSumMs = 0;
         m_submitLitFrames = 0;
         m_flowDisplays = m_flowShown = m_flowLate = 0;
+        m_flowGenerated = 0;
+        m_genFramesPrevSlot = m_generatedFrames;
         m_flowDecodedStart = 0;
         m_flowDecodeMaxMs = 0;
+        m_decSamples.Reset();  // TASK-DEC-PERCENTILE-2026-11-20 §1.3: same boundary as the flow window
         m_flowSlackMs.clear();
         m_flowWaiting[0] = m_flowWaiting[1] = m_flowWaiting[2] = 0;
         m_flowSlips = 0;
@@ -1386,6 +1415,14 @@ void App::LogVrTiming(const FrameState& frame, int64_t wokeNs) {
     }
     m_flowDisplays++;
     if (m_vrLatched) m_flowShown++;
+    // TASK-POLICY-FIX-TESTS-2026-11-20 §B: a slot with no new picture where
+    // GenerateFrame still drew is an extrapolated one. m_generatedFrames moves
+    // at most once per slot and only in GenerateFrame, so a change since the
+    // previous slot means this slot drew - counted here, in the same window as
+    // the other buckets, instead of reading m_generatedFrames across its own
+    // (5 s, separately clocked) reset inside GenerateFrame.
+    else if (m_generatedFrames != m_genFramesPrevSlot) m_flowGenerated++;
+    m_genFramesPrevSlot = m_generatedFrames;
     if (now - m_timingLogNs < 5'000'000'000LL) return;
     m_timingLogNs = now;
     uint32_t decoded = 0;
@@ -1396,12 +1433,16 @@ void App::LogVrTiming(const FrameState& frame, int64_t wokeNs) {
     }
     if (m_flowDisplays && decoded >= m_flowDecodedStart && m_flowDecodedStart) {
         // Decoded but never shown: skipped to catch up (see VideoDecoder::Latch). A display
-        // without a new picture repeats the last one (or a generated one).
+        // without a new picture either got an extrapolated frame or repeats the last one.
+        // TASK-POLICY-FIX-TESTS-2026-11-20 §B: the buckets are disjoint and sum to the
+        // window - shown (a newly latched decoded picture was drawn) + generated (an
+        // extrapolated frame was drawn) + repeated (a pure reprojection of the last
+        // picture) == displays.
         const int n = int(decoded - m_flowDecodedStart);
-        RC_LOGI("VR frame flow over %d displays: %d decoded, %d shown, %d never shown, %d displays "
-                "repeated, %d decoded after their latch; slowest decode %.1f ms",
-                m_flowDisplays, n, m_flowShown, std::max(0, n - m_flowShown), m_flowDisplays - m_flowShown, m_flowLate,
-                m_flowDecodeMaxMs);
+        RC_LOGI("VR frame flow over %d displays: %d decoded, %d shown, %d generated, %d never shown, %d repeated, "
+                "%d decoded after their latch; slowest decode %.1f ms",
+                m_flowDisplays, n, m_flowShown, m_flowGenerated, std::max(0, n - m_flowShown),
+                m_flowDisplays - m_flowShown - m_flowGenerated, m_flowLate, m_flowDecodeMaxMs);
         // How far ahead poses are predicted, and where that time goes (the last second's stages).
         std::string stages;
         for (int i = 0; i < kStageCount; i++) {
@@ -1435,7 +1476,9 @@ void App::LogVrTiming(const FrameState& frame, int64_t wokeNs) {
     m_flowSlips = 0;
     m_flowDecodedStart = decoded;
     m_flowDisplays = m_flowShown = m_flowLate = 0;
+    m_flowGenerated = 0;
     m_flowDecodeMaxMs = 0;
+    m_decSamples.Reset();  // TASK-DEC-PERCENTILE-2026-11-20 §1.3: the sampler's window ends with the flow window's
     if (m_timingFrames) {
         const double n = m_timingFrames * 1e6;
         RC_LOGI("VR frame timing at %.0f Hz: woken %.1f ms before the display, the picture picked up %.2f ms after "
@@ -1955,6 +1998,10 @@ void App::ReadMotion(const std::vector<uint8_t>& metadata) {
 // No new frame for this display: move the moving things on from the last picture. The layer
 // keeps the last frame's pose, so the compositor still turns it with the head.
 void App::GenerateFrame(const FrameState& frame) {
+    // TASK-QUOTA-GEN-2026-11-20 §1: this call spends the slot's credit whatever the
+    // outcome - a drawn frame, a front gate or the cap refusing - so an empty slot
+    // never hands a second try to the next one (better one filler missing than two).
+    m_genCredit = false;
     if (!m_motionMoves || !m_motionConsistent || !m_vrHasFrame || !m_vrSwapchain.handle || m_motionFrameNs <= 0) {
         if (m_motionMoves && !m_motionConsistent) m_generatedSkipped++;
         return;
@@ -2049,6 +2096,17 @@ void App::LatchVideo(const FrameState& frame, bool late) {
             }
             m_vrHasFrame = true;
             m_vrLatched = true;
+            // TASK-QUOTA-GEN-2026-11-20 §1: the decoded frame arms the quota, but only
+            // while the pace policy is at half rate with generation - a full-rate game
+            // needs no fillers, so Full never arms it. The user's master switch stays
+            // the overall gate; the policy only decides whether the gate has a quota.
+            if (m_settings.frameGeneration && m_linkPolicy.mode == rc::PaceMode::HalfWithGeneration) {
+                m_genCredit = true;
+                if (!m_genQuotaAnnounced) {
+                    m_genQuotaAnnounced = true;
+                    RC_LOGI("Frame generation quota armed: one generated frame per decoded frame");
+                }
+            }
             ReadMotion(info.metadata);
             m_vrFrames++;
             // ROUND20 T4: the decoded-frame seq range this diag window covers (telemetry
@@ -2066,27 +2124,33 @@ void App::LatchVideo(const FrameState& frame, bool late) {
                 auto it = m_trackingSent.find(m_vrMeta.trackingTimestampNs);
                 if (it != m_trackingSent.end()) sampledNs = it->second;
             }
-            if (sampledNs) {
-                const double latency = double(displayNs - sampledNs) / 1e6;
-                m_latencySum += latency;
+            // A22 (TASK-LATENCY-EMA): the panels' EMA takes at most one latency sample per
+            // display frame. Pose age comes first (what VD's overlay shows); a desktop latch's
+            // transport age only fills the slot when no pose age landed this frame, and frames
+            // with neither leave the EMA alone. The 1 s window sums below stay raw.
+            if (sampledNs) m_frameLatencyMs = double(displayNs - sampledNs) / 1e6;
+            // TASK-LATENCY-METER-FIX-2026-11-22 §1.1: the total and the stages count the
+            // same frames under the same conditions, so the stages add up to the total
+            // instead of falling short of it. Frames before the clocks are matched are
+            // left out of both (the first seconds of a session only).
+            if (sampledNs && haveMeta && info.receivedNs && info.decodedNs && m_client.HasClockOffset()) {
+                // PC times onto the headset's clock. How the pose's trip to the PC and the
+                // game share the time between them isn't measured: the trip counts as half
+                // the round trip.
+                m_latencySum += double(displayNs - sampledNs) / 1e6;
                 m_latencyCount++;
-                if (haveMeta && info.receivedNs && info.decodedNs && m_client.HasClockOffset()) {
-                    // PC times onto the headset's clock. How the pose's trip to the PC and the
-                    // game share the time between them isn't measured: the trip counts as half
-                    // the round trip.
-                    const int64_t offset = m_client.ClockOffsetNs();
-                    const double up = m_client.Stats().rttMs / 2;
-                    double s[kStageCount] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
-                    s[kStageUplink] = up;
-                    s[kStageGame] = double(m_vrMeta.pcSubmitNs - offset - sampledNs) / 1e6 - up;
-                    s[kStageEncoderWait] = double(m_vrMeta.pcEncodeStartNs - m_vrMeta.pcSubmitNs) / 1e6;
-                    s[kStageEncode] = double(m_vrMeta.pcEncodeEndNs - m_vrMeta.pcEncodeStartNs) / 1e6;
-                    s[kStageDownlink] = double(info.receivedNs - (m_vrMeta.pcEncodeEndNs - offset)) / 1e6;
-                    s[kStageDecode] = double(info.decodedNs - info.receivedNs) / 1e6;
-                    s[kStageNextFrame] = double(latchNs - info.decodedNs) / 1e6;
-                    s[kStageCompositor] = double(displayNs - latchNs) / 1e6;
-                    AddStages(s);
-                }
+                const int64_t offset = m_client.ClockOffsetNs();
+                const double up = m_client.Stats().rttMs / 2;
+                double s[kStageCount] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+                s[kStageUplink] = up;
+                s[kStageGame] = double(m_vrMeta.pcSubmitNs - offset - sampledNs) / 1e6 - up;
+                s[kStageEncoderWait] = double(m_vrMeta.pcEncodeStartNs - m_vrMeta.pcSubmitNs) / 1e6;
+                s[kStageEncode] = double(m_vrMeta.pcEncodeEndNs - m_vrMeta.pcEncodeStartNs) / 1e6;
+                s[kStageDownlink] = double(info.receivedNs - (m_vrMeta.pcEncodeEndNs - offset)) / 1e6;
+                s[kStageDecode] = double(info.decodedNs - info.receivedNs) / 1e6;
+                s[kStageNextFrame] = double(latchNs - info.decodedNs) / 1e6;
+                s[kStageCompositor] = double(displayNs - latchNs) / 1e6;
+                AddStages(s);
             }
             // Where this frame landed against the moment it should have been ready: the late
             // latch, less a margin. Folded into one display period, since a frame that just
@@ -2130,7 +2194,11 @@ void App::LatchVideo(const FrameState& frame, bool late) {
                     // From the PC's capture to the headset's display, as the protocol defines it.
                     std::memcpy(&dm, info.metadata.data(), sizeof(dm));
                     const int64_t offset = m_client.ClockOffsetNs();
-                    m_latencySum += double(displayNs - (dm.pcCaptureNs - offset)) / 1e6;
+                    const double transportMs = double(displayNs - (dm.pcCaptureNs - offset)) / 1e6;
+                    m_latencySum += transportMs;
+                    // A22 (TASK-LATENCY-EMA): transport age only fills the EMA's slot when no
+                    // pose age landed this display frame (the VR latch's pose age wins).
+                    if (m_frameLatencyMs < 0) m_frameLatencyMs = transportMs;
                     double s[kStageCount] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
                     s[kStageCapture] = double(dm.pcEncodeEndNs - dm.pcCaptureNs) / 1e6;
                     s[kStageDownlink] = double(info.receivedNs - (dm.pcEncodeEndNs - offset)) / 1e6;
@@ -2148,6 +2216,19 @@ void App::LatchVideo(const FrameState& frame, bool late) {
         m_statsFrames += id == rc::kVrStreamId || m_mode != Mode::Vr ? 1 : 0;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // A22 (TASK-LATENCY-EMA): commit the display frame's one staged latency sample to the
+    // panels' EMA - the same lerp VD's overlay uses (PerformanceOverlay.cs:386: alpha 0.02,
+    // a ~50-frame time constant), so spikes smooth into the trend. No 0.999 s cap: that cap
+    // is an artifact of VD's seconds-normalized VRLatency, ours is plain milliseconds. VD
+    // also floors its total at the runtime's motion-to-photon minimum, which OpenXR gives us
+    // no equivalent API to query - and the pose age already contains the trip to the PC, so
+    // that floor is not reproduced. Only the late latch commits: both latches of a display
+    // frame stage into the same slot, so the EMA still moves at most once per display frame.
+    if (late && m_frameLatencyMs >= 0) {
+        m_latencyEma = m_latencyEma < 0 ? m_frameLatencyMs : m_latencyEma + 0.02 * (m_frameLatencyMs - m_latencyEma);
+        m_frameLatencyMs = -1;
+    }
 
     // Once per second: statistics for the overlay and the PC.
     const int64_t now = rc::NowNs();
@@ -2172,8 +2253,97 @@ void App::LatchVideo(const FrameState& frame, bool late) {
                 RC_LOGI("DisplayTime probe: delta=%d frames", probeDelta);
             }
         }
+        // ROUND20 L17: the diagnostics switch panel - four files/ switches polled once a
+        // second (no per-frame IO), logged only on change, effects applied here. The
+        // foveation/scale overrides ride the next settings push; the forced refresh rate
+        // is re-asserted every second because KeepRefreshRate re-asks for the setting's
+        // own rate every two.
+        {
+            auto readSwitch = [this](const char* name) -> long {
+                std::FILE* f = std::fopen((Platform::FilesDir() + ("/" + std::string(name))).c_str(), "rb");
+                if (!f) return -1;  // missing file: caller decides the default
+                char buf[32] = {};
+                const size_t got = std::fread(buf, 1, sizeof(buf) - 1, f);
+                std::fclose(f);
+                char* end = nullptr;
+                const long parsed = std::strtol(buf, &end, 10);
+                return (got && end != buf) ? parsed : -1;
+            };
+            {
+                const long parsed = readSwitch("force_encode_scale.txt");
+                const int v = (parsed >= 50 && parsed <= 100) ? int(parsed) : 0;
+                if (v != m_forceEncodeScale) {
+                    m_forceEncodeScale = v;
+                    RC_LOGI("Debug force_encode_scale: %d (0 off, else the encode scale percent)", v);
+                    m_client.SendControl({{"type", rc::msg::kUpdateSettings}, {"settings", StreamSettingsForPc()}});
+                }
+            }
+            {
+                const long parsed = readSwitch("force_foveation.txt");
+                const int v = (parsed == 0 || parsed == 1) ? int(parsed) : 2;
+                if (v != m_forceFoveation) {
+                    m_forceFoveation = v;
+                    RC_LOGI("Debug force_foveation: %d (0 off, 1 on, 2 follow settings)", v);
+                    m_client.SendControl({{"type", rc::msg::kUpdateSettings}, {"settings", StreamSettingsForPc()}});
+                }
+            }
+            {
+                const long parsed = readSwitch("force_refresh.txt");
+                const int v = (parsed == 72 || parsed == 90) ? int(parsed) : 0;
+                if (v != m_forceRefresh) {
+                    m_forceRefresh = v;
+                    RC_LOGI("Debug force_refresh: %d (0 off, else forced Hz)", v);
+                    m_xr.SetRefreshRate(v ? float(v) : m_settings.refreshRate);
+                } else if (v) {
+                    m_xr.SetRefreshRate(float(v));  // keep winning over KeepRefreshRate
+                }
+            }
+            {
+                const long parsed = readSwitch("decode_stats.txt");
+                const bool v = parsed == 1;
+                if (v != m_decodeQuantiles) {
+                    m_decodeQuantiles = v;
+                    m_client.SetDecodeQuantiles(v);
+                    RC_LOGI("Debug decode_stats: %d (decode p50/p95 in the diag line)", v ? 1 : 0);
+                }
+            }
+        }
         const bool vr = m_mode == Mode::Vr || m_mode == Mode::LaunchingVr;
         m_stats.fps = m_statsFrames / secs / std::max<size_t>(1, vr ? 1 : m_desktopStreams.size());
+        // VD-OBSERVE (TASK 2026-11-20 §2.1): the pace policy, ticked at 1 Hz here rather than in
+        // GenerateFrame(): that one only runs with frame generation on, which is off by default,
+        // so its log would never be seen - exactly the state we want to judge first.
+        // Observation only: nothing below changes drawing, decoding or requests.
+        // recvFps (m_stats.fps) is the count of decoded frames newly latched per second -
+        // generated frames do NOT count in it (they go to m_generatedFrames, see :2023/:2157).
+        if (vr && m_xr.RefreshRate() > 0) {
+            rc::LinkPolicyInput policyIn;
+            policyIn.targetFps = m_xr.RefreshRate();
+            policyIn.gameFps = m_serverStats.contains("vr") ? float(m_serverStats["vr"].value("gameFps", 0.0)) : 0.f;
+            policyIn.recvFps = float(m_stats.fps);
+            policyIn.aer = false;  // reserved: no AER source on this build
+            const rc::PaceMode pace = rc::UpdateLinkPolicy(m_linkPolicy, policyIn, now);
+            // TASK-QUOTA-GEN-2026-11-20 §1: the quota only exists at half rate with
+            // generation. A pace switch to Full empties it (and re-arms the one-shot
+            // announcement for the next half-rate period); this reads the policy's
+            // verdict, it doesn't drive it.
+            if (pace != rc::PaceMode::HalfWithGeneration) {
+                m_genCredit = false;
+                m_genQuotaAnnounced = false;
+            }
+            if (++m_linkPolicyTicks % 5 == 0) {
+                double encFps = 0, dropped = 0;
+                if (m_serverStats.contains("vr")) {
+                    encFps = m_serverStats["vr"].value("encFps", 0.0);
+                    dropped = m_serverStats["vr"].value("droppedFps", 0.0);
+                }
+                RC_LOGI("Link policy: %s (%s), game %.0f/%.1f fps (raw/smoothed), shown %.1f, target %.0f Hz, "
+                        "enc %.0f fps, dropped %.0f/s",
+                        rc::PaceModeName(pace), rc::PaceReasonName(m_linkPolicy.lastReason),
+                        policyIn.gameFps, m_linkPolicy.smoothedGameFps, m_stats.fps, policyIn.targetFps,
+                        encFps, dropped);
+            }
+        }
         m_stats.latencyMs = m_latencyCount ? m_latencySum / m_latencyCount : 0;
         m_statsFrames = 0;
         m_latencySum = 0;
@@ -2230,19 +2400,32 @@ void App::LatchVideo(const FrameState& frame, bool late) {
             char seqPart[32];
             if (m_seqWindowMin) snprintf(seqPart, sizeof(seqPart), ", seq %u-%u", m_seqWindowMin, m_seqWindowMax);
             else snprintf(seqPart, sizeof(seqPart), ", seq -");
+            // TASK-DEC-PERCENTILE-2026-11-20 §1.3.3: the quantiles come from the app's own
+            // per-frame sampler now, so the field carries data without the debug switch.
+            // Format string untouched.
             RC_LOGI("rc vr diag 1s: %d shown, %d repeated, %d late of %d displays (flow window), %d generated, "
                     "%u stale dropped; "
                     "latency %.1f ms, pipeline %.1f ms, decode %.1f ms, rtt %.1f ms, stages %s, submit->lit %.1f ms, "
-                    "dt-probe %d%s",
+                    "dt-probe %d%s, fes %d, ffov %d, fref %d, dec p50/p95 %.1f/%.1f",
                     m_flowShown, m_flowDisplays - m_flowShown, m_flowLate, m_flowDisplays, uint32_t(m_generatedFrames),
                     m_statsDropStale,
                     m_stats.latencyMs, m_pipelineLatencyMs, m_stats.decodeMs, m_stats.rttMs,
-                    stages.empty() ? "NA" : stages.dump().c_str(), submitLitMs, m_displayDeltaApplied, seqPart);
+                    stages.empty() ? "NA" : stages.dump().c_str(), submitLitMs, m_displayDeltaApplied, seqPart,
+                    m_forceEncodeScale, m_forceFoveation, m_forceRefresh, m_decSamples.Percentile(50.f),
+                    m_decSamples.Percentile(95.f));
+            // TASK-DEC-PERCENTILE-2026-11-20 §1.3.4: the APK-forensics grep anchor and device
+            // cross-check line - the same decode_stats switch as the panel above gates it, so
+            // the default log volume is unchanged.
+            if (m_decodeQuantiles)
+                RC_LOGI("decode p50=%.1f p95=%.1f (n=%d)", m_decSamples.Percentile(50.f),
+                        m_decSamples.Percentile(95.f), m_decSamples.Count());
             m_seqWindowMin = 0;
             m_seqWindowMax = 0;
         }
         m_client.SendControl({{"type", rc::msg::kStats},
-                              {"stats", {{"fps", m_stats.fps}, {"latencyMs", m_stats.latencyMs}, {"decodeMs", m_stats.decodeMs}, {"latencyStages", stages}}}});
+                              {"stats", {{"fps", m_stats.fps}, {"latencyMs", m_stats.latencyMs}, {"decodeMs", m_stats.decodeMs}, {"latencyStages", stages},
+                                         {"debugFes", m_forceEncodeScale}, {"debugFfov", m_forceFoveation}, {"debugFref", m_forceRefresh},
+                                         {"debugDec", m_decodeQuantiles ? 1 : 0}}}});
     }
 }
 
@@ -2408,15 +2591,12 @@ void App::CatchUpVr(VideoDecoder& decoder, int waiting, const FrameState& frame)
 }
 
 void App::AddStages(const double (&ms)[kStageCount]) {
-    for (int i = 0; i < kStageCount; i++) {
-        if (ms[i] < 0 && ms[i] > -2) {
-            // A slightly wrong clock offset can push a short stage just below zero.
-            m_stageFrames[i]++;
-        } else if (ms[i] >= 0 && ms[i] < 1000) {
-            m_stageSum[i] += ms[i];
-            m_stageFrames[i]++;
-        }
-    }
+    // TASK-LATENCY-METER-FIX-2026-11-22 §1.2: no sample is dropped any more. The old
+    // filter threw away whole frames' stages (below -2 or at 1000 and up), so a clock
+    // offset error pushing the biggest stage (the game) below -2 removed it from the
+    // sum and the stages fell visibly short of the total. Every stage now counts every
+    // frame: negatives as zero, extremes capped at a second (see AddStageSamples).
+    AddStageSamples(m_stageSum, m_stageFrames, ms);
 }
 
 void App::RenderEyes(const FrameState& frame, float dt) {

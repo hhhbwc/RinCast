@@ -1,8 +1,10 @@
 // Headset networking: LAN discovery and the stream connection to a PC.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <functional>
+#include <utility>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -104,6 +106,12 @@ class StreamClient {
     void Connect(const ConnectTarget& target, const json& hello);
     // The headset's identity, for proving it's the headset the PC trusts.
     void SetIdentity(const rc::crypto::IdentitySeed& seed) { m_identity = seed; m_hasIdentity = true; }
+    // The PC's optional diagnosis short code ("diagnosis" in server.info; TASK-OPLOGIC-FIX-
+    // HMD-2026-11-22 §1.3, sent by the PC since A21). Empty when the PC didn't send one.
+    void SetDiagnosis(const std::string& d) {
+        std::lock_guard lock(m_mutex);
+        m_diagnosis = d;
+    }
     void Disconnect();
 
     State GetState() const { return m_state.load(); }
@@ -146,6 +154,10 @@ class StreamClient {
     std::unique_ptr<rc::Connection> m_connection;
     std::string m_status;
     std::string m_serverName;
+    // Connect-timeout statuses resolve through the string table at read time (StatusText,
+    // called on the main thread): Tr() on the network thread would race SetLanguage.
+    bool m_statusFromConnectTimeout = false;
+    std::string m_diagnosis;  // PC's optional "diagnosis" short code from server.info
     bool m_remote = false;
     bool m_vpn = false;
     bool m_usb = false;
@@ -187,11 +199,24 @@ class StreamClient {
     uint32_t m_rxDiagFragRecv = 0, m_rxDiagFragLost = 0, m_rxDiagFragRecovered = 0;
     uint32_t m_rxDiagFramesLost = 0, m_rxDiagSamples = 0;
     double m_rxDiagQueueMs = 0, m_rxDiagDecodeMs = 0, m_rxDiagNetworkMs = 0, m_rxDiagLatencyMs = 0;
+    // ROUND20 L17: the decode-time sample ring behind the diag line's p50/p95 (atomic,
+    // lock-free - the receive thread writes and the app's diag tick reads).
+    static constexpr size_t kDecodeRing = 512;
+    std::atomic<uint32_t> m_decodeIdx{0}, m_decodeCount{0};
+    std::atomic<bool> m_decodeQuantilesOn{false};
+    std::array<std::atomic<uint32_t>, kDecodeRing> m_decodeRing{};  // decode cost, microseconds
 
    public:
     // Reported by the app for the feedback packets.
     void ReportDecode(uint8_t streamId, double decodeMs, double latencyMs);
     void SetLastGoodFrame(uint8_t streamId, uint32_t frame);
+    // ROUND20 L17: decode p50/p95 over the last second, when the headset's diagnostics
+    // switch arms it; returns {-1, -1} when off or no samples this window.
+    void SetDecodeQuantiles(bool on);
+    std::pair<double, double> TakeDecodeQuantiles();
+    // R3: one per-frame decode cost from the VR decoder's output thread (the old feed point
+    // was the ~1 Hz feedback window average, which made p50 and p95 the same number).
+    void FeedDecodeSample(double decodeMs);
 };
 
 }  // namespace rv

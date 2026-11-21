@@ -17,6 +17,10 @@
 #include "rc/platform.h"
 #include "rc/protocol.h"
 
+// TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.3: connect-failure texts live in the string table
+// (strings.cpp) now. They resolve in StatusText() on the caller's thread — see there.
+#include "app/strings.h"
+
 namespace rv {
 
 // ---------------------------------------------------------------------------
@@ -223,6 +227,7 @@ void StreamClient::Connect(const ConnectTarget& target, const json& hello) {
         std::lock_guard lock(m_mutex);
         m_status = "Connecting to " + target.name + "...";
         m_serverName = target.name;
+        m_statusFromConnectTimeout = false;  // a fresh attempt gets fresh texts (StatusText)
     }
     m_remote = !target.cloudSession.empty();
     m_vpn = !m_remote && target.viaVpn;
@@ -248,6 +253,28 @@ void StreamClient::Disconnect() {
 
 std::string StreamClient::StatusText() {
     std::lock_guard lock(m_mutex);
+    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.3: the connect-timeout text resolves through the
+    // string table here, on the caller's (main) thread — Tr() on the network thread would
+    // race SetLanguage on the UI thread. The PC's optional diagnosis short code (server.info
+    // "diagnosis", stored by SetDiagnosis) names the reason the PC knows about; it wins when
+    // we have a string for it. Without a code (or with an unknown one) the text follows the
+    // path we tried: USB / VPN / LAN / remote. Old PCs send no code and get exactly the texts
+    // this build used to hard-code.
+    if (m_statusFromConnectTimeout && m_state == State::Failed) {
+        if (!m_diagnosis.empty()) {
+            const std::string diagKey = std::string("computers.diag.") + m_diagnosis;
+            const char* localized = Tr(diagKey.c_str());
+            if (diagKey != localized) return localized;  // Tr() echoes unknown keys back
+        }
+        // Same path order the hard-coded chain used to follow.
+        const char* key = "computers.timeout.lan";
+        if (m_usb)
+            key = "computers.timeout.usb";
+        else if (m_vpn)
+            key = "computers.timeout.vpn";
+        else if (m_remote) key = m_peers.empty() ? "computers.timeout.remoteOffline" : "computers.timeout.remoteNoDirect";
+        return Tr(key);
+    }
     return m_status;
 }
 
@@ -356,6 +383,33 @@ void StreamClient::ReportDecode(uint8_t streamId, double decodeMs, double latenc
     s.decodeMs = decodeMs;
     s.latencyMs = latencyMs;
 }
+void StreamClient::SetDecodeQuantiles(bool on) {
+    m_decodeQuantilesOn.store(on, std::memory_order_relaxed);
+    if (!on) m_decodeCount.store(0, std::memory_order_relaxed);
+}
+
+void StreamClient::FeedDecodeSample(double decodeMs) {
+    if (!m_decodeQuantilesOn.load(std::memory_order_relaxed)) return;
+    const uint32_t idx = uint32_t(m_decodeIdx.fetch_add(1, std::memory_order_relaxed) % kDecodeRing);
+    m_decodeRing[idx].store(uint32_t(decodeMs * 1000.0 + 0.5), std::memory_order_relaxed);
+    m_decodeCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::pair<double, double> StreamClient::TakeDecodeQuantiles() {
+    if (!m_decodeQuantilesOn.load(std::memory_order_relaxed)) return {-1.0, -1.0};
+    const uint32_t end = m_decodeIdx.load(std::memory_order_relaxed);
+    const uint32_t count = std::min<uint32_t>(m_decodeCount.exchange(0, std::memory_order_relaxed), uint32_t(kDecodeRing));
+    if (!count) return {-1.0, -1.0};
+    std::vector<double> samples;
+    samples.reserve(count);
+    for (uint32_t i = end - count; i < end; i++)
+        samples.push_back(double(m_decodeRing[i % kDecodeRing].load(std::memory_order_relaxed)) / 1000.0);
+    std::sort(samples.begin(), samples.end());
+    const double p50 = samples[size_t((samples.size() - 1) * 50 / 100)];
+    const double p95 = samples[size_t((samples.size() - 1) * 95 / 100)];
+    return {p50, p95};
+}
+
 
 void StreamClient::OnPacket(rc::PacketType type, const uint8_t* payload, size_t size) {
     switch (type) {
@@ -482,6 +536,8 @@ void StreamClient::SendFeedback() {
         m_rxDiagBytes = m_rxDiagFragRecv = m_rxDiagFragRecovered = m_rxDiagFragLost = 0;
         m_rxDiagFramesLost = m_rxDiagSamples = 0;
         m_rxDiagQueueMs = m_rxDiagDecodeMs = m_rxDiagNetworkMs = m_rxDiagLatencyMs = 0;
+        // R3: the quantiles window is defined by TakeDecodeQuantiles' exchange alone; a second
+        // 1 Hz reset here would beat against it and drop samples.
     }
 
     std::lock_guard lock(m_mutex);
@@ -623,13 +679,11 @@ void StreamClient::Run(ConnectTarget target, json hello) {
             std::lock_guard lock(m_mutex);
             RC_LOGW("Connect timed out (registered with the rendezvous: %d, PC addresses: %zu)", int(m_rvRegistered),
                     m_peers.size());
-            m_status = m_usb ? "The PC didn't answer over the USB cable. Check RinCast Streamer on the PC for a firewall message."
-                       : m_vpn ? "The PC didn't answer. Check that the VPN is on, on both devices."
-                       : !m_remote ? "The PC didn't answer. Check that both are on the same network."
-                       : m_peers.empty()
-                           ? "The PC didn't respond. Make sure the RinCast Streamer is running and online."
-                           : "No direct connection was possible: both networks block incoming connections. Using the same "
-                             "Wi-Fi, IPv6, or allowing automatic port sharing for the PC in its router helps.";
+            // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.3: the timeout text used to be hard-coded
+            // English here. It is a string-table key now ("computers.timeout.*", or the PC's
+            // "computers.diag.*" when server.info carried a diagnosis short code), resolved
+            // in StatusText() — Tr() here would race SetLanguage on the UI thread.
+            m_statusFromConnectTimeout = true;
             return;
         }
         if (m_remote) {

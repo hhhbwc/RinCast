@@ -15,6 +15,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -85,6 +86,9 @@ class VideoDecoder {
         std::lock_guard lock(m_statsMutex);
         return std::exchange(m_decodeMsMax, 0.0);
     }
+    // ROUND20 L17 rework R3: per-frame decode cost sink for the diagnostics quantiles.
+    // Set before Init (the output thread reads it without a lock); null = no sink.
+    void SetDecodeSampleSink(std::function<void(double)> sink) { m_decodeSampleSink = std::move(sink); }
     bool NeedsKeyframe() { return m_needKeyframe.exchange(false); }
     bool Failed() const { return m_failed; }
     // For explaining a missing picture: did the decoder start, and has it produced anything.
@@ -186,6 +190,7 @@ class VideoDecoder {
     std::mutex m_statsMutex;
     double m_decodeMsSum = 0, m_decodeMsMax = 0;
     int m_decodeCount = 0;
+    std::function<void(double)> m_decodeSampleSink;  // R3: set before Init, read by the output thread
     std::map<int64_t, int64_t> m_inputTimes;  // pts -> queued time
 };
 

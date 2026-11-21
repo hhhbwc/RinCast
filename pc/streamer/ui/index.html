@@ -63,66 +63,79 @@
     <!-- Streaming -->
     <section class="page" data-page="video" aria-labelledby="h-video">
       <h1 id="h-video" tabindex="-1" data-i18n="nav.video">Streaming</h1>
+      <div class="auto-tune" id="autoTuneBox">
+        <label class="check" id="autoTuneRow">
+          <input type="checkbox" data-setting="autoTune">
+          <span data-i18n="video.autoTune">Automatic tuning</span>
+          <small data-i18n="video.autoTuneHint">The system keeps the stream smooth: it may lower picture size, profile, CBR or foveation on its own. It only steps down; changing one yourself takes that setting back.</small>
+        </label>
+      </div>
       <div class="cols">
         <div>
           <h2 data-i18n="video.bitrate">Bitrate limit</h2>
           <h3 data-i18n="video.bitrateGames">Games</h3>
           <label class="bar" id="vrBitrateBar"><input type="range" min="20" max="500" step="10" data-setting="vrBitrateMbps" aria-label="Bitrate limit for games" data-i18n-aria="video.bitrateGamesAria"><output></output></label>
           <p class="note" id="streamNote" hidden></p>
-                    <h3 data-i18n="video.bitrateDesktop">Desktop</h3>
-          <label class="bar"><input type="range" min="10" max="150" step="5" data-setting="desktopBitrateMbps" aria-label="Bitrate limit for the desktop" data-i18n-aria="video.bitrateDesktopAria"><output></output></label>
-          <label class="check"><input type="checkbox" data-setting="adaptiveBitrate"><span data-i18n="video.adaptive">Adjust bitrate automatically</span></label>
-          <h3 id="l-profile" data-i18n="video.profile">What to favor</h3>
-          <div class="options" role="radiogroup" aria-labelledby="l-profile" aria-describedby="profileNote">
+          <label class="check" id="adaptiveBitrateRow"><input type="checkbox" data-setting="adaptiveBitrate"><span data-i18n="video.adaptive">Automatic bitrate</span></label>
+          <h3 id="l-profile" data-i18n="video.profile">Priority</h3>
+          <div class="options" id="profileOptions" role="radiogroup" aria-labelledby="l-profile" aria-describedby="profileNote">
             <label><input type="radio" name="streamProfile" data-setting="streamProfile" value="0"><span data-i18n="video.profileLatency">Low latency</span></label>
             <label><input type="radio" name="streamProfile" data-setting="streamProfile" value="1"><span data-i18n="video.profileBalanced">Balanced</span></label>
             <label><input type="radio" name="streamProfile" data-setting="streamProfile" value="2"><span data-i18n="video.profileQuality">Best picture</span></label>
           </div>
           <p class="note" id="profileNote"></p>
-          <label class="check spaced" id="profileVideoRow">
-            <input type="checkbox" data-setting="profileControlsVideo">
-            <span data-i18n="video.profileVideo">Let profiles adjust picture quality</span>
-            <small id="profileVideoHint" data-i18n="video.profileVideoHint">Only ever sharper, never worse.</small>
-          </label>
           <p class="note" id="overrideNote"></p>
         </div>
         <div>
           <h2 data-i18n="video.image">Image</h2>
-          <h3 id="l-codec" data-i18n="video.codec">Video codec</h3>
-          <div class="options grid" id="codecOptions" role="radiogroup" aria-labelledby="l-codec">
+          <h3 id="l-codec" data-i18n="video.codec">Codec</h3>
+          <div class="options grid" id="codecOptions" role="radiogroup" aria-labelledby="l-codec" aria-describedby="codecHint">
             <label><input type="radio" name="codec" data-setting="codec" value="auto"><span data-i18n="video.codecAuto">Automatic</span></label>
             <label><input type="radio" name="codec" data-setting="codec" value="hevc"><span>HEVC</span></label>
             <label><input type="radio" name="codec" data-setting="codec" value="av1"><span>AV1</span></label>
             <label><input type="radio" name="codec" data-setting="codec" value="h264"><span>H.264</span></label>
+            <small id="codecHint" hidden data-i18n="video.codecHint">At this picture size H.264 is not available; the stream falls back to HEVC.</small>
           </div>
-
-          <label class="check" id="pcBitrateRow"><input type="checkbox" data-setting="pcBitrateWins"><span data-i18n="video.pcBitrate">Use this PC's quality limit</span><small data-i18n="video.pcBitrateHint">Default follows the headset; on uses this PC.</small></label>
-          <label class="check spaced" id="tenBitRow"><input type="checkbox" data-setting="tenBit"><span data-i18n="video.tenBit">10-bit color</span><small id="tenBitHint" hidden data-i18n="video.tenBitHint">Needs HEVC or AV1.</small></label>
-          <label class="check" id="aqRow"><input type="checkbox" data-setting="adaptiveQuantization"><span data-i18n="video.aq">Smart detail placement</span><small data-i18n="video.aqHint">Fewer blocks in flat areas like skies.</small></label>
-          <label class="check" id="foveatedRow"><input type="checkbox" data-setting="foveatedEncoding"><span data-i18n="video.foveated">Sharper center in VR</span><small id="foveatedHint" data-i18n="video.foveatedHint">Sharp where you look, lighter at edges. NVIDIA only.</small></label>
-          <label class="check" id="twoPassRow"><input type="checkbox" data-setting="twoPassEncoding"><span data-i18n="video.twoPass">Two-pass encoding in VR</span><small data-i18n="video.twoPassHint">Steadier in motion, a little slower to encode.</small></label>
-          <label class="check" id="cbrRow"><input type="checkbox" data-setting="qualityProfileCbr"><span data-i18n="video.cbr">Best picture: use full limit every frame</span><small data-i18n="video.cbrHint">Steadier picture, but uses the full link every frame.</small></label>
-          <h3 id="l-enc-scale" data-i18n="video.encScale">VR picture size</h3>
-          <div class="options" role="radiogroup" aria-labelledby="l-enc-scale" aria-describedby="encScaleNote">
-            <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="0"><span data-i18n="video.encScaleAuto">Automatic</span></label>
-            <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="100"><span data-i18n="video.encScaleFull">Full</span></label>
-            <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="85"><span>85%</span></label>
-            <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="67"><span>67%</span></label>
-            <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="50"><span>50%</span></label>
-          </div>
-          <p class="note" id="encScaleNote" data-i18n="video.encScaleHint">Smaller sends fewer pixels to the headset. The picture still fills the view.</p>
-          <label class="check spaced" id="l7Row"><input type="checkbox" data-setting="l7Autoscale"><span data-i18n="video.l7Autoscale">Ease encode size when decoding struggles</span><small data-i18n="video.l7AutoscaleHint">Steps 100 → 85 → 67 → 50 while the headset decodes too slowly; only the reset climbs back.</small></label>
-          <p class="note" id="l7LevelLine" hidden><span data-i18n="video.l7Level">Current eased size</span>: <b id="l7Level">—</b> <button id="l7Reset" data-i18n="video.l7Reset">Reset to 100%</button></p>
+            <h3 id="l-enc-scale" data-i18n="video.encScale">VR picture size</h3>
+            <div class="options" role="radiogroup" aria-labelledby="l-enc-scale" aria-describedby="encScaleNote">
+              <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="0"><span data-i18n="video.encScaleAuto">Automatic</span></label>
+              <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="100"><span data-i18n="video.encScaleFull">Full</span></label>
+              <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="85"><span>85%</span></label>
+              <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="67"><span>67%</span></label>
+              <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="50"><span>50%</span></label>
+            </div>
+            <p class="note" id="encScaleNote" data-i18n="video.encScaleHint">Fewer pixels, still fills the view.</p>
+            <label class="check sub" id="l7Row"><input type="checkbox" data-setting="l7Autoscale"><span data-i18n="video.l7Autoscale">Shrink size when decoding is slow</span><small data-i18n="video.l7AutoscaleHint">Steps down only; the reset climbs back.</small></label>
+            <p class="note" id="l7LevelLine" hidden><span data-i18n="video.l7Level">Current size</span>: <b id="l7Level">—</b> <button id="l7Reset" data-i18n="video.l7Reset">Reset to 100%</button></p>
+            <label class="check sub" id="profileVideoRow">
+              <input type="checkbox" data-setting="profileControlsVideo">
+              <span data-i18n="video.profileVideo">Quality follows profile</span>
+              <small id="profileVideoHint" data-i18n="video.profileVideoHint">Only sharper, never worse.</small>
+            </label>
+            <label class="check sub" id="cbrRow"><input type="checkbox" data-setting="qualityProfileCbr"><span data-i18n="video.cbr">Full bitrate every frame</span><small data-i18n="video.cbrHint">Steadier, but always uses the full link.</small></label>
+            <label class="check" id="fillModeRow"><input type="checkbox" data-setting="fillMode"><span data-i18n="video.fillMode">Sharper when frames drop</span><small data-i18n="video.fillModeHint">More bitrate per frame; floor 45 fps.</small></label>
+            <label class="check" id="pcBitrateRow"><input type="checkbox" data-setting="pcBitrateWins"><span data-i18n="video.pcBitrate">Use this PC's limit</span><small data-i18n="video.pcBitrateHint">Off follows the headset.</small></label>
+            <label class="check" id="tenBitRow"><input type="checkbox" data-setting="tenBit"><span data-i18n="video.tenBit">10-bit color</span><small id="tenBitHint" hidden data-i18n="video.tenBitHint">Needs HEVC or AV1.</small></label>
+            <label class="check" id="aqRow"><input type="checkbox" data-setting="adaptiveQuantization"><span data-i18n="video.aq">Smart detail</span><small data-i18n="video.aqHint">Fewer blocks in flat areas.</small></label>
+            <label class="check" id="foveatedRow"><input type="checkbox" data-setting="foveatedEncoding"><span data-i18n="video.foveated">Sharp center in VR</span><small id="foveatedHint" data-i18n="video.foveatedHint">Lighter edges. NVIDIA only.</small></label>
+            <label class="check" id="twoPassRow"><input type="checkbox" data-setting="twoPassEncoding"><span data-i18n="video.twoPass">Two-pass encoding</span><small data-i18n="video.twoPassHint">Steadier motion, slower encode.</small></label>
         </div>
       </div>
       <div class="cols">
         <div>
-          <h2 id="l-desktop-res" data-i18n="video.res">Desktop resolution</h2>
+          <h2 data-i18n="video.desktop">Desktop</h2>
+          <h3 data-i18n="video.bitrate">Bitrate limit</h3>
+          <label class="bar"><input type="range" min="10" max="150" step="5" data-setting="desktopBitrateMbps" aria-label="Bitrate limit for the desktop" data-i18n-aria="video.bitrateDesktopAria"><output></output></label>
+          <h3 id="l-desktop-res" data-i18n="video.resolution">Resolution</h3>
           <div class="options" role="radiogroup" aria-labelledby="l-desktop-res">
             <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="0"><span data-i18n="video.resNative">Same as monitor</span></label>
             <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="2160"><span data-i18n="video.res2160">Up to 2160p</span></label>
             <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="1440"><span data-i18n="video.res1440">Up to 1440p</span></label>
             <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="1080"><span data-i18n="video.res1080">Up to 1080p</span></label>
+          </div>
+          <div id="elevateRow" hidden>
+            <button class="btn" id="elevateBtn" data-i18n="video.elevate">Restart as administrator</button>
+            <p class="note" id="elevateNote" data-i18n="video.elevateHint">Needed to click elevated windows.</p>
           </div>
         </div>
         <div>
@@ -134,7 +147,7 @@
             <label><input type="radio" name="fecPercent" data-setting="fecPercent" value="10"><span data-i18n="video.fecStrong">Strong</span></label>
             <label><input type="radio" name="fecPercent" data-setting="fecPercent" value="20"><span data-i18n="video.fecMax">Maximum</span></label>
           </div>
-          <p class="note" id="fecNote" data-i18n="video.fecNote">Stronger repair uses more of the bitrate.</p>
+          <p class="note" id="fecNote" data-i18n="video.fecNote">Stronger repair costs bitrate.</p>
         </div>
       </div>
     </section>

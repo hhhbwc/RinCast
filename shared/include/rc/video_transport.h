@@ -30,26 +30,22 @@ class VideoPacketizer {
     // fecPercent: 0 disables FEC; otherwise one parity packet per
     // round(100 / fecPercent) data fragments (clamped to [2, 64]).
     void SetFecPercent(int fecPercent) { m_fecPercent = fecPercent; }
-    // Spreads the datagrams at this rate instead of sending them in one burst, which
-    // shallow queues (Wi-Fi, the internet) drop. Blocks the caller. 0 = no pacing.
-    // The rate only changes the spacing: the clock carries on across frames, so a frame
-    // never starts with a burst of the previous frame's leftovers.
+    // Two roles. Legacy clock (frame budget 0): spreads the datagrams at this rate
+    // instead of sending them in one burst, which shallow queues (Wi-Fi, the internet)
+    // drop. Token-bucket burst mode (frame budget > 0): the AVERAGE ceiling the mode
+    // keeps - each frame bills its wire bytes at this rate, and the next frame may not
+    // start before the billing elapses. Blocks the caller. 0 = no pacing.
     void SetPacingKbps(uint32_t kbps) { m_pacingKbps.store(kbps, std::memory_order_relaxed); }
-    // Frame-level budget (nanoseconds), PLAN-pacing-fix WP1. When armed, one frame's
-    // datagrams leave within that period no matter what the average pacing rate says:
-    // the effective rate is max(pacing rate, this frame's wire bytes / budget) capped
-    // at kMaxBurstKbps, and the send clock restarts at every frame start (no cross-
-    // frame debt). 0 = off (the legacy continuous clock). The remote path never arms it.
+    // Frame-granularity token bucket (A10), nanoseconds. When armed (> 0), a frame's
+    // datagrams leave BACK-TO-BACK - nothing inside the frame waits - and the budget is
+    // kept BETWEEN frames: the next frame's first datagram may not leave before this
+    // frame's start + its wire bytes at the pacing rate. The value is the burst window
+    // the frame's own send is judged against (see BudgetOverruns). 0 = off (the legacy
+    // continuous clock: fragments spread at the pacing rate). The remote path and the
+    // desktop stream never arm it.
     void SetPacingFrameBudgetNs(int64_t budgetNs) { m_frameBudgetNs.store(budgetNs, std::memory_order_relaxed); }
-    // Instant-rate ceiling for the frame-budget mode (ROUND4 R4.1), kbps. 0 = off (the
-    // legacy budget behavior, capped only by kMaxBurstKbps). When armed, the effective
-    // burst rate is clamped to this value AND the frame's datagrams are spread evenly
-    // across the budget (interval floor = budgetNs / fragmentCount), so a big frame no
-    // longer leaves as one ~22 KB micro-burst that overruns a shallow Wi-Fi queue. The
-    // production sender arms 180000 (180 Mbps); the raw default stays 0 so callers that
-    // never opt in keep the exact pre-ROUND4 timeline.
-    void SetBurstCeilingKbps(uint32_t kbps) { m_burstCeilingKbps.store(kbps, std::memory_order_relaxed); }
-    // Frames whose send window exceeded their budget + ~1 ms of timer error.
+    // Frames whose burst window exceeded their budget + ~1 ms of timer error: the
+    // socket or the path backed the burst up (the token-bucket wait itself doesn't count).
     uint32_t BudgetOverruns() const { return m_budgetOverruns.load(std::memory_order_relaxed); }
 
     // Sends one frame. Returns number of datagrams sent. May return early (count <
@@ -67,20 +63,24 @@ class VideoPacketizer {
 
    private:
     // Waits until dueNs; false means a stop was requested: wrap up at once. precise=true
-    // (shaping armed) places fragments at sub-ms intervals instead of the legacy 0.2 ms batch.
+    // would place fragments at sub-ms intervals instead of the legacy 0.2 ms batch;
+    // every current caller waits with precise=false (the frame budget mode no longer
+    // shapes inside a frame).
     bool WaitDue(int64_t dueNs, bool precise);
 
     Connection* m_connection;
     int m_fecPercent = 5;
     std::atomic<uint32_t> m_pacingKbps{0};
     std::atomic<int64_t> m_frameBudgetNs{0};
-    std::atomic<uint32_t> m_burstCeilingKbps{0};  // 0 = legacy budget; >0 = instant-rate cap + even spread
     std::atomic<uint32_t> m_budgetOverruns{0};
-    // Continuous send clock: always the earliest moment the next packet may leave. It
-    // accumulates across frames; idle over 50 ms resets it to now (a hiccup would
+    // Two clocks, one per mode. Legacy clock (frame budget 0): the earliest moment the
+    // next PACKET may leave, accumulating across frames; idle over 50 ms resets it to
+    // now (a hiccup would otherwise repay its debt as one burst). Token-bucket burst
+    // mode: the earliest moment the next FRAME may START - the running frame's billing
+    // at the average ceiling. Stored as void* to keep windows.h out of this header.
     int64_t m_nextSendNs = 0;
     std::atomic<bool> m_stopRequested{false};
-    // otherwise repay the debt as one burst). Stored as void* to keep windows.h out
+    // Timer and stop event for WaitDue. Stored as void* to keep windows.h out
     void* m_paceTimer = nullptr;
     void* m_stopEvent = nullptr;
     std::vector<uint8_t> m_frame;

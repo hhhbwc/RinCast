@@ -4,6 +4,10 @@
 // encode, send and decode, taken where the eye can't see detail anyway.
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+
 #include <d3d11_4.h>
 
 #include "../util.h"
@@ -18,7 +22,12 @@ class Foveator {
     static constexpr float kFoveaSize = 0.45f;
     static constexpr float kFixedFoveaSize = 0.6f;
     // The squeezed eye size for a full one: the fovea, and the rest at half density.
-    static uint32_t EncodedSize(uint32_t full, float fovea);
+    // Inline (TASK-COMBO-SWEEP-2026-11-21): the pure config builders call it, and the
+    // offline sweep must not link the D3D side of this class. Body unchanged.
+    static uint32_t EncodedSize(uint32_t full, float fovea) {
+        const double size = full * (fovea + (1.0 - fovea) * 0.5);
+        return std::max<uint32_t>(64, uint32_t(std::lround(size / 16)) * 16);
+    }
 
     // eyeWidth x eyeHeight per eye in, encodedEyeWidth x encodedEyeHeight per eye out.
     bool Init(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight, uint32_t encodedEyeWidth,

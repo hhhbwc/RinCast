@@ -150,8 +150,9 @@ void Stat(Ui& ui, float x, float y, const std::string& label, const std::string&
     ui.R().Text(value, x, y + 26, 21, poor ? kWarn : kText, Face::SemiBold, align);
 }
 
-// The same lines the PC draws.
-bool PoorLatency(const App::Stats& s) { return s.latencyMs >= 80; }
+// The same line the PC draws (threshold unchanged); A22: judged on the panel's EMA
+// (LatencyDisplayMs), not the raw 1 s window average the diagnostics keep.
+bool PoorLatency(double latencyMs) { return latencyMs >= 80; }
 bool PoorFrameRate(const App::Stats& s, float wanted) { return s.fps > 0 && wanted > 0 && s.fps < wanted * 0.9f; }
 
 // ---- Pages of the main panel ----------------------------------------------------
@@ -213,7 +214,7 @@ void PageComputers(Ui& ui, const Rect& body) {
     // ---- connected ----
     if (Connected(app)) {
         const Rect row{body.x - 8, body.y - 8, body.w + 16, kPcRowH};
-        const bool slowLink = PoorLatency(app.CurrentStats());
+        const bool slowLink = PoorLatency(app.LatencyDisplayMs());  // A22: the smoothed value
         PcText(ui, row, "desktop_windows", app.Client().ServerName(),
                slowLink ? (app.Client().IsVpn() ? Tr("net.slowVpn") : app.Client().IsRemote() ? Tr("net.slowInternet") : Tr("net.slowLocal"))
                         : app.Client().IsVpn() ? Tr("net.throughVpn") : app.Client().IsRemote() ? Tr("net.overInternet") : Tr("net.connected"),
@@ -1107,11 +1108,12 @@ void BuildMain(Ui& ui, const Rect& r) {
         // Live numbers along the bottom, on every page.
         R.RectFill({r.x + 2, statusY, r.w - 4, 2}, kLine);
         const auto st = app.CurrentStats();
+        const double latencyEma = app.LatencyDisplayMs();  // A22: the panels show the smoothed value
         const float sx = r.Right() - 36;
         if (g_page != kComputers) Stat(ui, r.x + 28, statusY + 14, Tr("stat.connectedTo"), app.Client().ServerName());
         Stat(ui, sx, statusY + 14, Tr("stat.bitrate"), st.mbps > 0 ? FormatMs(st.mbps) + " Mbps" : "–", Align::Right);
         Stat(ui, sx - 180, statusY + 14, Tr("stat.fps"), st.fps > 0 ? FormatMs(st.fps) + " fps" : "–", Align::Right, app.CurrentMode() == Mode::Vr && PoorFrameRate(st, app.Settings().refreshRate));
-        Stat(ui, sx - 360, statusY + 14, Tr("stat.latency"), st.latencyMs > 0 ? FormatMs(st.latencyMs) + " ms" : "–", Align::Right, PoorLatency(st));
+        Stat(ui, sx - 360, statusY + 14, Tr("stat.latency"), latencyEma >= 0 ? FormatMs(latencyEma) + " ms" : "–", Align::Right, PoorLatency(latencyEma));
     }
 
     // A lost connection, a retry or a failure is news on any page.
@@ -1142,10 +1144,10 @@ void BuildDock(Ui& ui, const Rect& r) {
     UiRenderer& R = ui.R();
     Background(ui, r);
     // Connection summary.
-    const auto st = app.CurrentStats();
-    const bool slow = st.latencyMs >= 80;  // the same line the PC draws
+    const double latencyEma = app.LatencyDisplayMs();  // A22: the panels show the smoothed value
+    const bool slow = latencyEma >= 80;  // the same line the PC draws
     R.TextIn(app.Client().ServerName(), {r.x + 24, r.y + 18, 176, 36}, 21, kText, Face::SemiBold);
-    const std::string sub = st.latencyMs > 0 ? Trf("dock.latency", {{"ms", FormatMs(st.latencyMs)}}) + (slow ? Tr("net.slowSuffix") : "") : app.Client().IsVpn() ? Tr("pcDetail.vpn") : app.Client().IsRemote() ? Tr("net.overInternet") : Tr("net.connected");
+    const std::string sub = latencyEma >= 0 ? Trf("dock.latency", {{"ms", FormatMs(latencyEma)}}) + (slow ? Tr("net.slowSuffix") : "") : app.Client().IsVpn() ? Tr("pcDetail.vpn") : app.Client().IsRemote() ? Tr("net.overInternet") : Tr("net.connected");
     R.TextIn(sub, {r.x + 24, r.y + 54, 176, 30}, 19, slow ? kWarn : kMuted);
     R.RectFill({r.x + 212, r.y + 14, 2, r.h - 28}, kLine);
 
@@ -1210,25 +1212,43 @@ void BuildDock(Ui& ui, const Rect& r) {
 
 // ---- Stats ---------------------------------------------------------------------------
 
+// TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.1: the stats panel's "frame generation" line, three
+// states: off (the setting), half rate while the pace policy is in HalfWithGeneration -
+// the game rate it replaces → the panel refresh, plus the quota suffix while armed - and
+// full rate otherwise. The policy state freezes outside VR (its 1 Hz tick only runs there),
+// so with generation on but no VR picture the row shows "–" instead of a stale answer.
+std::string FrameGenStatus(const App& app) {
+    if (!app.Settings().frameGeneration) return Tr("stat.frameGen.off");
+    if (app.CurrentMode() != Mode::Vr) return "–";
+    const rc::LinkPolicyState policy = app.LinkPolicy();
+    if (policy.mode != rc::PaceMode::HalfWithGeneration) return Tr("stat.frameGen.full");
+    std::string v = Trf("stat.frameGen.half", {{"game", FormatMs(policy.smoothedGameFps)},
+                                               {"hmd", FormatMs(app.Settings().refreshRate)}});
+    if (app.GenCreditArmed()) v += Tr("stat.frameGen.armed");
+    return v;
+}
+
 void BuildStats(Ui& ui, const Rect& r) {
     App& app = *g_app;
     UiRenderer& R = ui.R();
     Background(ui, r);
     const auto s = app.CurrentStats();
+    const double latencyEma = app.LatencyDisplayMs();  // A22: the panels show the smoothed value
     struct Item {
         const char* label;
         std::string value;
     };
-    const Item items[] = {{Tr("stat.latency"), s.latencyMs > 0 ? FormatMs(s.latencyMs) + " ms" : "–"},
+    const Item items[] = {{Tr("stat.latency.total"), latencyEma >= 0 ? FormatMs(latencyEma) + " ms" : "–"},
                           {Tr("stat.fps"), s.fps > 0 ? FormatMs(s.fps) + " fps" : "–"},
+                          {Tr("stat.frameGen"), FrameGenStatus(app)},
                           {Tr("stat.bitrate"), s.mbps > 0 ? FormatMs(s.mbps) + " Mbps" : "–"},
                           {Tr("stat.decoding"), s.decodeMs > 0 ? FormatMs(s.decodeMs) + " ms" : "–"},
                           {Tr("stat.network"), s.rttMs > 0 ? FormatMs(s.rttMs) + " ms" : "–"},
                           {Tr("stat.video"), s.codec.empty() ? "–" : s.codec + " " + PixelSize(s.width, s.height)}};
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         const float y = r.y + 16 + i * 38;
         R.Text(items[i].label, r.x + 22, y, 20, kMuted);
-        const bool poor = (i == 0 && PoorLatency(s)) || (i == 1 && app.CurrentMode() == Mode::Vr && PoorFrameRate(s, app.Settings().refreshRate));
+        const bool poor = (i == 0 && PoorLatency(latencyEma)) || (i == 2 && app.CurrentMode() == Mode::Vr && PoorFrameRate(s, app.Settings().refreshRate));
         R.Text(items[i].value, r.Right() - 22, y, 20, poor ? kWarn : kText, Face::SemiBold, Align::Right);
     }
     // The latency, stage by stage. Bars are shares of the whole; the biggest stands out.
@@ -1237,7 +1257,8 @@ void BuildStats(Ui& ui, const Rect& r) {
         total += std::max(ms, 0.0);
         biggest = std::max(biggest, ms);
     }
-    float y = r.y + 16 + 6 * 38 + 6;
+    // One more row than before the frame-generation line, so the divider moved down with it.
+    float y = r.y + 16 + 7 * 38 + 6;
     ui.Divider(r.x + 22, y, r.w - 44);
     y += 16;
     if (total <= 0) {
@@ -1312,8 +1333,8 @@ void BuildVrOverlay(Ui& ui, const Rect& r) {
     const bool inVr = app.CurrentMode() == Mode::Vr;
     const std::string close = inVr ? Tr("btn.resume") : Tr("btn.hideMenu");
     const float cw = std::max(120.f, ButtonWidth(ui, close));
-    const auto s = app.CurrentStats();
-    if (s.latencyMs > 0) R.TextIn(Trf("dock.latency", {{"ms", FormatMs(s.latencyMs)}}), {r.Right() - pad - cw - 246, r.y + 14, 230, 54}, 21, kMuted, Face::Medium, Align::Right);
+    const double latencyEma = app.LatencyDisplayMs();  // A22: the panels show the smoothed value
+    if (latencyEma >= 0) R.TextIn(Trf("dock.latency", {{"ms", FormatMs(latencyEma)}}), {r.Right() - pad - cw - 246, r.y + 14, 230, 54}, 21, kMuted, Face::Medium, Align::Right);
     if (ui.Button("close", {r.Right() - pad - cw, r.y + 14, cw, 54}, close, nullptr, ButtonStyle::Primary))
         app.ToggleWindow("vr-overlay", false);
     // Left-aligned with the title, in the order you're likely to need them.
@@ -1370,7 +1391,9 @@ void Build(App& app, WindowManager& wm) {
     kb->zoneAt = [](Vec2 p) { return g_app->Kb().ZoneAt(p); };
     kb->twoHands = true;
     kb->showChrome = false;
-    Window* stats = make("stats", 380, 600, 0.30f, false, BuildStats);
+    // 640 (was 600): the frame-generation row (TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.1) added a
+    // 38 px row, and the stage list below already ended at the old bottom edge.
+    Window* stats = make("stats", 380, 640, 0.30f, false, BuildStats);
     stats->showChrome = true;
     Window* notices = make("notices", 800, 104, 0.68f, false, BuildNotices);
     notices->showChrome = false;

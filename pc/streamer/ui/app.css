@@ -165,6 +165,9 @@ input[type="radio"]:checked::after { content: ""; position: absolute; inset: 4px
 .check.off input, .options label.off input { border-color: #666; cursor: default; }
 .check.off input:checked, .options label.off input:checked { background: #555; border-color: #555; }
 
+/* Sub-options indent under the choice they belong to. */
+.check.sub { margin: 6px -6px 0 14px; }
+
 /* A line and a solid handle; the value sits at the end of the label's line. */
 .bar { display: block; position: relative; height: 32px; cursor: pointer; }
 .bar output { position: absolute; right: 0; top: -25px; font-weight: 600; pointer-events: none; font-variant-numeric: tabular-nums; }

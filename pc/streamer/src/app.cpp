@@ -10,6 +10,7 @@
 #include <fstream>
 
 #include "audio/audio.h"
+#include "input/input_injector.h"
 #include "rc/platform.h"
 #include "rc/project.h"
 #include "rc/protocol.h"
@@ -156,6 +157,20 @@ void App::PushUi(const json& message) {
 
 void App::OnSessionStarted(ClientSession* session) {
     m_streaming = true;
+    // A19 audit #13: the PC answered the approval prompt, but the wearer was still
+    // showing "waiting for approval" with no idea the PC had clicked. The asking
+    // device has no session of its own until now, so the answer goes out on the one
+    // that just started. (A denial has no session at all - the headset already shows
+    // the Reject's "declined" text on its next Hello.)
+    bool approved = false;
+    {
+        std::lock_guard lock(m_uiMutex);
+        approved = m_approvedNotice.erase(session->DeviceId()) > 0;
+    }
+    if (approved)
+        session->SendControl({{"type", rc::msg::kNotice},
+                              {"level", "info"},
+                              {"text", "This PC allowed the headset to connect."}});
     bool remember = true;
     {
         std::lock_guard lock(m_uiMutex);
@@ -240,6 +255,8 @@ json App::StateJson() {
           {"addresses", m_cloud.LanAddresses()},
           {"vpnAddresses", vpnAddresses},
           {"firewall", FirewallJson()},
+          {"elevated", IsElevated()},
+          {"inputBlocked", input::InputBlocked()},
           {"port", m_server.Port()}}},
     };
     if (auto session = m_server.ActiveSession()) {
@@ -281,6 +298,11 @@ json App::FirewallJson() {
 }
 
 void App::Tick() {
+    const bool blocked = input::InputBlocked();
+    if (blocked != m_lastInputBlocked) {
+        m_lastInputBlocked = blocked;
+        PushUi({{"type", "inputState"}, {"blocked", blocked}});
+    }
     if (m_firewallTicks-- <= 0) {
         m_firewallTicks = 10;
         CheckFirewall();
@@ -295,6 +317,7 @@ void App::Tick() {
         {
             std::lock_guard lock(m_uiMutex);
             m_pendingApproval = nullptr;
+            m_approvedNotice.erase(asking);  // nobody will start a session for it (A19 #13)
         }
         PushUi({{"type", "approvalEnded"}});
     }
@@ -320,6 +343,7 @@ std::string App::ApplySettingSideEffects(const json& changed) {
             changed.contains("vrBitrateMbps") || changed.contains("pcBitrateWins") ||
             changed.contains("desktopBitrateMbps") || changed.contains("adaptiveBitrate") ||
             changed.contains("videoPacingMode") || changed.contains("qualityProfileCbr") ||
+            changed.contains("fillMode") ||
             changed.contains("profileControlsVideo") || changed.contains("fecPercent") ||
             changed.contains("foveatedEncoding") || changed.contains("adaptiveQuantization") ||
             changed.contains("twoPassEncoding") || changed.contains("encodeScalePct") ||
@@ -377,13 +401,29 @@ void App::HandleUiMessage(const std::string& text) {
         }
     } else if (type == "approve" || type == "deny") {
         const std::string id = m.value("deviceId", "");
+        // A19 audit #13: the headset learns the result through the session that
+        // starts right after an approval (see OnSessionStarted). Mark it before the
+        // approval opens the door, so the session cannot race us. A denial keeps no
+        // session to talk on - the headset already shows the Reject's "declined"
+        // text on its next Hello, so nothing is sent for it here.
+        {
+            std::lock_guard lock(m_uiMutex);
+            if (type == "approve") m_approvedNotice.insert(id);
+            m_pendingApproval = nullptr;
+        }
         if (type == "approve")
             m_server.Approve(id, m.value("remember", true));
         else
             m_server.Deny(id);
         std::lock_guard lock(m_uiMutex);
         if (type == "approve" && !m.value("remember", true)) m_noRemember.insert(id);
-        m_pendingApproval = nullptr;
+    } else if (type == "restartElevated") {
+        if (IsElevated()) reply({{"ok", false}, {"error", "already"}});
+        else if (!RestartElevated()) reply({{"ok", false}, {"error", "cancelled"}});
+        else {
+            reply({{"ok", true}});
+            if (QuitRequest) QuitRequest();
+        }
     } else if (type == "disconnect") {
         RunAsync([this] { m_server.DisconnectActive("disconnected_by_pc"); });
     } else if (type == "removeTrusted") {

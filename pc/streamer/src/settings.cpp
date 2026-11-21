@@ -32,6 +32,8 @@ json Settings::ToJson(bool forUi) const {
         {"qualityProfileCbr", qualityProfileCbr},
         {"encodeScalePct", encodeScalePct},
         {"l7Autoscale", l7Autoscale},
+        {"autoTune", autoTune},
+        {"fillMode", fillMode},
         {"pcBitrateWins", pcBitrateWins},
         {"fecPercent", fecPercent},
         {"foveatedEncoding", foveatedEncoding},
@@ -82,6 +84,8 @@ void Settings::FromJson(const json& j) {
     get("qualityProfileCbr", qualityProfileCbr);
     get("encodeScalePct", encodeScalePct);
     get("l7Autoscale", l7Autoscale);
+    get("autoTune", autoTune);
+    get("fillMode", fillMode);
     get("pcBitrateWins", pcBitrateWins);
     get("fecPercent", fecPercent);
     get("foveatedEncoding", foveatedEncoding);

@@ -45,6 +45,10 @@ std::string HResultString(HRESULT hr);
 
 // Runs a process elevated (UAC prompt). Returns exit code or -1.
 int RunElevated(const std::wstring& exe, const std::wstring& args, bool wait);
+// True when this process holds an elevated token.
+bool IsElevated();
+// Relaunches this exe elevated with --elevated-handoff; false when UAC was declined.
+bool RestartElevated();
 // Runs a process hidden and waits. Returns exit code or -1.
 int RunHidden(const std::wstring& commandLine, DWORD timeoutMs = 30000);
 

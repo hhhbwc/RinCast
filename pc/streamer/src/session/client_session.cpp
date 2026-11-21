@@ -13,9 +13,11 @@
 #include "../settings.h"
 #include "../stream/desktop_stream.h"
 #include "../stream/foveator.h"
+#include "../stream/stream_config.h"  // the settings -> config builders (TASK-COMBO-SWEEP-2026-11-21)
 #include "../stream/vr_stream.h"
 #include "../vr/steamvr.h"
 #include "../vr/vr_bridge_host.h"
+#include "rc/link_policy.h"
 #include "rc/platform.h"
 #include "rc/stream_profile.h"
 
@@ -23,21 +25,40 @@ namespace rcs {
 
 namespace {
 
-float QualityScale(const std::string& q) {
-    if (q == "low") return 0.6f;
-    if (q == "medium") return 0.75f;
-    if (q == "ultra") return 1.0f;
-    if (q == "godlike") return 1.2f;
-    return 0.9f;  // high
-}
-
-uint32_t Align(uint32_t v, uint32_t a) { return std::max(a, (v + a / 2) / a * a); }
+// QualityScale and Align moved to stream/stream_config.h (the pure config builders;
+// TASK-COMBO-SWEEP-2026-11-21) so the offline sweep shares the one definition.
 
 // The most the stream takes of SteamVR's resolution, against the headset's panel (the slider on
 // the headset stops there too): Virtual Desktop's highest. Headsets before 1.2.0 send their
 // runtime's recommended size instead, smaller, and get less. A codec or decoder that can't take
 // the size still brings it down below.
 constexpr double kMaxVrScale = 1.5;
+
+// A19 audit #5: readable names for the synced keys in the ownership notice.
+std::string SyncedKeyTitle(const std::string& key) {
+    if (key == rc::synced::kCodec) return "Video codec";
+    if (key == rc::synced::kTenBit) return "10-bit color";
+    if (key == rc::synced::kAdaptiveBitrate) return "Adaptive bitrate";
+    if (key == rc::synced::kDesktopFps) return "Desktop frame rate";
+    if (key == rc::synced::kStreamProfile) return "Quality profile";
+    return key;
+}
+
+// A19 audit #10: one short code for "what's wrong on this PC", for headsets that
+// surface server.info's diagnosis. Derived from the same checks the PC page's
+// health() makes (firewall, USB adapter, SteamVR, the account relay); first match
+// wins; empty = nothing to say, and the key stays off the message.
+std::string DiagnosisCode() {
+    const json fw = App::Get().FirewallJson();
+    if (!fw.value("otherNetworksOpen", true)) return "firewall";
+    if (!fw.value("usbAdapter", std::string()).empty() && !fw.value("usbOpen", true)) return "usb";
+    if (!steamvr::IsRunning()) return "steamvrDown";
+    const json cloud = App::Get().Cloud().StatusJson();
+    if (cloud.value("signedIn", false) && cloud.value("allowRemote", false) &&
+        cloud.value("status", std::string()) == "error")
+        return "remoteDown";
+    return {};
+}
 
 }  // namespace
 
@@ -435,6 +456,10 @@ void ClientSession::HandleMessage(const json& m) {
                                {"bitrateKbps", s.bitrateKbps}, {"framesLost", s.framesLost},
                                {"qp", s.qp}, {"encWidth", s.encWidth}, {"encHeight", s.encHeight},
                                {"gameFps", s.gameFps}, {"encFps", s.encFps}, {"droppedFps", s.droppedFps}};
+                // A19 audit #2: the headset is on the desktop / in a menu, the encoder
+                // is paused and these numbers freeze. The additive key marks them; the
+                // cadence and the fields are unchanged (old headsets ignore the key).
+                if (m_vr->Paused()) stats["vr"]["paused"] = true;
             }
             json desk = json::array();
             for (auto& [id, d] : m_desktop) {
@@ -455,9 +480,20 @@ void ClientSession::HandleMessage(const json& m) {
     if (type == "_serverInfo") return SendServerInfo();
     if (type == rc::msg::kClientInfo) {
         ApplyClientInfo(m);
+        // PLAN-AUTO-TUNE: a streamProfile the headset picked at connect is as
+        // manual as a UI click - auto never fights it (DECISION-TABLE §3.1).
+        // Same condition AdoptHeadsetOwnedSettings below uses for the profile.
+        {
+            const Settings adopted = SettingsStore::Get().Snapshot();
+            std::lock_guard lock(m_mutex);
+            if (!m_ownedSettings.count(rc::synced::kStreamProfile) &&
+                adopted.streamProfile != m_settings.streamProfile)
+                m_autoTune.MarkManual(rc::AutoDim::Profile);
+        }
         // First connect: adopt the headset's profile/bitrate picks before StartVr
         // builds cfg from the PC copy, so the page and the encoder agree from frame 1.
         AdoptHeadsetOwnedSettings();
+        LogAutoCapability();
         SendServerInfo();
         SendMonitors();
         StartVr();
@@ -469,12 +505,22 @@ void ClientSession::HandleMessage(const json& m) {
         ApplyClientInfo(m);
         ClientStreamSettings after = StreamSettings();
         AdoptHeadsetOwnedSettings();
+        // PLAN-AUTO-TUNE: a streamProfile the headset sends with a value the PC
+        // never pushed (or one that differs from its pushed copy) is the
+        // headset's own pick - auto steps aside (DECISION-TABLE §3.1).
+        if (m.contains("settings") && m["settings"].contains(rc::synced::kStreamProfile)) {
+            std::lock_guard lock(m_mutex);
+            const auto it = m_ownedSettings.find(rc::synced::kStreamProfile);
+            if (it == m_ownedSettings.end() || it->second != m["settings"][rc::synced::kStreamProfile])
+                m_autoTune.MarkManual(rc::AutoDim::Profile);
+        }
         const bool profileChanged = before.streamProfile != after.streamProfile;
         const bool videoChanged = before.codec != after.codec || before.tenBit != after.tenBit ||
                                   before.vrQuality != after.vrQuality || before.vrScale != after.vrScale ||
                                   before.matchSteamVr != after.matchSteamVr || before.gazeFoveation != after.gazeFoveation ||
                                   before.eyesTracked != after.eyesTracked ||
                                   before.frameGeneration != after.frameGeneration || before.refreshRate != after.refreshRate ||
+                                  before.debugEncodeScalePct != after.debugEncodeScalePct ||
                                   before.vrBitrateMbps != after.vrBitrateMbps ||
                                   before.adaptiveBitrate != after.adaptiveBitrate;
         const bool desktopChanged = before.codec != after.codec || before.tenBit != after.tenBit ||
@@ -559,8 +605,11 @@ void ClientSession::HandleMessage(const json& m) {
         // reads as no pressure (the ladder is conservative on absent signals), the
         // PC's own dropped-frame average and the handshake's decode-fps hint fill the
         // rest in. A step rebuilds the VR stream on the existing hot path, at most
-        // once per cooldown - never the rebuild storm of 513f150.
-        if (SettingsStore::Get().Snapshot().l7Autoscale) {
+        // once per cooldown - never the rebuild storm of 513f150. PLAN-AUTO-TUNE:
+        // autoTune drives the same ladder while the user has not locked a manual
+        // scale (encodeScalePct > 0 keeps it off - DECISION-TABLE §3.1).
+        const Settings pcAuto = SettingsStore::Get().Snapshot();
+        if (pcAuto.l7Autoscale || (pcAuto.autoTune && pcAuto.encodeScalePct == 0)) {
             rc::L7Autoscale::Config c;
             const double hintMs = m_caps.maxFpsAtMaxRes > 0 ? 1000.0 / m_caps.maxFpsAtMaxRes : 0.0;
             c.decodeBudgetMs = hintMs > 0 ? hintMs * 0.8 : 20.0;
@@ -571,8 +620,13 @@ void ClientSession::HandleMessage(const json& m) {
             if (r.changed)
                 RC_LOGI("L7 autoscale: encode scale -> %d%% (decode %.1f ms vs budget %.1f ms, dropped %.1f fps)",
                         m_autoscale.Pct(), decodeMs, c.decodeBudgetMs, dropped);
-            if (r.changed) OnStreamProfileChanged();
+            if (r.changed) {
+                m_autoTune.NoteLadderStep(rc::NowNs());  // one variable per cooldown window
+                OnStreamProfileChanged();
+            }
         }
+        // PLAN-AUTO-TUNE: the decision layer, dormant unless Settings::autoTune.
+        if (pcAuto.autoTune) RunAutoTune();
         return;
     }
 }
@@ -622,6 +676,8 @@ void ClientSession::ApplyClientInfo(const json& m) {
         m_settings.desktopFps = s.value("desktopFps", m_settings.desktopFps);
         m_settings.adaptiveBitrate = s.value("adaptiveBitrate", m_settings.adaptiveBitrate);
         m_settings.streamProfile = std::clamp(s.value("streamProfile", m_settings.streamProfile), 0, 2);
+        m_settings.debugEncodeScalePct =
+            std::clamp(s.value("debugEncodeScalePct", m_settings.debugEncodeScalePct), 0, 100);  // ROUND20 L17
         // The preference is a PC-side setting for now (rcs::Settings::streamProfile).
         // The headset will send its own choice once its three-way UI exists.
         m_settings.streamAudio = s.value("streamAudio", m_settings.streamAudio);
@@ -631,33 +687,31 @@ void ClientSession::ApplyClientInfo(const json& m) {
             if (!s.contains(key)) continue;
             auto it = m_ownedSettings.find(key);
             if (it == m_ownedSettings.end()) continue;
-            if (it->second != s[key]) m_ownedSettings.erase(it);
+            if (it->second != s[key]) {
+                m_ownedSettings.erase(it);
+                // A19 audit #5: an ownership move used to be silent on both ends - say
+                // so on the existing notice channel instead. The same key stays quiet
+                // for 10 s: one settings batch can move several keys, and repeated
+                // edits must not spam the headset.
+                const int64_t now = rc::NowNs();
+                if (now - m_ownershipNoticeNs[key] > 10'000'000'000LL) {
+                    m_ownershipNoticeNs[key] = now;
+                    SendControl({{"type", rc::msg::kNotice},
+                                 {"level", "info"},
+                                 {"text", SyncedKeyTitle(key) + " is now controlled by the headset."}});
+                }
+            }
         }
     }
 }
 
 rc::VideoCodec ClientSession::ChooseCodec(bool forVr) const {
-    const EncoderCaps& enc = App::Get().Caps();
-    const ClientCaps& dec = m_caps;
-    const bool tenBit = m_settings.tenBit;
-    auto ok = [&](rc::VideoCodec c) {
-        switch (c) {
-            case rc::VideoCodec::H264: return enc.h264 && dec.h264 && !tenBit;
-            case rc::VideoCodec::HEVC: return enc.hevc && dec.hevc && (!tenBit || (enc.hevc10 && dec.hevc10));
-            case rc::VideoCodec::AV1: return enc.av1 && dec.av1 && (!tenBit || (enc.av110 && dec.av110));
-        }
-        return false;
-    };
+    // The pure decision lives in stream_config.h; this method only gathers the
+    // live inputs (TASK-COMBO-SWEEP-2026-11-21).
     std::string pref = m_settings.codec;
     if (pref == "auto") pref = SettingsStore::Get().Snapshot().codec;
-    if (pref == "av1" && ok(rc::VideoCodec::AV1)) return rc::VideoCodec::AV1;
-    if (pref == "h264" && (enc.h264 && dec.h264)) return rc::VideoCodec::H264;
-    if (pref == "hevc" && ok(rc::VideoCodec::HEVC)) return rc::VideoCodec::HEVC;
-    // Auto: HEVC is the best latency/quality trade-off on Quest; AV1 when HEVC is missing.
-    if (ok(rc::VideoCodec::HEVC)) return rc::VideoCodec::HEVC;
-    if (ok(rc::VideoCodec::AV1)) return rc::VideoCodec::AV1;
     (void)forVr;
-    return rc::VideoCodec::H264;
+    return ChooseStreamCodec(App::Get().Caps(), m_caps, m_settings.tenBit, pref);
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +759,7 @@ void ClientSession::SendServerInfo() {
     const EncoderCaps& caps = App::Get().Caps();
     const auto route = audio::ResolveRoute(s.audioDevices);
     const auto svr = steamvr::SteamVrPath();
-    SendControl({
+    json info{
         {"type", rc::msg::kServerInfo},
         {"pcName", s.pcName},
         {"serverId", s.serverId},
@@ -729,7 +783,12 @@ void ClientSession::SendServerInfo() {
         // 可同步的共享设置：只推 PC 仍然拥有的那些项（头显改过的项所有权已收回）。
         // 码率不算：头显已有「跟随 PC」的 0 值语义，双向覆盖会破坏它。
         {"settings", OwnedSettingsJson()},
-    });
+    };
+    // A19 audit #10: an optional additive short code for "what's wrong on this PC"
+    // (see DiagnosisCode). A json key, not a protocol field - protocol.h is untouched
+    // and old headsets ignore keys they don't know. Absent when nothing is wrong.
+    if (const std::string diagnosis = DiagnosisCode(); !diagnosis.empty()) info["diagnosis"] = diagnosis;
+    SendControl(info);
 }
 
 // The synced settings the PC still owns, as a json object for server.info.
@@ -781,6 +840,13 @@ void ClientSession::OnMonitorsChanged() {
 }
 
 void ClientSession::OnSettingsChanged(const json& changed) {
+    // PLAN-AUTO-TUNE: a manual write of a dimension auto owns locks that
+    // dimension until autoTune is turned off and back on (DECISION-TABLE §3.1).
+    // Enabling autoTune itself is the hand-over, so it clears last.
+    if (changed.contains("streamProfile")) m_autoTune.MarkManual(rc::AutoDim::Profile);
+    if (changed.contains("qualityProfileCbr")) m_autoTune.MarkManual(rc::AutoDim::Cbr);
+    if (changed.contains("foveatedEncoding")) m_autoTune.MarkManual(rc::AutoDim::Fovea);
+    if (changed.contains("autoTune") && changed.value("autoTune", false)) m_autoTune.ClearLocks();
     if (changed.contains("desktopInput")) ApplyInputSetting(true);
     if (changed.contains("streamAudio") || changed.contains("micPassthrough") ||
         changed.contains("audioDevices") || changed.contains("playOnPcToo") || changed.contains("switchDefaultAudio"))
@@ -796,8 +862,114 @@ void ClientSession::ResetAutoscale() {
     {
         std::lock_guard lock(m_mutex);
         m_autoscale.Reset();
+        m_autoTune.ResetEpisodes();  // a manual reset starts a fresh episode for auto as well
     }
     RC_LOGI("L7 autoscale: reset to 100% by the user");
+    OnStreamProfileChanged();
+}
+
+// ---------------------------------------------------------------------------
+// PLAN-AUTO-TUNE (P1 + P3). LogAutoCapability: one read-only line per session
+// summarising the device's own capability answers and the PC settings auto may
+// move. RunAutoTune: called from the kStats handler with m_mutex held, only
+// when Settings::autoTune is on - it classifies the tick, logs the signals
+// line on a 30 s cadence, and applies at most one action through the same
+// SettingsStore + OnStreamProfileChanged channel a manual UI write takes.
+// Design authority: AUTO-TUNE-2026-11-19/DECISION-TABLE.md.
+// ---------------------------------------------------------------------------
+
+void ClientSession::LogAutoCapability() {
+    ClientCaps caps;
+    {
+        std::lock_guard lock(m_mutex);
+        caps = m_caps;
+    }
+    const Settings pc = SettingsStore::Get().Snapshot();
+    std::string rates;
+    for (float r : caps.refreshRates) {
+        if (!rates.empty()) rates += '/';
+        rates += std::to_string(int(r + 0.5f));
+    }
+    RC_LOGI("AUTO: capability device=%s serial=%s decoders=h264:%d hevc:%d hevc10:%d av1:%d av110:%d "
+            "maxDecode=%ux%u maxFpsAtMaxRes=%u refresh=[%s] eye=%ux%u | autoTune=%d encodeScalePct=%d "
+            "l7Autoscale=%d streamProfile=%d qualityProfileCbr=%d profileControlsVideo=%d foveatedEncoding=%d "
+            "vrBitrateMbps=%d pcBitrateWins=%d adaptiveBitrate=%d codec=%s tenBit=%d",
+            m_hello.model.c_str(), m_hello.deviceId.c_str(), caps.h264, caps.hevc, caps.hevc10, caps.av1,
+            caps.av110, caps.maxDecodeWidth, caps.maxDecodeHeight, caps.maxFpsAtMaxRes, rates.c_str(),
+            caps.recommendedEyeWidth, caps.recommendedEyeHeight, int(pc.autoTune), pc.encodeScalePct,
+            int(pc.l7Autoscale), pc.streamProfile, int(pc.qualityProfileCbr), int(pc.profileControlsVideo),
+            int(pc.foveatedEncoding), pc.vrBitrateMbps, int(pc.pcBitrateWins), int(pc.adaptiveBitrate),
+            pc.codec.c_str(), int(pc.tenBit));
+}
+
+void ClientSession::RunAutoTune() {
+    const Settings pc = SettingsStore::Get().Snapshot();
+    if (!pc.autoTune) return;
+    const ClientStreamSettings st = m_settings;
+    const auto vs = m_vr ? m_vr->Stats() : VideoSenderStats{};
+
+    // The effective rate StartVr built the stream with (its own validation of
+    // the headset's refresh choice).
+    float nominal = st.refreshRate;
+    if (!m_caps.refreshRates.empty() && std::find(m_caps.refreshRates.begin(), m_caps.refreshRates.end(), nominal) ==
+                                            m_caps.refreshRates.end())
+        nominal = m_caps.refreshRates.back();
+
+    rc::BottleneckSignal sig;
+    sig.decodeMs = m_clientStats.value("decodeMs", -1.0);
+    const double hintMs = m_caps.maxFpsAtMaxRes > 0 ? 1000.0 / m_caps.maxFpsAtMaxRes : 0.0;
+    sig.decodeBudgetMs = hintMs > 0 ? hintMs * 0.8 : 20.0;  // the ladder's own budget formula
+    sig.droppedFps = m_vr ? double(vs.droppedFps) : -1.0;
+    sig.gameFps = double(vs.gameFps);
+    sig.nominalFps = double(nominal);
+    sig.qp = double(vs.qp);
+    sig.mbps = vs.mbps;
+    sig.ceilingKbps = vs.bitrateKbps;
+    sig.queueMs = vs.queueMs;
+    sig.loss = vs.lossAvg;
+
+    rc::AutoTuneInput in = BuildAutoTuneInput(pc, st, m_slowPath,
+                                              m_ownedSettings.count(rc::synced::kStreamProfile) != 0);
+
+    const int64_t now = rc::NowNs();
+    const auto r = m_autoTune.Update(sig, in, now);
+
+    // P1: the 30 s signals line (DECISION-TABLE §4) - autoTune only, so an
+    // opted-out install sees nothing new beyond the one capability line.
+    if (!m_autoSignalLogNs || now - m_autoSignalLogNs >= 30'000'000'000LL) {
+        m_autoSignalLogNs = now;
+        RC_LOGI("AUTO: signals %s fps=%.0f game=%.0f qp=%.1f wire=%.1f ceiling=%u queue=%.0f loss=%.1f%% "
+                "decode=%.1f/%.1f ms dropped=%.1f",
+                rc::BottleneckName(r.cls), vs.fps, vs.gameFps, vs.qp, vs.mbps, vs.bitrateKbps, vs.queueMs,
+                vs.lossAvg * 100.0, sig.decodeMs, sig.decodeBudgetMs, vs.droppedFps);
+    }
+
+    if (r.action == rc::AutoAction::None) return;
+    if (r.action == rc::AutoAction::LogOnly) {
+        RC_LOGI("AUTO: %s -> %s", rc::BottleneckName(r.cls), r.reason);
+        return;
+    }
+    const char* dimName = r.action == rc::AutoAction::CbrOff    ? "qualityProfileCbr=false"
+                          : r.action == rc::AutoAction::FoveaOn ? "foveatedEncoding=true"
+                                                                : "streamProfile down";
+    RC_LOGI("AUTO: %s (qp %.1f, wire %.1f of %u kbps, queue %.0f ms, loss %.1f%%) -> %s (%s)",
+            rc::BottleneckName(r.cls), sig.qp, sig.mbps, sig.ceilingKbps, sig.queueMs, sig.loss * 100.0, dimName,
+            r.reason);
+    switch (r.action) {
+        case rc::AutoAction::CbrOff:
+            SettingsStore::Get().Update([](Settings& s) { s.qualityProfileCbr = false; });
+            break;
+        case rc::AutoAction::FoveaOn:
+            SettingsStore::Get().Update([](Settings& s) { s.foveatedEncoding = true; });
+            break;
+        case rc::AutoAction::ProfileDown:
+            SettingsStore::Get().Update([&](Settings& s) { s.streamProfile = r.profileId; });
+            break;
+        default:
+            return;
+    }
+    // The user's own channel: the same rebuild path a manual settings write
+    // takes (App::ApplySettingSideEffects -> OnStreamProfileChanged).
     OnStreamProfileChanged();
 }
 
@@ -841,45 +1013,17 @@ void ClientSession::StartDesktop(const json& m) {
         if (wanted.empty() || std::find(wanted.begin(), wanted.end(), mon.id) != wanted.end()) selected.push_back(&mon);
     if (selected.empty()) return;
 
-    float fps = st.desktopFps > 0 ? float(st.desktopFps) : (pc.desktopFps > 0 ? float(pc.desktopFps) : st.refreshRate);
-    fps = std::clamp(fps, 30.f, 120.f);
-    const int totalMbps = st.desktopBitrateMbps > 0 ? st.desktopBitrateMbps : pc.desktopBitrateMbps;
     double totalPixels = 0;
     for (auto* mon : selected) totalPixels += double(mon->width) * mon->height;
-
-    const uint32_t maxW = std::min<uint32_t>(caps.maxDecodeWidth, codec == rc::VideoCodec::H264 ? 4096 : 8192);
-    const uint32_t maxH = std::min<uint32_t>(caps.maxDecodeHeight, codec == rc::VideoCodec::H264 ? 4096 : 8192);
 
     json streams = json::array();
     std::map<uint8_t, std::unique_ptr<DesktopStream>> created;
     for (auto* mon : selected) {
-        double w = mon->width, h = mon->height;
-        double scale = 1.0;
-        if (pc.desktopMaxHeight > 0 && h > pc.desktopMaxHeight) scale = pc.desktopMaxHeight / h;
-        scale = std::min({scale, maxW / w, maxH / h});
-        DesktopStreamConfig cfg;
-        cfg.cheapEncode = m_vr != nullptr;  // VR in flight: the desktop skips two-pass
-        cfg.codec = codec;
-        cfg.tenBit = st.tenBit && codec != rc::VideoCodec::H264;
-        cfg.width = Align(uint32_t(w * scale), 2);
-        cfg.height = Align(uint32_t(h * scale), 2);
-        cfg.fps = fps;
-        cfg.bitrateKbps = uint32_t(totalMbps * 1000.0 * (double(mon->width) * mon->height / totalPixels));
-        cfg.bitrateKbps = std::max<uint32_t>(cfg.bitrateKbps, 5000);
-        // Internet paths lose packets and have no retransmissions: recover more of them locally.
-        cfg.fecPercent = m_slowPath ? std::max(pc.fecPercent, 12) : pc.fecPercent;
-        // The desktop stream keeps the legacy pacing for now (PLAN-pacing-fix §7: it
-        // was not part of the diagnosed lock). NOTE: the send thread back-pressures the
-        // capacity-1 send slot when the pacer is slower than the encode - the old claim
-        // that "encoding overlaps the send for free" only holds while the send is faster.
-        cfg.pace = true;
-        cfg.adaptiveQuant = pc.adaptiveQuantization;
-        // Over the internet a fixed bitrate only fills queues or loses frames: always adapt.
-        cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate);
-        cfg.profile = rc::ProfileFromId(pc.streamProfile);
-        // Over the internet the upload is often far below the LAN bitrate: start low and
-        // let the bitrate control find what the path carries, instead of filling queues.
-        if (m_slowPath) cfg.startBitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, std::max<uint32_t>(3000, 8000 / uint32_t(selected.size())));
+        // The settings -> config synthesis is a pure function now (stream_config.h,
+        // TASK-COMBO-SWEEP-2026-11-21); the fps / bitrate / decode-limit fill moved
+        // there VERBATIM. Monitor selection, stream ids and creation stay here.
+        const DesktopStreamConfig cfg = BuildDesktopStreamConfig(pc, st, codec, m_slowPath, m_vr != nullptr, *mon,
+                                                                 totalPixels, int(selected.size()), caps);
         const uint8_t streamId = uint8_t(rc::kFirstMonitorStreamId + mon->index);
         if (streamId >= rc::kMaxStreams) continue;
         auto ds = std::make_unique<DesktopStream>(m_connection.get(), streamId, *mon, cfg);
@@ -985,6 +1129,12 @@ void ClientSession::StartVr() {
                 "stream requests %.0f fps - consider a lower resolution or frame rate",
                 caps.maxFpsAtMaxRes, rate);
     }
+    // VD-OFFLINE (TASK 2026-11-20 §2.4): an advice line next to the hint - what
+    // the ladder would suggest as an encode rate for this device. Advice only:
+    // nothing here changes the rate (same deliberate no-op as the warning above).
+    if (const float suggest = rc::SuggestStartFps(rate, int(caps.maxFpsAtMaxRes)))
+        RC_LOGI("Link policy: device reports about %u fps at large sizes - suggest encoding at %.0f fps instead of %.0f (advice only, not applied this build)",
+                caps.maxFpsAtMaxRes, suggest, rate);
     dc.ipd = caps.ipd;
     std::memcpy(dc.fovTan, caps.fovTan, sizeof(dc.fovTan));
     strncpy_s(dc.headsetModel, m_hello.model.empty() ? "Quest" : m_hello.model.c_str(), _TRUNCATE);
@@ -998,71 +1148,32 @@ void ClientSession::StartVr() {
     const bool needsRestart = bridge.Configure(dc);
     bridge.SetHeadsetConnected(true);
 
-    VrStreamConfig cfg;
-    cfg.codec = codec;
-    cfg.tenBit = st.tenBit && codec != rc::VideoCodec::H264;
-    cfg.eyeWidth = dc.eyeWidth;
-    cfg.eyeHeight = dc.eyeHeight;
-    cfg.fps = rate;
-    cfg.bitrateKbps = uint32_t(rcs::EffectiveVrBitrate(pc.vrBitrateMbps, st.vrBitrateMbps, pc.pcBitrateWins) * 1000);
-    if (m_slowPath) cfg.bitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 60000);
-    cfg.fecPercent = m_slowPath ? std::max(pc.fecPercent, 12) : pc.fecPercent;
-    // PLAN-pacing-fix WP2b: the legacy "pace = true" made the pacer follow the guard's
-    // cap, which self-locked (cap down -> pacer slower -> one frame stretched -> the
-    // capacity-1 send slot back-pressures the encoder -> the queue climbs -> cap down;
-    // the real device's downlink hit 76.7 ms). The user's ceiling drives the pacer now,
-    // and a frame leaves within its own frame period. A remote path keeps the legacy.
-    if (m_slowPath || pc.videoPacingMode == 2) cfg.pacingMode = 2;
-    else if (pc.videoPacingMode == 1) cfg.pacingMode = 1;
-    else cfg.pacingMode = 3;  // burst: the LAN default
-    cfg.pace = cfg.pacingMode != 1;
-    cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate);  // see above
-    cfg.profile = rc::ProfileFromId(pc.streamProfile);
-    // ROUND18 L2: the user's encode scale overrides the profile's value (both 1.0
-    // today). 0 = follow the profile. The percentage is stored as an int for the UI.
-    cfg.encodeScale = pc.encodeScalePct > 0 ? rc::ClampEncodeScale(pc.encodeScalePct / 100.0f)
-                                            : rc::ProfileParams(cfg.profile).encodeScale;
-    // ROUND19 T3: the autoscale ladder multiplies the base above (never raises it);
-    // the level survives until the user's manual reset. The frame size itself still
-    // comes out of ScaledEncodeSize, the one formula shared with the foveation config.
+    int autoscalePct = 100;
     if (pc.l7Autoscale) {
         std::lock_guard lock(m_mutex);
-        cfg.encodeScale = rc::ClampEncodeScale(cfg.encodeScale * m_autoscale.Pct() / 100.0f);
+        autoscalePct = m_autoscale.Pct();
     }
-    if (m_slowPath) cfg.startBitrateKbps = std::min<uint32_t>(cfg.bitrateKbps, 12000);
-    // QP map is the user's own switch, just like two-pass. A profile no longer
-    // turns it on behind their back. The encoder runs it only when the headset's
-    // geometric squeeze is off (vr_stream.cpp gates it on !job.foveated) - the two
-    // cannot share a frame - so the page says so when that squeeze is on.
-    cfg.foveated = pc.foveatedEncoding;
-    cfg.adaptiveQuant = pc.adaptiveQuantization;
-    // Two-pass is the user's own switch, never forced by a profile. The Best-picture
-    // profile used to turn it on by itself (and the page greyed it out), which
-    // surprised users who had deliberately left it off; the user decides.
-    cfg.twoPass = pc.twoPassEncoding;
-    // CBR is the quality profile's "spend exactly this" mode; opt-in, quality only.
-    cfg.cappedVbr = !rcs::QualityProfileCbr(pc.qualityProfileCbr, pc.profileControlsVideo && !match && !m_slowPath,
-                                            cfg.profile == rc::StreamProfile::Quality);
-    cfg.motionField = st.frameGeneration;
-    // ROUND18 L2-FIX2: the real encoded PER-EYE size after encodeScale. One value
-    // feeds the foveation metadata, the coded-size hint and the log, so the headset
-    // can never undo foveation with a different density than the encoder used.
-    // Start from the plain (un-foveated) base; the foveated block overrides it.
-    uint32_t codedEyeW = rc::ScaledEncodeSize(cfg.eyeWidth * 2, cfg.encodeScale) / 2;
-    uint32_t codedEyeH = rc::ScaledEncodeSize(cfg.eyeHeight, cfg.encodeScale);
+    // The settings -> config synthesis is a pure function now (stream_config.h,
+    // TASK-COMBO-SWEEP-2026-11-21); this method keeps the bridge, the logs and the
+    // wire messages. The block below was moved there VERBATIM. The guarded wrapper
+    // (TASK-CAPS-GUARD) moves an H264 stream whose full frame exceeds NVENC's 4096 px
+    // width onto HEVC instead of an encoder that could never open; the session owns
+    // the log line, the header stays log-free.
+    const VrStreamBuild vrBuild = BuildVrStreamConfigGuarded(pc, st, codec, m_slowPath, match, autoscalePct,
+                                                            dc.eyeWidth, dc.eyeHeight, rate, App::Get().Caps(), caps);
+    if (vrBuild.h264WidthFallback) {
+        RC_LOGW("H264 unsupported at %upx, falling back to HEVC", vrBuild.h264RejectedWidth);
+        // A19 audit #4: the headset saw the codec change in its stats but never the
+        // reason (the PC page's #codecHint only covers the PC). Same notice channel
+        // as the restart-SteamVR message below.
+        SendControl({{"type", rc::msg::kNotice},
+                     {"level", "warning"},
+                     {"text", "H.264 does not support this picture size; the stream switched to HEVC."}});
+    }
+    VrStreamConfig cfg = vrBuild.cfg;
+    const uint32_t codedEyeW = vrBuild.codedEyeWidth;
+    const uint32_t codedEyeH = vrBuild.codedEyeHeight;
     if (st.gazeFoveation && cfg.encodeScale >= 1.0f) {
-        cfg.foveaSize = st.eyesTracked ? Foveator::kFoveaSize : Foveator::kFixedFoveaSize;
-        // When the user lets the profiles drive video settings, each one floors the
-        // full-density centre at its own share (latency 0.6, balanced 0.7, quality 0.8)
-        // and only ever raises; matched-SteamVR sizes and the slow internet path pick
-        // their own. This runs BEFORE the EncodedSize calls, so the sizes encoded - and
-        // the share sent to the headset - come from the same value.
-        cfg.foveaSize = QualityProfileFoveaFor(cfg.foveaSize, pc.profileControlsVideo && !match && !m_slowPath,
-                                               int(cfg.profile));
-        cfg.foveatedEyeWidth = Foveator::EncodedSize(cfg.eyeWidth, cfg.foveaSize);
-        cfg.foveatedEyeHeight = Foveator::EncodedSize(cfg.eyeHeight, cfg.foveaSize);
-        codedEyeW = rc::ScaledEncodeSize(cfg.foveatedEyeWidth * 2, cfg.encodeScale) / 2;
-        codedEyeH = rc::ScaledEncodeSize(cfg.foveatedEyeHeight, cfg.encodeScale);
         RC_LOGI("VR stream: foveated %s, encoding %ux%u per eye (scaled from %ux%u)",
                 st.eyesTracked ? "where the eyes look" : "at the lens centre",
                 codedEyeW, codedEyeH, cfg.foveatedEyeWidth, cfg.foveatedEyeHeight);
@@ -1292,6 +1403,9 @@ json ClientSession::StatusJson() {
     // The headset's geometric squeeze and the PC's QP map cannot share a frame,
     // so the page greys the QP map switch out when this is on.
     j["headsetGazeFoveation"] = m_settings.gazeFoveation;
+    // A19 audit #14 (the read-only tier, no control): frame generation is owned by
+    // the headset - the page shows its state next to the other headset-owned picks.
+    j["headsetFrameGeneration"] = m_settings.frameGeneration;
     // Read-only hints so the page can grey out CBR, which the encoder ignores when
     // the headset follows SteamVR's resolution or the link is remote/slow.
     j["matchSteamVr"] = m_settings.matchSteamVr;
@@ -1307,6 +1421,10 @@ json ClientSession::StatusJson() {
                    {"refreshRate", c.fps}, {"latencyMs", s.clientLatencyMs}, {"decodeMs", s.clientDecodeMs},
                    {"qp", s.qp}, {"encWidth", s.encWidth}, {"encHeight", s.encHeight},
                    {"gameFps", s.gameFps}, {"encFps", s.encFps}, {"droppedFps", s.droppedFps}};
+        // A19 audit #2: paused stream (headset on the desktop / in a menu) - the
+        // numbers above froze. Additive key; the page stops the poor counts and the
+        // trouble card while it is set, and reads the numbers as live again without it.
+        if (m_vr->Paused()) j["vr"]["paused"] = true;
         // ROUND19 T3: read-only ladder level for the page (null when the switch is off).
         // No lock here: StatusJson already holds m_mutex (taken at the top), and re-locking
         // it on the same thread throws resource_deadlock_would_occur - the streamer died

@@ -180,6 +180,20 @@ bool VideoDecoder::Configure(const std::vector<uint8_t>& keyframe) {
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_OPERATING_RATE, int32_t(m_fps * 2 + 0.5f));
     AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-low-latency.enable", 1);
     AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-picture-order.enable", 1);
+    // VD-OFFLINE (TASK 2026-11-20 §2.3): three more Qualcomm keys that cannot
+    // change sync or parse semantics. Keys a decoder doesn't know are ignored,
+    // so a non-Qualcomm codec simply no-ops these. Deliberately NOT set here:
+    //   - vendor.qti-ext-output-fence.enable / .fence_type: changes the decoder's
+    //     output synchronisation semantics; we don't consume fences, so this
+    //     needs a real device before it may be added.
+    //   - vendor.qti-ext-extradata-enable.types: interacts with the out-of-band
+    //     csd-0/csd-1 parameter sets below; needs a real device first.
+    //   - operating-rate stays twice the stream rate (see the comment above:
+    //     the maximum books the whole decoder budget on Quest 2 and starves the
+    //     second stream).
+    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-info-misr.disable", 1);
+    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-instant-decode.enable", 1);
+    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-error-correction.conceal", 1);
 
     // Parameter sets as codec-specific data (they are also repeated inline).
     if (m_codec != rc::VideoCodec::AV1) {
@@ -266,16 +280,20 @@ void VideoDecoder::OutputLoop() {
         const ssize_t index = AMediaCodec_dequeueOutputBuffer(m_codecHandle, &info, 10000);
         if (index >= 0) {
             const int64_t now = rc::NowNs();
+            double frameDecodeMs = -1;
             {
                 std::lock_guard lock(m_statsMutex);
                 auto it = m_inputTimes.find(info.presentationTimeUs);
                 if (it != m_inputTimes.end()) {
-                    m_decodeMsSum += rc::NsToMs(now - it->second);
-                    m_decodeMsMax = std::max(m_decodeMsMax, rc::NsToMs(now - it->second));
+                    frameDecodeMs = rc::NsToMs(now - it->second);
+                    m_decodeMsSum += frameDecodeMs;
+                    m_decodeMsMax = std::max(m_decodeMsMax, frameDecodeMs);
                     m_decodeCount++;
                     m_inputTimes.erase(it);
                 }
             }
+            // R3: the per-frame cost feeds the diagnostics quantiles (outside the stats lock).
+            if (frameDecodeMs >= 0 && m_decodeSampleSink) m_decodeSampleSink(frameDecodeMs);
             {
                 std::lock_guard lock(m_mutex);
                 auto it = m_infos.find(info.presentationTimeUs);

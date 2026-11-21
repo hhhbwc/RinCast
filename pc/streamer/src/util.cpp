@@ -193,6 +193,28 @@ int RunElevated(const std::wstring& exe, const std::wstring& args, bool wait) {
     return int(code);
 }
 
+bool IsElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION el{};
+    DWORD size = 0;
+    const bool ok = GetTokenInformation(token, TokenElevation, &el, sizeof(el), &size);
+    CloseHandle(token);
+    return ok && el.TokenIsElevated;
+}
+
+bool RestartElevated() {
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return false;
+    SHELLEXECUTEINFOW sei{sizeof(sei)};
+    sei.fMask = SEE_MASK_NO_CONSOLE | SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe;
+    sei.lpParameters = L"--elevated-handoff";
+    sei.nShow = SW_SHOWNORMAL;
+    return ShellExecuteExW(&sei);
+}
+
 int RunHidden(const std::wstring& commandLine, DWORD timeoutMs) {
     STARTUPINFOW si{sizeof(si)};
     si.dwFlags = STARTF_USESHOWWINDOW;

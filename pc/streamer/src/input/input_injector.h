@@ -20,6 +20,8 @@ void Key(unsigned short vk, bool down);
 void Text(const std::wstring& text);
 // Releases every button/key we may have left pressed (on disconnect).
 void ReleaseAll();
+// True when the last SendInput was refused (UIPI: higher-privilege window in front).
+bool InputBlocked();
 
 }  // namespace input
 
