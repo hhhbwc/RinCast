@@ -95,6 +95,14 @@ constexpr bool PlausibleEyeSize(uint32_t px) { return px >= 256u && px <= 4096u;
 constexpr bool PlausibleDecodeSize(uint32_t px) { return px >= 512u && px <= 16384u; }
 constexpr bool PlausibleIpd(float meters) { return meters >= 0.03f && meters <= 0.09f; }
 constexpr bool PlausibleFovTangent(float t) { return t > -10.0f && t < 10.0f; }  // NaN fails both
+// A61: one eye's tangent halves are one projection, not four independent numbers. Each
+// half can be in range while the pair cannot be used: (0,0) and (-1,1) pass the
+// per-component check and make u = a/(a+b) a 0/0. Headsets send positive tan halves
+// (headset app: tan of each half-angle), so a non-positive half means the report is not
+// one we understand; the sum floor keeps u meaningful for absurdly narrow eyes.
+constexpr bool PlausibleFovPair(float a, float b) {
+    return PlausibleFovTangent(a) && PlausibleFovTangent(b) && a > 0.0f && b > 0.0f && a + b > 0.05f;
+}
 
 constexpr StreamProfileParams ProfileParams(StreamProfile p) {
     switch (p) {

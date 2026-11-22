@@ -49,7 +49,7 @@ class VrBridgeHost {
         std::lock_guard lock(m_mutex);
         return m_textures[slot];
     }
-    uint32_t TextureGeneration() const { return m_generation; }
+    uint32_t TextureGeneration() const { return m_generation.load(std::memory_order_relaxed); }
 
     rcvr::ProducerKind ActiveProducer() const;
     std::string ApplicationName() const;
@@ -72,7 +72,7 @@ class VrBridgeHost {
     GpuInfo m_gpu;
     ComPtr<ID3D11Texture2D> m_textures[rcvr::kFrameSlots];
     HANDLE m_textureHandles[rcvr::kFrameSlots] = {};
-    uint32_t m_generation = 0;
+    std::atomic<uint32_t> m_generation{0};
     bool m_hasConfig = false;
 
     std::thread m_thread;

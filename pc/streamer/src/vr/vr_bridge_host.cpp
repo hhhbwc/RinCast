@@ -78,7 +78,7 @@ void VrBridgeHost::Stop() {
 bool VrBridgeHost::CreateTextures(uint32_t width, uint32_t height) {
     ComPtr<ID3D11Device1> device1;
     m_device.As(&device1);
-    m_generation++;
+    const uint32_t generation = m_generation.fetch_add(1, std::memory_order_relaxed) + 1;
     for (int i = 0; i < rcvr::kFrameSlots; i++) {
         if (m_textureHandles[i]) CloseHandle(m_textureHandles[i]);
         m_textureHandles[i] = nullptr;
@@ -100,7 +100,7 @@ bool VrBridgeHost::CreateTextures(uint32_t width, uint32_t height) {
             return false;
         }
         wchar_t name[64];
-        swprintf_s(name, L"Local\\RinCastVRTex.%u.%lu.%d", m_generation, GetCurrentProcessId(), i);
+        swprintf_s(name, L"Local\\RinCastVRTex.%u.%lu.%d", generation, GetCurrentProcessId(), i);
         ComPtr<IDXGIResource1> res;
         m_textures[i].As(&res);
         hr = res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, name,

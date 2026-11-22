@@ -669,11 +669,15 @@ void ClientSession::ApplyClientInfo(const json& m) {
         if (const auto fov = d.find("fov"); fov != d.end() && fov->is_array() && fov->size() == 2 &&
                                          (*fov)[0].is_array() && (*fov)[0].size() == 4 &&
                                          (*fov)[1].is_array() && (*fov)[1].size() == 4) {
+            float t[2][4];
             for (int e = 0; e < 2; e++)
-                for (int k = 0; k < 4; k++) {
-                    const float v = FloatAt((*fov)[e], size_t(k), m_caps.fovTan[e][k]);
-                    if (rc::PlausibleFovTangent(v)) m_caps.fovTan[e][k] = v;
-                }
+                for (int k = 0; k < 4; k++) t[e][k] = FloatAt((*fov)[e], size_t(k), m_caps.fovTan[e][k]);
+            // A61: two in-range halves can still sum to zero (0,0 / -1,1); such a pair
+            // collapses SteamVR's frustum and makes the fovea placement divide by zero.
+            // A block we cannot use keeps the previous one whole.
+            if (rc::PlausibleFovPair(t[0][0], t[0][1]) && rc::PlausibleFovPair(t[0][2], t[0][3]) &&
+                rc::PlausibleFovPair(t[1][0], t[1][1]) && rc::PlausibleFovPair(t[1][2], t[1][3]))
+                std::memcpy(m_caps.fovTan, t, sizeof(t));
         }
     }
     if (const auto decoders = m.find("decoders"); decoders != m.end() && decoders->is_object()) {

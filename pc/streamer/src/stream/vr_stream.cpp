@@ -11,6 +11,7 @@
 
 #include "foveator.h"
 #include "motion_estimator.h"
+#include "rc/fovea_placement.h"
 #include "rc/motion_field.h"
 #include "rc/stale_flush.h"
 
@@ -98,25 +99,13 @@ void VrStream::PlaceFovea(const float fovTan[2][4], float start[2][2]) {
         at = m_gazeNs;
     }
     const bool fresh = at && rc::NowNs() - at < 250'000'000LL;
-    const float F = m_config.foveaSize;
     for (int eye = 0; eye < 2; eye++) {
-        const float* t = fovTan[eye];  // left, right, up, down
         // The eye's own gaze, or the other one's while it blinks.
         const int from = (g.flags & (1 << eye)) ? eye : (g.flags & (1 << (1 - eye))) ? 1 - eye : -1;
-        float u = t[0] / (t[0] + t[1]), v = t[2] / (t[2] + t[3]);  // straight ahead
-        if (fresh && from >= 0 && g.gaze[from][2] < -0.2f) {
-            const float* d = g.gaze[from];
-            u = (d[0] / -d[2] + t[0]) / (t[0] + t[1]);
-            v = (t[2] - d[1] / -d[2]) / (t[2] + t[3]);
-        }
-        const float x = std::clamp(u - F / 2, 0.f, 1.f - F), y = std::clamp(v - F / 2, 0.f, 1.f - F);
-        float* s = m_foveaStart[eye];
-        if (!m_foveaPlaced || std::fabs(x - s[0]) > 0.04f || std::fabs(y - s[1]) > 0.04f) {
-            s[0] = x;
-            s[1] = y;
-        }
-        start[eye][0] = s[0];
-        start[eye][1] = s[1];
+        const float* gaze = fresh && from >= 0 ? g.gaze[from] : nullptr;
+        rc::FoveaSquare(fovTan[eye], gaze, m_config.foveaSize, m_foveaPlaced, m_foveaStart[eye]);
+        start[eye][0] = m_foveaStart[eye][0];
+        start[eye][1] = m_foveaStart[eye][1];
     }
     m_foveaPlaced = true;
 }
@@ -317,6 +306,20 @@ void VrStream::Run() {
     std::vector<float> motionField;
     // A18: the quantized grid lives on in m_motionGridPrev (the hysteresis state) instead of
     // a local, per the card: the cross-frame state belongs to VrStream.
+    uint32_t lastTextureGeneration = m_bridge->TextureGeneration();
+    // A61: a producer that restarted starts its frame counter over (driver.cpp resets it
+    // per vrserver process) and the textures may be a new generation. Everything derived
+    // from the old producer's frames has to go with it - above all lastFrameIndex, which
+    // otherwise rejects every new frame as stale for the rest of the session.
+    const auto resetProducerCaches = [&] {
+        lastFrameIndex = 0;
+        m_diagArrivalPrevNs = 0;
+        motionViews.clear();  // the SRVs pin the previous generation's textures
+        motion.Reset();
+        m_motionGridPrev.clear();
+        motionPose = rcvr::BridgePose{};
+        motionPreviousTimestamp = 0;
+    };
 
     m_onState("waiting", "", "");
     bool firstFrameLogged = false;
@@ -327,6 +330,13 @@ void VrStream::Run() {
         // Not before the encoder is about to want it; the frame waits in the bridge, the game with it.
         if (streaming && !m_paused) WaitForEncoder(convertAvgNs);
         const int64_t now = rc::NowNs();
+        // A61: dead-producer recovery and a resolution change both hand out new textures.
+        if (const uint32_t generation = m_bridge->TextureGeneration(); generation != lastTextureGeneration) {
+            RC_LOGI("VR: bridge textures recreated (generation %u -> %u), restarting frame accounting",
+                    lastTextureGeneration, generation);
+            lastTextureGeneration = generation;
+            resetProducerCaches();
+        }
         // No picture: say every 10 s what the bridge looks like, so a log shows whether the
         // driver never sent a frame or frames arrive and get dropped here.
         if (!streaming && now - lastWaitReportNs > 10'000'000'000LL) {
@@ -360,8 +370,14 @@ void VrStream::Run() {
         const int slot = int(latest & 0xFF);
         if (slot >= rcvr::kFrameSlots) continue;
         rcvr::FrameSlot& fs = shared->slots[slot];
-        if (fs.frameIndex <= lastFrameIndex && lastFrameIndex != 0) continue;
         if (InterlockedCompareExchange(&fs.state, rcvr::kSlotReading, rcvr::kSlotReady) != rcvr::kSlotReady) continue;
+        // A61: a restarted producer's counter runs backwards. Read only after a successful
+        // CAS: before it, the slot's index is whatever the last wake already consumed.
+        if (lastFrameIndex != 0 && fs.frameIndex <= lastFrameIndex) {
+            RC_LOGI("VR: producer restarted (frame %llu -> %llu), restarting frame accounting",
+                    (unsigned long long)lastFrameIndex, (unsigned long long)fs.frameIndex);
+            resetProducerCaches();
+        }
         // Frames the game finished that were replaced before this one was taken.
         if (lastFrameIndex && !m_paused) {
             const uint64_t given = fs.frameIndex - lastFrameIndex;

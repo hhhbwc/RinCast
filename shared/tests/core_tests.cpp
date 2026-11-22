@@ -54,6 +54,7 @@
 // A26 (TASK-BACKLOG-FLUSH-2026-11-22): the sender-side stale-frame flush's pure
 // decision logic (expiry, debt wipe, keyframe/log throttles), tested below.
 #include "rc/stale_flush.h"
+#include "rc/fovea_placement.h"
 #include "rc/stream_profile.h"
 #include "rc/video_transport.h"
 #include "rc/wire_ceiling.h"
@@ -1818,6 +1819,69 @@ static void TestStreamProfile() {
         CHECK(run.lastRate >= 75000 && run.lastRate <= 104000);
         CHECK(run.floorHits == 0);
     }
+}
+
+static void TestFoveaPlacement() {
+    CHECK(rc::PlausibleFovPair(1.376f, 0.839f));
+    CHECK(!rc::PlausibleFovPair(0.0f, 0.0f));
+    CHECK(!rc::PlausibleFovPair(-1.0f, 1.0f));
+    CHECK(!rc::PlausibleFovPair(-1.0f, 3.0f));
+    CHECK(!rc::PlausibleFovPair(0.025f, 0.025f));
+    CHECK(rc::PlausibleFovPair(0.03f, 0.03f));
+    CHECK(!rc::PlausibleFovPair(10.0f, 1.0f));
+    CHECK(!rc::PlausibleFovPair(std::numeric_limits<float>::quiet_NaN(), 1.0f));
+    CHECK(!rc::PlausibleFovPair(std::numeric_limits<float>::infinity(), 1.0f));
+
+    const float F = 0.45f;
+    const float normal[4] = {1.376f, 0.839f, 0.966f, 1.191f};
+    const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float flat[4] = {-1.0f, 1.0f, 0.966f, 1.191f};
+    const float gaze[3] = {0.3f, 0.0f, -1.0f};
+    const float nanGaze[3] = {std::numeric_limits<float>::quiet_NaN(), 0.0f, -1.0f};
+    float s[2];
+
+    rc::FoveaSquare(normal, nullptr, F, false, s);
+    CHECK(std::fabs(s[0] - 0.3963f) < 1e-3f);
+    CHECK(std::fabs(s[1] - 0.2229f) < 1e-3f);
+
+    rc::FoveaSquare(zero, nullptr, F, false, s);
+    CHECK(std::fabs(s[0] - 0.275f) < 1e-4f);
+    CHECK(std::fabs(s[1] - 0.275f) < 1e-4f);
+
+    rc::FoveaSquare(flat, nullptr, F, false, s);
+    CHECK(std::fabs(s[0] - 0.275f) < 1e-4f);
+    CHECK(std::fabs(s[1] - 0.275f) < 1e-4f);
+
+    rc::FoveaSquare(normal, gaze, F, false, s);
+    CHECK(std::fabs(s[0] - 0.532f) < 1e-3f);
+    CHECK(s[0] < 1.0f - F);
+
+    rc::FoveaSquare(normal, nanGaze, F, false, s);
+    CHECK(std::fabs(s[0] - 0.275f) < 1e-4f);
+    CHECK(std::fabs(s[1] - 0.2229f) < 1e-3f);
+
+    s[0] = 0.4f;
+    s[1] = 0.2229f;
+    rc::FoveaSquare(normal, nullptr, F, true, s);
+    CHECK(s[0] == 0.4f);
+    CHECK(s[1] == 0.2229f);
+
+    s[0] = 0.42f;
+    s[1] = 0.2229f;
+    rc::FoveaSquare(normal, nullptr, F, true, s);
+    CHECK(s[0] == 0.42f);
+
+    s[0] = 0.2f;
+    s[1] = 0.2f;
+    rc::FoveaSquare(normal, nullptr, F, true, s);
+    CHECK(std::fabs(s[0] - 0.3963f) < 1e-3f);
+    CHECK(std::fabs(s[1] - 0.2229f) < 1e-3f);
+
+    s[0] = std::numeric_limits<float>::quiet_NaN();
+    s[1] = std::numeric_limits<float>::quiet_NaN();
+    rc::FoveaSquare(normal, nullptr, F, true, s);
+    CHECK(std::isfinite(s[0]));
+    CHECK(std::isfinite(s[1]));
 }
 
 static void TestQueueGuard() {
@@ -5722,6 +5786,7 @@ int main() {
     TestH264CapsFallback();  // TASK-CAPS-GUARD: the H264 width-cap fallback cases
     TestFecWireBillingLoopback();
     TestPaceBaseKbps();  // A33 (TASK-PACE-FOLLOW-2026-11-22): the burst pacer's billing base
+    TestFoveaPlacement();  // A61: the fovea square's placement rule
     TestFpsLadder();
     TestFillFloorByTier();
     TestPercentile();  // TASK-DEC-PERCENTILE-2026-11-20 §1.2
