@@ -102,10 +102,17 @@ class MfEncoder final : public VideoEncoder {
         }
         m_transform.As(&m_events);
         m_transform.As(&m_codecApi);
+        if (!m_events) {
+            RC_LOGE("MF: the %s encoder gives no event generator (synchronous MFT)", CodecName(config.codec));
+            return false;
+        }
 
         UINT token = 0;
         if (FAILED(MFCreateDXGIDeviceManager(&token, &m_deviceManager))) return false;
-        m_deviceManager->ResetDevice(device, token);
+        if (FAILED(m_deviceManager->ResetDevice(device, token))) {
+            RC_LOGE("MF: the DXGI device manager rejected the device");
+            return false;
+        }
         if (FAILED(m_transform->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, ULONG_PTR(m_deviceManager.Get())))) {
             RC_LOGE("MF: encoder rejected D3D manager");
             return false;
@@ -217,7 +224,17 @@ class MfEncoder final : public VideoEncoder {
 
     bool PumpEvent(EncodedFrame& out) {
         ComPtr<IMFMediaEvent> event;
-        if (FAILED(m_events->GetEvent(0, &event))) return false;
+        // The stream thread must also notice a quit or a dead driver: an unbounded wait here
+        // froze the encoder thread, and with it the Stop() join.
+        for (int waited = 0;; waited++) {
+            const HRESULT hr = m_events->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+            if (hr != MF_E_NO_EVENTS_AVAILABLE) {
+                if (FAILED(hr)) return false;
+                break;
+            }
+            if (waited >= 1000) return false;  // 1 s without an event: the MFT has stalled
+            rc::SleepMs(1);
+        }
         MediaEventType type;
         event->GetType(&type);
         if (type == METransformNeedInput) {
