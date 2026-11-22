@@ -2459,6 +2459,46 @@ void App::LatchVideo(const FrameState& frame, bool late) {
                         m_decSamples.Percentile(95.f), m_decSamples.Count());
             m_seqWindowMin = 0;
             m_seqWindowMax = 0;
+            // TASK-A80 M2: the runtime's measured view fov (XrContext::BeginFrame ->
+            // frame.eyes[e].fov) next to the fovTan the PC told us to declare
+            // (m_vrMeta.fovTan, what BuildLayers turns into m_vrViews[e].fov), index by
+            // index, on the existing 1 s diag beat - no new timer. Readings only: neither
+            // array is touched here, and the layer is built elsewhere.
+            // Both sides print as POSITIVE magnitudes in vr_bridge.h's order
+            // (left, right, up, down), so a match is a plain number-for-number read.
+            // It settles the card's Q1: if the runtime's angleUp lines up with meta[3]
+            // rather than meta[2], the contract is inverted and the evidence is on the
+            // device instead of in a reading of the code. Q2 rides along: the printed
+            // degrees show whether either side is stuck on whole numbers.
+            {
+                static const char* const kIdxName[4] = {"left", "right", "up", "down"};
+                const double kRad = 180.0 / 3.14159265358979323846;
+                char cmp[1000];
+                int used = snprintf(cmp, sizeof(cmp), "rc fov cmp 1s:");
+                for (int eye = 0; eye < 2; eye++) {
+                    if (used <= 0 || used >= int(sizeof(cmp))) break;
+                    const float* t = m_vrMeta.fovTan[eye];
+                    const XrFovf& f = frame.eyes[eye].fov;
+                    // XrFovf carries the sign the projection needs; the metadata is
+                    // unsigned tangents, so compare magnitudes.
+                    const double rt[4] = {std::fabs(double(f.angleLeft)), std::fabs(double(f.angleRight)),
+                                          std::fabs(double(f.angleUp)), std::fabs(double(f.angleDown))};
+                    const double md[4] = {std::atan(double(t[0])) * kRad, std::atan(double(t[1])) * kRad,
+                                          std::atan(double(t[2])) * kRad, std::atan(double(t[3])) * kRad};
+                    int worst = 0;
+                    for (int k = 1; k < 4; k++)
+                        if (std::fabs(rt[k] - md[k]) > std::fabs(rt[worst] - md[worst])) worst = k;
+                    const int n = snprintf(
+                        cmp + used, sizeof(cmp) - used,
+                        " e%d rtDeg %.9g %.9g %.9g %.9g (rad %.9g %.9g %.9g %.9g) metaTan %.9g %.9g %.9g %.9g"
+                        " metaDeg %.9g %.9g %.9g %.9g maxdev %s %.9g deg;",
+                        eye, rt[0], rt[1], rt[2], rt[3], double(f.angleLeft), double(f.angleRight),
+                        double(f.angleUp), double(f.angleDown), t[0], t[1], t[2], t[3], md[0], md[1], md[2], md[3],
+                        kIdxName[worst], rt[worst] - md[worst]);
+                    if (n > 0) used += n;
+                }
+                RC_LOGI("%s", cmp);
+            }
         }
         m_client.SendControl({{"type", rc::msg::kStats},
                               {"stats", {{"fps", m_stats.fps}, {"latencyMs", m_stats.latencyMs}, {"decodeMs", m_stats.decodeMs}, {"latencyStages", stages},

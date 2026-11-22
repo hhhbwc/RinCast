@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdio>  // TASK-A80 M1: snprintf for the full-precision geometry readings
 #include <cstring>
 
 #include "../app.h"
@@ -34,6 +35,68 @@ namespace {
 // runtime's recommended size instead, smaller, and get less. A codec or decoder that can't take
 // the size still brings it down below.
 constexpr double kMaxVrScale = 1.5;
+
+// ---------------------------------------------------------------------------
+// TASK-A80 stage M1: geometry SHAPE readings. Diagnostics only - nothing below
+// changes a size, a field of view, or any decision (the card forbids it, and the
+// fix is stage F, which waits for these numbers). Three shapes have to be read
+// side by side, and no line ever printed two of them together:
+//   announced - DisplayConfig.eyeWidth/eyeHeight, what SteamVR is told per eye
+//   fov tan   - the fovTan spans, (tanL+tanR) / (tanU+tanD)
+//   rendered  - Shared.renderedEyeWidth/Height, what the game really renders at
+// fovTan prints at %.9g on purpose: the earlier %.3f print made the values look
+// like they could have come from a lookup table (card 1, Q2).
+// ---------------------------------------------------------------------------
+
+// One eye's fovTan: the four raw tangents, their angles, the tan spans, their ratio.
+static std::string A80FovShape(const float f[4]) {
+    const double kRad = 180.0 / 3.14159265358979323846;
+    const double tanH = double(f[0]) + double(f[1]);
+    const double tanV = double(f[2]) + double(f[3]);
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "tan L%.9g R%.9g U%.9g D%.9g deg %.9g %.9g %.9g %.9g tanH %.9g tanV %.9g tanAspect %.9g",
+             f[0], f[1], f[2], f[3], std::atan(double(f[0])) * kRad, std::atan(double(f[1])) * kRad,
+             std::atan(double(f[2])) * kRad, std::atan(double(f[3])) * kRad, tanH, tanV,
+             tanV > 0 ? tanH / tanV : 0.0);
+    return std::string(buf);
+}
+
+static double A80TanAspect(const float f[4]) {
+    const double tanV = double(f[2]) + double(f[3]);
+    return tanV > 0 ? (double(f[0]) + double(f[1])) / tanV : 0.0;
+}
+
+// The 1 s reading of all three aspects, from the session's existing 1 s tick. The WARN
+// the card asks for is rate limited to 10 s because on the affected device the condition
+// holds for the whole session (the driver cannot hot-change the resolution) - the aspects
+// themselves stay in the 1 s INFO, so nothing is lost between warnings.
+static void LogVrShapeReadings() {
+    auto& bridge = App::Get().Bridge();
+    const rcvr::DisplayConfig dc = bridge.LastConfig();
+    if (!dc.eyeWidth || !dc.eyeHeight) return;  // no VR stream configured yet
+    const double announced = double(dc.eyeWidth) / double(dc.eyeHeight);
+    const double tan = A80TanAspect(dc.fovTan[0]);
+    uint32_t rw = 0, rh = 0;
+    const bool haveRendered = bridge.SteamVrEyeSize(rw, rh);
+    const double rendered = haveRendered ? double(rw) / double(rh) : 0.0;
+    const std::string renderedText = haveRendered ? std::to_string(rw) + "x" + std::to_string(rh) : "none yet";
+    RC_LOGI("A80-M1 shape 1s: announced %ux%u aspect %.9g | fov e0 [%s] | rendered %s aspect %.9g"
+            " | renderEye %ux%u (0x0 = following the headset's size, not SteamVR's)",
+            dc.eyeWidth, dc.eyeHeight, announced, A80FovShape(dc.fovTan[0]).c_str(), renderedText.c_str(), rendered,
+            dc.renderEyeWidth, dc.renderEyeHeight);
+    // The two 2 % tests the card names. They gate THIS WARNING and nothing else - no
+    // value here feeds back into dc, the encoder, or the driver.
+    const bool fovOff = tan > 0 && std::fabs(announced - tan) / tan > 0.02;
+    const bool renderOff = haveRendered && std::fabs(rendered - announced) / announced > 0.02;
+    if (!fovOff && !renderOff) return;
+    static thread_local int64_t lastWarnNs = 0;
+    const int64_t now = rc::NowNs();
+    if (lastWarnNs && now - lastWarnNs < 10'000'000'000LL) return;
+    lastWarnNs = now;
+    RC_LOGW("A80-M1 SHAPE MISMATCH (announced %.9g vs fov-tan %.9g vs rendered %.9g): %s%s", announced, tan, rendered,
+            fovOff ? "announced-vs-fov-tan over 2%, " : "", renderOff ? "announced-vs-rendered over 2%" : "");
+}
 
 // A19 audit #5: readable names for the synced keys in the ownership notice.
 std::string SyncedKeyTitle(const std::string& key) {
@@ -457,6 +520,14 @@ void ClientSession::HandleMessage(const json& m) {
             NotifyVrState("error", "steamvr", "", "SteamVR did not start. Check SteamVR on your PC.");
         }
         FollowSteamVrResolution();
+        // A80-M1: the announced / fov-tan / rendered aspects on this same 1 s tick.
+        // Purely a reading; it decides nothing and changes nothing.
+        bool vrStreamLive = false;
+        {
+            std::lock_guard lock(m_mutex);
+            vrStreamLive = m_vr != nullptr;
+        }
+        if (vrStreamLive) LogVrShapeReadings();
         // Server statistics for the headset's performance overlay.
         json stats{{"type", rc::msg::kServerStats}};
         {
@@ -1202,6 +1273,16 @@ void ClientSession::StartVr() {
     RC_LOGI("VR stream: %ux%u per eye%s", dc.eyeWidth, dc.eyeHeight,
             !match ? "" : seenW ? (", SteamVR renders " + std::to_string(seenW) + "x" + std::to_string(seenH)).c_str()
                                 : ", following SteamVR's resolution once it renders");
+    // A80-M1: the same shapes at the announce point, before the bridge has anything to
+    // follow. Readings only - dc is already fully built above and is not touched here.
+    {
+        const std::string fov0 = A80FovShape(dc.fovTan[0]);
+        const std::string fov1 = A80FovShape(dc.fovTan[1]);
+        RC_LOGI("A80-M1 geometry: announced %ux%u per eye aspect %.9g | fovTan e0 [%s] | fovTan e1 [%s]"
+                " | ipd %.9g model '%s' serial '%s' matchSteamVr %d renderEye %ux%u",
+                dc.eyeWidth, dc.eyeHeight, double(dc.eyeWidth) / double(dc.eyeHeight), fov0.c_str(), fov1.c_str(),
+                dc.ipd, dc.headsetModel, dc.headsetSerial, match ? 1 : 0, dc.renderEyeWidth, dc.renderEyeHeight);
+    }
 
     const bool needsRestart = bridge.Configure(dc);
     bridge.SetHeadsetConnected(true);

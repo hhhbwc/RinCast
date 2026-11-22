@@ -600,7 +600,20 @@ bool XrContext::BeginFrame(FrameState& frame) {
     XrViewState vs{XR_TYPE_VIEW_STATE};
     XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
     uint32_t count = 0;
-    xrLocateViews(m_session, &vli, &vs, 2, &count, views);
+    const XrResult located = xrLocateViews(m_session, &vli, &vs, 2, &count, views);
+    // TASK-A80 M2: the runtime's own field of view is only a trustworthy reading if this call
+    // filled the views. It used to be ignored: on a failure the two XrView stay zeroed, e.fov
+    // becomes 0/0/0/0, and the app's new fov comparison line would then read as a contract
+    // mismatch rather than as what it is - no runtime answer at all. Log only, at most 1 Hz.
+    if (XR_FAILED(located) || count < 2) {
+        static int64_t s_locateWarnNs = 0;
+        const int64_t now = rc::NowNs();
+        if (now - s_locateWarnNs > 1'000'000'000LL) {
+            s_locateWarnNs = now;
+            RC_LOGW("A80-M2 xrLocateViews: %s, %u of 2 views - the runtime fov below is not a measurement",
+                    XrResultString(located), count);
+        }
+    }
     for (int eye = 0; eye < 2; eye++) {
         EyeView& e = frame.eyes[eye];
         e.pose = ToPose(views[eye].pose);

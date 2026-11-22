@@ -687,6 +687,20 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
             r.m[0][3] = c.ipd / 2;
             vr::VRServerDriverHost()->SetDisplayEyeToHead(m_id, l, r);
         }
+        // TASK-A80 M3: H0 made this silent. A new headset (or a new resolution) arrives here
+        // as a different eyeWidth/eyeHeight, and this function cannot act on it - SteamVR
+        // takes its render resolution only when it starts, so the game keeps rendering at the
+        // size the PREVIOUS headset was registered with. Saying so is the whole point of this
+        // line: it turns "the picture is quietly the wrong shape" into a named fact in
+        // vrserver.txt. Log only - no restart, no geometry change (the card forbids both, and
+        // restarting the user's SteamVR is not ours to do).
+        if (c.eyeWidth && (c.eyeWidth != old.eyeWidth || c.eyeHeight != old.eyeHeight)) {
+            Log("WARN: SteamVR keeps its render resolution until it is restarted - the headset now asks "
+                "for %ux%u per eye but this driver is still registered at %ux%u (streamer's renderEye %ux%u, "
+                "model '%s' was '%s'). Restart SteamVR for the new size to take effect.",
+                c.eyeWidth, c.eyeHeight, old.eyeWidth, old.eyeHeight, c.renderEyeWidth, c.renderEyeHeight,
+                c.headsetModel, old.headsetModel);
+        }
     }
     vr::DistortionCoordinates_t ComputeDistortion(vr::EVREye, float u, float v) override {
         // The headset's own compositor handles lens distortion.
