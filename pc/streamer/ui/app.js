@@ -257,9 +257,8 @@ function renderAutoscale() {
   const line = $("#l7LevelLine");
   if (!line) return;
   const on = document.querySelector('[data-setting="l7Autoscale"]')?.checked;
-  // UI-SLIM keeps the whole ladder row hidden; a stats tick must not bring the level
-  // line back through here (A19 audit #11: it leaked into view with the switch on).
-  line.hidden = !on || !!$("#l7Row")?.hidden;
+  // 等级行跟随开关；整块可见性由 .expert-only 的 data-mode 门禁控制，不再用行级 hidden。
+  line.hidden = !on;
   const lvl = state?.session?.vr?.autoscaleLevel;
   $("#l7Level").textContent = lvl != null ? lvl + "%" : "—";
 }
@@ -657,29 +656,27 @@ function setOff(row, off) {
   row.classList.toggle("off", off);
   row.querySelector("input").disabled = off;
 }
-// 撤出串流页：这些项头显端已有对应开关，PC 端是重复的一份。
-// 依据 UI-SLIM-DESIGN-2026-11-20 v3；只加 hidden，不删节点、不改设置值。
-const HIDDEN_ROWS = [
-  "adaptiveBitrateRow",                       // 自动码率 → 头显「自动调整码率」
-  "l-profile", "profileOptions", "profileNote", // 侧重 → 头显「画质档位」
-  "l-codec", "codecOptions",                  // 编码 → 头显「视频编码」
-  "l7Row", "l7LevelLine",                     // 解码慢时降尺寸（含状态行）
-  "profileVideoRow",                          // 画质随档位（元开关）
-  "cbrRow",                                   // 每帧用满码率
-  "pcBitrateRow",                             // 用电脑码率上限 → 头显「使用电脑的上限」
-  "tenBitRow",                                // 10-bit 色深 → 头显「10-bit 色深」
-  "foveatedRow",                              // VR 中心清晰 → 头显「Foveated encoding」
-  "autoTuneRow",                              // 自动调参 → 用户指令 2026-11-20：藏开关，设置值不动
-  "autoTuneBox",                              // 藏容器连空框，autoTune 行已藏于 A2.5
-];
 
-function applySlimLayout() {
-  for (const id of HIDDEN_ROWS) {
-    const el = document.getElementById(id);
-    if (el) el.hidden = true;
-  }
+// ---------------------------------------------------------------- streaming view mode
+// 区块级切换：标准模式整块隐藏 .expert-only（含 h2），不存在行级 hidden 掏空标题的问题。
+// 同一套 DOM 切换 data-mode，表单状态天然保留。localStorage 非法值回退 standard。
+const STREAM_MODE_KEY = "rincast.streamMode";
+function readStreamMode() {
+  try { return localStorage.getItem(STREAM_MODE_KEY) === "expert" ? "expert" : "standard"; }
+  catch { return "standard"; }
 }
-applySlimLayout();   // 模块是 defer 执行的，此时 DOM 已就绪；放在顶层保证首帧不闪
+function applyStreamMode(mode) {
+  const page = $("#videoPage");
+  if (!page) return;
+  page.dataset.mode = mode;
+  $$("#videoPage [data-set-mode]").forEach((b) =>
+    b.setAttribute("aria-pressed", String(b.dataset.setMode === mode)));
+  try { localStorage.setItem(STREAM_MODE_KEY, mode); } catch {}
+}
+$$("#videoPage [data-set-mode]").forEach((b) =>
+  b.addEventListener("click", () => applyStreamMode(b.dataset.setMode)));
+applyStreamMode(readStreamMode());  // defer 执行，DOM 已就绪；首帧即定模式，避免闪现
+
 function renderDependents() {
   const enc = state.system.encoder;
   const offers = { auto: true, hevc: enc.hevc, av1: enc.av1, h264: enc.h264 };
@@ -687,6 +684,7 @@ function renderDependents() {
   $$("#codecOptions label").forEach((l) => {
     const off = !offers[l.querySelector("input").value] && !!enc.backend;
     if (off) unsupported.push(l.textContent.trim());
+    setOff(l, off);  // 能力探测置灰而不是藏行：标准卡片的编码标题下永远有可见控件
   });
   const a = state.system.audioDriver;
   $("#audioRincast").hidden = !(a.speaker || a.microphone);
@@ -769,7 +767,6 @@ function renderDependents() {
   setOff($("#cbrRow"), profile !== 2 || !state.settings.profileControlsVideo || cbrBlockedByLink);
   setOff($("#playOnPcRow"), !state.settings.streamAudio);
   setOff($("#micRow"), state.settings.audioDevices === "system");
-  applySlimLayout();  // idempotent: state refreshes above may touch these rows
 }
 
 function renderAudio() {

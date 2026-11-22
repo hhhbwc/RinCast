@@ -66,6 +66,26 @@ main { overflow-y: auto; padding: 24px 32px 32px; min-height: 0; }
 .page.active { display: block; }
 .cols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 40px; }
 .cols:first-of-type > div > h2:first-child { margin-top: 0; }
+
+/* ---- streaming: standard / expert view ---- */
+.mode-bar { display: inline-flex; margin: 0 0 4px; border: 1px solid var(--edge); border-radius: 3px; overflow: hidden; }
+.mode-bar button {
+  font: 600 14px var(--font); color: var(--muted); background: #000; border: 0;
+  border-right: 1px solid var(--edge); padding: 7px 16px; cursor: pointer;
+}
+.mode-bar button:last-child { border-right: 0; }
+.mode-bar button:hover { background: var(--row-hover); color: var(--text); }
+.mode-bar button[aria-pressed="true"], .mode-bar button[aria-pressed="true"]:hover { background: var(--accent); color: #000; }
+#videoPage .card { margin-top: 18px; }
+#videoPage .card > h2:first-child { margin-top: 0; }
+#videoPage .card + .card { border-top: 1px solid var(--line); padding-top: 18px; }
+#videoPage .row { margin-top: 14px; }
+#videoPage .row > h3:first-child { margin-top: 0; }
+
+/* 硬门禁：控制粒度是区块，不是行。标准模式整块移除专家区（标题与内容同生共死）。 */
+#videoPage[data-mode="standard"] .expert-only { display: none; }
+/* 兜底：任何卡片只要没有可见行，连 h2 一起消失；能力探测只置灰不藏行。 */
+.card:not(:has(.row:not([hidden]))) { display: none; }
 h1 { font: 600 30px/1.2 var(--display); letter-spacing: -0.01em; margin-bottom: 18px; }
 .top h1 { margin-bottom: 0; }
 #subline { color: var(--good); font-weight: 600; }
@@ -277,6 +297,7 @@ dialog p { color: var(--muted); }
   input[type="range"]::-webkit-slider-thumb { background: CanvasText; }
   .btn { border: 1px solid ButtonText; }
   .btn[disabled] { border-color: GrayText; }
+  .mode-bar button[aria-pressed="true"] { background: Highlight; color: HighlightText; }
   #headline::before { forced-color-adjust: none; }
   .toast { border: 1px solid CanvasText; }
   :focus-visible { outline-color: Highlight; }

@@ -144,7 +144,33 @@ try {
   }
   const selector = key => `[data-setting="${key}"]`;
   const value = key => js(`(() => {const a=[...document.querySelectorAll(${JSON.stringify(selector(key))})];const el=a.find(x=>x.type!=='radio'||x.checked);return el.type==='checkbox'?el.checked:el.type==='range'||/^\\d+$/.test(el.value)?Number(el.value):el.value;})()`);
-  async function fresh(old = false, width = 1100, height = 1000) {
+  // Progressive disclosure (A48): the streaming page has two views over the SAME DOM.
+  // Driving the mode with real clicks keeps every later per-setting test deterministic
+  // no matter what a previous run left in localStorage.
+  async function setMode(mode) {
+    await click(`#videoPage [data-set-mode="${mode}"]`);
+    await wait(40);
+    assert.equal(await js(`document.querySelector('#videoPage').dataset.mode`), mode);
+  }
+  async function cardReport() {
+    return js(`(() => {
+      const page = document.querySelector('#videoPage');
+      const cards = [...page.querySelectorAll('.card')];
+      const visible = cards.filter(c => c.getBoundingClientRect().height > 0);
+      const titleOf = c => (c.querySelector('h2')?.innerText || '').trim();
+      return {
+        mode: page.dataset.mode,
+        cards: cards.length,
+        visible: visible.length,
+        // A visible title with no visible control under it is the "empty shell" bug.
+        danglingTitles: visible.filter(c => !titleOf(c)).length,
+        emptyCards: visible.filter(c => ![...c.querySelectorAll('.row')].some(r => r.getBoundingClientRect().height > 0)).length,
+        expertShown: page.querySelector('.expert-only').getBoundingClientRect().height > 0,
+        keys: new Set([...page.querySelectorAll('[data-setting]')].map(e => e.dataset.setting)).size,
+      };
+    })()`);
+  }
+  async function fresh(old = false, width = 1100, height = 1000, mode = 'expert') {
     useBaseline = old;
     await page('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
     await page('Page.navigate', { url });
@@ -153,6 +179,8 @@ try {
     await wait(60);
     assert.equal(await js(`document.querySelector('.page.active').dataset.page`), 'video');
     assert.deepEqual(await js('__bridge.pageErrors'), []);
+    // The baseline app.js predates the mode switcher, so only the candidate gets driven.
+    if (!old && mode) await setMode(mode);
   }
   async function shot(name) {
     const { data } = await page('Page.captureScreenshot', { format: 'png' });
@@ -179,6 +207,39 @@ try {
     }
     check(old ? 'baseline_20_real_clicks' : 'candidate_20_real_clicks_last_intent', { clicks: 20, ms, inflightRequests: count, totalRequests: await js('__bridge.changes().length') });
   }
+
+  // A48 progressive disclosure: standard view must hide the whole tuning block (title
+  // included - never a bare heading over nothing), expert view must show every control,
+  // and the choice must survive a reload. Same DOM both ways, so settings never reset.
+  await js(`localStorage.removeItem('rincast.streamMode')`);
+  await fresh(false, 1100, 1000, null);  // null = don't drive the mode: observe the real first-run default
+  const stdMode = await cardReport();
+  assert.equal(stdMode.mode, 'standard');
+  assert.equal(stdMode.expertShown, false);
+  assert.equal(stdMode.visible, 2);
+  assert.equal(stdMode.danglingTitles, 0);
+  assert.equal(stdMode.emptyCards, 0);
+  assert.equal(stdMode.keys, 18);  // hidden, not removed: the form state survives a mode flip
+  await setMode('expert');
+  const expMode = await cardReport();
+  assert.equal(expMode.expertShown, true);
+  assert.equal(expMode.visible, 3);
+  assert.equal(expMode.danglingTitles, 0);
+  assert.equal(expMode.emptyCards, 0);
+  assert.equal(expMode.keys, 18);
+  await fresh(false, 1100, 1000, null);
+  const keptMode = await cardReport();
+  assert.equal(keptMode.mode, 'expert');  // remembered across reloads
+  assert.equal(keptMode.expertShown, true);
+  await setMode('standard');
+  const backMode = await cardReport();
+  assert.equal(backMode.expertShown, false);
+  assert.equal(backMode.visible, 2);
+  check('progressive_disclosure_standard_vs_expert', {
+    standard: { visibleCards: stdMode.visible, danglingTitles: stdMode.danglingTitles, controls: stdMode.keys },
+    expert: { visibleCards: expMode.visible, danglingTitles: expMode.danglingTitles, controls: expMode.keys },
+    persistedAfterReload: keptMode.mode,
+  });
 
   await fresh(); await js('__bridge.auto=false');
   await click(selector('tenBit'));
@@ -234,7 +295,16 @@ try {
 
   await fresh();
   const keys = await js(`[...new Set([...document.querySelectorAll('.page[data-page="video"] [data-setting]')].map(e=>e.dataset.setting))]`);
-  assert.equal(keys.length, 14);
+  // Full expected set, not a bare count: a dropped or renamed setting must fail loudly.
+  // (This page's controls were 14 when the gate was written; the count had drifted since.
+  //  Verified against HEAD before A48: HEAD also has these 18 keys, so this is drift in
+  //  the gate, not something A48 changed.)
+  assert.deepEqual(keys.slice().sort(), [
+    'adaptiveBitrate', 'adaptiveQuantization', 'autoTune', 'codec', 'desktopBitrateMbps',
+    'desktopMaxHeight', 'encodeScalePct', 'fecPercent', 'fillMode', 'foveatedEncoding',
+    'l7Autoscale', 'pcBitrateWins', 'profileControlsVideo', 'qualityProfileCbr', 'streamProfile',
+    'tenBit', 'twoPassEncoding', 'vrBitrateMbps',
+  ]);
   const stressStart = performance.now();
   const framesBefore = await js('__bridge.frames');
   for (const key of keys) {
@@ -260,7 +330,7 @@ try {
   const stressMs = Math.round(performance.now() - stressStart);
   assert(stressMs >= 30000);
   assert.equal(await js(`[...document.querySelectorAll('.failed')].filter(e=>e.textContent).length`), 0);
-  check('all_actual_video_controls_30s', { controls: keys.length, operations: 140, ms: stressMs, animationFrames: await js('__bridge.frames') - framesBefore, absentPcControls: ['videoPacingMode', 'desktopFps'], video: 'NOT_TESTED' });
+  check('all_actual_video_controls_30s', { controls: keys.length, operations: keys.length * 10, ms: stressMs, animationFrames: await js('__bridge.frames') - framesBefore, absentPcControls: ['videoPacingMode', 'desktopFps'], video: 'NOT_TESTED' });
 
   for (const nav of ['home','audio','vr','devices','general','account','video']) {
     await click(`#nav [data-page="${nav}"]`); await wait(60);
