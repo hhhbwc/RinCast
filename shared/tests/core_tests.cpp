@@ -1642,6 +1642,166 @@ SimRun RunGuard(rc::QueueGuard& guard, SimLink& link, uint32_t targetKbps, doubl
     }
     return run;
 }
+
+// The same run, keeping every report instead of only the counters. TASK-A73's two scenarios
+// are about the *shape* of the pump - which dip came after which queue, how fast the rate
+// moved back up - so a scalar per scenario is not enough to pin it.
+struct GuardStep {
+    double sec = 0;        // the clock this report was made at
+    double rateKbps = 0;   // the rate that was on the wire during this step
+    uint32_t capKbps = 0;  // the cap after it; 0 = released (the target again)
+    double reportMs = 0;   // what the headset reported
+    int action = 0;        // 0 none, 1 dip, 2 climb, 3 released
+};
+
+struct GuardTrace {
+    std::vector<GuardStep> s;
+    uint32_t target = 0;
+    double floorKbps = 0;
+
+    double RateAt(size_t i) const { return s[i].capKbps ? double(s[i].capKbps) : double(target); }
+    double LastRate() const { return s.empty() ? 0 : RateAt(s.size() - 1); }
+    int DipCount() const {
+        int n = 0;
+        for (const auto& x : s)
+            if (x.action == 1) n++;
+        return n;
+    }
+    double PeakReport(double fromSec) const {
+        double p = 0;
+        for (const auto& x : s)
+            if (x.sec >= fromSec) p = std::max(p, x.reportMs);
+        return p;
+    }
+    double MeanRate(double fromSec, double toSec) const {
+        double sum = 0;
+        int n = 0;
+        for (size_t i = 0; i < s.size(); i++)
+            if (s[i].sec >= fromSec && s[i].sec < toSec) {
+                sum += RateAt(i);
+                n++;
+            }
+        return n ? sum / n : 0;
+    }
+    double MaxRate(double fromSec, double toSec) const {
+        double m = 0;
+        for (size_t i = 0; i < s.size(); i++)
+            if (s[i].sec >= fromSec && s[i].sec < toSec) m = std::max(m, RateAt(i));
+        return m;
+    }
+    double MinRate(double fromSec, double toSec) const {
+        double m = -1;
+        for (size_t i = 0; i < s.size(); i++)
+            if (s[i].sec >= fromSec && s[i].sec < toSec) m = m < 0 ? RateAt(i) : std::min(m, RateAt(i));
+        return m < 0 ? 0 : m;
+    }
+    // The most dips any window of widthSec can hold, counting windows that open at fromSec.
+    int WorstWindow(double widthSec, double fromSec) const {
+        int worst = 0;
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i].action != 1 || s[i].sec < fromSec) continue;
+            int n = 0;
+            for (const auto& x : s)
+                if (x.action == 1 && x.sec >= s[i].sec && x.sec < s[i].sec + widthSec) n++;
+            worst = std::max(worst, n);
+        }
+        return worst;
+    }
+    // Dips taken against a queue that was no worse than the one the previous dip was taken
+    // against, counting only dips inside one congestion episode: an episode ends when a
+    // report comes back under the band, which is the drain finishing. Those dips are the guard
+    // pressing again on a backlog its last press is already draining (TASK-A73 M1).
+    int PressedWhileDraining(double episodeEndsBelowMs) const {
+        int n = 0;
+        double prev = -1;
+        for (const auto& x : s) {
+            if (x.reportMs < episodeEndsBelowMs) prev = -1;
+            if (x.action != 1) continue;
+            if (prev >= 0 && x.reportMs <= prev) n++;
+            prev = x.reportMs;
+        }
+        return n;
+    }
+    // The largest relative gain of the sent rate in any window of widthSec - how fast the
+    // guard sprints back up. Steps taken from the floor are excluded: the pinned self-rescue
+    // is allowed to be fast (test 6).
+    double FastestGain(double fromSec, double widthSec) const {
+        double worst = 1;
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i].sec < fromSec) continue;
+            const double r0 = RateAt(i);
+            if (r0 <= floorKbps * 1.05) continue;
+            size_t j = i;
+            while (j < s.size() && s[j].sec < s[i].sec + widthSec) j++;
+            const double r1 = RateAt(j < s.size() ? j - 1 : s.size() - 1);
+            if (r0 > 0) worst = std::max(worst, r1 / r0);
+        }
+        return worst;
+    }
+};
+
+GuardTrace RunGuardTrace(rc::QueueGuard& guard, SimLink& link, uint32_t targetKbps, double seconds,
+                         int64_t& now) {
+    GuardTrace tr;
+    tr.target = targetKbps;
+    tr.floorKbps = double(targetKbps) / guard.Config().minDivisor;
+    const int steps = int(seconds * 10);
+    for (int i = 0; i < steps; i++) {
+        GuardStep st;
+        st.rateKbps = guard.Cap() ? guard.Cap() : targetKbps;
+        link.Step(st.rateKbps, 100.0);
+        now += 100'000'000LL;
+        st.sec = double(now) / 1e9;
+        st.reportMs = link.Report();
+        const auto res = guard.Update(targetKbps, st.reportMs, 0, false, now);
+        st.capKbps = res.capKbps;
+        st.action = res.action == rc::QueueGuard::Action::Dip
+                        ? 1
+                        : (res.action == rc::QueueGuard::Action::Climb
+                               ? 2
+                               : (res.action == rc::QueueGuard::Action::Released ? 3 : 0));
+        tr.s.push_back(st);
+    }
+    return tr;
+}
+
+// Reports fed by hand, the way test 7 does it: the link model is the thing being reported, so
+// a scenario that is about the guard's own timers can state the reports directly. Each phase
+// is [from, to) with the reported queue ramping q0 -> q1.
+struct FeedPhase {
+    double from, to, q0, q1;
+};
+
+GuardTrace RunFeedTrace(rc::QueueGuard& guard, uint32_t targetKbps,
+                        const std::vector<FeedPhase>& phases) {
+    GuardTrace tr;
+    tr.target = targetKbps;
+    tr.floorKbps = double(targetKbps) / guard.Config().minDivisor;
+    int64_t now = 0;
+    for (int i = 0; i * 100'000'000LL < int64_t(phases.back().to * 1e9); i++) {
+        const double t = i * 0.1;  // the report lands at t + 0.1 s
+        const FeedPhase* ph = nullptr;
+        for (const auto& p : phases)
+            if (t >= p.from && t < p.to) ph = &p;
+        if (!ph) continue;
+        const double f = ph->to > ph->from ? (t - ph->from) / (ph->to - ph->from) : 0.0;
+        const double queueMs = ph->q0 + (ph->q1 - ph->q0) * f;
+        GuardStep st;
+        st.rateKbps = guard.Cap() ? guard.Cap() : targetKbps;
+        now += 100'000'000LL;
+        st.sec = double(now) / 1e9;
+        st.reportMs = queueMs;
+        const auto res = guard.Update(targetKbps, queueMs, 0, false, now);
+        st.capKbps = res.capKbps;
+        st.action = res.action == rc::QueueGuard::Action::Dip
+                        ? 1
+                        : (res.action == rc::QueueGuard::Action::Climb
+                               ? 2
+                               : (res.action == rc::QueueGuard::Action::Released ? 3 : 0));
+        tr.s.push_back(st);
+    }
+    return tr;
+}
 }  // namespace
 
 static void TestStreamProfile() {
@@ -2077,6 +2237,310 @@ static void TestQueueGuard() {
         CHECK(over.action == rc::QueueGuard::Action::Dip);
         std::printf("queue guard: startup keyframe ignored, clean late request held, congestion dips to %u kbps\n",
                     lateBusy.capKbps);
+    }
+
+    // 8. TASK-A73 P1, the pump (card §1 M1). Field log 22:48:38-45: 180000 -> 38442 kbps in
+    //    three seconds, and the last four of those dips were taken against a queue that had
+    //    already turned around and was falling. The guard cannot see its own press: the
+    //    headset report is relative (DelayTracker - newest minus the lowest of the last four
+    //    seconds), so a dip's effect enters the report seconds later, while the 400 ms
+    //    throttle already allows the next press. SimLink with the card's numbers reproduces
+    //    the same shape: 200 Mbps aimed at a path that carries 90.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        const uint32_t p1Target = 200000;
+        const double capacity = 90000;
+        SimLink link;
+        link.capacityKbps = capacity;
+        link.naturalMs = 25;
+        int64_t now = 0;
+        GuardTrace t = RunGuardTrace(guard, link, p1Target, 40, now);
+        // One congestion episode ends when a report comes back inside the dead band: that is
+        // the backlog draining, and any press after it against a queue no worse than the one
+        // the previous press was taken against is the guard pushing again on a drain.
+        const double episodeEndsBelow = cfg.targetMs - cfg.bandMs;  // 33 ms with the defaults
+        const int pressed = t.PressedWhileDraining(episodeEndsBelow);
+        const int worst5 = t.WorstWindow(5.0, 0.0);
+        const double minRate = t.MinRate(0.0, 40.0);
+        const double gain2 = t.FastestGain(0.0, 2.0);
+        const double steady = t.MeanRate(30.0, 40.0);
+        std::printf(
+            "queue guard: A73 P1 flood 200 Mb/s onto 90, %d dips, %d in the worst 5 s, %d pressed "
+            "a draining queue, min %.0f kbps, back up %.3f x in 2 s\n",
+            t.DipCount(), worst5, pressed, minRate, gain2);
+        // Card §3.1 also asks for the reported peak to stay under 120 ms for the whole run.
+        // That is not reachable in this model and no law that dips on the reported queue can
+        // reach it: the first dip cannot land before 0.5 s (m_lastDipNs starts at 0 plus the
+        // 400 ms throttle), and by then 200 Mbps over a 90 Mbps path has queued 611 ms
+        // (122 ms per 100 ms of a 122 % overload). Printed, not asserted; the settled window
+        // (from 10 s on) is asserted below. See the TASK-A73 report, card §5.4.
+        std::printf(
+            "queue guard: A73 P1 reported queue peak %.0f ms over the whole run, %.0f ms once "
+            "settled (from 10 s); steady %.0f kbps\n",
+            t.PeakReport(0.0), t.PeakReport(10.0), steady);
+        CHECK(pressed == 0);                       // M1 itself: red with 7 before the fix
+        CHECK(minRate >= 0.8 * capacity);          // 72000; red with 26696 = 0.30 x capacity
+        CHECK(worst5 <= 3);                        // red with 7 presses in the first 5 s
+        CHECK(gain2 <= 1.12);                      // §2.3: red with 1.170 (the +4 %/400 ms sprint)
+        CHECK(t.WorstWindow(5.0, 10.0) <= 2);      // the card's own gate, once settled
+        CHECK(t.PeakReport(10.0) < 120);           // ... and the settled part of the peak gate
+        CHECK(steady >= 80000 && steady <= 95000);  // the card's steady band
+    }
+
+    // 9. TASK-A73 P2, the ceiling creeping while the guard is still dipping (card §1 M2).
+    //    Field 22:49-23:0x: 114664 -> 118104 kbps, exactly 1.0300, one +3 % ceiling rise, while
+    //    the queue was being pressed throughout. m_ceilingNs is only refreshed by an *isolated*
+    //    dip (more than 2 s after the previous one), so the members of a cascade - the dips
+    //    that prove nothing about the ceiling - leave the rise timer alone, and the ceiling
+    //    rises inside a window that is still dipping. Reports are fed by hand, the way test 7
+    //    does, because what is under test here is the guard's own timers.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        const uint32_t p2Target = 200000;
+        // 0-3 s clean; 3-3.6 s one deep queue, which proves the ceiling; 3.6-20 s the guard
+        // climbs back to its aim; 20-30 s a cascade, one press every 500 ms while the queue
+        // creeps 60 -> 100 ms; 30-120 s clean again.
+        GuardTrace t = RunFeedTrace(guard, p2Target, {{0.0, 3.0, 5.0, 5.0},
+                                                     {3.0, 3.6, 300.0, 300.0},
+                                                     {3.6, 20.0, 5.0, 5.0},
+                                                     {20.0, 30.0, 60.0, 100.0},
+                                                     {30.0, 120.0, 5.0, 5.0}});
+        // The plateau the guard holds just before the cascade starts: the aim the flood dip of
+        // 3 s left behind. Measured in [15, 20) on purpose - the clean phase before that has no
+        // cap at all, and its rate is the raw target, which is not what a ceiling produces.
+        const double preDipAim = t.MaxRate(15.0, 20.0);  // the plateau: 0.97 x the proved ceiling
+        int cascade = 0;
+        for (const auto& x : t.s)
+            if (x.action == 1 && x.sec >= 20.0 && x.sec < 30.0) cascade++;
+        // The aim the cascade's first isolated dip records, which is what the working point may
+        // come back to. The rise that would beat it is not due before 80.1 s (60 s after the
+        // last ceiling refresh), so [50, 84] measures the creep itself in either code.
+        const double allowed = preDipAim * 97 / 100;
+        const double maxInWindow = t.MaxRate(50.0, 84.0);
+        std::printf(
+            "queue guard: A73 P2 pre-dip aim %.0f kbps, %d cascade dips, aim after them %.0f kbps, "
+            "max rate in [50,84] s %.0f kbps = %.4f x\n",
+            preDipAim, cascade, allowed, maxInWindow, maxInWindow / allowed);
+        CHECK(preDipAim >= 0.96 * p2Target && preDipAim <= 0.98 * p2Target);  // the aim, not the target
+        CHECK(cascade >= 5);                  // ... and what follows really is a cascade
+        // Red before the fix: 193825 = 1.0300 x, the same ratio as 114664 -> 118104 in the log.
+        CHECK(maxInWindow <= allowed);
+        // §2.1 must stall a rise inside a dipping window, not forbid it: past the window the
+        // ceiling still rises by its own percent.
+        CHECK(t.MaxRate(40.0, 120.0) >= allowed * (1.0 + cfg.ceilingRisePercent / 100.0) * 0.999);
+    }
+
+    // 9b. The card's literal second form of P2: capacity fixed, five minutes, and the steady
+    //     rate of the last two minutes may not exceed that of the first. Red before the fix,
+    //     green after - but for M1's reason, not the +3 %/min creep: on a uniform path the
+    //     per-minute means do not creep up at all (they drift down ~0.7 % over the last three
+    //     minutes, printed below), because there every cycle's first dip is isolated and
+    //     refreshes m_ceilingNs itself. The creep needs a cascade, which is what test 9 feeds
+    //     by hand. Reported per card §5.4 rather than quietly substituted.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        const uint32_t p2Target = 200000;
+        SimLink link;
+        link.capacityKbps = 90000;
+        link.naturalMs = 25;
+        int64_t now = 0;
+        GuardTrace t = RunGuardTrace(guard, link, p2Target, 300, now);
+        const double minute1 = t.MeanRate(0.0, 60.0);
+        const double last2 = t.MeanRate(180.0, 300.0);
+        std::printf("queue guard: A73 P2b per-minute means:");
+        for (int m = 0; m < 5; m++)
+            std::printf(" %.0f", t.MeanRate(m * 60.0, m * 60.0 + 60.0));
+        std::printf(" -> minute 1 %.0f, last two minutes %.0f, ratio %.4f\n", minute1, last2,
+                    last2 / minute1);
+        CHECK(last2 <= minute1);  // red before the fix at 1.1236
+        CHECK(t.MeanRate(240.0, 300.0) <= t.MeanRate(60.0, 120.0) * 1.03);
+    }
+}
+
+// TASK-A73b §3: the recovery-cost table. One isolated dip must not pay the cascade's price,
+// so the recovery law is measured here on its own, with the reports fed by hand: a real
+// SimLink would add its own seconds of lag on top of the guard's, and the question this table
+// answers is how many seconds the *guard* spends getting back up. Three columns per card §3:
+//   1. seconds from the last dip until the rate is back at its aim,
+//   2. the largest relative gain of the sent rate in any 2 s window,
+//   3. the deepest rate over the target.
+// The three isolated depths are the three dip steps the guard has: 900 (queue past the band),
+// 750 (queue more than 2.5x past it), 650 (a keyframe request on a congested queue).
+static void TestGuardRecoveryCost() {
+    const uint32_t target = 140000;
+    const rc::QueueGuardConfig cfg;
+    const double dipAt = cfg.targetMs + cfg.bandMs;  // 57 ms with the defaults
+
+    struct Feed {
+        double q;
+        bool key;
+    };
+    auto ramp = [](int n, double q0, double q1, bool key) {
+        std::vector<Feed> v;
+        for (int i = 0; i < n; i++) {
+            const double f = n > 1 ? double(i) / double(n - 1) : 0.0;
+            v.push_back({q0 + (q1 - q0) * f, key});
+        }
+        return v;
+    };
+    auto drive = [&](const std::vector<Feed>& in) {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        GuardTrace tr;
+        tr.target = target;
+        tr.floorKbps = double(target) / cfg.minDivisor;
+        int64_t now = 0;
+        for (const auto& f : in) {
+            GuardStep st;
+            st.rateKbps = guard.Cap() ? guard.Cap() : target;
+            now += 100'000'000LL;
+            st.sec = double(now) / 1e9;
+            st.reportMs = f.q;
+            const auto res = guard.Update(target, f.q, 0, f.key, now);
+            st.capKbps = res.capKbps;
+            st.action = res.action == rc::QueueGuard::Action::Dip
+                            ? 1
+                            : (res.action == rc::QueueGuard::Action::Climb
+                                   ? 2
+                                   : (res.action == rc::QueueGuard::Action::Released ? 3 : 0));
+            tr.s.push_back(st);
+        }
+        return tr;
+    };
+    // lead + flood + recovery, and the three numbers the card asks for.
+    struct Row {
+        int dips;
+        double lastDipSec;
+        double deadSec;
+        double aimKbps;
+        double backSec;
+        double gain2;
+        double deepestOverTarget;
+    };
+    auto measure = [&](const std::vector<Feed>& flood) {
+        std::vector<Feed> in = ramp(30, 5, 5, false);  // 3 s clean: past the startup grace
+        for (const auto& f : flood) in.push_back(f);
+        for (const auto& f : ramp(500, 5, 5, false)) in.push_back(f);  // 50 s to get back
+        const GuardTrace tr = drive(in);
+        Row r{};
+        for (const auto& x : tr.s)
+            if (x.action == 1) {
+                r.dips++;
+                r.lastDipSec = x.sec;
+            }
+        r.aimKbps = tr.LastRate();
+        // The dead time: how long after the last dip the first climb is allowed. This is what
+        // the ladder actually buys, and it is the only column that separates a cascade from an
+        // isolated dip at all - during the flood the report never comes back under the band, so
+        // `calm` refuses every climb and no recovery constant can be reached between the knives.
+        r.deadSec = -1;
+        for (size_t i = 0; i < tr.s.size(); i++) {
+            if (tr.s[i].sec <= r.lastDipSec) continue;
+            if (tr.s[i].action == 2 || tr.s[i].action == 3) {
+                r.deadSec = tr.s[i].sec - r.lastDipSec;
+                break;
+            }
+        }
+        r.backSec = -1;
+        for (size_t i = 0; i < tr.s.size(); i++) {
+            if (tr.s[i].sec <= r.lastDipSec) continue;
+            if (tr.RateAt(i) >= r.aimKbps * 0.995) {
+                r.backSec = tr.s[i].sec - r.lastDipSec;
+                break;
+            }
+        }
+        r.gain2 = tr.FastestGain(0.0, 2.0);
+        r.deepestOverTarget = tr.MinRate(0.0, 1e9) / double(target);
+        return r;
+    };
+    auto print = [](const char* name, const Row& r) {
+        std::printf("queue guard: recovery %-16s %2d dips, last at %.1f s, dead %.1f s, aim %.0f kbps, "
+                    "back in %5.1f s, gain2 %.4f x, deepest %.3f x target\n",
+                    name, r.dips, r.lastDipSec, r.deadSec, r.aimKbps, r.backSec, r.gain2,
+                    r.deepestOverTarget);
+    };
+
+    const Row shallow = measure(ramp(6, dipAt * 1.8, dipAt * 1.8, false));   // 103 ms -> dip 900
+    const Row medium = measure(ramp(6, 300, 300, false));                    // -> dip 750
+    const Row deep = measure(ramp(6, dipAt * 1.8, dipAt * 1.8, true));       // -> dip 650
+    const Row cascade = measure(ramp(35, dipAt + 3, dipAt * 2.4, false));    // 7 in 3.5 s
+    print("isolated 900", shallow);
+    print("isolated 750", medium);
+    print("isolated 650", deep);
+    print("cascade", cascade);
+
+    // What the card's direction 1 asks for: an isolated dip is back at its aim in seconds,
+    // not in the tens of seconds a cascade deserves, and the dead time in front of it is under
+    // a second. Measured 0.9 s dead / 1.9 s back.
+    CHECK(shallow.dips == 1 && shallow.deadSec >= 0 && shallow.deadSec <= 1.0);
+    CHECK(shallow.backSec >= 0 && shallow.backSec <= 3.0);
+    // The ladder is about how many knives an episode took, not how deep the last one was, so a
+    // deeper cut on the same rung costs only the arithmetic of climbing back out of it: same
+    // 0.9 s dead, more seconds. Measured 5.9 s (750) and 8.9 s (650).
+    CHECK(medium.dips == 1 && std::fabs(medium.deadSec - shallow.deadSec) < 0.05);
+    CHECK(deep.dips == 1 && std::fabs(deep.deadSec - shallow.deadSec) < 0.05);
+    CHECK(medium.backSec > shallow.backSec && deep.backSec > medium.backSec);
+    CHECK(deep.backSec <= 12.0);
+    // Direction 3: nothing climbs faster than 1.12 in 2 s, and no dip refills a cut in a
+    // second. Same gate as test 8's gain2, measured on the recovery law alone.
+    CHECK(shallow.gain2 <= 1.12 && medium.gain2 <= 1.12 && deep.gain2 <= 1.12);
+    CHECK(cascade.gain2 <= 1.12);
+    // Direction 2: the cascade pays more than the isolated dip, and what it pays is the dead
+    // time. Held to twice the isolated one, not to a tuned number: rung 5 is 800 ms + 4 steps
+    // of 1 s, measured 4.9 s against 0.9 s. Mutation V-a (card R5), which takes the rung back
+    // to 1 for every dip, lands both rows on 0.9 s and dies here - test 8's M1 group cannot see
+    // it, because its seven knives all fall while the report is still past the band, `calm` is
+    // false for every one of them, and no climb happens between the dip and the recovery at
+    // all. Its 3-in-5-s and 1.08x are identical with or without the ladder.
+    CHECK(cascade.deadSec >= 2 * shallow.deadSec);
+    CHECK(cascade.dips >= 5);
+    CHECK(cascade.backSec > shallow.backSec);
+    CHECK(cascade.deepestOverTarget < shallow.deepestOverTarget);
+
+    // The half of the story test 5 tells: the ceiling's +3 % rise comes due 60 s after the last
+    // dip of the settling run, and once the rate crosses the capacity the report grows ~2.7 ms
+    // per 100 ms step, so a 10 % dip follows it about 2.2 s later. Test 5 samples only the last
+    // 10 s of its 30 s window, so the rise and its dip have to be over before the window opens.
+    // With a dead time long enough to charge an isolated dip for a cascade the whole event moves
+    // to 19.9 s -> 22.1 s and lands inside it, which is the 92436-102707 = 10.00 % red.
+    {
+        rc::QueueGuard guard;
+        guard.Configure(cfg);
+        SimLink link;
+        link.capacityKbps = 100000;
+        int64_t now = 0;
+        RunGuard(guard, link, target, 60, &now);  // the same settle test 5 does
+        double firstDipSec = -1;
+        int lateDips = 0;
+        double maxSampled = 0;
+        for (int i = 0; i < 300; i++) {  // the same 30 s of steady state
+            const uint32_t cap = guard.Cap();
+            link.Step(cap ? cap : target, 100.0);
+            now += 100'000'000LL;
+            const auto res = guard.Update(target, link.Report(), 0, false, now);
+            if (i >= 200) {
+                const double r = res.capKbps ? res.capKbps : target;
+                if (r > maxSampled) maxSampled = r;
+            }
+            if (res.action == rc::QueueGuard::Action::Dip) {
+                if (firstDipSec < 0) firstDipSec = i * 0.1;
+                if (i >= 200) lateDips++;
+            }
+        }
+        std::printf("queue guard: recovery test-5 replay, first dip at %.1f s, %d in the sampled 10 s,"
+                    " sampled max %.0f kbps against a %.0f kbps path\n",
+                    firstDipSec, lateDips, maxSampled, link.capacityKbps);
+        CHECK(lateDips == 0);
+        // And it has to still be under the path. Test 5 itself only asks the sampled rate not to
+        // *pump*, so a guard that parks quietly 1.4 % over capacity passes it - measured 2026-11-23
+        // with mutation V-e (the `recovering` window cut from waitNs*3 to waitNs*2), which printed
+        // `steady state 101433-101433 kbps over 25 s, 0 dips`, all green, while the backlog grew
+        // 1.4 ms per step and would have taken 40 s - longer than the window - to reach dipAt. The
+        // whole point of the +3 %-then-hold ceiling is that the aim stays where the path failed.
+        CHECK(maxSampled <= link.capacityKbps);
     }
 }
 
@@ -6082,6 +6546,7 @@ int main() {
     TestStaleFlushGraceReplay();  // A75 (TASK-A75-FLUSH-GRACE-2026-11-22): the grace period replayed
     TestLossBrake();
     TestQueueGuard();
+    TestGuardRecoveryCost();  // A73b (TASK-A73b-RECOVERY-COST): the recovery-cost table
     TestL7Autoscale();
     TestAutoTuneClassify();
     TestAutoTuneClassifyEdgeCases();  // TASK-ROBUST-EDGES-2026-11-20 §2
