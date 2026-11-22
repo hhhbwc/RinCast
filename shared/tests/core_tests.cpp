@@ -1339,7 +1339,7 @@ static void TestMotionHysteresis() {
 
 // An Ogg Opus file of a stereo sine, built the way an encoder lays it out (no CRCs: the
 // reader doesn't check them).
-static rc::TrackData MakeOggOpus(double hz, int packets, int trimEnd) {
+static rc::TrackData MakeOggOpus(double hz, int packets, int trimEnd, bool badTail = false) {
     std::vector<uint8_t> file;
     int64_t pageNo = 0;
     auto page = [&](const std::vector<std::vector<uint8_t>>& ps, uint64_t granule, uint8_t flags) {
@@ -1383,6 +1383,7 @@ static rc::TrackData MakeOggOpus(double hz, int packets, int trimEnd) {
             pending.clear();
         }
     }
+    if (badTail) page({}, ~uint64_t(0), 0);  // a truncated trailer: granule -1, no packet ends here
     return std::make_shared<const std::vector<uint8_t>>(std::move(file));
 }
 
@@ -1461,6 +1462,31 @@ static void TestMusic() {
     CHECK(low > 4000);
     CHECK(high < 7500);
     CHECK(std::abs(l.hz - played) < 15);  // and it's the other track again
+
+    // A54: a truncated tail page carries granule -1 ("no packet ends here"). Reading that as
+    // the track length gave zero frames, so the whole track silently never played; the reader
+    // has to walk back to the last page that actually closes a packet.
+    {
+        rc::OggOpusReader r;
+        CHECK(r.Open(MakeOggOpus(440, 120, 300, /*badTail=*/true)));
+        CHECK(r.TotalFrames() == 120 * 960 - 300 - 312);  // identical to the untruncated file
+        std::vector<int16_t> chunk(1000 * 2);
+        CHECK(r.Read(chunk.data(), 1000) == 1000);        // and it really plays
+    }
+    // A54: replacing the playlist must reset the "any track but the last one" index; a stale
+    // one is an index into a list that no longer exists.
+    {
+        mix.SetActive(false);
+        for (int i = 0; i < 25; i++) step();  // fade out
+        // 10 s each: longer than the 8 s crossfade window, so the fade-in is not being restarted
+        // by a track that is already inside that window on its first frame.
+        mix.SetTracks({MakeOggOpus(440, 500, 0), MakeOggOpus(660, 500, 0)}, 3);
+        mix.SetActive(true);
+        for (int i = 0; i < 12; i++) l = step();
+        CHECK(l.rms > 500);                   // still audible after the swap
+        mix.SetActive(false);
+        for (int i = 0; i < 25; i++) step();
+    }
     std::printf("music OK\n");
 }
 

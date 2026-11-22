@@ -40,8 +40,15 @@ bool OggOpusReader::Open(TrackData data) {
     const auto& d = *m_data;
     for (size_t at = d.size() >= 27 ? d.size() - 27 : 0;; at--) {
         if (IsPage(d, at)) {
-            m_total = std::max<int64_t>(0, int64_t(Le64(&d[at + 6])) - m_skip);
-            break;
+            // A54: a granule of 0xFFFFFFFFFFFFFFFF is Ogg's "-1", meaning no packet ends on
+            // this page. A truncated file can leave that on the final page; taking it as a
+            // length gave m_total == 0, so Read() stopped immediately and the track never
+            // played at all. Fall back to the previous page that does close a packet.
+            const uint64_t granule = Le64(&d[at + 6]);
+            if (granule != ~uint64_t(0)) {
+                m_total = std::max<int64_t>(0, int64_t(granule) - m_skip);
+                break;
+            }
         }
         if (at == 0) return false;
     }
@@ -103,6 +110,9 @@ int OggOpusReader::Read(int16_t* out, int frames) {
 void MusicMixer::SetTracks(std::vector<TrackData> tracks, uint32_t seed) {
     std::lock_guard lock(m_mutex);
     m_tracks = std::move(tracks);
+    // A54: "any track but the last one" is an index into the old list. A stale value (say 3
+    // when only two tracks are left) biased the next pick towards index 0.
+    m_lastTrack = -1;
     m_random.seed(seed);
 }
 
@@ -125,9 +135,13 @@ MusicMixer::Voice* MusicMixer::Start(float fadeSeconds) {
         if (!v.alive) voice = &v;
     if (!voice) {
         // All busy (stopped and started again mid-fade): drop the quietest.
-        voice = &m_voices[0];
+        // A54: never hand back m_current. Render stores the old track as `ending` and then
+        // writes ending->rate, so reusing the current voice made the brand-new track fade out
+        // instantly while the old one kept playing.
+        voice = nullptr;
         for (Voice& v : m_voices)
-            if (&v != m_current && v.level < voice->level) voice = &v;
+            if (&v != m_current && (!voice || v.level < voice->level)) voice = &v;
+        if (!voice) return nullptr;
     }
     // A track that doesn't open is skipped, not retried forever.
     for (size_t tries = 0; tries < m_tracks.size(); tries++) {
@@ -156,6 +170,10 @@ void MusicMixer::Render(int16_t* out, int frames) {
     } else if (!m_tracks.empty()) {
         if (!m_current) {
             m_current = Start(kFadeInSeconds);
+            // A54: Start already tried every track once. If none opened, retrying on every
+            // callback re-parsed all the files on the audio thread forever - a stall, not a
+            // recovery. Stop wanting music; SetActive(true) starts it again later.
+            if (!m_current) m_active = false;
         } else {
             // Into the next track while this one ends: equal-power, so no dip in the middle.
             const int64_t left = m_current->reader.RemainingFrames();
@@ -168,8 +186,12 @@ void MusicMixer::Render(int16_t* out, int frames) {
         }
     }
 
-    m_mix.assign(size_t(frames) * 2, 0.f);
-    m_scratch.resize(size_t(frames) * 2);
+    // A54: this runs on the audio callback thread, where a heap allocation can miss the
+    // deadline and click. Growing every callback was pure waste - grow once, then reuse.
+    const size_t samples = size_t(frames) * 2;
+    if (m_mix.size() < samples) m_mix.resize(samples);
+    if (m_scratch.size() < samples) m_scratch.resize(samples);
+    std::fill_n(m_mix.data(), samples, 0.f);
     bool any = false;
     for (Voice& v : m_voices) {
         if (!v.alive) continue;
@@ -189,7 +211,7 @@ void MusicMixer::Render(int16_t* out, int frames) {
         }
     }
     const float gain = m_gain;
-    for (size_t i = 0; i < m_mix.size(); i++) out[i] = int16_t(std::clamp(m_mix[i] * gain, -32768.f, 32767.f));
+    for (size_t i = 0; i < samples; i++) out[i] = int16_t(std::clamp(m_mix[i] * gain, -32768.f, 32767.f));
     m_idle = !any && !m_active;
 }
 
