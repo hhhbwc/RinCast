@@ -619,6 +619,7 @@ void VrStream::RunEncoder() {
     rcvr::Shared* shared = m_bridge->Shared();
     std::unique_ptr<VideoEncoder> encoder;
     uint32_t encWidth = 0, encHeight = 0;
+    uint32_t srcW = 0, srcH = 0;
     DXGI_FORMAT encFormat = DXGI_FORMAT_UNKNOWN;
     uint32_t appliedKbps = 0;
     EncodedFrame out;
@@ -636,10 +637,20 @@ void VrStream::RunEncoder() {
             m_encodeStartNs = rc::NowNs();
         }
         m_jobTaken.notify_one();
-        if (!encoder || encWidth != job.width || encHeight != job.height || encFormat != job.format) {
+        // A62: the NVENC backend caches nvEncRegisterResource per input texture pointer.
+        // Those registrations live exactly as long as the converter outputs do, so the
+        // encoder must be rebuilt whenever the converters were rebuilt - and they are
+        // rebuilt on any SOURCE size change, even when the encoded size stays the same
+        // (foveated sizes are derived from the config and round to 16 px). Without this,
+        // a rebuilt texture that lands on a freed address is handed to NVENC as its dead
+        // predecessor's registration.
+        if (!encoder || encWidth != job.width || encHeight != job.height || encFormat != job.format ||
+            srcW != job.srcWidth || srcH != job.srcHeight) {
             encWidth = job.width;
             encHeight = job.height;
             encFormat = job.format;
+            srcW = job.srcWidth;
+            srcH = job.srcHeight;
             EncoderConfig ec;
             ec.codec = m_config.codec;
             ec.width = encWidth;

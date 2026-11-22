@@ -55,6 +55,7 @@
 // decision logic (expiry, debt wipe, keyframe/log throttles), tested below.
 #include "rc/stale_flush.h"
 #include "rc/fovea_placement.h"
+#include "rc/fovea_qp.h"
 #include "rc/stream_profile.h"
 #include "rc/video_transport.h"
 #include "rc/wire_ceiling.h"
@@ -1882,6 +1883,22 @@ static void TestFoveaPlacement() {
     rc::FoveaSquare(normal, nullptr, F, true, s);
     CHECK(std::isfinite(s[0]));
     CHECK(std::isfinite(s[1]));
+}
+
+static void TestFoveaQpDelta() {
+    // The angle ramp: flat inside 25 degrees, smoothstep out to 50, then flat again.
+    CHECK(rc::FoveaQpDelta(0.0f, 6) == 0);
+    CHECK(rc::FoveaQpDelta(25.0f, 6) == 0);
+    CHECK(rc::FoveaQpDelta(37.5f, 6) == 3);   // smoothstep(0.5) * 6
+    CHECK(rc::FoveaQpDelta(50.0f, 6) == 6);
+    CHECK(rc::FoveaQpDelta(90.0f, 6) == 6);
+    CHECK(rc::FoveaQpDelta(37.5f, 24) == 12);  // AV1 counts in finer steps
+    // A non-finite fov tangent must not reach the QP map at all.
+    CHECK(rc::FoveaQpDelta(std::numeric_limits<float>::quiet_NaN(), 6) == 0);
+    CHECK(rc::FoveaQpDelta(std::numeric_limits<float>::infinity(), 6) == 0);
+    // An infinite tangent is not the same thing: atan(inf) is a real 90 degrees, so it
+    // arrives here as a finite angle and earns the full offset.
+    CHECK(rc::FoveaQpDelta(std::atan(std::numeric_limits<float>::infinity()) * 57.2958f, 6) == 6);
 }
 
 static void TestQueueGuard() {
@@ -5787,6 +5804,7 @@ int main() {
     TestFecWireBillingLoopback();
     TestPaceBaseKbps();  // A33 (TASK-PACE-FOLLOW-2026-11-22): the burst pacer's billing base
     TestFoveaPlacement();  // A61: the fovea square's placement rule
+    TestFoveaQpDelta();  // A62: the foveated QP ramp's NaN rule
     TestFpsLadder();
     TestFillFloorByTier();
     TestPercentile();  // TASK-DEC-PERCENTILE-2026-11-20 §1.2

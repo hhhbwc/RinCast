@@ -7,6 +7,7 @@
 
 #include "encoder.h"
 #include "nvenc/nvEncodeAPI.h"
+#include "rc/fovea_qp.h"
 #include "rc/fps_ladder.h"
 #include "rc/platform.h"
 #include "rc/stream_profile.h"
@@ -428,8 +429,7 @@ class NvencEncoder final : public VideoEncoder {
                 const float tx = -f[0] + u * (f[0] + f[1]);
                 const float ty = f[2] - v * (f[2] + f[3]);
                 const float deg = std::atan(std::sqrt(tx * tx + ty * ty)) * 57.2958f;
-                const float t = std::clamp((deg - 25.f) / 25.f, 0.f, 1.f);
-                m_qpMap[size_t(by) * bw + bx] = int8_t(std::lround(t * t * (3 - 2 * t) * maxDelta));
+                m_qpMap[size_t(by) * bw + bx] = int8_t(rc::FoveaQpDelta(deg, maxDelta));
             }
         }
     }
@@ -513,6 +513,10 @@ class NvencEncoder final : public VideoEncoder {
         if (m_encoder) ReconfigureRate(now);
     }
 
+    // The caller guarantees that an encoder outlives only the input textures it was
+    // created for: rebuilding the textures rebuilds the encoder (VrStream::RunEncoder).
+    // With a bare-pointer cache that contract is what rules out an ABA hit - a new
+    // texture at a freed address would otherwise be taken for the dead one.
     NV_ENC_REGISTERED_PTR Register(ID3D11Texture2D* tex) {
         if (auto it = m_registered.find(tex); it != m_registered.end()) return it->second;
         if (m_registered.size() >= 8) UnregisterAll();
