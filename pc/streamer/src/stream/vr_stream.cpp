@@ -706,7 +706,9 @@ void VrStream::RunEncoder() {
         send.meta = std::move(frameMeta);
         send.flags = rc::kVideoHasPose | (m_config.tenBit ? rc::kVideoHdr10 : 0);
         send.encodeMs = rc::NsToMs(encEnd - encStart);
-        send.frameIndex = job.frameIndex;  // ROUND19 T1: pass the existing counter through
+        // A55: the producer counts in 64 bits, the wire's diag seq field is 32 bits by design
+        // (it is a wrapping sequence number). Say so instead of letting the compiler warn.
+        send.frameIndex = static_cast<uint32_t>(job.frameIndex);  // ROUND19 T1: pass the existing counter through
         send.recovery = recovery;
         send.predictedDisplayPcNs = job.predictedDisplayPcNs;  // A26: the flush gate judges this
         {
