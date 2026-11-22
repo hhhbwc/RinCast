@@ -67,6 +67,19 @@ static double A80TanAspect(const float f[4]) {
     return tanV > 0 ? (double(f[0]) + double(f[1])) / tanV : 0.0;
 }
 
+// A82-M2: renders an enumerated refresh list in the same 60/72/90 shape the AUTO:
+// capability line uses (LogAutoCapability) so the clamp WARN carries the whole list -
+// with only the two ends a reader cannot tell a near-miss request from a wildly off
+// list. Readings only.
+static std::string A82RateList(const std::vector<float>& rates) {
+    std::string out;
+    for (float r : rates) {
+        if (!out.empty()) out += '/';
+        out += std::to_string(int(r + 0.5f));
+    }
+    return out;
+}
+
 // The 1 s reading of all three aspects, from the session's existing 1 s tick. The WARN
 // the card asks for is rate limited to 10 s because on the affected device the condition
 // holds for the whole session (the driver cannot hot-change the resolution) - the aspects
@@ -586,6 +599,13 @@ void ClientSession::HandleMessage(const json& m) {
         ClientStreamSettings before = StreamSettings();
         ApplyClientInfo(m);
         ClientStreamSettings after = StreamSettings();
+        // A82-M3: the PC-visible half of the headset's rate chase. FollowDisplayRate
+        // (headset/app/src/main/cpp/app/app.cpp:292-309) pushes the panel's ACTUAL rate
+        // through settings.refreshRate after 6 s of divergence; KeepRefreshRate's 2 s retry
+        // loop (xr_context.cpp:762-780) never reaches the wire. Readings only.
+        if (before.refreshRate != after.refreshRate)
+            RC_LOGI("Headset moved refreshRate %.0f -> %.0f Hz (its panel's actual rate) - the stream rebuilds at it",
+                    before.refreshRate, after.refreshRate);
         AdoptHeadsetOwnedSettings();
         // PLAN-AUTO-TUNE: a streamProfile the headset sends with a value the PC
         // never pushed (or one that differs from its pushed copy) is the
@@ -1042,6 +1062,11 @@ void ClientSession::RunAutoTune() {
     if (!m_caps.refreshRates.empty() && std::find(m_caps.refreshRates.begin(), m_caps.refreshRates.end(), nominal) ==
                                             m_caps.refreshRates.end())
         nominal = m_caps.refreshRates.back();
+    // A82-M2: the clamp fired exactly when the fallback rewrote the request - back() is
+    // itself in the list, so an unclamped nominal always equals st.refreshRate. The WARN
+    // rides the existing 30 s signals gate below because RunAutoTune runs on every stats
+    // tick; unthrottled it would spam. Fallback value untouched (stage F call, A82 §3 F3).
+    const bool nominalClamped = nominal != st.refreshRate;
 
     rc::BottleneckSignal sig;
     sig.decodeMs = NumberField(m_clientStats, "decodeMs", -1.0);
@@ -1070,6 +1095,10 @@ void ClientSession::RunAutoTune() {
                 "decode=%.1f/%.1f ms dropped=%.1f",
                 rc::BottleneckName(r.cls), vs.fps, vs.gameFps, vs.qp, vs.mbps, vs.bitrateKbps, vs.queueMs,
                 vs.lossAvg * 100.0, sig.decodeMs, sig.decodeBudgetMs, vs.droppedFps);
+        if (nominalClamped)
+            RC_LOGW("Refresh clamp (autoTune mirror of the StartVr stream-build clamp): %.0f Hz requested, not in "
+                    "the device's enumerated list [%s] - nominal %.0f Hz (the top entry)",
+                    st.refreshRate, A82RateList(m_caps.refreshRates).c_str(), nominal);
     }
 
     if (r.action == rc::AutoAction::None) return;
@@ -1246,6 +1275,15 @@ void ClientSession::StartVr() {
     if (!caps.refreshRates.empty() &&
         std::find(caps.refreshRates.begin(), caps.refreshRates.end(), rate) == caps.refreshRates.end())
         rate = caps.refreshRates.back();
+    // A82-M2: this fallback was silent - "why is this session encoding at 120 Hz" was
+    // undiagnosable from the log (TASK-A82 §1: on a Quest 2 list [60/72/80/90/120] a
+    // request of e.g. 85 lands on back() = 120). Readings only: the clamp target
+    // (back() = highest, not nearest) is a stage-F judgment (§3 F3) and stays untouched.
+    // Fired exactly when rate != st.refreshRate - back() is itself in the list.
+    if (rate != st.refreshRate)
+        RC_LOGW("Refresh clamp: %.0f Hz requested, not in the device's enumerated list [%s] - the stream "
+                "builds at %.0f Hz (the top entry)",
+                st.refreshRate, A82RateList(caps.refreshRates).c_str(), rate);
     dc.refreshRate = rate;
     // ROUND18 L3: warn when the requested rate is above the headset's measured
     // decode ceiling at large sizes. Informational only - we deliberately do NOT
@@ -1270,9 +1308,19 @@ void ClientSession::StartVr() {
     strncpy_s(dc.headsetSerial, m_hello.deviceId.c_str(), _TRUNCATE);
     dc.renderEyeWidth = renderW;
     dc.renderEyeHeight = renderH;
-    RC_LOGI("VR stream: %ux%u per eye%s", dc.eyeWidth, dc.eyeHeight,
+    // A82-M1: the effective nominal rate joins the resolution line, appended at the END
+    // (this line's parser, analyze_dual.py RE_RES, is not end-anchored - checked 2026-11-23).
+    // Provenance so the three values need no inference: what the headset requested
+    // (st.refreshRate), whether the enumerated list clamped it, and what the stream is
+    // actually built at (dc.refreshRate). The AUTO: capability refresh=[...] is the device's
+    // SUPPORT LIST and reads exactly like an effective value - that misreading produced the
+    // wrong-memory episode in TASK-A82 §1. Readings only.
+    RC_LOGI("VR stream: %ux%u per eye%s, %.0f Hz requested, effective %.0f Hz (%s)", dc.eyeWidth, dc.eyeHeight,
             !match ? "" : seenW ? (", SteamVR renders " + std::to_string(seenW) + "x" + std::to_string(seenH)).c_str()
-                                : ", following SteamVR's resolution once it renders");
+                                : ", following SteamVR's resolution once it renders",
+            st.refreshRate, dc.refreshRate,
+            rate != st.refreshRate ? "clamped: the request is not in the device's list"
+                                   : "as requested, present in the device's list");
     // A80-M1: the same shapes at the announce point, before the bridge has anything to
     // follow. Readings only - dc is already fully built above and is not touched here.
     {
