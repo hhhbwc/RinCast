@@ -1,6 +1,7 @@
 #include "rc/handshake.h"
 
 #include <cstring>
+#include <utility>
 
 #include "rc/platform.h"
 
@@ -31,6 +32,7 @@ bool IsHandshakeDatagram(const uint8_t* data, size_t size) {
     if (size < sizeof(PacketHeader)) return false;
     PacketHeader header;
     std::memcpy(&header, data, sizeof(header));
+    if (header.version != uint8_t(kProtocolVersion)) return false;  // keep in sync with ParseHandshake
     if (header.flags & kFlagEncrypted) return false;
     const auto t = PacketType(header.type);
     return t == PacketType::Hello || t == PacketType::Welcome || t == PacketType::Reject || t == PacketType::Punch;
@@ -41,17 +43,21 @@ bool ParseHandshake(const uint8_t* data, size_t size, HandshakePacket& out) {
     PacketHeader header;
     std::memcpy(&header, data, sizeof(header));
     if (header.version != uint8_t(kProtocolVersion) || (header.flags & kFlagEncrypted)) return false;
-    out.type = PacketType(header.type);
-    out.sessionId = header.sessionId;
+    // Parse into a local first so a rejection (truncated/invalid packet, or a
+    // Reject with no key) never leaves stale fields in the caller's `out`.
+    HandshakePacket parsed{};
+    parsed.type = PacketType(header.type);
+    parsed.sessionId = header.sessionId;
     size_t offset = sizeof(header);
-    if (out.type == PacketType::Hello || out.type == PacketType::Welcome) {
+    if (parsed.type == PacketType::Hello || parsed.type == PacketType::Welcome) {
         if (size < offset + 32) return false;
-        std::memcpy(out.publicKey.data(), data + offset, 32);
+        std::memcpy(parsed.publicKey.data(), data + offset, 32);
         offset += 32;
-    } else if (out.type != PacketType::Reject) {
+    } else if (parsed.type != PacketType::Reject) {
         return false;
     }
-    out.json.assign(reinterpret_cast<const char*>(data + offset), size - offset);
+    parsed.json.assign(reinterpret_cast<const char*>(data + offset), size - offset);
+    out = std::move(parsed);
     return true;
 }
 

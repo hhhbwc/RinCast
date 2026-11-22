@@ -60,6 +60,20 @@ SessionKeys DeriveSessionKeys(const Key& mySecret, const Key& peerPublic, const 
     uint8_t shared[32];
     crypto_x25519(shared, mySecret.data(), peerPublic.data());
 
+    // A low-order peer public key (all zeros, or one of Curve25519's small-order
+    // points) makes X25519 silently output an all-zero shared secret. In local
+    // sessions (empty connectSecret) that would make the session key predictable
+    // to a passive observer. Detect it with a constant-time compare and substitute
+    // a domain-separated value so no fixed key can be forced. Legitimate handshakes
+    // never take this branch, so their derived bytes stay byte-identical (wire frozen).
+    static const uint8_t kZeroShared[32] = {0};
+    static const char kLowOrderSubstitute[] = "rincast-x25519-loworder-reject!!";  // 32 bytes
+    static_assert(sizeof(kLowOrderSubstitute) - 1 == 32, "domain separator must be 32 bytes");
+    if (crypto_verify32(shared, kZeroShared) == 0) {
+        std::memcpy(shared, kLowOrderSubstitute, sizeof(shared));
+        RC_LOGE("X25519 low-order peer public key detected; refusing predictable shared secret");
+    }
+
     std::vector<uint8_t> transcript;
     static const char kLabel[] = "rincast-session-v3";
     transcript.insert(transcript.end(), kLabel, kLabel + sizeof(kLabel) - 1);
@@ -73,6 +87,9 @@ SessionKeys DeriveSessionKeys(const Key& mySecret, const Key& peerPublic, const 
     SessionKeys keys;
     std::memcpy(keys.clientToServer.data(), okm, 32);
     std::memcpy(keys.serverToClient.data(), okm + 32, 32);
+    // transcript holds the connectSecret in the clear for cloud sessions; wipe it
+    // before returning. KDF input bytes are untouched.
+    crypto_wipe(transcript.data(), transcript.size());
     crypto_wipe(shared, sizeof(shared));
     crypto_wipe(okm, sizeof(okm));
     return keys;

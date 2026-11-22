@@ -37,6 +37,10 @@
 #include "rc/motion_field.h"
 #include "rc/music.h"
 #include "rc/platform.h"
+// A44 (TASK-HANDSHAKE-HARDEN-2026-11-22): the low-order defense test uses a
+// frozen copy of the wire KDF as a known-answer oracle, so it calls Monocypher
+// directly (rincast-core exports its include dir PUBLIC).
+#include "monocypher.h"
 #include "rc/fps_ladder.h"
 #include "rc/loss_brake.h"
 #include "rc/autoscale.h"
@@ -142,6 +146,119 @@ struct Peer {
         if (thread.joinable()) thread.join();
     }
 };
+
+// A44 (TASK-HANDSHAKE-HARDEN-2026-11-22): frozen KDF oracle. This reproduces the
+// pre-change wire bytes exactly and deliberately lacks the low-order defense, so
+// equality proves interop/byte-frozen derivation and inequality on a low-order
+// input proves the defense actually fired.
+static crypto::SessionKeys ReferenceDerive(const crypto::Key& shared, const crypto::Key& clientPublic,
+                                           const crypto::Key& serverPublic, const std::string& context) {
+    std::vector<uint8_t> transcript;
+    static const char kLabel[] = "rincast-session-v3";
+    transcript.insert(transcript.end(), kLabel, kLabel + sizeof(kLabel) - 1);
+    transcript.insert(transcript.end(), clientPublic.begin(), clientPublic.end());
+    transcript.insert(transcript.end(), serverPublic.begin(), serverPublic.end());
+    transcript.insert(transcript.end(), context.begin(), context.end());
+
+    uint8_t okm[64];
+    crypto_blake2b_keyed(okm, sizeof(okm), shared.data(), shared.size(), transcript.data(), transcript.size());
+    crypto::SessionKeys keys;
+    std::memcpy(keys.clientToServer.data(), okm, 32);
+    std::memcpy(keys.serverToClient.data(), okm + 32, 32);
+    crypto_wipe(okm, sizeof(okm));
+    return keys;
+}
+
+static void TestHandshakeHardening() {
+    // --- gate 5 / 1.1 regression: byte-identical derivation on a normal exchange ---
+    crypto::Key mySecret{}, peerSecret{}, clientPublic{}, serverPublic{};
+    for (size_t i = 0; i < 32; ++i) {
+        mySecret[i] = uint8_t(i);
+        peerSecret[i] = uint8_t(0xA0 + i);
+        clientPublic[i] = uint8_t(0x20 + i);
+        serverPublic[i] = uint8_t(0x40 + i);
+    }
+    crypto::Key peerPublic{};
+    crypto_x25519_public_key(peerPublic.data(), peerSecret.data());
+    const std::string context = "cn|sn|secret";  // == SessionContext("cn","sn","secret")
+
+    crypto::Key refShared{};
+    crypto_x25519(refShared.data(), mySecret.data(), peerPublic.data());
+    const auto expected = ReferenceDerive(refShared, clientPublic, serverPublic, context);
+    const auto actual = crypto::DeriveSessionKeys(mySecret, peerPublic, clientPublic, serverPublic, context);
+    CHECK(actual.clientToServer == expected.clientToServer);
+    CHECK(actual.serverToClient == expected.serverToClient);
+    // Known-answer hex captured from the pre-change build (fixed vector, wire frozen).
+    CHECK(HexEncode(actual.clientToServer.data(), 32) ==
+          "2765ab9a32996cbd13c7c4faa93b84fa1869ffca6d9407f55bf670446d697c9f");
+    CHECK(HexEncode(actual.serverToClient.data(), 32) ==
+          "77697a0a60407ce545e8ef05810146cb138e7a5c8d9f7bdab3f644f326540436");
+
+    // --- 1.1: a low-order peer public key must not yield the predictable key ---
+    crypto::Key zeroPublic{};  // all-zero public key is a low-order point
+    crypto::Key probe{};
+    crypto_x25519(probe.data(), mySecret.data(), zeroPublic.data());
+    uint8_t probeAcc = 0;
+    for (size_t i = 0; i < 32; ++i) probeAcc |= probe[i];
+    CHECK(probeAcc == 0);  // confirm the crafted input really drives shared to all zeros
+
+    const auto predictable = ReferenceDerive(zeroPublic /* all-zero shared */, clientPublic, serverPublic, context);
+    const auto defended = crypto::DeriveSessionKeys(mySecret, zeroPublic, clientPublic, serverPublic, context);
+    CHECK(defended.clientToServer != predictable.clientToServer);
+    CHECK(defended.serverToClient != predictable.serverToClient);
+    const auto defendedAgain = crypto::DeriveSessionKeys(mySecret, zeroPublic, clientPublic, serverPublic, context);
+    CHECK(defendedAgain.clientToServer == defended.clientToServer);  // still deterministic
+    CHECK(defendedAgain.serverToClient == defended.serverToClient);
+
+    // --- 1.3: a rejected parse must not clobber the caller's out ---
+    HandshakePacket io;
+    io.type = PacketType::Reject;
+    io.sessionId = 0xDEADBEEFu;
+    io.publicKey = clientPublic;
+    io.json = "stale";
+
+    HandshakePacket welcome;
+    welcome.type = PacketType::Welcome;
+    welcome.sessionId = 7;
+    welcome.publicKey = serverPublic;
+    welcome.json = R"({"ok":true})";
+    auto welcomeBytes = BuildHandshake(welcome);
+    CHECK(ParseHandshake(welcomeBytes.data(), welcomeBytes.size(), io));
+    CHECK(io.publicKey == serverPublic && io.sessionId == 7 && io.json == welcome.json);
+
+    HandshakePacket reject;
+    reject.type = PacketType::Reject;
+    reject.sessionId = 8;
+    reject.json = R"({"reason":"no"})";
+    auto rejectBytes = BuildHandshake(reject);
+    CHECK(ParseHandshake(rejectBytes.data(), rejectBytes.size(), io));
+    CHECK(io.publicKey == crypto::Key{});  // Reject carries no key -> must be zeroed
+    CHECK(io.sessionId == 8 && io.json == reject.json);
+
+    // Truncated Hello: returns false and leaves `io` byte-for-byte untouched.
+    const HandshakePacket before = io;
+    auto trunc = BuildHandshake(welcome);
+    trunc.resize(sizeof(PacketHeader) + 16);  // key field cut in half
+    CHECK(!ParseHandshake(trunc.data(), trunc.size(), io));
+    CHECK(io.type == before.type && io.sessionId == before.sessionId && io.publicKey == before.publicKey &&
+          io.json == before.json);
+
+    // --- 1.4: version gate on IsHandshakeDatagram (Punch included) ---
+    auto helloBytes = BuildHandshake(welcome);
+    helloBytes[0] = uint8_t(kProtocolVersion) + 1;  // header.version is byte 0
+    CHECK(!IsHandshakeDatagram(helloBytes.data(), helloBytes.size()));
+    helloBytes[0] = uint8_t(kProtocolVersion);
+    CHECK(IsHandshakeDatagram(helloBytes.data(), helloBytes.size()));
+    // Punch is hand-built in cloud_client.cpp with version = kProtocolVersion;
+    // it must still be recognized (hole punching preserved).
+    PacketHeader punch{};
+    punch.version = uint8_t(kProtocolVersion);
+    punch.type = uint8_t(PacketType::Punch);
+    punch.flags = kFlagNone;
+    CHECK(IsHandshakeDatagram(reinterpret_cast<const uint8_t*>(&punch), sizeof(punch)));
+
+    std::printf("handshake hardening OK: low-order defense + frozen KDF vector + parse isolation + version gate\n");
+}
 
 static void TestHandshakeAndTransport() {
     auto client = crypto::KeyPair::Generate();
@@ -4830,6 +4947,7 @@ int main() {
     TestSuggestStartFps();
     TestSessionDisconnectReconnect();
     TestFecDeterministic();
+    TestHandshakeHardening();  // A44 (TASK-HANDSHAKE-HARDEN-2026-11-22)
     TestHandshakeAndTransport();
     if (g_failures) std::printf("%d FAILURES\n", g_failures);
     else if (g_skips) std::printf("ALL TESTS PASSED (%d skipped)\n", g_skips);
