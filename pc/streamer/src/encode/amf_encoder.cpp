@@ -168,7 +168,8 @@ class AmfEncoder final : public VideoEncoder {
     bool Encode(ID3D11Texture2D* input, bool forceKeyframe, EncodedFrame& out) override {
         amf::AMFSurfacePtr surface;
         if (m_context->CreateSurfaceFromDX11Native(input, &surface, nullptr) != AMF_OK) return false;
-        if (forceKeyframe || m_frames == 0) {
+        const bool requestedKeyframe = forceKeyframe || m_frames == 0;
+        if (requestedKeyframe) {
             switch (m_config.codec) {
                 case rc::VideoCodec::H264:
                     surface->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE, AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR);
@@ -208,18 +209,24 @@ class AmfEncoder final : public VideoEncoder {
                 out.data.assign(p, p + buffer->GetSize());
                 int64_t type = -1;
                 switch (m_config.codec) {
-                    case rc::VideoCodec::H264:
-                        buffer->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &type);
-                        out.keyframe = type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR;
+                    case rc::VideoCodec::H264: {
+                        const AMF_RESULT q = buffer->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &type);
+                        out.keyframe = q == AMF_OK ? type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR
+                                                   : requestedKeyframe;
                         break;
-                    case rc::VideoCodec::HEVC:
-                        buffer->GetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE, &type);
-                        out.keyframe = type == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_IDR;
+                    }
+                    case rc::VideoCodec::HEVC: {
+                        const AMF_RESULT q = buffer->GetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE, &type);
+                        out.keyframe = q == AMF_OK ? type == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_IDR
+                                                   : requestedKeyframe;
                         break;
-                    case rc::VideoCodec::AV1:
-                        buffer->GetProperty(AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE, &type);
-                        out.keyframe = type == AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE_KEY;
+                    }
+                    case rc::VideoCodec::AV1: {
+                        const AMF_RESULT q = buffer->GetProperty(AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE, &type);
+                        out.keyframe = q == AMF_OK ? type == AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE_KEY
+                                                   : requestedKeyframe;
                         break;
+                    }
                 }
                 return true;
             }
@@ -267,6 +274,19 @@ class AmfEncoder final : public VideoEncoder {
     uint64_t m_frames = 0;
 };
 
+// TASK-A66: a creatable HEVC component does not imply Main10 - older VCE generations
+// create it and only fail Init(P010 / MAIN_10). The capability manager reports the
+// real max profile; when it cannot answer, keep the old "HEVC implies Main10" rule.
+bool HevcMain10Supported(amf::AMFContext* ctx, amf::AMFFactory* factory) {
+    amf::AMFComponentPtr component;
+    if (factory->CreateComponent(ctx, AMFVideoEncoder_HEVC, &component) != AMF_OK) return false;
+    amf::AMFCapsPtr caps;
+    if (component->GetCaps(&caps) != AMF_OK || !caps) return true;
+    int64_t profile = 0;
+    if (caps->GetProperty(AMF_VIDEO_ENCODER_HEVC_CAP_MAX_PROFILE, &profile) != AMF_OK) return true;
+    return profile >= AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN_10;
+}
+
 }  // namespace
 
 bool AmfProbe(ID3D11Device* device, EncoderCaps& caps) {
@@ -282,7 +302,9 @@ bool AmfProbe(ID3D11Device* device, EncoderCaps& caps) {
     caps.h264 = test(AMFVideoEncoderVCE_AVC);
     caps.hevc = test(AMFVideoEncoder_HEVC);
     caps.av1 = test(AMFVideoEncoder_AV1);
-    caps.hevc10 = caps.hevc;
+    caps.hevc10 = caps.hevc && HevcMain10Supported(ctx, lib.factory);
+    // AV1 Main already covers 10-bit and AMF has no separate bit-depth capability;
+    // the codec's presence is the only signal there is.
     caps.av110 = caps.av1;
     caps.maxWidth = 7680;
     caps.maxHeight = 4320;
