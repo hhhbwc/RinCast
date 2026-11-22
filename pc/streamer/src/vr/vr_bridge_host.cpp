@@ -7,6 +7,7 @@
 #include "../settings.h"
 #include "rc/platform.h"
 #include "rc/protocol.h"
+#include "rc/stream_profile.h"
 
 namespace rcs {
 
@@ -201,7 +202,7 @@ bool VrBridgeHost::PoseWaitNs(int64_t atNs, int64_t& waitNs, int64_t& periodNs) 
     if (ActiveProducer() != rcvr::ProducerKind::SteamVR) return false;
     const float rate = m_shared->config.refreshRate;
     const int64_t epoch = m_shared->vsyncEpochNs;
-    if (rate <= 1 || !epoch) return false;
+    if (!rc::PlausibleRefreshRate(rate) || !epoch) return false;
     // As the driver's TrackingLoop counts: vsyncs at epoch + k * period, poses read 1 ms before.
     periodNs = int64_t(1e9 / rate);
     const int64_t pickup = epoch - 1'000'000;

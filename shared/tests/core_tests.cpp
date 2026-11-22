@@ -1723,6 +1723,53 @@ static void TestStreamProfile() {
     CHECK(rc::ValidateDecodeFpsHint(241) == 0);   // malformed high
     CHECK(rc::ValidateDecodeFpsHint(0xFFFFFFFFu) == 0);  // garbage
 
+    // A60: the plausibility gate every self-reported headset number passes through.
+    // A bad value must read as "not reported" (the caller keeps its previous copy);
+    // NaN/inf fail the comparisons, so none of them reaches a period (1e9/hz) or a
+    // stream size.
+    CHECK(!rc::PlausibleRefreshRate(23.9f));
+    CHECK(rc::PlausibleRefreshRate(24.0f));
+    CHECK(rc::PlausibleRefreshRate(72.0f));
+    CHECK(rc::PlausibleRefreshRate(90.0f));
+    CHECK(rc::PlausibleRefreshRate(120.0f));
+    CHECK(rc::PlausibleRefreshRate(240.0f));
+    CHECK(!rc::PlausibleRefreshRate(240.1f));
+    CHECK(!rc::PlausibleRefreshRate(std::numeric_limits<float>::infinity()));
+    CHECK(!rc::PlausibleRefreshRate(std::nanf("")));
+
+    // The panel size: 0 makes the encode geometry 0/0 later, 0xFFFFFFFF wraps the
+    // alignment - both must read as "not reported".
+    CHECK(!rc::PlausibleEyeSize(0u));
+    CHECK(!rc::PlausibleEyeSize(255u));
+    CHECK(rc::PlausibleEyeSize(256u));
+    CHECK(rc::PlausibleEyeSize(1832u));
+    CHECK(rc::PlausibleEyeSize(1920u));
+    CHECK(rc::PlausibleEyeSize(4096u));
+    CHECK(!rc::PlausibleEyeSize(4097u));
+    CHECK(!rc::PlausibleEyeSize(0xFFFFFFFFu));
+
+    CHECK(!rc::PlausibleDecodeSize(0u));
+    CHECK(!rc::PlausibleDecodeSize(511u));
+    CHECK(rc::PlausibleDecodeSize(512u));
+    CHECK(rc::PlausibleDecodeSize(4096u));
+    CHECK(rc::PlausibleDecodeSize(16384u));
+    CHECK(!rc::PlausibleDecodeSize(16385u));
+
+    CHECK(!rc::PlausibleIpd(0.0f));
+    CHECK(rc::PlausibleIpd(0.03f));
+    CHECK(rc::PlausibleIpd(0.063f));
+    CHECK(rc::PlausibleIpd(0.09f));
+    CHECK(!rc::PlausibleIpd(0.2f));
+
+    CHECK(!rc::PlausibleFovTangent(-10.0f));
+    CHECK(rc::PlausibleFovTangent(-1.0f));
+    CHECK(rc::PlausibleFovTangent(0.0f));
+    CHECK(rc::PlausibleFovTangent(1.1f));
+    CHECK(rc::PlausibleFovTangent(9.9f));
+    CHECK(!rc::PlausibleFovTangent(10.0f));
+    CHECK(!rc::PlausibleFovTangent(std::numeric_limits<float>::quiet_NaN()));
+    CHECK(!rc::PlausibleFovTangent(std::numeric_limits<float>::infinity()));
+
     // A one-frame VBV cannot hold NVENC's VBR rate control. Measured 2026-11-15
     // (encode-bench --synthetic, 3488x1744 @90): LowLatency with 100 % sent
     // 136 / 126 / 109 % of a 20 / 30 / 40 Mbps ceiling and only 87 % of 140 Mbps;

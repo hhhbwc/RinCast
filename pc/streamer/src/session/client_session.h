@@ -184,7 +184,7 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     std::string m_vrState = "idle";
     std::string m_vrProducer;
     std::string m_vrApp;
-    int64_t m_steamVrLaunchNs = 0;
+    std::atomic<int64_t> m_steamVrLaunchNs{0};
     // Matching SteamVR's resolution: the size the VR stream was started for, a new one
     // SteamVR has rendered at since, for how many ticks (s) it held, and when the stream
     // last restarted to follow one.

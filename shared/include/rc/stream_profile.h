@@ -85,6 +85,17 @@ constexpr uint32_t ValidateDecodeFpsHint(uint32_t fps) {
     return (fps >= 24u && fps <= 240u) ? fps : 0u;
 }
 
+// A60: plausibility of the numbers a headset reports about itself. A value no real
+// device produces (NaN/inf, zero, absurd) reads as "not reported": callers keep
+// their previous copy instead of sizing a stream from it. PlausibleRefreshRate's
+// 24..240 is the same range ValidateDecodeFpsHint states above, kept equal here so
+// the two can never disagree.
+constexpr bool PlausibleRefreshRate(float hz) { return hz >= 24.0f && hz <= 240.0f; }
+constexpr bool PlausibleEyeSize(uint32_t px) { return px >= 256u && px <= 4096u; }
+constexpr bool PlausibleDecodeSize(uint32_t px) { return px >= 512u && px <= 16384u; }
+constexpr bool PlausibleIpd(float meters) { return meters >= 0.03f && meters <= 0.09f; }
+constexpr bool PlausibleFovTangent(float t) { return t > -10.0f && t < 10.0f; }  // NaN fails both
+
 constexpr StreamProfileParams ProfileParams(StreamProfile p) {
     switch (p) {
         case StreamProfile::LowLatency:

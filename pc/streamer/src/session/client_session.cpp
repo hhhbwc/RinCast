@@ -610,7 +610,7 @@ void ClientSession::HandleMessage(const json& m) {
     }
     if (type == rc::msg::kStats) {
         std::lock_guard lock(m_mutex);
-        m_clientStats = m.value("stats", json::object());
+        m_clientStats = ObjectField(m, "stats");
         // ROUND19 T3: the decode-side autoscale ladder (default off). The headset's
         // decode average arrives here at ~1 Hz - the natural tick. A missing decodeMs
         // reads as no pressure (the ladder is conservative on absent signals), the
@@ -625,7 +625,7 @@ void ClientSession::HandleMessage(const json& m) {
             const double hintMs = m_caps.maxFpsAtMaxRes > 0 ? 1000.0 / m_caps.maxFpsAtMaxRes : 0.0;
             c.decodeBudgetMs = hintMs > 0 ? hintMs * 0.8 : 20.0;
             m_autoscale.Configure(c);
-            const double decodeMs = m_clientStats.value("decodeMs", -1.0);
+            const double decodeMs = NumberField(m_clientStats, "decodeMs", -1.0);
             const double dropped = m_vr ? double(m_vr->Stats().droppedFps) : -1.0;
             const auto r = m_autoscale.Update(decodeMs, dropped, rc::NowNs());
             if (r.changed)
@@ -649,15 +649,18 @@ void ClientSession::ApplyClientInfo(const json& m) {
     // thread, where an uncaught throw is std::terminate.
     if (const auto display = m.find("display"); display != m.end() && display->is_object()) {
         const json& d = *display;
-        m_caps.recommendedEyeWidth = UIntField(d, "eyeWidth", m_caps.recommendedEyeWidth);
-        m_caps.recommendedEyeHeight = UIntField(d, "eyeHeight", m_caps.recommendedEyeHeight);
-        m_caps.ipd = FloatField(d, "ipd", m_caps.ipd);
+        const uint32_t eyeW = UIntField(d, "eyeWidth", m_caps.recommendedEyeWidth);
+        if (rc::PlausibleEyeSize(eyeW)) m_caps.recommendedEyeWidth = eyeW;
+        const uint32_t eyeH = UIntField(d, "eyeHeight", m_caps.recommendedEyeHeight);
+        if (rc::PlausibleEyeSize(eyeH)) m_caps.recommendedEyeHeight = eyeH;
+        const float ipd = FloatField(d, "ipd", m_caps.ipd);
+        if (rc::PlausibleIpd(ipd)) m_caps.ipd = ipd;
         if (const auto rates = d.find("refreshRates"); rates != d.end() && rates->is_array()) {
             std::vector<float> valid;
             for (const auto& r : *rates) {
                 if (!r.is_number()) continue;
-                const double hz = r.get<double>();
-                if (std::isfinite(hz) && hz > 0) valid.push_back(float(hz));
+                const float hzF = float(r.get<double>());
+                if (rc::PlausibleRefreshRate(hzF)) valid.push_back(hzF);
             }
             if (!valid.empty()) m_caps.refreshRates = std::move(valid);
         }
@@ -667,8 +670,10 @@ void ClientSession::ApplyClientInfo(const json& m) {
                                          (*fov)[0].is_array() && (*fov)[0].size() == 4 &&
                                          (*fov)[1].is_array() && (*fov)[1].size() == 4) {
             for (int e = 0; e < 2; e++)
-                for (int k = 0; k < 4; k++)
-                    m_caps.fovTan[e][k] = FloatAt((*fov)[e], size_t(k), m_caps.fovTan[e][k]);
+                for (int k = 0; k < 4; k++) {
+                    const float v = FloatAt((*fov)[e], size_t(k), m_caps.fovTan[e][k]);
+                    if (rc::PlausibleFovTangent(v)) m_caps.fovTan[e][k] = v;
+                }
         }
     }
     if (const auto decoders = m.find("decoders"); decoders != m.end() && decoders->is_object()) {
@@ -678,8 +683,10 @@ void ClientSession::ApplyClientInfo(const json& m) {
         m_caps.hevc10 = BoolField(d, "hevc10", false);
         m_caps.av1 = BoolField(d, "av1", false);
         m_caps.av110 = BoolField(d, "av110", false);
-        m_caps.maxDecodeWidth = UIntField(d, "maxWidth", 4096u);
-        m_caps.maxDecodeHeight = UIntField(d, "maxHeight", 4096u);
+        const uint32_t mw = UIntField(d, "maxWidth", m_caps.maxDecodeWidth);
+        if (rc::PlausibleDecodeSize(mw)) m_caps.maxDecodeWidth = mw;
+        const uint32_t mh = UIntField(d, "maxHeight", m_caps.maxDecodeHeight);
+        if (rc::PlausibleDecodeSize(mh)) m_caps.maxDecodeHeight = mh;
         // ROUND18 L3: optional fps ceiling. 0/missing = old headset, no warning.
         // Reject malformed values via the shared validator (also unit-tested).
         m_caps.maxFpsAtMaxRes = rc::ValidateDecodeFpsHint(UIntField(d, "maxFpsAtMaxRes", 0u));
@@ -704,9 +711,12 @@ void ClientSession::ApplyClientInfo(const json& m) {
         // headsets before 1.2.1 only foveate tracked
         m_settings.eyesTracked = BoolField(s, "eyesTracked", m_settings.eyesTracked);
         m_settings.frameGeneration = BoolField(s, "frameGeneration", m_settings.frameGeneration);
-        m_settings.refreshRate = FloatField(s, "refreshRate", m_settings.refreshRate);
-        m_settings.vrBitrateMbps = IntField(s, "vrBitrateMbps", m_settings.vrBitrateMbps);
-        m_settings.desktopBitrateMbps = IntField(s, "desktopBitrateMbps", m_settings.desktopBitrateMbps);
+        const float hz = FloatField(s, "refreshRate", m_settings.refreshRate);
+        if (rc::PlausibleRefreshRate(hz)) m_settings.refreshRate = hz;
+        const int vrMbps = IntField(s, "vrBitrateMbps", m_settings.vrBitrateMbps);
+        m_settings.vrBitrateMbps = vrMbps ? std::clamp(vrMbps, 10, 500) : 0;
+        const int desktopMbps = IntField(s, "desktopBitrateMbps", m_settings.desktopBitrateMbps);
+        m_settings.desktopBitrateMbps = desktopMbps ? std::clamp(desktopMbps, 5, 200) : 0;
         m_settings.desktopFps = IntField(s, "desktopFps", m_settings.desktopFps);
         m_settings.adaptiveBitrate = BoolField(s, "adaptiveBitrate", m_settings.adaptiveBitrate);
         m_settings.streamProfile = std::clamp(IntField(s, "streamProfile", m_settings.streamProfile), 0, 2);
@@ -789,6 +799,12 @@ void ClientSession::MeasurePoseWait(int64_t receivedNs) {
 }
 
 void ClientSession::SendServerInfo() {
+    // Read under the lock: NotifyVrState rewrites these strings from the VR stream thread.
+    std::string vrState;
+    {
+        std::lock_guard lock(m_mutex);
+        vrState = m_vrState;
+    }
     const Settings s = SettingsStore::Get().Snapshot();
     const EncoderCaps& caps = App::Get().Caps();
     const auto route = audio::ResolveRoute(s.audioDevices);
@@ -813,7 +829,7 @@ void ClientSession::SendServerInfo() {
                          {"devices", route.micSet.empty() ? route.speakerSet : route.micSet}}},
         {"account", s.cloudUserName},
         {"remote", m_remote},
-        {"vrState", m_vrState},
+        {"vrState", vrState},
         // 可同步的共享设置：只推 PC 仍然拥有的那些项（头显改过的项所有权已收回）。
         // 码率不算：头显已有「跟随 PC」的 0 值语义，双向覆盖会破坏它。
         {"settings", OwnedSettingsJson()},
@@ -877,10 +893,13 @@ void ClientSession::OnSettingsChanged(const json& changed) {
     // PLAN-AUTO-TUNE: a manual write of a dimension auto owns locks that
     // dimension until autoTune is turned off and back on (DECISION-TABLE §3.1).
     // Enabling autoTune itself is the hand-over, so it clears last.
-    if (changed.contains("streamProfile")) m_autoTune.MarkManual(rc::AutoDim::Profile);
-    if (changed.contains("qualityProfileCbr")) m_autoTune.MarkManual(rc::AutoDim::Cbr);
-    if (changed.contains("foveatedEncoding")) m_autoTune.MarkManual(rc::AutoDim::Fovea);
-    if (changed.contains("autoTune") && changed.value("autoTune", false)) m_autoTune.ClearLocks();
+    {
+        std::lock_guard lock(m_mutex);
+        if (changed.contains("streamProfile")) m_autoTune.MarkManual(rc::AutoDim::Profile);
+        if (changed.contains("qualityProfileCbr")) m_autoTune.MarkManual(rc::AutoDim::Cbr);
+        if (changed.contains("foveatedEncoding")) m_autoTune.MarkManual(rc::AutoDim::Fovea);
+        if (changed.contains("autoTune") && changed.value("autoTune", false)) m_autoTune.ClearLocks();
+    }
     if (changed.contains("desktopInput")) ApplyInputSetting(true);
     if (changed.contains("streamAudio") || changed.contains("micPassthrough") ||
         changed.contains("audioDevices") || changed.contains("playOnPcToo") || changed.contains("switchDefaultAudio"))
@@ -950,7 +969,7 @@ void ClientSession::RunAutoTune() {
         nominal = m_caps.refreshRates.back();
 
     rc::BottleneckSignal sig;
-    sig.decodeMs = m_clientStats.value("decodeMs", -1.0);
+    sig.decodeMs = NumberField(m_clientStats, "decodeMs", -1.0);
     const double hintMs = m_caps.maxFpsAtMaxRes > 0 ? 1000.0 / m_caps.maxFpsAtMaxRes : 0.0;
     sig.decodeBudgetMs = hintMs > 0 ? hintMs * 0.8 : 20.0;  // the ladder's own budget formula
     sig.droppedFps = m_vr ? double(vs.droppedFps) : -1.0;
@@ -1025,12 +1044,13 @@ void ClientSession::StartDesktop(const json& m) {
         m_restartDesktop = false;
         if (!m_restartVr) m_restartDueNs = 0;
     }
-    StopDesktop();
     const Settings pc = SettingsStore::Get().Snapshot();
     std::vector<MonitorInfo> monitors = EnumerateMonitors();
     std::vector<std::string> wanted;
     if (m.contains("monitors") && m["monitors"].is_array())
-        for (const auto& id : m["monitors"]) wanted.push_back(id.get<std::string>());
+        for (const auto& id : m["monitors"])
+            if (id.is_string()) wanted.push_back(id.get<std::string>());
+    StopDesktop();
 
     ClientCaps caps;
     ClientStreamSettings st;
