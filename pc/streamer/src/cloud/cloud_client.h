@@ -41,7 +41,7 @@ class CloudClient {
    private:
     void Run();
     bool EnsureAccessToken();
-    bool RefreshTokens();
+    bool RefreshTokens(bool force = false);
     void StoreTokens(const json& tokens);
     HttpResponse Api(const std::string& method, const std::string& path, const json& body, int timeoutMs = 15000);
     void RegisterPc();
@@ -56,12 +56,22 @@ class CloudClient {
     std::atomic<bool> m_running{false};
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
+    // Serializes refresh-token use: two concurrent POSTs with the same refresh
+    // token trip rotation servers, and a refresh landing after SignOut would
+    // write the tokens straight back. Lock order is always refresh -> m_mutex.
+    std::mutex m_refreshMutex;
     std::string m_accessToken;
     int64_t m_accessExpiresNs = 0;
     std::string m_status = "signed_out";  // signed_out | connecting | online | error
     std::string m_lastError;
     bool m_registered = false;
     std::string m_registeredName;
+
+    // Detached rendezvous threads: Stop waits for them so App's members cannot
+    // be destroyed under a thread that is still resolving or punching.
+    std::atomic<int> m_rvActive{0};
+    std::mutex m_rvDoneMutex;
+    std::condition_variable m_rvDoneCv;
 
     // Rendezvous
     std::mutex m_rvMutex;

@@ -42,6 +42,10 @@ void CloudClient::Stop() {
     m_running = false;
     m_cv.notify_all();
     if (m_thread.joinable()) m_thread.join();
+    {
+        std::unique_lock lock(m_rvDoneMutex);
+        m_rvDoneCv.wait(lock, [this] { return m_rvActive.load() == 0; });
+    }
     m_portMapper.Stop();
 }
 
@@ -108,6 +112,7 @@ std::string CloudClient::Register(const std::string& name, const std::string& em
 }
 
 void CloudClient::SignOut() {
+    std::lock_guard refreshLock(m_refreshMutex);
     const Settings s = SettingsStore::Get().Snapshot();
     const std::string refresh = UnprotectString(s.cloudRefreshTokenProtected);
     if (!refresh.empty())
@@ -130,7 +135,14 @@ std::string CloudClient::ApproveHeadsetCode(const std::string& code) {
     return {};
 }
 
-bool CloudClient::RefreshTokens() {
+bool CloudClient::RefreshTokens(bool force) {
+    std::lock_guard refreshLock(m_refreshMutex);
+    if (!force) {
+        // Another thread may have refreshed while we were waiting for the lock;
+        // using its result is the whole point of serializing.
+        std::lock_guard lock(m_mutex);
+        if (!m_accessToken.empty() && rc::NowNs() < m_accessExpiresNs) return true;
+    }
     const std::string refresh = UnprotectString(SettingsStore::Get().Snapshot().cloudRefreshTokenProtected);
     if (refresh.empty()) return false;
     auto r = HttpRequest("POST", BaseUrl() + "/auth/refresh", json{{"refreshToken", refresh}}.dump(), "", 15000);
@@ -170,7 +182,7 @@ HttpResponse CloudClient::Api(const std::string& method, const std::string& path
         token = m_accessToken;
     }
     auto r = HttpRequest(method, BaseUrl() + path, body.is_null() ? "" : body.dump(), token, timeoutMs);
-    if (r.status == 401 && RefreshTokens()) {
+    if (r.status == 401 && RefreshTokens(true)) {
         std::lock_guard lock(m_mutex);
         token = m_accessToken;
         r = HttpRequest(method, BaseUrl() + path, body.is_null() ? "" : body.dump(), token, timeoutMs);
@@ -267,7 +279,11 @@ void CloudClient::Run() {
             lastHeartbeat = rc::NowNs();
         }
         // Long-poll for connection requests.
-        auto r = Api("GET", "/pcs/" + s.serverId + "/events?wait=25", json(), 35000);
+        // Short enough that Stop()'s join cannot sit on a 25 s server hold: the
+        // server keeps an idle long-poll open for `wait` seconds and WinHTTP's
+        // receive timeout is what a shutdown would otherwise wait on. Two seconds
+        // of margin cover connect/handshake. The cost is a few more idle requests.
+        auto r = Api("GET", "/pcs/" + s.serverId + "/events?wait=5", json(), 7000);
         if (r.status == 200) {
             for (const auto& ev : r.Json().value("events", json::array())) HandleEvent(ev);
         } else if (r.status == 404) {
@@ -286,6 +302,9 @@ void CloudClient::HandleEvent(const json& ev) {
     const json data = ev.value("data", json::object());
     if (type == "unlinked") {
         RC_LOGI("PC was unlinked from the account");
+        // Same race as SignOut: a refresh that is already in flight must not
+        // write the tokens back after they were cleared.
+        std::lock_guard refreshLock(m_refreshMutex);
         SettingsStore::Get().Update([](Settings& s) {
             s.cloudRefreshTokenProtected.clear();
             s.cloudUserName.clear();
@@ -303,9 +322,16 @@ void CloudClient::HandleEvent(const json& ev) {
     RC_LOGI("Remote connection request from %s", expected.headsetName.c_str());
     m_server->ExpectCloudSession(sessionId, expected);
     const json rv = data.value("rendezvous", json::object());
-    std::thread(&CloudClient::RendezvousLoop, this, sessionId, data.value("relayToken", ""), rv.value("host", ""),
-                rv.value("port", 0))
-        .detach();
+    ++m_rvActive;
+    try {
+        std::thread(&CloudClient::RendezvousLoop, this, sessionId, data.value("relayToken", ""), rv.value("host", ""),
+                    rv.value("port", 0))
+            .detach();
+    } catch (...) {
+        --m_rvActive;
+        m_rvDoneCv.notify_all();
+        throw;
+    }
 }
 
 // Introduces this PC to the headset for one connect session: registers with the
@@ -315,6 +341,13 @@ void CloudClient::HandleEvent(const json& ev) {
 // does the same in the other direction; whichever path answers first carries the
 // session. Nothing is ever relayed through the server.
 void CloudClient::RendezvousLoop(std::string sessionId, std::string token, std::string host, int port) {
+    struct ActiveGuard {
+        CloudClient* self;
+        ~ActiveGuard() {
+            --self->m_rvActive;
+            self->m_rvDoneCv.notify_all();
+        }
+    } activeGuard{this};
     std::vector<rc::NetAddress> servers;
     if (!host.empty() && port > 0)
         for (const auto& a : rc::NetAddress::ResolveAll(host, uint16_t(port)))
