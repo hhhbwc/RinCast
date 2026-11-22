@@ -780,48 +780,43 @@ void VrStream::RunSender() {
             m_send.reset();
         }
         m_sendCv.notify_all();
-        // A26 (stale-frame flush): the frame's display moment has already passed - it is
-        // late no matter how fast it goes out, and sending it would keep the queue (and
-        // the latency) growing. Drop it, wipe the pacer's billing (the backlog's debt is
-        // forgiven, the next frame leaves at once), and ask for a keyframe (throttled,
-        // rc/stale_flush.h) so the reference chain rebuilds at the new scene; any frame
-        // that already referenced this one fails on the headset and is answered by the
-        // existing loss path. Normal frames are never touched here: their predicted
-        // display time sits in the future, so in the steady state this branch is dead.
+        // A26 (stale-frame flush) + A72 (the chain rule): a frame whose display moment has
+        // already passed is late no matter how fast it goes out, and a frame whose
+        // references were dropped with it decodes against a stale picture. So: drop the
+        // expired one, and while the chain is broken let only repair frames (IDR /
+        // recovery) leave - freezing on the last good picture beats one more artifact.
+        // The debt wipe, the two throttles and the log line are A26's, unchanged. In the
+        // steady state nothing here fires: normal frames' display moment sits in the future.
         const int64_t nowNs = rc::NowNs();
-        rc::FlushDecision flush =
-            rc::StaleFlushDecide(send.predictedDisplayPcNs, nowNs, m_staleKeyframeNs, m_staleLogNs);
-        // A46 circuit breaker: a tracking fault, clock jump or calibration skew can put
-        // the display prediction systematically behind nowNs, so every fresh frame
-        // satisfies the expired test and the sender drops 100% forever (black screen).
-        // Force one frame through after a bounded streak and warn, breaking the loop.
-        if (flush.drop && rc::StaleFlushBreaker(++m_staleFlushStreak)) {
-            RC_LOGW("VR stale flush circuit breaker: %u consecutive frames were predicted "
-                    "past their display moment; forcing one through to break the drop loop",
-                    m_staleFlushStreak);
-            m_staleFlushStreak = 0;
-            flush = {false, false, false};
-        }
-        if (flush.drop) {
+        const rc::FlushGate gate =
+            rc::StaleFlushGate(send.frame.keyframe || send.recovery, send.predictedDisplayPcNs,
+                               nowNs, m_staleFlush);
+        if (!gate.send) {
             m_flowStaleDrops.fetch_add(1, std::memory_order_relaxed);
-            if (flush.requestKeyframe) {
-                m_staleKeyframeNs = nowNs;
-                m_sender.RequestKeyframe();
-            }
+            if (gate.requestKeyframe) m_sender.RequestKeyframe();
             // The old billing lives in the packetizer and is unknown here; the wipe is
             // unconditional, so the argument is irrelevant (rc/stale_flush.h).
-            m_sender.ResetPacingDebt(rc::FlushSendDebtNs(0, nowNs));
+            if (gate.resetDebt) m_sender.ResetPacingDebt(rc::FlushSendDebtNs(0, nowNs));
             m_staleLogCount++;
-            if (flush.log) {
-                RC_LOGI("VR stale flush: dropped %u frame(s) whose display moment had passed "
-                        "(last %lld ms late); pacer debt wiped, keyframe requested",
-                        m_staleLogCount, (long long)((nowNs - send.predictedDisplayPcNs) / 1'000'000));
+            if (gate.log) {
+                // A72 review: a drop is either late (A26's reason) or held back because the
+                // frames it references were dropped with it. Calling the second one "display
+                // moment had passed" sends the next reader chasing a clock fault that never
+                // happened, and "keyframe requested" was a lie whenever the throttle held.
+                const bool late = rc::FrameExpiredForSend(send.predictedDisplayPcNs, nowNs);
+                RC_LOGI("VR stale flush: dropped %u frame(s) since the last line; last one %s "
+                        "(%lld ms from its display moment); pacer debt wiped, repair %s",
+                        m_staleLogCount, late ? "expired" : "held, chain broken",
+                        (long long)((nowNs - send.predictedDisplayPcNs) / 1'000'000),
+                        gate.requestKeyframe ? "requested" : "already pending");
                 m_staleLogCount = 0;
-                m_staleLogNs = nowNs;
             }
+            if (gate.breaker)
+                RC_LOGW("VR stale flush circuit breaker: chain broken, %u consecutive frame(s) "
+                        "dropped; forcing a repair request instead of sending a broken frame",
+                        rc::kStaleFlushBreakerDrops);
             continue;
         }
-        m_staleFlushStreak = 0;  // a frame actually goes out: the drop streak ends
         m_sender.Send(send.frame, send.meta.data(), uint16_t(send.meta.size()), send.flags, send.encodeMs, send.recovery);
         // ROUND19 T1: feed the diag window (telemetry only; relaxed stores, the same cost
         // class as the flow counters). The CAS makes the window's first seq its minimum.

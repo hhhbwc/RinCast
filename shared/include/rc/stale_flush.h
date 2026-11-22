@@ -85,4 +85,89 @@ inline FlushDecision StaleFlushDecide(int64_t predictedDisplayNs, int64_t nowNs,
             due(lastLogNs, nowNs, kFlushLogThrottleNs)};
 }
 
+// A72 (TASK-A72-STALE-FLUSH-2026-11-22): the same question with the other half added.
+// StaleFlushDecide only asks "is this frame still in time"; it never asked "what does
+// this frame reference", so the frame right after a burst of drops went out with its
+// own references already on the discard pile and the headset decoded it against a stale
+// picture (the artifact the user sees as "stutters, then smears"). The gate below keeps
+// the chain state and is the flush branch's only entry point; StaleFlushDecide stays as
+// the expiry-only judgment the A46 offline tests walk.
+
+// The flush's chain state: once a frame is dropped, every descendant of it is
+// undecodable until a repair frame (IDR or post-invalidation recovery) gets out.
+struct StaleFlushState {
+    int64_t lastKeyframeReqNs = 0;  // 300 ms request throttle stamp (0 = never)
+    int64_t lastLogNs = 0;          // 1 s log-line throttle stamp (0 = never)
+    bool chainBroken = false;       // a frame was dropped, no repair has got out since
+    uint32_t dropStreak = 0;        // consecutive drops, the circuit breaker's count
+};
+
+struct FlushGate {
+    bool send;              // this frame may leave the sender
+    bool requestKeyframe;   // ask the encoder for a repair now
+    bool resetDebt;         // wipe the pacer's billing with this drop
+    bool log;               // carry the once-per-second log line
+    bool breaker;           // the forced repair fired (log a WARN)
+};
+
+// `isRepair` = this frame is an IDR or a recovery frame: it rebuilds the chain, so
+// it is exempt from the expired test. `prev` is the caller's state, mutated in place.
+inline FlushGate StaleFlushGate(bool isRepair, int64_t predictedDisplayNs, int64_t nowNs,
+                                StaleFlushState& prev) {
+    // A46: `now` can go backwards (clock source reset, sleep/wake, mixed time bases),
+    // and a stamp ahead of `now` made the subtraction negative, so the throttle said
+    // "not due" and silently swallowed every request and log until `now` caught up.
+    // A rollback means due now - the same defense StaleFlushDecide keeps.
+    const auto due = [](int64_t lastNs, int64_t now, int64_t windowNs) {
+        return lastNs <= 0 || now < lastNs || now - lastNs >= windowNs;
+    };
+    // Rule 1: a repair frame goes out even past its display moment. Holding the send
+    // window for one late IDR is the deal - every 300 ms without it is another second
+    // of artifacts, so the expired test simply does not apply here.
+    if (isRepair) {
+        prev.chainBroken = false;
+        prev.dropStreak = 0;
+        prev.lastKeyframeReqNs = nowNs;  // a repair just went out: none needed yet
+        return {true, false, false, false, false};
+    }
+    FlushGate g{false, false, true, false, false};  // a drop: the debt is forgiven (A26)
+    if (prev.chainBroken) {
+        // Rule 2: with the chain broken this frame decodes against references that are
+        // gone, so it never goes out - freezing on the last good picture beats sending
+        // a frame that is guaranteed garbage (the card's trade: more frames dropped
+        // while broken, no artifact after the recovery).
+        // The request here deliberately ignores the 300 ms throttle: that throttle
+        // protects a healthy chain from a recovery storm, and a throttled request only
+        // lengthens the break. Valid only while VideoSender::RequestKeyframe() is a
+        // single bool - if it ever becomes a counter or a queue, the throttle belongs
+        // here again.
+        g.requestKeyframe = true;
+        prev.lastKeyframeReqNs = nowNs;
+    } else {
+        // Rule 3: intact chain, so the original expiry test decides, throttles included.
+        if (!FrameExpiredForSend(predictedDisplayNs, nowNs)) {
+            prev.dropStreak = 0;  // rule 5: a frame that goes out ends the streak
+            return {true, false, false, false, false};
+        }
+        g.requestKeyframe = due(prev.lastKeyframeReqNs, nowNs, kFlushKeyframeThrottleNs);
+        if (g.requestKeyframe) prev.lastKeyframeReqNs = nowNs;
+        prev.chainBroken = true;  // this drop makes its descendants undecodable
+    }
+    // Rule 4: the A46 breaker, re-targeted. It used to force the current frame through
+    // after a bounded streak - under rule 2 that frame is exactly the broken P frame
+    // this gate exists to stop. Force the repair request instead and keep dropping.
+    if (++prev.dropStreak >= kStaleFlushBreakerDrops) {
+        prev.dropStreak = 0;
+        g.requestKeyframe = true;
+        g.breaker = true;
+    }
+    // A72 review: the log stamp is taken here, on the path that actually drops. Stamping
+    // it while judging a frame that then goes out would consume the next second's flush
+    // line, and the first line of a burst - the one that proves the burst happened -
+    // would be silently missing.
+    g.log = due(prev.lastLogNs, nowNs, kFlushLogThrottleNs);
+    if (g.log) prev.lastLogNs = nowNs;
+    return g;
+}
+
 }  // namespace rc

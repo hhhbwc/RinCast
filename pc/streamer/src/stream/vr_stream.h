@@ -15,6 +15,7 @@
 #include "../encode/encoder.h"
 #include "rc/platform.h"
 #include "rc/protocol.h"
+#include "rc/stale_flush.h"  // A72: the flush's chain state lives in the members below
 #include "video_sender.h"
 
 namespace rcs {
@@ -174,15 +175,12 @@ class VrStream {
     // m_flowReplacedQueue: that one means "replaced while the encoder was busy", and the
     // 10 s flow line reports this one separately when it is non-zero.
     std::atomic<uint32_t> m_flowStaleDrops{0};
-    // A26: RunSender-thread-only flush state - the keyframe-request (300 ms) and log
-    // (1 s) throttle stamps, and the drop count since the last throttled log line.
-    int64_t m_staleKeyframeNs = 0, m_staleLogNs = 0;
+    // A26/A72: RunSender-thread-only flush state - the keyframe-request (300 ms) and log
+    // (1 s) throttle stamps, the broken-chain flag and the consecutive-drop streak the
+    // A46 breaker counts (rc::StaleFlushState, rc/stale_flush.h), plus the drop count
+    // since the last throttled log line.
+    rc::StaleFlushState m_staleFlush;
     uint32_t m_staleLogCount = 0;
-    // A46 circuit breaker: consecutive stale drops (rc::kStaleFlushBreakerDrops).
-    // When a systematic prediction/clock offset makes every frame look expired, a
-    // bounded streak is forced through instead of dropping 100% forever (black
-    // screen). Reset whenever a frame actually goes out. RunSender-thread-only.
-    uint32_t m_staleFlushStreak = 0;
     int64_t m_flowSinceNs = 0;
     // ROUND19 T1: the diag window's encode-time distribution and frame-seq range. A small
     // lock-free ring the sender thread writes (two relaxed stores per frame, the same cost

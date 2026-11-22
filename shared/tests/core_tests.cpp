@@ -2492,6 +2492,141 @@ static void TestStaleFlush() {
                 "A46: clock rollback makes throttles due, 100 consecutive stale drops force 3 frames through\n");
 }
 
+// A72 (TASK-A72-STALE-FLUSH-2026-11-22 §4.5): the flush's chain rules C1-C8. The card's
+// evidence is the user's log: 19 flushes of 4-7 frames, and the first frame after each one
+// went out with its own references already on the discard pile ("stutters, then smears").
+// rc::StaleFlushGate is the sender's only flush entry point now; StaleFlushDecide is called
+// alongside it below only to show what the old expiry-only gate did NOT look at. Same
+// synthetic clock as above: int64 arithmetic, no wall time.
+static void TestStaleFlushChainGate() {
+    const int64_t kMs = 1'000'000;
+    const int64_t t0 = 5'000'000'000;  // arbitrary anchor
+    // C1: chain intact, frame still in time -> it goes out with nothing attached.
+    {
+        rc::StaleFlushState s;
+        const rc::FlushGate g = rc::StaleFlushGate(false, t0 + 40 * kMs, t0 + 12 * kMs, s);
+        CHECK(g.send && !g.requestKeyframe && !g.resetDebt && !g.log && !g.breaker);
+        CHECK(!s.chainBroken && s.dropStreak == 0);
+        // A72 review gate: judging a frame that then goes out must leave the log throttle
+        // untouched, or a healthy second swallows the flush line that opens the next burst.
+        CHECK(s.lastLogNs == 0);
+        std::printf("A72 C1 intact + in time: send=%d req=%d debt=%d log=%d breaker=%d broken=%d\n",
+                    g.send, g.requestKeyframe, g.resetDebt, g.log, g.breaker, s.chainBroken);
+    }
+    // C2: chain intact, frame expired -> dropped (A26 unchanged) AND the chain is now
+    // broken, so no descendant may leave until a repair gets out.
+    {
+        rc::StaleFlushState s;
+        const rc::FlushGate g = rc::StaleFlushGate(false, t0 + 40 * kMs, t0 + 119 * kMs, s);
+        CHECK(!g.send && g.requestKeyframe && g.resetDebt && g.log && !g.breaker);
+        CHECK(s.chainBroken && s.dropStreak == 1);
+        std::printf("A72 C2 intact + expired: send=%d req=%d debt=%d log=%d breaker=%d "
+                    "broken=%d streak=%u\n",
+                    g.send, g.requestKeyframe, g.resetDebt, g.log, g.breaker, s.chainBroken,
+                    s.dropStreak);
+    }
+    // C3: chain broken, non-repair, frame NOT even late -> still dropped, and the repair
+    // is asked for although a request went out 100 ms ago. The bypass is what C3 proves:
+    // the same stamps through the expiry-only gate stay quiet.
+    {
+        rc::StaleFlushState s;
+        s.chainBroken = true;
+        const int64_t now = t0 + 100 * kMs;
+        s.lastKeyframeReqNs = t0;  // inside the 300 ms window
+        const rc::FlushGate g = rc::StaleFlushGate(false, now + 40 * kMs, now, s);
+        CHECK(!g.send && g.requestKeyframe && g.resetDebt && !g.breaker);
+        CHECK(!rc::FrameExpiredForSend(now + 40 * kMs, now));  // not late at all
+        CHECK(!rc::StaleFlushDecide(now + 40 * kMs, now, t0, 0).requestKeyframe);  // old: throttled
+        std::printf("A72 C3 broken + on time (300 ms window open): send=%d req=%d debt=%d | "
+                    "old StaleFlushDecide req=%d\n",
+                    g.send, g.requestKeyframe, g.resetDebt,
+                    rc::StaleFlushDecide(now + 40 * kMs, now, t0, 0).requestKeyframe);
+    }
+    // C4: chain broken, non-repair, frame expired -> same verdict as C3 (rule 2 outranks
+    // the expiry test: lateness is not the reason this one stops).
+    {
+        rc::StaleFlushState s;
+        s.chainBroken = true;
+        const int64_t now = t0 + 50 * kMs;
+        s.lastKeyframeReqNs = t0;
+        const rc::FlushGate g = rc::StaleFlushGate(false, now - 40 * kMs, now, s);
+        CHECK(!g.send && g.requestKeyframe && g.resetDebt && !g.breaker);
+        CHECK(rc::FrameExpiredForSend(now - 40 * kMs, now));
+        std::printf("A72 C4 broken + expired: send=%d req=%d debt=%d log=%d breaker=%d\n",
+                    g.send, g.requestKeyframe, g.resetDebt, g.log, g.breaker);
+    }
+    // C5: chain broken, repair frame, past its display moment -> it goes out anyway (the
+    // expired test never applies to a repair), and the chain state clears with the streak.
+    {
+        rc::StaleFlushState s;
+        s.chainBroken = true;
+        s.dropStreak = 7;
+        s.lastKeyframeReqNs = t0;
+        const int64_t now = t0 + 50 * kMs;
+        const rc::FlushGate g = rc::StaleFlushGate(true, now - 40 * kMs, now, s);
+        CHECK(g.send && !g.requestKeyframe && !g.resetDebt && !g.log && !g.breaker);
+        CHECK(!s.chainBroken && s.dropStreak == 0 && s.lastKeyframeReqNs == now);
+        std::printf("A72 C5 broken + late IDR: send=%d req=%d broken=%d streak=%u stampMovedNow=%d\n",
+                    g.send, g.requestKeyframe, s.chainBroken, s.dropStreak,
+                    s.lastKeyframeReqNs == now);
+    }
+    // C6: 30 consecutive drops -> exactly one breaker, and not one of the 30 frames left.
+    // The old breaker forced the current frame through (a broken P frame by construction);
+    // rule 4 forces the repair request instead.
+    {
+        rc::StaleFlushState s;
+        int drops = 0, sent = 0, breakers = 0;
+        for (int i = 0; i < 30; i++) {
+            const int64_t now = t0 + i * 50 * kMs;
+            const rc::FlushGate g = rc::StaleFlushGate(false, now - 10 * kMs, now, s);
+            if (g.send) sent++;
+            else drops++;
+            if (g.breaker) breakers++;
+        }
+        CHECK(drops == 30 && sent == 0);
+        CHECK(breakers == 1);  // fires at the 30th drop, then the streak starts over
+        CHECK(s.dropStreak == 0);
+        std::printf("A72 C6 30 consecutive drops: sent=%d dropped=%d breakerFired=%d streakNow=%u\n",
+                    sent, drops, breakers, s.dropStreak);
+    }
+    // C7a: two broken-chain drops 100 ms apart both ask for the repair (no throttle).
+    {
+        rc::StaleFlushState s;
+        s.chainBroken = true;
+        s.lastKeyframeReqNs = t0;
+        const rc::FlushGate a = rc::StaleFlushGate(false, t0 + 100 * kMs + 40 * kMs, t0 + 100 * kMs, s);
+        const rc::FlushGate b = rc::StaleFlushGate(false, t0 + 200 * kMs + 40 * kMs, t0 + 200 * kMs, s);
+        CHECK(a.requestKeyframe && b.requestKeyframe);
+        std::printf("A72 C7a broken chain, 100 ms apart: req1=%d req2=%d\n",
+                    a.requestKeyframe, b.requestKeyframe);
+    }
+    // C7b: chain intact, two expired frames 100 ms apart -> the second asks nothing: the
+    // 300 ms throttle still holds there (only the broken-chain path bypasses it).
+    {
+        rc::StaleFlushState s;
+        const rc::FlushGate x1 = rc::StaleFlushGate(false, t0 - 40 * kMs, t0, s);
+        CHECK(x1.requestKeyframe && s.chainBroken);
+        const rc::FlushGate repair = rc::StaleFlushGate(true, t0 - 40 * kMs, t0, s);  // the IDR gets out
+        CHECK(repair.send && !s.chainBroken);
+        const int64_t second = t0 + 100 * kMs;
+        const rc::FlushGate x2 = rc::StaleFlushGate(false, second - 40 * kMs, second, s);
+        CHECK(!x2.requestKeyframe && x2.resetDebt && !x2.send);
+        std::printf("A72 C7b intact, 100 ms apart: req1=%d req2=%d (300 ms throttle holds)\n",
+                    x1.requestKeyframe, x2.requestKeyframe);
+    }
+    // C8 (A46 defense kept): a throttle stamp ahead of `now` (clock source reset,
+    // sleep/wake, mixed bases) must count as due instead of swallowing the request for
+    // the whole window.
+    {
+        rc::StaleFlushState s;
+        s.lastKeyframeReqNs = t0 + 500 * kMs;  // a stamp in the future: the clock went back
+        const rc::FlushGate g = rc::StaleFlushGate(false, t0 - 40 * kMs, t0, s);
+        CHECK(!g.send && g.requestKeyframe && g.log);
+        std::printf("A72 C8 clock rollback (stamp 500 ms ahead): send=%d req=%d log=%d\n",
+                    g.send, g.requestKeyframe, g.log);
+    }
+}
+
 // TASK-LATENCY-METER-FIX-2026-11-22 §2: the stage accumulator must not drop samples.
 // The user saw the panel's stages sum fall far short of the total latency: the old
 // AddStages filtered each stage on its own, so a clock-offset error pushing the game
@@ -5811,6 +5946,7 @@ int main() {
     TestLatencyStageAccumulation();  // TASK-LATENCY-METER-FIX-2026-11-22 §2
     TestFrameQueueBound();  // A23 (TASK-QUEUE-BOUND-2026-11-22)
     TestStaleFlush();  // A26 (TASK-BACKLOG-FLUSH-2026-11-22)
+    TestStaleFlushChainGate();  // A72 (TASK-A72-STALE-FLUSH-2026-11-22): rules C1-C8
     TestLossBrake();
     TestQueueGuard();
     TestL7Autoscale();
