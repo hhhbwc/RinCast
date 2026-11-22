@@ -10,6 +10,7 @@
 #include "../audio/audio.h"
 #include "../encode/encoder.h"
 #include "../input/input_injector.h"
+#include "../json_field.h"
 #include "../settings.h"
 #include "../stream/desktop_stream.h"
 #include "../stream/foveator.h"
@@ -210,31 +211,35 @@ void ClientSession::OnControl(const std::string& text) {
         RC_LOGW("Malformed control message");
         return;
     }
-    if (!m.is_object() || !m.contains("type")) return;
-    // Input events are latency sensitive and cheap: handle them inline.
-    const std::string type = m["type"].get<std::string>();
+    if (!m.is_object()) return;
+    // This runs on the receive thread, so every read here is one that must not throw: a control
+    // message whose "type" is a number used to end the process (json_field.h).
+    const std::string type = StrField(m, "type");
+    if (type.empty()) return;
     if (!m_inputAllowed && (type == rc::msg::kMouseButton || type == rc::msg::kMouseWheel ||
                             type == rc::msg::kKey || type == rc::msg::kText))
         return;
     if (type == rc::msg::kMouseButton) {
-        input::MouseButton(m.value("button", 0), m.value("down", false));
+        input::MouseButton(IntField(m, "button", 0), BoolField(m, "down", false));
         return;
     }
     if (type == rc::msg::kMouseWheel) {
-        input::MouseWheel(m.value("dx", 0.f), m.value("dy", 0.f));
+        input::MouseWheel(FloatField(m, "dx", 0.f), FloatField(m, "dy", 0.f));
         return;
     }
     if (type == rc::msg::kKey) {
-        input::Key(uint16_t(m.value("vk", 0)), m.value("down", false));
+        input::Key(uint16_t(std::clamp(IntField(m, "vk", 0), 0, 0xFFFF)), BoolField(m, "down", false));
         return;
     }
     if (type == rc::msg::kText) {
-        input::Text(Widen(m.value("text", "")));
+        input::Text(Widen(StrField(m, "text")));
         return;
     }
-    if (type.empty() || type.front() == '_') return;
+    if (type.front() == '_') return;
     m.erase("_pcRevisions");
     if (m.contains("settings")) {
+        // Enqueue merges this into a queued message; a non-object has nothing to merge.
+        if (!m["settings"].is_object()) return;
         std::lock_guard lock(m_mutex);
         m["_pcRevisions"] = json::object();
         for (const char* key : rc::synced::kAll)
@@ -257,9 +262,15 @@ void ClientSession::Enqueue(json message) {
             if (!coalesces(queuedType)) break;
             if (queuedType != type) continue;
             if (type == rc::msg::kUpdateSettings) {
-                if (!(*it)["settings"].is_object() || !message.value("settings", json::object()).is_object()) break;
-                (*it)["settings"].update(message.value("settings", json::object()));
-                if (message.contains("_pcRevisions")) (*it)["_pcRevisions"].update(message["_pcRevisions"]);
+                // Merged without value() so a wrong-typed "settings" reads as nothing to merge
+                // instead of throwing (this is reached from the receive thread).
+                json& queued = (*it)["settings"];
+                if (!queued.is_object()) break;
+                const json& incoming = ObjectField(message, "settings");
+                if (!incoming.empty()) queued.update(incoming);
+                if (const auto revisions = message.find("_pcRevisions");
+                    revisions != message.end() && revisions->is_object())
+                    (*it)["_pcRevisions"].update(*revisions);
             }
             return;
         }
@@ -633,55 +644,78 @@ void ClientSession::HandleMessage(const json& m) {
 
 void ClientSession::ApplyClientInfo(const json& m) {
     std::lock_guard lock(m_mutex);
-    if (m.contains("display")) {
-        const auto& d = m["display"];
-        m_caps.recommendedEyeWidth = d.value("eyeWidth", m_caps.recommendedEyeWidth);
-        m_caps.recommendedEyeHeight = d.value("eyeHeight", m_caps.recommendedEyeHeight);
-        m_caps.ipd = d.value("ipd", m_caps.ipd);
-        if (d.contains("refreshRates")) m_caps.refreshRates = d["refreshRates"].get<std::vector<float>>();
-        if (d.contains("fov") && d["fov"].size() == 2)
+    // Everything here comes off the wire, and every read is type-checked (json_field.h). A field
+    // of the wrong type used to throw type_error out of the handshake and out of the receive
+    // thread, where an uncaught throw is std::terminate.
+    if (const auto display = m.find("display"); display != m.end() && display->is_object()) {
+        const json& d = *display;
+        m_caps.recommendedEyeWidth = UIntField(d, "eyeWidth", m_caps.recommendedEyeWidth);
+        m_caps.recommendedEyeHeight = UIntField(d, "eyeHeight", m_caps.recommendedEyeHeight);
+        m_caps.ipd = FloatField(d, "ipd", m_caps.ipd);
+        if (const auto rates = d.find("refreshRates"); rates != d.end() && rates->is_array()) {
+            std::vector<float> valid;
+            for (const auto& r : *rates) {
+                if (!r.is_number()) continue;
+                const double hz = r.get<double>();
+                if (std::isfinite(hz) && hz > 0) valid.push_back(float(hz));
+            }
+            if (!valid.empty()) m_caps.refreshRates = std::move(valid);
+        }
+        // Two eyes, four tan halves each - anything else is not a projection we can use, and the
+        // shape has to be checked before indexing into it.
+        if (const auto fov = d.find("fov"); fov != d.end() && fov->is_array() && fov->size() == 2 &&
+                                         (*fov)[0].is_array() && (*fov)[0].size() == 4 &&
+                                         (*fov)[1].is_array() && (*fov)[1].size() == 4) {
             for (int e = 0; e < 2; e++)
-                for (int k = 0; k < 4; k++) m_caps.fovTan[e][k] = d["fov"][e][k].get<float>();
+                for (int k = 0; k < 4; k++)
+                    m_caps.fovTan[e][k] = FloatAt((*fov)[e], size_t(k), m_caps.fovTan[e][k]);
+        }
     }
-    if (m.contains("decoders")) {
-        const auto& d = m["decoders"];
-        m_caps.h264 = d.value("h264", true);
-        m_caps.hevc = d.value("hevc", true);
-        m_caps.hevc10 = d.value("hevc10", false);
-        m_caps.av1 = d.value("av1", false);
-        m_caps.av110 = d.value("av110", false);
-        m_caps.maxDecodeWidth = d.value("maxWidth", 4096u);
-        m_caps.maxDecodeHeight = d.value("maxHeight", 4096u);
+    if (const auto decoders = m.find("decoders"); decoders != m.end() && decoders->is_object()) {
+        const json& d = *decoders;
+        m_caps.h264 = BoolField(d, "h264", true);
+        m_caps.hevc = BoolField(d, "hevc", true);
+        m_caps.hevc10 = BoolField(d, "hevc10", false);
+        m_caps.av1 = BoolField(d, "av1", false);
+        m_caps.av110 = BoolField(d, "av110", false);
+        m_caps.maxDecodeWidth = UIntField(d, "maxWidth", 4096u);
+        m_caps.maxDecodeHeight = UIntField(d, "maxHeight", 4096u);
         // ROUND18 L3: optional fps ceiling. 0/missing = old headset, no warning.
         // Reject malformed values via the shared validator (also unit-tested).
-        m_caps.maxFpsAtMaxRes = rc::ValidateDecodeFpsHint(d.value("maxFpsAtMaxRes", 0u));
+        m_caps.maxFpsAtMaxRes = rc::ValidateDecodeFpsHint(UIntField(d, "maxFpsAtMaxRes", 0u));
     }
-    if (m.contains("settings")) {
-        auto s = m["settings"];
-        const auto revisions = m.value("_pcRevisions", json::object());
+    if (const auto info = m.find("settings"); info != m.end() && info->is_object()) {
+        json s = *info;
+        const json& revisions = ObjectField(m, "_pcRevisions");
         // A headset snapshot queued before a PC edit must not undo that edit later.
-        for (const char* key : rc::synced::kAll)
-            if (revisions.value(key, uint64_t(0)) < m_pcKeyRevisions[key]) s.erase(key);
-        m_settings.codec = s.value("codec", m_settings.codec);
-        m_settings.tenBit = s.value("tenBit", m_settings.tenBit);
-        m_settings.vrQuality = s.value("vrQuality", m_settings.vrQuality);
-        m_settings.vrScale = s.value("vrScale", m_settings.vrScale);
-        m_settings.matchSteamVr = s.value("matchSteamVr", m_settings.matchSteamVr);
-        m_settings.gazeFoveation = s.value("gazeFoveation", m_settings.gazeFoveation);
-        m_settings.eyesTracked = s.value("eyesTracked", m_settings.eyesTracked);  // headsets before 1.2.1 only foveate tracked
-        m_settings.frameGeneration = s.value("frameGeneration", m_settings.frameGeneration);
-        m_settings.refreshRate = s.value("refreshRate", m_settings.refreshRate);
-        m_settings.vrBitrateMbps = s.value("vrBitrateMbps", m_settings.vrBitrateMbps);
-        m_settings.desktopBitrateMbps = s.value("desktopBitrateMbps", m_settings.desktopBitrateMbps);
-        m_settings.desktopFps = s.value("desktopFps", m_settings.desktopFps);
-        m_settings.adaptiveBitrate = s.value("adaptiveBitrate", m_settings.adaptiveBitrate);
-        m_settings.streamProfile = std::clamp(s.value("streamProfile", m_settings.streamProfile), 0, 2);
+        for (const char* key : rc::synced::kAll) {
+            const auto rev = revisions.find(key);
+            // Compared as a double so an absurd revision cannot overflow a cast: any value at
+            // least the PC's means "the headset's copy is newer", which is what the number says.
+            const double theirs = rev != revisions.end() && rev->is_number() ? rev->get<double>() : 0.0;
+            if (!(theirs >= double(m_pcKeyRevisions[key]))) s.erase(key);
+        }
+        if (const std::string codec = StrField(s, "codec"); !codec.empty()) m_settings.codec = codec;
+        m_settings.tenBit = BoolField(s, "tenBit", m_settings.tenBit);
+        if (const std::string quality = StrField(s, "vrQuality"); !quality.empty()) m_settings.vrQuality = quality;
+        m_settings.vrScale = FloatField(s, "vrScale", m_settings.vrScale);
+        m_settings.matchSteamVr = BoolField(s, "matchSteamVr", m_settings.matchSteamVr);
+        m_settings.gazeFoveation = BoolField(s, "gazeFoveation", m_settings.gazeFoveation);
+        // headsets before 1.2.1 only foveate tracked
+        m_settings.eyesTracked = BoolField(s, "eyesTracked", m_settings.eyesTracked);
+        m_settings.frameGeneration = BoolField(s, "frameGeneration", m_settings.frameGeneration);
+        m_settings.refreshRate = FloatField(s, "refreshRate", m_settings.refreshRate);
+        m_settings.vrBitrateMbps = IntField(s, "vrBitrateMbps", m_settings.vrBitrateMbps);
+        m_settings.desktopBitrateMbps = IntField(s, "desktopBitrateMbps", m_settings.desktopBitrateMbps);
+        m_settings.desktopFps = IntField(s, "desktopFps", m_settings.desktopFps);
+        m_settings.adaptiveBitrate = BoolField(s, "adaptiveBitrate", m_settings.adaptiveBitrate);
+        m_settings.streamProfile = std::clamp(IntField(s, "streamProfile", m_settings.streamProfile), 0, 2);
         m_settings.debugEncodeScalePct =
-            std::clamp(s.value("debugEncodeScalePct", m_settings.debugEncodeScalePct), 0, 100);  // ROUND20 L17
+            std::clamp(IntField(s, "debugEncodeScalePct", m_settings.debugEncodeScalePct), 0, 100);  // ROUND20 L17
         // The preference is a PC-side setting for now (rcs::Settings::streamProfile).
         // The headset will send its own choice once its three-way UI exists.
-        m_settings.streamAudio = s.value("streamAudio", m_settings.streamAudio);
-        m_settings.micPassthrough = s.value("micPassthrough", m_settings.micPassthrough);
+        m_settings.streamAudio = BoolField(s, "streamAudio", m_settings.streamAudio);
+        m_settings.micPassthrough = BoolField(s, "micPassthrough", m_settings.micPassthrough);
         // 头显改了某个可同步项（值与 PC 推过去的不一样）→ 这一项的所有权归它，PC 不再推。
         for (const char* key : rc::synced::kAll) {
             if (!s.contains(key)) continue;

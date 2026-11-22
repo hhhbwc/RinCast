@@ -5,6 +5,7 @@
 #include <set>
 
 #include "../app.h"
+#include "../json_field.h"
 #include "../session/client_session.h"
 #include "../settings.h"
 #include "hello_trust.h"

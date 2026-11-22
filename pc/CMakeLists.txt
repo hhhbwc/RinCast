@@ -73,6 +73,11 @@ target_link_libraries(pose-probe PRIVATE d3d11)
 add_executable(hello-trust-test ../tools/hello-trust-test/main.cpp)
 target_include_directories(hello-trust-test PRIVATE streamer/src ../third_party)
 
+# Developer tool: the field readers used on everything that arrives over the wire
+# (pc/streamer/src/json_field.h). None of them may throw - see TASK-CLIENT-SESSION-WIRE-2026-11-22.
+add_executable(json-field-test ../tools/json-field-test/main.cpp)
+target_include_directories(json-field-test PRIVATE streamer/src ../third_party)
+
 # Developer tool: checks the desktop capture -> YUV pipeline.
 add_executable(capture-test ../tools/capture-test/main.cpp
   streamer/src/capture/desktop_capture.cpp streamer/src/capture/monitors.cpp

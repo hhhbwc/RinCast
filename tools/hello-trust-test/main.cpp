@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "json_field.h"
 #include "net/hello_trust.h"
 #include "nlohmann/json.hpp"
 
