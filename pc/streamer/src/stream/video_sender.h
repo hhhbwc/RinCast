@@ -161,7 +161,10 @@ class VideoSender {
     std::atomic<int> m_pacingMode{0};
     std::atomic<int64_t> m_pacingBudgetNs{0};
     std::atomic<double> m_measuredFps{0};  // the send-side copy of the stats fps
-    double m_lossAvg = 0;
+    // A64: written on the network thread (OnFeedback), read by the send thread's 3 s
+    // log and by Stats() on the stats thread (auto-tune). Relaxed is right: this is a
+    // smoothed measurement, not a happens-before edge.
+    std::atomic<double> m_lossAvg{0};
     uint32_t m_frameIndex = 0;
 
     // R4.2: the 1 s wire-byte ceiling (burst mode only). The user's setting is a WIRE
@@ -193,7 +196,7 @@ class VideoSender {
     double m_windowEncodeMs = 0;
     VideoSenderStats m_stats;
     int64_t m_lastStatsLogNs = 0;
-    double m_queueMs = -1;            // smoothed queueing delay reported by the headset
+    std::atomic<double> m_queueMs{-1};  // smoothed queueing delay reported by the headset
     double m_receivedKbps = 0;        // smoothed rate that actually arrives
 };
 

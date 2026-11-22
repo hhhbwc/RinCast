@@ -161,14 +161,16 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
             const uint32_t refused = m_packetizer.SendFailures();
             const uint32_t effectiveTarget = TargetBitrateKbps();
             const uint32_t wireCap = m_wireCapKbps.load(std::memory_order_relaxed);
+            const double queueMs = m_queueMs.load(std::memory_order_relaxed);
+            const double lossAvg = m_lossAvg.load(std::memory_order_relaxed);
             if (refused) {
                 RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps, %u datagrams refused, effective %u kbps, wireCap %u kbps, queue %.0f ms, loss %.1f%%",
                         m_streamId, m_stats.mbps, m_stats.fps, m_targetKbps.load(), refused,
-                        effectiveTarget, wireCap, m_queueMs, m_lossAvg * 100);
+                        effectiveTarget, wireCap, queueMs, lossAvg * 100);
             } else {
                 RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps, effective %u kbps, wireCap %u kbps, queue %.0f ms, loss %.1f%%",
                         m_streamId, m_stats.mbps, m_stats.fps, m_targetKbps.load(),
-                        effectiveTarget, wireCap, m_queueMs, m_lossAvg * 100);
+                        effectiveTarget, wireCap, queueMs, lossAvg * 100);
             }
         }
         m_windowFrames = 0;
@@ -242,9 +244,13 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     const uint32_t total = fb.fragmentsReceived + fb.fragmentsLost;
     const double lossRate = total ? double(fb.fragmentsLost) / total : 0;
     const bool measured = fb.queueDelayMs >= 0;
-    if (measured) m_queueMs = m_queueMs < 0 ? fb.queueDelayMs : m_queueMs * 0.6 + fb.queueDelayMs * 0.4;
+    if (measured) {
+        const double prev = m_queueMs.load(std::memory_order_relaxed);
+        m_queueMs.store(prev < 0 ? fb.queueDelayMs : prev * 0.6 + fb.queueDelayMs * 0.4,
+                        std::memory_order_relaxed);
+    }
     // Without frames in this report (a still desktop) there is nothing to judge by.
-    const double q = measured ? m_queueMs : -1;
+    const double q = measured ? m_queueMs.load(std::memory_order_relaxed) : -1;
     // The device's own floor: some decode queues run 10-15 ms even when the link is
     // idle. Absolute thresholds would ratchet the guard down forever on those. The
     // baseline jumps down instantly with q, and creeps up very slowly if a queue
@@ -257,20 +263,21 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     if (fb.receivedKbps) m_receivedKbps = m_receivedKbps ? m_receivedKbps * 0.7 + fb.receivedKbps * 0.3 : fb.receivedKbps;
     {
         std::lock_guard lock(m_statsMutex);
-        m_stats.queueMs = m_queueMs;
+        m_stats.queueMs = m_queueMs.load(std::memory_order_relaxed);
     }
     // Wi-Fi and mobile links lose the odd packet without being full: only sustained or
     // heavy loss counts. (Headsets that measure no delay have nothing better than lost frames.)
-    m_lossAvg = m_lossAvg * 0.8 + lossRate * 0.2;
+    const double lossAvg = m_lossAvg.load(std::memory_order_relaxed) * 0.8 + lossRate * 0.2;
+    m_lossAvg.store(lossAvg, std::memory_order_relaxed);
     // Loss-coupled parity: at the edge of a real link the steady state includes small
     // losses. The recovery frames cover single-frame gaps; a little more parity covers
     // the rest. Cheaper than the keyframe waits that unrecoverable frames cost. The
     // extra parity costs wire time, so it steps back down when the link calms.
     if (m_baseFecPercent >= 0 && measured) {
-        const int fec = m_lossAvg > 0.10 ? 12 : m_lossAvg > 0.04 ? 8 : m_baseFecPercent;
+        const int fec = lossAvg > 0.10 ? 12 : lossAvg > 0.04 ? 8 : m_baseFecPercent;
         if (fec != m_dynamicFec.exchange(fec)) {
             m_packetizer.SetFecPercent(fec);
-            RC_LOGI("Stream %u: FEC %d%% (loss %.1f %%)", m_streamId, fec, m_lossAvg * 100);
+            RC_LOGI("Stream %u: FEC %d%% (loss %.1f %%)", m_streamId, fec, lossAvg * 100);
         }
     }
 
@@ -288,7 +295,7 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     // The loss brake runs beside the guard: whichever cap is lower wins, and neither
     // side's climb can override the other's hold (the real link oscillated 88 <-> 99
     // Mbps for 12 minutes on loss-driven dips that the climb instantly undid).
-    const auto brake = rc::LossBrakeStep(m_brake, m_lossAvg, aim, now);
+    const auto brake = rc::LossBrakeStep(m_brake, lossAvg, aim, now);
     const uint32_t guardCap = res.capKbps ? res.capKbps : UINT32_MAX;
     const uint32_t brakeCap = brake.capKbps ? brake.capKbps : UINT32_MAX;
     const uint32_t finalCap = guardCap < brakeCap ? guardCap : brakeCap;
@@ -301,11 +308,11 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     m_congestionKbps.store(finalCap == UINT32_MAX ? 0 : finalCap);
     // Sustained heavy loss means the path is below the user's ceiling - say it once
     // every 30 s so the setting vs. reality mismatch shows up in the log.
-    if (m_lossAvg > 0.05) {
+    if (lossAvg > 0.05) {
         if (!m_lossHeavySinceNs) m_lossHeavySinceNs = now;
         else if (now - m_lossHeavySinceNs > 30'000'000'000LL) {
             RC_LOGW("Stream %u: loss still %.1f %% at the 70 %% brake (path below the user's ceiling)",
-                    m_streamId, m_lossAvg * 100);
+                    m_streamId, lossAvg * 100);
             m_lossHeavySinceNs = now;
         }
     } else {
@@ -314,12 +321,12 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     if (brake.changed) {
         if (brake.released) {
             RC_LOGI("Stream %u: loss brake released, back to %u kbps (loss %.1f %%)", m_streamId, aim,
-                    m_lossAvg * 100);
+                    lossAvg * 100);
         } else {
             const int64_t holdSecs = (m_brake.holdUntilNs - now) / 1000000000LL;
             RC_LOGI("Stream %u: loss brake %s %u kbps (loss %.1f %%, hold %lld s)", m_streamId,
                     brake.capKbps < res.capKbps || res.capKbps == 0 ? "cut to" : "holds", brake.capKbps,
-                    m_lossAvg * 100, (long long)holdSecs);
+                    lossAvg * 100, (long long)holdSecs);
         }
     }
     if (res.action == rc::QueueGuard::Action::Dip) {
@@ -345,7 +352,7 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
 VideoSenderStats VideoSender::Stats() {
     std::lock_guard lock(m_statsMutex);
     VideoSenderStats s = m_stats;
-    s.lossAvg = m_lossAvg;  // PLAN-AUTO-TUNE: the same read the throughput log already makes
+    s.lossAvg = m_lossAvg.load(std::memory_order_relaxed);  // PLAN-AUTO-TUNE: the same read the throughput log already makes
     m_stats.framesLost = 0;
     return s;
 }
