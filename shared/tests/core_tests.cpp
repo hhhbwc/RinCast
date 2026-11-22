@@ -44,6 +44,12 @@
 #include "rc/percentile.h"
 #include "rc/link_policy.h"
 #include "rc/queue_guard.h"
+// A23 (TASK-QUEUE-BOUND-2026-11-22): the decode queue bound's pure decision logic
+// (threshold, boundary, keyframe-request throttle), tested below.
+#include "rc/frame_queue_bound.h"
+// A26 (TASK-BACKLOG-FLUSH-2026-11-22): the sender-side stale-frame flush's pure
+// decision logic (expiry, debt wipe, keyframe/log throttles), tested below.
+#include "rc/stale_flush.h"
 #include "rc/stream_profile.h"
 #include "rc/video_transport.h"
 #include "rc/wire_ceiling.h"
@@ -1914,6 +1920,151 @@ static void TestPercentile() {
     }
     std::printf("decode percentile: empty sentinel, single sample, 1..100 direct-rank, ceil on 3 samples, "
                 "invalid inputs ignored, 600->512 overwrite, reset\n");
+}
+
+// A23 (TASK-QUEUE-BOUND-2026-11-22): the decode queue bound. The card's semantics,
+// pinned: a frame that queued strictly longer than kQueueDropMs between arrival
+// (receivedNs) and the decode submission point is dropped; exactly kQueueDropMs
+// passes ("超过" is strictly greater, so the boundary is defined, not accidental);
+// a missing timestamp or a negative age never drops. The inputs follow the shape of
+// the real arrival timeline the card was written from (the AB9 session's queue
+// overload: frames arriving 151-479 ms after they were queued for decode). Pure
+// int64 arithmetic - no wall clock, no flake surface. There is no old
+// implementation to run red against: before this card nothing judged frame age at
+// all (the gate's absence was the bug), so red/green here is the compile itself.
+static void TestFrameQueueBound() {
+    const int64_t kMs = 1'000'000;
+    // Q1: the constants are the card's numbers (a silent threshold change re-fails here).
+    CHECK(rc::kQueueDropMs == 100);
+    CHECK(rc::kQueueDropKeyframeEvery == 5);
+    // Q2: the synthetic arrival timeline. Arrival at t0; the submission point checks
+    // the frame's age at each line. Under the bound: decode; over: drop.
+    const int64_t t0 = 1'000'000'000;  // arbitrary: one frame arrives here
+    CHECK(!rc::FrameQueueExpired(t0 + 0 * kMs, t0));            // submitted on arrival
+    CHECK(!rc::FrameQueueExpired(t0 + 25 * kMs, t0));           // healthy stream (AB9 baseline queue 0.4-1.0 ms)
+    CHECK(!rc::FrameQueueExpired(t0 + 50 * kMs, t0));
+    CHECK(!rc::FrameQueueExpired(t0 + 99 * kMs, t0));           // one ns under the bound
+    CHECK(!rc::FrameQueueExpired(t0 + 100 * kMs, t0));          // boundary: exactly 100 ms passes
+    CHECK(rc::FrameQueueExpired(t0 + 100 * kMs + 1, t0));       // the first ns past it drops
+    CHECK(rc::FrameQueueExpired(t0 + 151 * kMs, t0));           // AB9: total 593 / queue 151
+    CHECK(rc::FrameQueueExpired(t0 + 479 * kMs, t0));           // AB9: total 410 / queue 479
+    // Q3: unknowable ages keep the frame (no timestamp, or the clock went backwards).
+    CHECK(!rc::FrameQueueExpired(t0, 0));
+    CHECK(!rc::FrameQueueExpired(t0, -5));
+    CHECK(!rc::FrameQueueExpired(t0, t0 + kMs));  // negative age
+    // Q4: the keyframe request throttle: every 5th drop of a streak asks, 1-based.
+    CHECK(!rc::QueueDropRequestKeyframe(0));   // defensive: a reset streak never asks
+    CHECK(!rc::QueueDropRequestKeyframe(1));   // drop 1: quiet
+    CHECK(!rc::QueueDropRequestKeyframe(2));
+    CHECK(!rc::QueueDropRequestKeyframe(3));
+    CHECK(!rc::QueueDropRequestKeyframe(4));
+    CHECK(rc::QueueDropRequestKeyframe(5));    // drop 5: one request
+    CHECK(!rc::QueueDropRequestKeyframe(6));
+    CHECK(!rc::QueueDropRequestKeyframe(9));
+    CHECK(rc::QueueDropRequestKeyframe(10));   // drop 10: the next one
+    // Q5: the caller's streak loop over a burst: 30 expired frames in a row ask
+    // exactly 6 times (at 5, 10, 15, 20, 25, 30); a frame that passes resets the
+    // streak, so a scattered drop never rides an older burst's count.
+    uint32_t streak = 0, requests = 0;
+    for (int i = 0; i < 30; i++) {
+        streak++;
+        if (rc::QueueDropRequestKeyframe(streak)) {
+            requests++;
+            streak = 0;  // as the caller does on a request: a fresh count per 5
+        }
+    }
+    CHECK(requests == 6);
+    CHECK(streak == 0);
+    streak = 0;
+    for (int i = 0; i < 4; i++) {  // 4 drops: under the throttle, no request
+        streak++;
+        CHECK(!rc::QueueDropRequestKeyframe(streak));
+    }
+    CHECK(!rc::QueueDropRequestKeyframe(streak));
+    streak = 0;                     // a frame passes: the streak ends
+    streak++;                       // the next drop is the streak's first again
+    CHECK(!rc::QueueDropRequestKeyframe(streak));
+    std::printf("frame queue bound: constants pinned, 0/25/50/99/100 ms pass, 100 ms + 1 ns / 151 / 479 ms drop, "
+                "unknowable ages pass, request on every 5th streak drop, 30-drop burst asks 6 times\n");
+}
+
+// A26 (TASK-BACKLOG-FLUSH-2026-11-22): the sender-side stale-frame flush. The card's
+// synthetic timeline: a normal frame passes, an expired frame drops, and the drop
+// wipes the pacer's billing. The throttles (300 ms keyframe, 1 s log) are walked over
+// a burst shaped like the AB9 scene change (a giant frame queues the pipeline for
+// hundreds of ms, every frame it overtakes expires). All int64 arithmetic on one
+// synthetic clock: no wall time, no flake surface.
+static void TestStaleFlush() {
+    const int64_t kMs = 1'000'000;
+    // F1: the constants are the card's numbers (a silent change re-fails here).
+    CHECK(rc::kFlushKeyframeThrottleNs == 300 * kMs);
+    CHECK(rc::kFlushLogThrottleNs == 1'000 * kMs);
+    // F2: normal frames pass - the predicted display time sits in the future by
+    // design, so the steady state never drops (card §2: 稳态零改动).
+    const int64_t t0 = 2'000'000'000;  // arbitrary: the frame was submitted here
+    CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 10 * kMs));   // picked up mid-pipeline
+    CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 12 * kMs));   // ... just before sending
+    CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 39 * kMs));   // one ns before the moment
+    CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 40 * kMs));   // boundary: `<` is strict
+    CHECK(rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 40 * kMs + 1));  // the first ns past it drops
+    CHECK(rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 119 * kMs));   // AB9: queue 119 ms
+    CHECK(rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 479 * kMs));   // AB9: queue 479 ms
+    // F3: an unknown moment (0, no tracking yet) and a clock anomaly keep the frame -
+    // the flush must never fire on a prediction it does not have.
+    CHECK(!rc::FrameExpiredForSend(0, t0 + 9'999 * kMs));
+    CHECK(!rc::FrameExpiredForSend(-1, t0 + 9'999 * kMs));
+    // F4: the send loop's gate, one call per frame. A frame predicted for the future
+    // passes with nothing else attached; an expired one drops, and the throttles say
+    // which side effects this particular drop carries (first stamps are 0 = never).
+    const rc::FlushDecision pass = rc::StaleFlushDecide(t0 + 40 * kMs, t0 + 12 * kMs, 0, 0);
+    CHECK(!pass.drop && !pass.requestKeyframe && !pass.log);
+    const rc::FlushDecision first = rc::StaleFlushDecide(t0 + 40 * kMs, t0 + 119 * kMs, 0, 0);
+    CHECK(first.drop && first.requestKeyframe && first.log);
+    // 299 ms after a request: throttled; at exactly 300 ms: due again (>= window).
+    const int64_t at = t0 + 119 * kMs;
+    CHECK(!rc::StaleFlushDecide(at - 40 * kMs, at + 299 * kMs, at, at).requestKeyframe);
+    CHECK(rc::StaleFlushDecide(at - 40 * kMs, at + 300 * kMs, at, at).requestKeyframe);
+    CHECK(!rc::StaleFlushDecide(at - 40 * kMs, at + 999 * kMs, at, at).log);
+    CHECK(rc::StaleFlushDecide(at - 40 * kMs, at + 1'000 * kMs, at, at).log);
+    // F5: the card's reset rule - whatever the giant frames billed is forgiven, the
+    // bucket re-baselines to now, so the next frame may start at once.
+    const int64_t billedTo = at + 900 * kMs;  // a giant frame's leftover billing
+    CHECK(rc::FlushSendDebtNs(billedTo, at) == at);              // the debt is gone
+    CHECK(rc::FlushSendDebtNs(0, at) == at);                     // and it stays now
+    // F6: a burst shaped like the AB9 scene change: a giant frame blocks the send
+    // thread for 900 ms; every frame encoded meanwhile expires when picked up (its
+    // display moment was 10 ms before its pickup), then fresh frames flow again
+    // (F7). 19 expired frames between t and t+900 ms carry exactly 4 keyframe
+    // requests (0/300/600/900 ms stamps) and 1 log line (at t).
+    int64_t keyframeStamp = 0, logStamp = 0, debtNs = billedTo;
+    uint32_t drops = 0, requests = 0, logs = 0;
+    for (int64_t t = at; t <= at + 900 * kMs; t += 50 * kMs) {
+        const int64_t predicted = t - 10 * kMs;  // each was overtaken by the queue
+        const rc::FlushDecision d = rc::StaleFlushDecide(predicted, t, keyframeStamp, logStamp);
+        if (!d.drop) continue;
+        drops++;
+        if (d.requestKeyframe) {
+            requests++;
+            keyframeStamp = t;
+        }
+        debtNs = rc::FlushSendDebtNs(debtNs, t);  // every drop wipes the bucket again
+        if (d.log) {
+            logs++;
+            logStamp = t;
+        }
+    }
+    CHECK(drops == 19);
+    CHECK(requests == 4);  // at +0, +300, +600, +900 ms
+    CHECK(logs == 1);      // at +0 ms only
+    CHECK(debtNs == at + 900 * kMs);  // the last drop re-baselined to its own now
+    // F7: after the burst, the first fresh frame (predicted 30 ms ahead) passes
+    // untouched even with the throttle stamps mid-window - and per the wiring its
+    // all-false decision means Send proceeds exactly as before the flush existed.
+    const rc::FlushDecision fresh = rc::StaleFlushDecide(at + 930 * kMs + 30 * kMs, at + 930 * kMs,
+                                                         keyframeStamp, logStamp);
+    CHECK(!fresh.drop && !fresh.requestKeyframe && !fresh.log);
+    std::printf("stale flush: constants pinned, future/0-prediction frames pass, 40 ms + 1 ns / 119 / 479 ms late drop, "
+                "strict < boundary, debt re-baselines to now, 19-drop burst asks 4 times and logs once\n");
 }
 
 // TASK-LATENCY-METER-FIX-2026-11-22 §2: the stage accumulator must not drop samples.
@@ -4628,6 +4779,8 @@ int main() {
     TestFillFloorByTier();
     TestPercentile();  // TASK-DEC-PERCENTILE-2026-11-20 §1.2
     TestLatencyStageAccumulation();  // TASK-LATENCY-METER-FIX-2026-11-22 §2
+    TestFrameQueueBound();  // A23 (TASK-QUEUE-BOUND-2026-11-22)
+    TestStaleFlush();  // A26 (TASK-BACKLOG-FLUSH-2026-11-22)
     TestLossBrake();
     TestQueueGuard();
     TestL7Autoscale();

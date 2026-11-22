@@ -29,6 +29,14 @@
 #include "rc/platform.h"
 #include "util.h"
 
+// A20fix2 构建修复 (TASK-OPLOGIC-FIX-HMD-2026-11-22): stream_client.cpp resolves its
+// connect-failure texts through rv::Tr now, and this tool links that TU without the
+// headset's strings.cpp (headset-only, no UI here). The stub keeps Tr's documented
+// fallback semantics: an unknown key returns the key itself.
+namespace rv {
+const char* Tr(const char* key) { return key; }
+}  // namespace rv
+
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 

@@ -12,6 +12,7 @@
 #include "foveator.h"
 #include "motion_estimator.h"
 #include "rc/motion_field.h"
+#include "rc/stale_flush.h"
 
 #include <avrt.h>
 
@@ -73,6 +74,15 @@ void WarnEvery5s(const char* reason) {
     last = now;
     count = 0;
 }
+
+// A26 (stale-frame flush): how long after the driver's submit the headset expects to
+// show the frame, when the frame's exact prediction is unavailable. The same 40 ms
+// client_session falls back to when no clock offset is known yet.
+constexpr int64_t kStalePredictAheadNs = 40'000'000;
+// A26: a prediction further before the driver's submit than this means the clock
+// mapping behind it is off (a frame cannot be displayed before it was rendered);
+// such a value is not trusted and the predict-ahead estimate is used instead.
+constexpr int64_t kStaleClockGuardNs = 5'000'000;
 
 }  // namespace
 
@@ -212,6 +222,7 @@ void VrStream::LogFrameFlow(int64_t now) {
     m_flowSinceNs = now;
     const uint32_t given = m_flowGiven.exchange(0), bridge = m_flowReplacedBridge.exchange(0),
                    queue = m_flowReplacedQueue.exchange(0), encoded = m_flowEncoded.exchange(0);
+    const uint32_t staleDrops = m_flowStaleDrops.exchange(0);  // A26: the window's flush count
     const int64_t convertNs = m_flowConvertNs.exchange(0), encodeNs = m_flowEncodeNs.exchange(0),
                   heldNs = m_flowHeldNs.exchange(0);
     if (!given) return;
@@ -237,6 +248,10 @@ void VrStream::LogFrameFlow(int64_t now) {
             converted ? double(convertNs) / converted / 1e6 : 0.0, encoded ? double(encodeNs) / encoded / 1e6 : 0.0,
             converted ? double(heldNs) / converted / 1e6 : 0.0,
             gapMin, gapMax, lockAvgMs, lockMaxMs, lockN);
+    // A26: the window's stale-flush count, on its own line and only when it fired -
+    // the steady state's log stream stays byte-for-byte as it was.
+    if (staleDrops)
+        RC_LOGI("VR stale flush: %u frame(s) dropped past their display moment in this 10 s window", staleDrops);
 }
 
 void VrStream::WaitForEncoder(int64_t convertAvgNs) {
@@ -511,6 +526,21 @@ void VrStream::Run() {
             continue;
         }
 
+        // A26 (stale-frame flush): recover this frame's predicted display moment in the
+        // PC clock. The frame slot only carries the headset-clock echo
+        // (FrameSlot::headsetTargetNs), so the moment comes from the tracking sample the
+        // frame was rendered with - the streamer translated the headset's target into the
+        // PC clock when it published it (client_session: RemoteToLocalNs, or its +40 ms
+        // fallback). When the latest sample is still this frame's, the prediction is
+        // exact; a newer one means the frame is at most one vsync old (the error stays
+        // far below what the staleness gate judges), and the submit-time + predict-ahead
+        // estimate covers the rest (seqlock hiccup, no tracking yet, a mapping that
+        // failed the sanity guard above).
+        rcvr::TrackingSnapshot flushTracking{};
+        const bool flushTrackingRead = rcvr::ReadTracking(shared, flushTracking);
+        const bool flushExact = flushTrackingRead && flushTracking.sequence == slotCopy.trackingSequence &&
+                                flushTracking.targetDisplayPcNs > slotCopy.submitPcNs - kStaleClockGuardNs;
+
         EncodeJob job;
         job.yuv = converter->Output();
         job.format = converter->Format();
@@ -524,6 +554,8 @@ void VrStream::Run() {
         job.frameIndex = slotCopy.frameIndex;
         job.headsetTargetNs = slotCopy.headsetTargetNs;
         job.submitPcNs = slotCopy.submitPcNs;
+        job.predictedDisplayPcNs = flushExact ? flushTracking.targetDisplayPcNs
+                                              : slotCopy.submitPcNs + kStalePredictAheadNs;
         std::memcpy(job.renderOrientation, slotCopy.renderPose.orientation, sizeof(job.renderOrientation));
         std::memcpy(job.renderPosition, slotCopy.renderPose.position, sizeof(job.renderPosition));
         std::memcpy(job.fovTan, slotCopy.fovTan, sizeof(job.fovTan));
@@ -676,6 +708,7 @@ void VrStream::RunEncoder() {
         send.encodeMs = rc::NsToMs(encEnd - encStart);
         send.frameIndex = job.frameIndex;  // ROUND19 T1: pass the existing counter through
         send.recovery = recovery;
+        send.predictedDisplayPcNs = job.predictedDisplayPcNs;  // A26: the flush gate judges this
         {
             // The one before still going out (a paced send): wait, a dropped frame would break
             // the ones referencing it.
@@ -710,6 +743,36 @@ void VrStream::RunSender() {
             m_send.reset();
         }
         m_sendCv.notify_all();
+        // A26 (stale-frame flush): the frame's display moment has already passed - it is
+        // late no matter how fast it goes out, and sending it would keep the queue (and
+        // the latency) growing. Drop it, wipe the pacer's billing (the backlog's debt is
+        // forgiven, the next frame leaves at once), and ask for a keyframe (throttled,
+        // rc/stale_flush.h) so the reference chain rebuilds at the new scene; any frame
+        // that already referenced this one fails on the headset and is answered by the
+        // existing loss path. Normal frames are never touched here: their predicted
+        // display time sits in the future, so in the steady state this branch is dead.
+        const int64_t nowNs = rc::NowNs();
+        const rc::FlushDecision flush =
+            rc::StaleFlushDecide(send.predictedDisplayPcNs, nowNs, m_staleKeyframeNs, m_staleLogNs);
+        if (flush.drop) {
+            m_flowStaleDrops.fetch_add(1, std::memory_order_relaxed);
+            if (flush.requestKeyframe) {
+                m_staleKeyframeNs = nowNs;
+                m_sender.RequestKeyframe();
+            }
+            // The old billing lives in the packetizer and is unknown here; the wipe is
+            // unconditional, so the argument is irrelevant (rc/stale_flush.h).
+            m_sender.ResetPacingDebt(rc::FlushSendDebtNs(0, nowNs));
+            m_staleLogCount++;
+            if (flush.log) {
+                RC_LOGI("VR stale flush: dropped %u frame(s) whose display moment had passed "
+                        "(last %lld ms late); pacer debt wiped, keyframe requested",
+                        m_staleLogCount, (long long)((nowNs - send.predictedDisplayPcNs) / 1'000'000));
+                m_staleLogCount = 0;
+                m_staleLogNs = nowNs;
+            }
+            continue;
+        }
         m_sender.Send(send.frame, send.meta.data(), uint16_t(send.meta.size()), send.flags, send.encodeMs, send.recovery);
         // ROUND19 T1: feed the diag window (telemetry only; relaxed stores, the same cost
         // class as the flow counters). The CAS makes the window's first seq its minimum.

@@ -69,6 +69,10 @@ class VideoSender {
               double encodeMs, bool recovery);
 
     void RequestKeyframe() { m_keyframeRequested = true; }
+    // A26 (stale-frame flush): after dropping an expired frame, the sender wipes the
+    // pacer's billing so the next frame leaves at once instead of repaying the
+    // backlog's debt (rc/stale_flush.h). Send-thread only, same as Send.
+    void ResetPacingDebt(int64_t nowNs) { m_packetizer.ResetPacingDebtNs(nowNs); }
     // True if the headset is waiting for a frame (keyframe or loss recovery), so one
     // should be encoded even if the picture didn't change.
     bool WantsFrame();

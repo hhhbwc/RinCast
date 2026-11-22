@@ -48,6 +48,16 @@ class VideoPacketizer {
     // socket or the path backed the burst up (the token-bucket wait itself doesn't count).
     uint32_t BudgetOverruns() const { return m_budgetOverruns.load(std::memory_order_relaxed); }
 
+    // A26 (stale-frame flush, rc/stale_flush.h): re-baselines the pacing clock to
+    // `nowNs`, wiping whatever the backlog billed (card §1.3: the debt is forgiven
+    // so the next frame may start at once). Send-thread only - SendFrame owns this
+    // clock on that thread, and the flush runs on the same thread between two
+    // SendFrame calls, so no lock is needed (the same discipline as the setters
+    // above). In the legacy modes the clock holds at most kPaceMaxDebtNs, so the
+    // reset is a harmless re-baseline; in burst mode it is what turns the flush
+    // into an instant recovery.
+    void ResetPacingDebtNs(int64_t nowNs) { m_nextSendNs = nowNs; }
+
     // Sends one frame. Returns number of datagrams sent. May return early (count <
     // expected) once RequestStop() was called.
     size_t SendFrame(uint8_t streamId, VideoCodec codec, uint8_t frameFlags, uint32_t frameIndex,

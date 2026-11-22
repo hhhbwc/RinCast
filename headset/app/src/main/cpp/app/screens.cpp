@@ -1393,7 +1393,7 @@ void Build(App& app, WindowManager& wm) {
     kb->showChrome = false;
     // 640 (was 600): the frame-generation row (TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.1) added a
     // 38 px row, and the stage list below already ended at the old bottom edge.
-    Window* stats = make("stats", 380, 640, 0.30f, false, BuildStats);
+    Window* stats = make("stats", 380, 724, 0.30f, false, BuildStats);
     stats->showChrome = true;
     Window* notices = make("notices", 800, 104, 0.68f, false, BuildNotices);
     notices->showChrome = false;

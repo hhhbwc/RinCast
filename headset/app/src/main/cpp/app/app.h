@@ -366,6 +366,14 @@ class App {
     uint32_t m_flowDecodedStart = 0;
     double m_flowDecodeMaxMs = 0;
     uint32_t m_statsDropStale = 0, m_statsSkippedPrev = 0;  // ROUND18 L5: stale frames dropped per 1 s
+    // A23 (TASK-QUEUE-BOUND-2026-11-22): frames dropped at the decode submission point
+    // (OnVideoFrame) because they queued longer than rc::kQueueDropMs since arrival, the
+    // consecutive-drop counter the keyframe request throttle rides (reset whenever a
+    // frame passes the gate, and after every request), and the last time the overflow
+    // was logged (throttled to 5 s). Written only under m_decoderMutex.
+    uint32_t m_queueDrops = 0;
+    uint32_t m_queueDropStreak = 0;
+    int64_t m_queueDropLogNs = 0;
     int64_t m_timingLogNs = 0;
     GLuint m_vrTimer = 0;
     bool m_vrTimerChecked = false, m_vrTimerRunning = false, m_vrTimerPending = false;

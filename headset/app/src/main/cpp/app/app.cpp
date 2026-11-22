@@ -21,6 +21,7 @@
 #include "../platform/jni_bridge.h"
 
 #include <net/if.h>
+#include "rc/frame_queue_bound.h"  // A23 (TASK-QUEUE-BOUND-2026-11-22): the decode queue bound
 #include "rc/hand_skeleton.h"
 #include "rc/platform.h"
 #include "rc/protocol.h"
@@ -1036,6 +1037,30 @@ void App::OnVideoFrame(rc::ReceivedFrame&& f) {
     auto it = m_decoders.find(f.streamId);
     if (it == m_decoders.end() || !it->second) return;
     if (it->second->Codec() != f.codec) return;
+    // A23 (TASK-QUEUE-BOUND-2026-11-22): the decode queue bound, judged at the decode
+    // submission point (the Submit call below). A frame that queued longer than
+    // rc::kQueueDropMs from its arrival (completeNs - the receivedNs the decoder books)
+    // to here is dropped instead of decoded: the cost of a queue overload becomes a
+    // momentary freeze (a keyframe resumes the picture) instead of half a second of
+    // queued latency. A drop breaks the frame chain, so the PC learns through the
+    // existing reaction chain: the next frame that reaches Submit hits the gap (it
+    // needs a frame to resume from) and the regular keyframe feedback carries the
+    // requests - both the throttled ones below and Submit's own after the gap.
+    // Fewer than kQueueDropMs queued: exactly the behaviour this had before the gate.
+    if (rc::FrameQueueExpired(rc::NowNs(), f.completeNs)) {
+        m_queueDrops++;
+        m_queueDropStreak++;
+        if (rc::QueueDropRequestKeyframe(m_queueDropStreak)) m_client.RequestKeyframe(f.streamId);
+        const int64_t nowNs = rc::NowNs();
+        if (nowNs - m_queueDropLogNs >= 5'000'000'000LL) {
+            m_queueDropLogNs = nowNs;
+            RC_LOGW("Decode queue overflow: %u frame(s) dropped after >%d ms queued so far "
+                    "(keyframe every %u drops, streak %u)",
+                    m_queueDrops, int(rc::kQueueDropMs), rc::kQueueDropKeyframeEvery, m_queueDropStreak);
+        }
+        return;
+    }
+    m_queueDropStreak = 0;
     it->second->Submit(f.frameIndex, (f.flags & rc::kVideoKeyframe) != 0, (f.flags & rc::kVideoRecovery) != 0,
                        std::move(f.bitstream), std::move(f.metadata), f.completeNs);
     m_client.SetLastGoodFrame(f.streamId, it->second->LastGoodFrame());

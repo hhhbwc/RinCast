@@ -108,6 +108,10 @@ class VrStream {
         uint64_t frameIndex = 0;
         uint64_t headsetTargetNs = 0;
         int64_t submitPcNs = 0;
+        // A26 (stale-frame flush): this frame's predicted display moment in the PC
+        // clock, recovered in Run() from the tracking sample the frame was rendered
+        // with (0 = unknown: never expires - see rc/stale_flush.h).
+        int64_t predictedDisplayPcNs = 0;
         float renderOrientation[4] = {}, renderPosition[3] = {};
         float fovTan[2][4] = {};
         std::vector<uint8_t> motion;  // the motion field, already in its wire form
@@ -122,6 +126,7 @@ class VrStream {
         double encodeMs = 0;
         bool recovery = false;
         uint32_t frameIndex = 0;  // ROUND19 T1: the producer's frame counter, for the diag seq field
+        int64_t predictedDisplayPcNs = 0;  // A26: carried from the EncodeJob for the flush gate
     };
 
     void Run();
@@ -145,6 +150,7 @@ class VrStream {
     std::mutex m_sendMutex;
     std::condition_variable m_sendCv;  // a frame to send, or room for one
     std::optional<SendJob> m_send;     // one at most: frames are never dropped, the encoder waits
+                                       // (A26: expired ones are dropped at the take-off - RunSender)
     std::mutex m_jobMutex;
     std::condition_variable m_jobReady;
     std::condition_variable m_jobTaken;
@@ -163,6 +169,15 @@ class VrStream {
     // and how long the game's frames were held back so the encoder could keep up.
     std::atomic<uint32_t> m_flowGiven{0}, m_flowReplacedBridge{0}, m_flowReplacedQueue{0}, m_flowEncoded{0};
     std::atomic<int64_t> m_flowConvertNs{0}, m_flowEncodeNs{0}, m_flowHeldNs{0};
+    // A26 (stale-frame flush): frames RunSender dropped because their predicted display
+    // moment had passed (rc/stale_flush.h). Its own family, not folded into
+    // m_flowReplacedQueue: that one means "replaced while the encoder was busy", and the
+    // 10 s flow line reports this one separately when it is non-zero.
+    std::atomic<uint32_t> m_flowStaleDrops{0};
+    // A26: RunSender-thread-only flush state - the keyframe-request (300 ms) and log
+    // (1 s) throttle stamps, and the drop count since the last throttled log line.
+    int64_t m_staleKeyframeNs = 0, m_staleLogNs = 0;
+    uint32_t m_staleLogCount = 0;
     int64_t m_flowSinceNs = 0;
     // ROUND19 T1: the diag window's encode-time distribution and frame-seq range. A small
     // lock-free ring the sender thread writes (two relaxed stores per frame, the same cost
