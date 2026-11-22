@@ -4700,6 +4700,44 @@ static void TestFecWireBillingLoopback() {
     }
 }
 
+// A33 (TASK-PACE-FOLLOW-2026-11-22): the burst pacer's billing base, extracted from
+// VideoSender::Send as the pure inline rcs::PaceBaseKbps (video_sender.h) - the real
+// call site bills base x 1.08 into SetPacingKbps. The card pins three laws (the
+// selection is a one-line policy the card mandates asserting; nothing here mirrors
+// more than that single rule):
+//   1. burst mode, adaptive target < user ceiling: bill the TARGET (the pacer follows
+//      the collapse instead of releasing frames the sinking link cannot carry - the
+//      real device's 479 ms send-side queue spike);
+//   2. burst mode, target >= ceiling: bill the ceiling (the old behaviour whenever
+//      adaptation is not pushing under the user's setting);
+//   3. adaptive off (the target IS the user's setting == the ceiling): bill the
+//      ceiling x 1.08 exactly as before - zero behaviour change on that path.
+static void TestPaceBaseKbps() {
+    // The card's diagnosis pair: the 165 Mbps burst-ceiling tier and the adaptive
+    // target collapsed to 109 Mbps by the link.
+    constexpr uint32_t kCeiling = 165'000, kTarget = 109'000;
+    // Law 1: follow the adaptive target down.
+    CHECK(rcs::PaceBaseKbps(3, kCeiling, kTarget) == kTarget);
+    // Law 2: the ceiling stays the bill when the target is at or above it - the
+    // at-ceiling boundary (the real "adaptive has climbed back to max" case) and a
+    // synthetic strictly-above target proving the clamp direction.
+    CHECK(rcs::PaceBaseKbps(3, kCeiling, kCeiling) == kCeiling);
+    CHECK(rcs::PaceBaseKbps(3, kCeiling, kCeiling + 35'000) == kCeiling);
+    // Law 3: adaptive off - the target IS the user's setting, so it equals the ceiling
+    // (ctor + SetMaxBitrate pin m_targetKbps to maxBitrateKbps when !adaptive) - bills
+    // exactly as the old code did (same boundary value as law 2, different meaning:
+    // this is the zero-behaviour-change path).
+    CHECK(rcs::PaceBaseKbps(3, kCeiling, kCeiling) == kCeiling);
+    // The follow modes (0 auto / 1 off / 2 follow-the-guard) never used the ceiling:
+    // unchanged in both directions, target above or below it.
+    CHECK(rcs::PaceBaseKbps(0, kCeiling, kTarget) == kTarget);
+    CHECK(rcs::PaceBaseKbps(1, kCeiling, kTarget) == kTarget);
+    CHECK(rcs::PaceBaseKbps(2, kCeiling, kTarget) == kTarget);
+    CHECK(rcs::PaceBaseKbps(2, kCeiling, kCeiling) == kCeiling);
+    std::printf("A33 pace base: burst follows the adaptive target down (109k), keeps the 165k ceiling, "
+                "adaptive-off and follow modes unchanged\n");
+}
+
 #undef A12_CHECK
 
 int main() {
@@ -4775,6 +4813,7 @@ int main() {
     TestConfigCouplingCases();
     TestH264CapsFallback();  // TASK-CAPS-GUARD: the H264 width-cap fallback cases
     TestFecWireBillingLoopback();
+    TestPaceBaseKbps();  // A33 (TASK-PACE-FOLLOW-2026-11-22): the burst pacer's billing base
     TestFpsLadder();
     TestFillFloorByTier();
     TestPercentile();  // TASK-DEC-PERCENTILE-2026-11-20 §1.2

@@ -84,15 +84,24 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
             m_lastRecoveryNs = rc::NowNs();
         }
     }
-    // Burst pacing follows the USER's ceiling, not the guard's cap: an encoded frame
-    // must leave within its own frame period, otherwise the capacity-1 send slot
-    // back-pressures the encoder and the queue climbs (the real device's 205 ms at a
-    // 100 Mbps ceiling). The legacy follow mode keeps pacing from TargetBitrateKbps()
-    // so remote paths and the follow control retain the old behavior. The encoder's
+    // A33 (TASK-PACE-FOLLOW-2026-11-22, 2026-11-22): burst pacing bills min(the USER's
+    // ceiling, the ADAPTIVE target), i.e. the billing rate follows the adaptive target
+    // when it is pushed under the ceiling. The old rule - bill the user's ceiling
+    // unconditionally - predates the A10 frame-granularity token bucket: back then an
+    // encoded frame had to leave within its own frame period or the capacity-1 send
+    // slot back-pressured the encoder and the queue climbed (205 ms at a 100 Mbps
+    // ceiling). Under burst + token-bucket billing a frame no longer must, so keeping
+    // the inflated rate only mattered when it hurt: with rate adaptation holding the
+    // target under the ceiling on a collapsed link, the pacer kept releasing frames the
+    // link could not carry - the real device's 479 ms send-side queue spike. Adaptive
+    // off is a no-op: the target then IS the user's setting, so min(max, target) == max
+    // == exactly the old bill. The selection lives in PaceBaseKbps (video_sender.h,
+    // pure + tested); the legacy follow modes keep pacing from TargetBitrateKbps() so
+    // remote paths and the follow control retain the old behavior. The encoder's
     // budget still obeys the guard in both modes.
     if (m_pace) {
         const int mode = m_pacingMode.load(std::memory_order_relaxed);
-        const uint32_t paceBase = mode == 3 ? m_maxKbps.load() : TargetBitrateKbps();
+        const uint32_t paceBase = PaceBaseKbps(mode, m_maxKbps.load(), TargetBitrateKbps());
         m_packetizer.SetPacingKbps(uint32_t(paceBase * 1.08));
         if (mode == 3) {
             int64_t budgetNs = m_pacingBudgetNs.load(std::memory_order_relaxed);

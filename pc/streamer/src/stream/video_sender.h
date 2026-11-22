@@ -51,6 +51,23 @@ inline size_t FrameWireBytes(size_t fragPayload, size_t totalPayload, int fecPer
            nParity * (sizeof(rc::VideoParityHeader) + fragPayload);
 }
 
+// A33 (TASK-PACE-FOLLOW-2026-11-22): the billing base one Send feeds the pacer (the
+// call site bills base x 1.08). Extracted verbatim from VideoSender::Send as a pure
+// inline - the same pattern as FrameWireBytes above - because the real selection reads
+// private atoms (m_maxKbps and the inputs of TargetBitrateKbps) and drives a private
+// packetizer, i.e. it is not injectable from a test. In burst mode (3) the billing
+// rate now follows the ADAPTIVE target: when the guard/loss brake push the target
+// under the user's ceiling (link collapse), the old "bill the ceiling" rule kept
+// releasing frames at a rate the sinking link cannot carry - the real device's 479 ms
+// send-side queue spike. Under A10's frame-granularity token bucket an encoded frame
+// no longer has to leave within its own frame period, so that old rationale is
+// obsolete. Adaptive off is a no-op: the target then IS the user's setting, so
+// min(max, target) == max == exactly the old value. The follow modes (mode != 3) never
+// used the ceiling and keep pacing from the target as they always have.
+inline uint32_t PaceBaseKbps(int pacingMode, uint32_t maxKbps, uint32_t targetKbps) {
+    return pacingMode == 3 ? std::min(maxKbps, targetKbps) : targetKbps;
+}
+
 class VideoSender {
    public:
     VideoSender(rc::Connection* connection, uint8_t streamId, rc::VideoCodec codec, uint32_t maxBitrateKbps,

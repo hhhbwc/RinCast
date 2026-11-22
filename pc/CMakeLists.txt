@@ -102,6 +102,17 @@ target_include_directories(a14-matrix PRIVATE ../third_party)
 target_compile_definitions(a14-matrix PRIVATE UNICODE _UNICODE)
 target_link_libraries(a14-matrix PRIVATE rincast-core)
 
+# Developer tool: TASK-TRACE-REPLAY-2026-11-22 (A24) adversarial timing replay. Drives
+# the real VideoPacketizer (burst token bucket) + VideoReassembler over a real loopback
+# Connection pair, and judges every frame with the real A23 decode-queue gate
+# (rc/frame_queue_bound.h) and A26 stale flush (rc/stale_flush.h) - against synthetic
+# timelines calibrated to the AB9/AB10 session aggregates. Measurement only - no
+# product behaviour in here.
+add_executable(a24-replay ../tools/a24-replay/main.cpp)
+target_include_directories(a24-replay PRIVATE ../third_party)
+target_compile_definitions(a24-replay PRIVATE UNICODE _UNICODE)
+target_link_libraries(a24-replay PRIVATE rincast-core)
+
 # Developer tool: lists the virtual audio devices and how each setting resolves.
 add_executable(audio-check ../tools/audio-check/main.cpp streamer/src/audio/audio.cpp streamer/src/util.cpp)
 target_include_directories(audio-check PRIVATE streamer/src ../third_party)
