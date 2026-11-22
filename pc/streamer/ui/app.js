@@ -150,7 +150,9 @@ function documentTitle(page, heading) {
   return page === "home" ? t("app.title") : `${heading} - ${t("app.title")}`;
 }
 function goTo(page, moveFocus) {
-  $$("#nav button").forEach((x) => {
+  // A53: Account lives in the rail footer rather than the main list, so this looks at every
+  // rail entry instead of only the ones inside <nav>.
+  $$(".rail [data-page]").forEach((x) => {
     if (x.dataset.page === page) x.setAttribute("aria-current", "page");
     else x.removeAttribute("aria-current");
   });
@@ -163,7 +165,7 @@ function goTo(page, moveFocus) {
   if (page !== "home") request({ type: "getState" });
   if (state) renderStatus();
 }
-$$("#nav button").forEach((b) =>
+$$(".rail [data-page]").forEach((b) =>
   // detail is 0 for keyboard activation: then focus follows to the new page.
   b.addEventListener("click", (e) => goTo(b.dataset.page, e.detail === 0)),
 );
@@ -565,7 +567,7 @@ function renderStatus() {
   if (!state) return;  // push can arrive before the first getState reply
   const el = $("#status");
   const s = state.session;
-  const onHome = $("#nav [aria-current]")?.dataset.page === "home";
+  const onHome = $(".rail [data-page][aria-current]")?.dataset.page === "home";
   let html = "";
   if (s && !onHome) {
     const cell = (label, value, poor) => `<div><span>${esc(label)}</span><b class="${poor ? "poor" : ""}">${esc(value)}</b></div>`;

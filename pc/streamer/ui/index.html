@@ -15,11 +15,15 @@
       <button data-page="home" aria-current="page" data-i18n="nav.home">Home</button>
       <button data-page="video" data-i18n="nav.video">Streaming</button>
       <button data-page="audio" data-i18n="nav.audio">Audio</button>
-      <button data-page="vr" data-i18n="nav.vr">SteamVR</button>
       <button data-page="devices" data-i18n="nav.devices">Headsets</button>
       <button data-page="general" data-i18n="nav.general">General</button>
-      <button data-page="account" data-i18n="nav.account">Account</button>
     </nav>
+    <!-- A53: five sections a new user has to choose between, not seven. SteamVR moved into
+         Headsets (same subject: the VR device you stream to) and Account is a once-a-year
+         visit that belongs at the bottom of the rail, not in the main list. -->
+    <div class="rail-foot">
+      <button data-page="account" data-i18n="nav.account">Account</button>
+    </div>
   </aside>
 
   <main id="main" tabindex="-1">
@@ -214,27 +218,6 @@
       </div>
     </section>
 
-    <!-- SteamVR -->
-    <section class="page" data-page="vr" aria-labelledby="h-vr">
-      <h1 id="h-vr" tabindex="-1" data-i18n="nav.vr">SteamVR</h1>
-      <dl class="facts tight" id="vrFacts"></dl>
-      <div class="btns spaced">
-        <button class="btn" id="launchSteamVR" data-i18n="vr.start">Start SteamVR</button>
-        <button class="btn" id="restartSteamVR" data-i18n="vr.restart">Restart SteamVR</button>
-        <button class="btn" id="registerDriver" data-i18n="vr.register">Add RinCast to SteamVR</button>
-        <button class="btn primary" id="getSteamVR" data-i18n="vr.get">Get SteamVR</button>
-      </div>
-      <label class="check spaced"><input type="checkbox" data-setting="autoRegisterSteamVrDriver"><span data-i18n="vr.autoRegister">Add RinCast to SteamVR automatically</span></label>
-      <div id="runtimeRow">
-        <h2 id="runtimeLabel" data-i18n="vr.runtime">OpenXR games run through</h2>
-        <div class="options inline" id="runtimeSeg" role="radiogroup" aria-labelledby="runtimeLabel" aria-describedby="runtimeNote">
-          <label><input type="radio" name="openxrRuntime" value="rincast"><span>RinCast</span></label>
-          <label><input type="radio" name="openxrRuntime" value="steamvr"><span>SteamVR</span></label>
-        </div>
-        <p class="note" id="runtimeNote"></p>
-      </div>
-    </section>
-
     <!-- Devices -->
     <section class="page" data-page="devices" aria-labelledby="h-devices">
       <h1 id="h-devices" tabindex="-1" data-i18n="nav.devices">Headsets</h1>
@@ -244,6 +227,27 @@
       <label class="check"><input type="checkbox" data-setting="requireApproval"><span data-i18n="devices.requireApproval">Ask before a new headset connects</span><small data-i18n="devices.requireApprovalHint">Without this, anyone on this network can control your PC.</small></label>
       <h2 data-i18n="devices.desktop">On the desktop</h2>
       <label class="check"><input type="checkbox" data-setting="desktopInput"><span data-i18n="devices.desktopInput">Let headsets use the mouse and keyboard</span><small data-i18n="devices.desktopInputHint">Turn off to only watch your screens from the headset. VR games still get the controllers.</small></label>
+
+      <!-- A53: the SteamVR section used to be its own page with a single checkbox in it.
+           It belongs here: same subject (the VR device you stream to), and "Add RinCast to
+           SteamVR" is exactly what a first-time user has to find. -->
+      <h2 data-i18n="nav.vr">SteamVR</h2>
+      <dl class="facts tight" id="vrFacts"></dl>
+      <div class="btns spaced">
+        <button class="btn" id="launchSteamVR" data-i18n="vr.start">Start SteamVR</button>
+        <button class="btn" id="restartSteamVR" data-i18n="vr.restart">Restart SteamVR</button>
+        <button class="btn" id="registerDriver" data-i18n="vr.register">Add RinCast to SteamVR</button>
+        <button class="btn primary" id="getSteamVR" data-i18n="vr.get">Get SteamVR</button>
+      </div>
+      <label class="check spaced"><input type="checkbox" data-setting="autoRegisterSteamVrDriver"><span data-i18n="vr.autoRegister">Add RinCast to SteamVR automatically</span></label>
+      <div id="runtimeRow">
+        <h3 id="runtimeLabel" data-i18n="vr.runtime">OpenXR games run through</h3>
+        <div class="options inline" id="runtimeSeg" role="radiogroup" aria-labelledby="runtimeLabel" aria-describedby="runtimeNote">
+          <label><input type="radio" name="openxrRuntime" value="rincast"><span>RinCast</span></label>
+          <label><input type="radio" name="openxrRuntime" value="steamvr"><span>SteamVR</span></label>
+        </div>
+        <p class="note" id="runtimeNote"></p>
+      </div>
     </section>
 
     <!-- Account -->

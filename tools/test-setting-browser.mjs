@@ -346,11 +346,20 @@ try {
   assert.equal(await js(`[...document.querySelectorAll('.failed')].filter(e=>e.textContent).length`), 0);
   check('all_actual_video_controls_30s', { controls: keys.length, operations: keys.length * 10, ms: stressMs, animationFrames: await js('__bridge.frames') - framesBefore, absentPcControls: ['videoPacingMode', 'desktopFps'], video: 'NOT_TESTED' });
 
-  for (const nav of ['home','audio','vr','devices','general','account','video']) {
-    await click(`#nav [data-page="${nav}"]`); await wait(60);
+  for (const nav of ['home','audio','devices','general','video']) {
+    await click(`.rail [data-page="${nav}"]`); await wait(60);
     assert.equal(await js(`document.querySelector('.page.active').dataset.page`), nav);
   }
-  check('navigation_after_stress', { pages: 7 });
+  // A53: Account left the main list for the rail footer; the section must still open, and the
+  // everyday list must stay at five so a new user has five things to choose between.
+  assert.equal(await js(`document.querySelectorAll('#nav [data-page]').length`), 5);
+  assert.equal(await js(`document.querySelectorAll('.rail-foot [data-page]').length`), 1);
+  await click('.rail-foot [data-page="account"]'); await wait(60);
+  assert.equal(await js(`document.querySelector('.page.active').dataset.page`), 'account');
+  assert.equal(await js(`document.querySelector('.rail-foot [data-page="account"]').getAttribute('aria-current')`), 'page');
+  check('navigation_after_stress', { mainSections: 5, railFoot: 1, pages: await js(`document.querySelectorAll('.page').length`) });
+  // The viewport checks measure a Streaming control, so go back to the page that owns it.
+  await click('.rail [data-page="video"]'); await wait(60);
   for (const [width,height] of [[1100,1000],[760,560]]) {
     await page('Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:false});
     await js(`document.querySelector('#main').scrollTop=0`); await wait(150);

@@ -38,17 +38,22 @@ button, .rail, label { user-select: none; }
 h1:focus, main:focus { outline: none; }
 
 /* ---- rail ---- */
-.rail { padding: 18px 10px; border-right: 1px solid var(--line); overflow-y: auto; min-height: 0; }
+.rail { display: flex; flex-direction: column; padding: 18px 10px; border-right: 1px solid var(--line); overflow-y: auto; min-height: 0; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 0 12px 20px; font: 600 18px var(--display); }
 .brand svg { color: var(--accent); flex: none; margin-left: -3px; }
-nav { display: flex; flex-direction: column; gap: 2px; }
-nav button {
+nav { display: flex; flex-direction: column; gap: 2px; flex: none; }
+/* A53: Account sits at the bottom of the rail, away from the five everyday sections. */
+.rail-foot { margin-top: auto; padding-top: 12px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; }
+nav button, .rail-foot button {
   padding: 0 12px; min-height: 38px; border: 0; border-radius: 3px; background: none; color: var(--muted);
   font: 16px var(--font); text-align: left; cursor: pointer;
 }
-nav button:hover { background: #262626; color: var(--text); }
-nav button:active { background: var(--control-press); }
-nav button[aria-current="page"], nav button[aria-current="page"]:hover { background: #404040; color: var(--text); font-weight: 600; }
+nav button:hover, .rail-foot button:hover { background: #262626; color: var(--text); }
+nav button:active, .rail-foot button:active { background: var(--control-press); }
+nav button[aria-current="page"], nav button[aria-current="page"]:hover,
+.rail-foot button[aria-current="page"], .rail-foot button[aria-current="page"]:hover {
+  background: #404040; color: var(--text); font-weight: 600;
+}
 
 /* ---- status bar ---- */
 .status { grid-column: 1 / -1; display: flex; gap: 40px; align-items: center; min-height: 58px; padding: 8px 32px 8px 22px; border-top: 1px solid var(--line); }
