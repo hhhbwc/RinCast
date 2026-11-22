@@ -360,7 +360,9 @@ class NvencEncoder final : public VideoEncoder {
                         // The trailing fields are additive: log parsers key on the leading
                         // fixed-width part; diagnostics get the raw rejected value and the
                         // min..max spread (a steady mean can hide quality pumping).
-                        RC_LOGI("ENC 5s: %.0f fps, qp %.1f, %.1f KB/frame, %.1f Mbps (ceiling %u), submit %.1f ms, gpu wait %.1f ms, qpValid %u/%u, qpFirstBad %u, qpRange %u-%u, kbRange %.1f-%.1f",
+                        // stream= tells the two encoder instances apart (VR and desktop can
+                        // both print this prefix); it reuses the existing config.desktop flag.
+                        RC_LOGI("ENC 5s: %.0f fps, qp %.1f, %.1f KB/frame, %.1f Mbps (ceiling %u), submit %.1f ms, gpu wait %.1f ms, qpValid %u/%u, qpFirstBad %u, qpRange %u-%u, kbRange %.1f-%.1f, stream %s",
                                 m_statFrames / secs, m_qpStats.Mean(),
                                 double(m_statBytes) / m_statFrames / 1024.0,
                                 double(m_statBytes) * 8.0 / secs / 1e6, m_config.bitrateKbps / 1000,
@@ -368,7 +370,8 @@ class NvencEncoder final : public VideoEncoder {
                                 double(m_statGpuWaitNs) / m_statFrames / 1e6,
                                 m_qpStats.valid, m_qpStats.valid + m_qpStats.rejected,
                                 m_qpStats.firstBadRaw, m_qpStats.min, m_qpStats.max,
-                                double(m_statBytesMin) / 1024.0, double(m_statBytesMax) / 1024.0);
+                                double(m_statBytesMin) / 1024.0, double(m_statBytesMax) / 1024.0,
+                                m_config.desktop ? "desktop" : "vr");
                         m_statStartNs = now;
                         m_statFrames = 0;
                         m_qpStats.Reset();
@@ -484,24 +487,38 @@ class NvencEncoder final : public VideoEncoder {
         candidateInit.frameRateNum = plan.rateNum;
         candidateInit.frameRateDen = 1000;
         candidateInit.encodeConfig = &candidateConfig;
+        // nvEncReconfigureEncoder 是编码侧唯一没有耗时仪表的阻塞点：它落在 submitStart
+        // 之前，ENC 5s 的 submit/gpu wait 都看不见它，而一次单发的慢调用可以被按帧统计的
+        // enc p95 排名数学藏住。ApplyEncoderRateTransaction 恰好调用 lambda 一次，所以
+        // 这里量的就是这一次 nvEncReconfigureEncoder 的墙钟耗时。
+        double reconfigMs = 0.0;
         const bool ok = rc::ApplyEncoderRateTransaction(m_rateState, plan, now, [&] {
             NV_ENC_RECONFIGURE_PARAMS re{};
             re.version = NV_ENC_RECONFIGURE_PARAMS_VER;
             re.reInitEncodeParams = candidateInit;
             // resetEncoder/forceIDR 为零；保留已提交的 vbvInitialDelay，不重新灌满桶。
-            return NvencLib::Get().api.nvEncReconfigureEncoder(m_encoder, &re) == NV_ENC_SUCCESS;
+            const int64_t reconfigStart = rc::NowNs();
+            const bool done = NvencLib::Get().api.nvEncReconfigureEncoder(m_encoder, &re) == NV_ENC_SUCCESS;
+            reconfigMs = double(rc::NowNs() - reconfigStart) / 1e6;
+            return done;
         });
         if (!ok) {
-            RC_LOGW("NVENC: rate reconfigure failed; request retained for throttled retry");
+            // 失败的重配置同样可能很慢，所以失败分支也带耗时（行末追加，前导字段不变）。
+            RC_LOGW("NVENC: rate reconfigure failed; request retained for throttled retry, reconfig %.1f ms",
+                    reconfigMs);
             return;
         }
         m_encodeConfig = candidateConfig;
         m_init = candidateInit;
         m_init.encodeConfig = &m_encodeConfig;
         m_config.bitrateKbps = plan.requestedKbps;
-        RC_LOGI("NVENC: %.1f fps measured, encoder rate %.1f fps, max %u kbps, VBV %.2f Mbit",
+        // 语义澄清（字段名是历史日志锚，不许改）：`X fps measured` 不是产出率，是
+        // RateTracker::RealFps() = 1e9 / fastIntervalNs（fps_ladder.h），即 Encode 入口
+        // 间隔的快速 EMA。偏低 ⇒ 存在约 1e9/X ns 的入口空隙（上游停顿），不能读成
+        // 「只编出 X 帧」；产出率看同窗的 rc diag 1s enc/s 与 ENC 5s 行。
+        RC_LOGI("NVENC: %.1f fps measured, encoder rate %.1f fps, max %u kbps, VBV %.2f Mbit, reconfig %.1f ms",
                 m_rateTracker.RealFps(m_config.fps), double(plan.rateNum) / 1000.0,
-                plan.budget.maxBitrate / 1000, double(plan.budget.vbvBufferSize) / 1e6);
+                plan.budget.maxBitrate / 1000, double(plan.budget.vbvBufferSize) / 1e6, reconfigMs);
     }
 
     void TrackFrameInterval() {
