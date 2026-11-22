@@ -513,6 +513,11 @@ void VrStream::Run() {
             converter && (foveated ? foveator.Squeeze(ctx.Get(), tex, foveaStart) && converter->Convert(ctx.Get(), foveator.Output())
                                    : converter->Convert(ctx.Get(), tex));
         bool motionValid = false;
+        // Only a frame the estimator saw becomes its previous one. A frame that failed
+        // conversion, or could not be given a view, must not be named in the next field's
+        // interval: the headset scales the field by that interval, so a pair that really
+        // spans two frames would be bent as if it spanned one.
+        bool motionConsumed = false;
         if (converted && motionReady) {
             ComPtr<ID3D11ShaderResourceView>& view = motionViews[tex];
             if (!view) {
@@ -524,10 +529,13 @@ void VrStream::Run() {
                 sd.Texture2D.MipLevels = 1;
                 device->CreateShaderResourceView(tex, &sd, &view);
             }
-            float turn[9];
-            HeadTurn(motionPose, fs.renderPose, turn);
-            if (view) motionValid = motion.Process(ctx.Get(), view.Get(), turn, fs.fovTan);
-            motionPose = fs.renderPose;
+            if (view) {
+                float turn[9];
+                HeadTurn(motionPose, fs.renderPose, turn);
+                motionValid = motion.Process(ctx.Get(), view.Get(), turn, fs.fovTan);
+                motionPose = fs.renderPose;
+                motionConsumed = true;
+            }
         }
         if (mutex) mutex->ReleaseSync(0);
         // The encoder is on another thread: hand the GPU the conversion now.
@@ -579,7 +587,7 @@ void VrStream::Run() {
         // only with frame generation on.
         if (motionValid && motion.Read(ctx.Get(), motionField))
             AppendMotion(motion, motionField, motionPreviousTimestamp, m_motionGridPrev, job.motion);
-        motionPreviousTimestamp = slotCopy.headsetTargetNs;
+        if (motionConsumed) motionPreviousTimestamp = slotCopy.headsetTargetNs;
         const int64_t convertNs = rc::NowNs() - convertStart;
         m_flowConvertNs += convertNs;
         convertAvgNs = convertAvgNs ? (convertAvgNs * 7 + convertNs) / 8 : convertNs;
