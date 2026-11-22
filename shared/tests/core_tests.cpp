@@ -5188,6 +5188,203 @@ static void TestTransportRobustPacketizer() {
     std::printf("A45 packetizer: small MTU safe, parity billing exact, FEC race safe, clock bounded\n");
 }
 
+// ---------------------------------------------------------------------------
+// A49 (TASK-CONN-HARDEN-2026-11-22): connection-layer hardening.
+// The receiver is driven through the real HandleDatagram (version gate + AEAD +
+// replay window) with datagrams sealed by a peer that holds the session keys, so the
+// tests need no test-only visibility hook and production code gains no new surface.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Connection::HandleDatagram's direction byte for client -> server (connection.cpp).
+// Wire format, not a protocol.h constant; a test peer must use the same byte.
+constexpr uint8_t kDirClientToServerTest = 0x43;  // 'C'
+const NetAddress kInjectFrom{0x7F000001, 5000};
+
+// Seals control/other datagrams the way a peer would, with an order-preserving
+// PacketHeader sequence and a caller-controlled chunkSeq/version.
+struct PeerInjector {
+    Connection& conn;
+    const crypto::Key& key;  // the sender's m_sendKey (== receiver's m_recvKey)
+    uint32_t sessionId;
+    uint64_t packetSeq = 1;
+    uint32_t chunkSeq = 0;
+    uint8_t version = uint8_t(kProtocolVersion);
+
+    PeerInjector(Connection& c, const crypto::Key& k, uint32_t sid) : conn(c), key(k), sessionId(sid) {}
+
+    bool Send(const uint8_t* plain, size_t plainSize, PacketType type = PacketType::Control) {
+        PacketHeader h{};
+        h.version = version;
+        h.type = uint8_t(type);
+        h.flags = kFlagEncrypted;
+        h.sessionId = sessionId;
+        h.sequence = packetSeq++;
+        std::vector<uint8_t> dg(sizeof(h) + plainSize + kMacSize);
+        std::memcpy(dg.data(), &h, sizeof(h));
+        crypto::Seal(key, h.sequence, kDirClientToServerTest, dg.data(), sizeof(h), plain, plainSize,
+                     dg.data() + sizeof(h));
+        return conn.HandleDatagram(dg.data(), dg.size(), kInjectFrom);
+    }
+
+    bool Chunk(uint32_t messageId, uint16_t index, uint16_t count, const std::string& data) {
+        ControlChunkHeader ch{};
+        ch.chunkSeq = chunkSeq++;
+        ch.messageId = messageId;
+        ch.chunkIndex = index;
+        ch.chunkCount = count;
+        std::vector<uint8_t> plain(sizeof(ch) + data.size());
+        std::memcpy(plain.data(), &ch, sizeof(ch));
+        if (!data.empty()) std::memcpy(plain.data() + sizeof(ch), data.data(), data.size());
+        return Send(plain.data(), plain.size());
+    }
+};
+
+}  // namespace
+
+static void TestConnectionHardening() {
+    UdpSocket dead;  // never opened: every ack is refused, nothing reaches the network
+    CHECK(!dead.IsOpen());
+    auto keys = crypto::DeriveSessionKeys(crypto::KeyPair::Generate().secretKey,
+                                          crypto::KeyPair::Generate().publicKey,
+                                          crypto::KeyPair::Generate().publicKey,
+                                          crypto::KeyPair::Generate().publicKey, "a49");
+
+    // --- 5.1: chunkCount == 0 and chunkIndex >= chunkCount must not accumulate. ---
+    {
+        const uint32_t sid = 0xA49'00001;
+        Connection conn(&dead, kInjectFrom, sid, keys, true, kMaxDatagramLan);
+        int deliveries = 0;
+        std::string last;
+        conn.SetControlHandler([&](const std::string& m) {
+            deliveries++;
+            last = m;
+        });
+        PeerInjector in(conn, keys.clientToServer, sid);
+
+        // "Last chunk" can never arrive (0 + 1 != 0), so the old code appended 4000x120
+        // bytes to m_assembly and kept growing.
+        int accepted = 0;
+        for (int i = 0; i < 4000; i++) accepted += in.Chunk(11, 0, 0, std::string(120, 'z')) ? 1 : 0;
+        CHECK(accepted == 4000);  // authentic, so delivery is attempted - and must be dropped
+        CHECK(deliveries == 0);
+        // Index past the end: same non-terminating shape.
+        accepted = 0;
+        for (int i = 0; i < 4000; i++) accepted += in.Chunk(12, 5, 3, std::string(120, 'y')) ? 1 : 0;
+        CHECK(accepted == 4000);
+        CHECK(deliveries == 0);
+        // A well-formed message still arrives byte-exact: no stale prefix survived.
+        CHECK(in.Chunk(13, 0, 2, "hello "));
+        CHECK(in.Chunk(13, 1, 2, "world"));
+        CHECK(deliveries == 1);
+        CHECK(last == "hello world");
+        // The dropped bytes were never accounted as received control data.
+        CHECK(conn.Stats().packetsReceived == 8002);
+
+        // --- 5.2: over the 4 MB cap the buffer is cleared and nothing is delivered. ---
+        // 3200 x 1356 B > 4 MiB, so the cap trips mid-message; the message's own final
+        // chunk then cannot complete a 4.3 MB delivery (the old code delivered it).
+        const std::string body(1356, 'q');
+        const uint16_t kCount = 4000;
+        for (uint16_t i = 0; i < 3200; i++) CHECK(in.Chunk(21, i, kCount, body));
+        CHECK(deliveries == 1);
+        CHECK(in.Chunk(21, uint16_t(kCount - 1), kCount, body));
+        CHECK(deliveries == 1);  // not delivered: reassembly was reset at the cap
+        CHECK(last == "hello world");
+        // After the reset a fresh message is reassembled from scratch, cleanly.
+        CHECK(in.Chunk(22, 0, 1, "fresh"));
+        CHECK(deliveries == 2);
+        CHECK(last == "fresh");
+    }
+
+    // --- 5.3: a maxDatagram below the floor is clamped, never divides by zero. ---
+    {
+        const uint32_t sid = 0xA49'00002;
+        for (size_t mtu : {size_t(0), size_t(1), size_t(sizeof(PacketHeader) + kMacSize), size_t(44)}) {
+            UdpSocket tx;
+            CHECK(tx.Open(0));
+            Connection conn(&tx, kInjectFrom, sid, keys, true, mtu);
+            // The floor leaves room for one control header byte, so SendControl cannot
+            // underflow chunkData (the old code produced a 0 or huge divisor).
+            CHECK(conn.MaxPayload() > sizeof(ControlChunkHeader));
+        }
+        // End to end with an absurd MTU: 1 byte per chunk still arrives intact, so this
+        // is a clamp, not a silent drop.
+        Peer a, b;
+        CHECK(a.socket.Open(0) && b.socket.Open(0));
+        const NetAddress aAddr{0x7F000001, a.socket.LocalPort()};
+        const NetAddress bAddr{0x7F000001, b.socket.LocalPort()};
+        a.conn = std::make_unique<Connection>(&a.socket, bAddr, sid, keys, true, 0);
+        b.conn = std::make_unique<Connection>(&b.socket, aAddr, sid, keys, false, 0);
+        CHECK(a.conn->MaxPayload() > sizeof(ControlChunkHeader));
+        std::atomic<int> got{0};
+        std::mutex m;
+        std::string text;
+        b.conn->SetControlHandler([&](const std::string& s) {
+            std::lock_guard lock(m);
+            text = s;
+            got++;
+        });
+        b.Run();
+        a.conn->SendControl("tiny-mtu");
+        for (int i = 0; i < 100 && got.load() < 1; i++) {
+            a.conn->Tick(NowNs());
+            SleepMs(5);
+        }
+        CHECK(got.load() == 1);
+        {
+            std::lock_guard lock(m);
+            CHECK(text == "tiny-mtu");
+        }
+        b.Stop();
+    }
+
+    // --- 5.4: a datagram the socket refuses is not counted as sent. ---
+    {
+        const uint32_t sid = 0xA49'00003;
+        Connection conn(&dead, kInjectFrom, sid, keys, true, kMaxDatagramLan);
+        const ConnectionStats before = conn.Stats();
+        CHECK(!conn.Send(PacketType::Ping, nullptr, 0));
+        CHECK(!conn.Send2(PacketType::Ping, "ab", 2, "cd", 2));
+        conn.SendControl("refused");  // control chunks take the same path
+        const ConnectionStats after = conn.Stats();
+        CHECK(after.packetsSent == before.packetsSent);
+        CHECK(after.bytesSent == before.bytesSent);
+        // Not vacuous: a live socket does count the same send.
+        UdpSocket sink;
+        CHECK(sink.Open(0));
+        Connection live(&sink, NetAddress{0x7F000001, sink.LocalPort()}, sid, keys, true, kMaxDatagramLan);
+        CHECK(live.Send(PacketType::Ping, nullptr, 0));
+        CHECK(live.Stats().packetsSent == 1);
+        CHECK(live.Stats().bytesSent == sizeof(PacketHeader) + kMacSize);
+    }
+
+    // --- 5.5: header.version is gated, and a version reject is not a MAC reject. ---
+    {
+        const uint32_t sid = 0xA49'00004;
+        Connection conn(&dead, kInjectFrom, sid, keys, true, kMaxDatagramLan);
+        int deliveries = 0;
+        conn.SetControlHandler([&](const std::string&) { deliveries++; });
+        PeerInjector in(conn, keys.clientToServer, sid);
+
+        in.version = uint8_t(kProtocolVersion) + 1;
+        const ConnectionStats before = conn.Stats();
+        CHECK(!in.Chunk(31, 0, 1, "v4"));  // valid session + valid MAC, wrong version
+        const ConnectionStats rejected = conn.Stats();
+        CHECK(rejected.packetsRejected == before.packetsRejected);  // not an auth failure
+        CHECK(rejected.packetsReceived == before.packetsReceived);
+        CHECK(deliveries == 0);
+
+        in.version = uint8_t(kProtocolVersion);
+        in.chunkSeq = 0;  // the rejected datagram never advanced the receiver's expectation
+        CHECK(in.Chunk(31, 0, 1, "v3"));  // identical datagram shape, correct version
+        CHECK(deliveries == 1);
+        CHECK(conn.Stats().packetsReceived == before.packetsReceived + 1);
+    }
+
+    std::printf("A49 connection hardening: chunk bounds, 4 MB cap, MTU floor, stats truth, version gate\n");
+}
+
 static void TestTransportRobustFixedVector() {
     // A45 gate §2.5: a frozen wire vector (fragment + XOR parity + short tail)
     // reassembles to an exact byte sequence - the legal-frame behaviour proof.
@@ -5290,6 +5487,7 @@ int main() {
     TestTransportRobustReassembly();   // A45 §1.1 / 1.4 / 1.5 / 1.6
     TestTransportRobustFixedVector();  // A45 gate §2.5: legal frame byte-for-byte unchanged
     TestTransportRobustPacketizer();   // A45 §1.2 / 1.3 / 1.7
+    TestConnectionHardening();         // A49 (TASK-CONN-HARDEN-2026-11-22)
     TestPacing();
     TestPacingBursts();
     TestPacingStop();

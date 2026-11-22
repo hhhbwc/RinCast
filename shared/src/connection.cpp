@@ -11,6 +11,13 @@ namespace rc {
 namespace {
 constexpr size_t kMaxInFlightChunks = 512;
 constexpr size_t kMaxOutOfOrder = 2048;
+// A49: the smallest datagram that still fits a header, a MAC and ONE byte of control
+// chunk, so MaxPayload() > sizeof(ControlChunkHeader) is a compile-time invariant.
+constexpr size_t kMinDatagram = sizeof(PacketHeader) + kMacSize + sizeof(ControlChunkHeader) + 1;
+static_assert(kMinDatagram <= kMaxDatagram);
+// A49: a control message assembled from a peer that never completes (chunkCount == 0,
+// index out of range, or a lost tail) must not grow the buffer without bound.
+constexpr size_t kMaxControlMessageBytes = 4u * 1024u * 1024u;
 constexpr int64_t kPingIntervalNs = 250'000'000;
 constexpr uint8_t kDirClientToServer = 0x43;  // 'C'
 constexpr uint8_t kDirServerToClient = 0x53;  // 'S'
@@ -24,7 +31,15 @@ Connection::Connection(UdpSocket* socket, const NetAddress& remote, uint32_t ses
       m_remote(remote),
       m_sessionId(sessionId),
       m_isServer(isServer),
-      m_maxDatagram(std::min(maxDatagram, kMaxDatagram)) {
+      // A49: without a floor, MaxPayload() (== maxDatagram - header - MAC) wrapped around
+      // for small or zero values, and SendControl's `MaxPayload() - sizeof(ControlChunkHeader)`
+      // underflowed into a huge chunk count. The floor leaves room for one header byte,
+      // so MaxPayload() > sizeof(ControlChunkHeader) always holds.
+      m_maxDatagram(std::clamp(maxDatagram, kMinDatagram, kMaxDatagram)) {
+    if (m_maxDatagram != maxDatagram) {
+        RC_LOGW("maxDatagram %zu clamped to %zu (allowed %zu..%zu)", maxDatagram, m_maxDatagram, kMinDatagram,
+                kMaxDatagram);
+    }
     m_sendKey = isServer ? keys.serverToClient : keys.clientToServer;
     m_recvKey = isServer ? keys.clientToServer : keys.serverToClient;
     m_sendDirection = isServer ? kDirServerToClient : kDirClientToServer;
@@ -61,9 +76,11 @@ bool Connection::Send2(PacketType type, const void* a, size_t aSize, const void*
 }
 
 bool Connection::SendRaw(PacketType type, const void* a, size_t aSize, const void* b, size_t bSize) {
-    const size_t plainSize = aSize + bSize;
-    if (sizeof(PacketHeader) + plainSize + kMacSize > m_maxDatagram) {
-        RC_LOGE("Packet too large (%zu bytes, type %d)", plainSize, int(type));
+    // A49: each part is checked against the budget BEFORE summing. aSize + bSize used to
+    // wrap, slip past the bound, and the memcpys below then overran plain[kMaxDatagram].
+    if (aSize > m_maxDatagram || bSize > m_maxDatagram - aSize ||
+        sizeof(PacketHeader) + aSize + bSize + kMacSize > m_maxDatagram) {
+        RC_LOGE("Packet too large (%zu+%zu bytes, type %d)", aSize, bSize, int(type));
         return false;
     }
     uint8_t plain[kMaxDatagram];
@@ -78,11 +95,13 @@ bool Connection::SendRaw(PacketType type, const void* a, size_t aSize, const voi
     header.sessionId = m_sessionId;
     header.sequence = m_sendSeq.fetch_add(1);
     std::memcpy(datagram, &header, sizeof(header));
-    crypto::Seal(m_sendKey, header.sequence, m_sendDirection, datagram, sizeof(header), plain, plainSize,
+    crypto::Seal(m_sendKey, header.sequence, m_sendDirection, datagram, sizeof(header), plain, aSize + bSize,
                  datagram + sizeof(header));
-    const size_t total = sizeof(header) + plainSize + kMacSize;
+    const size_t total = sizeof(header) + aSize + bSize + kMacSize;
     const bool ok = m_socket->SendTo(Remote(), datagram, total);
-    {
+    // A49: a datagram the socket refused never reached the wire, so it must not show up
+    // in bytesSent/packetsSent (VideoPacketizer counts these as loss the sender can't see).
+    if (ok) {
         std::lock_guard lock(m_statsMutex);
         m_stats.bytesSent += total;
         m_stats.packetsSent++;
@@ -97,31 +116,38 @@ void Connection::SendControl(const std::string& json) {
         RC_LOGE("Control message too large: %zu bytes", json.size());
         return;
     }
-    std::lock_guard lock(m_controlMutex);
-    const uint32_t messageId = m_nextMessageId++;
-    for (size_t i = 0; i < count; i++) {
-        PendingChunk chunk;
-        chunk.chunkSeq = m_nextChunkSeq++;
-        ControlChunkHeader h{};
-        h.chunkSeq = chunk.chunkSeq;
-        h.messageId = messageId;
-        h.chunkIndex = uint16_t(i);
-        h.chunkCount = uint16_t(count);
-        const size_t offset = i * chunkData;
-        const size_t len = std::min(chunkData, json.size() - std::min(json.size(), offset));
-        chunk.payload.resize(sizeof(h) + len);
-        std::memcpy(chunk.payload.data(), &h, sizeof(h));
-        if (len) std::memcpy(chunk.payload.data() + sizeof(h), json.data() + offset, len);
-        m_sendQueue.push_back(std::move(chunk));
+    // A49: the lock only bookkeeps. Sending inside it would hold the control mutex across
+    // Remote(), the stats mutex, the AEAD and the sendto() syscall, so the receive thread
+    // stalls behind a syscall it has nothing to do with (same pattern as Tick).
+    std::vector<std::vector<uint8_t>> toSend;
+    {
+        std::lock_guard lock(m_controlMutex);
+        const uint32_t messageId = m_nextMessageId++;
+        for (size_t i = 0; i < count; i++) {
+            PendingChunk chunk;
+            chunk.chunkSeq = m_nextChunkSeq++;
+            ControlChunkHeader h{};
+            h.chunkSeq = chunk.chunkSeq;
+            h.messageId = messageId;
+            h.chunkIndex = uint16_t(i);
+            h.chunkCount = uint16_t(count);
+            const size_t offset = i * chunkData;
+            const size_t len = std::min(chunkData, json.size() - std::min(json.size(), offset));
+            chunk.payload.resize(sizeof(h) + len);
+            std::memcpy(chunk.payload.data(), &h, sizeof(h));
+            if (len) std::memcpy(chunk.payload.data() + sizeof(h), json.data() + offset, len);
+            m_sendQueue.push_back(std::move(chunk));
+        }
+        const int64_t now = NowNs();
+        while (!m_sendQueue.empty() && m_unacked.size() < kMaxInFlightChunks) {
+            auto chunk = std::move(m_sendQueue.front());
+            m_sendQueue.pop_front();
+            chunk.lastSendNs = now;
+            m_unacked.push_back(std::move(chunk));
+            toSend.push_back(m_unacked.back().payload);  // same order as m_unacked
+        }
     }
-    const int64_t now = NowNs();
-    while (!m_sendQueue.empty() && m_unacked.size() < kMaxInFlightChunks) {
-        auto chunk = std::move(m_sendQueue.front());
-        m_sendQueue.pop_front();
-        chunk.lastSendNs = now;
-        SendRaw(PacketType::Control, chunk.payload.data(), chunk.payload.size(), nullptr, 0);
-        m_unacked.push_back(std::move(chunk));
-    }
+    for (const auto& p : toSend) SendRaw(PacketType::Control, p.data(), p.size(), nullptr, 0);
 }
 
 void Connection::SendDisconnect() {
@@ -153,6 +179,10 @@ bool Connection::HandleDatagram(const uint8_t* data, size_t size, const NetAddre
     if (size < sizeof(PacketHeader) + kMacSize) return false;
     PacketHeader header;
     std::memcpy(&header, data, sizeof(header));
+    // A49: the version byte was never checked, so a future/foreign peer's datagram was
+    // decrypted and dispatched with this build's layout (A44 added the same gate to
+    // IsHandshakeDatagram). Rejected before the MAC, so packetsRejected stays honest.
+    if (header.version != uint8_t(kProtocolVersion)) return false;
     if (header.sessionId != m_sessionId || !(header.flags & kFlagEncrypted)) return false;
 
     uint8_t plain[kMaxDatagram];
@@ -227,11 +257,20 @@ void Connection::HandleControlChunk(const uint8_t* payload, size_t size) {
         auto deliver = [&](const uint8_t* p, size_t n) {
             ControlChunkHeader ch;
             std::memcpy(&ch, p, sizeof(ch));
+            // A49: with chunkCount == 0 or an index past the end, chunkIndex + 1 == chunkCount
+            // can never hold, so every chunk was appended and m_assembly grew forever.
+            if (ch.chunkCount == 0 || ch.chunkIndex >= ch.chunkCount) return;
             if (ch.chunkIndex == 0) {
                 m_assembly.clear();
                 m_assemblyMessage = ch.messageId;
             }
             if (ch.messageId != m_assemblyMessage) return;  // should not happen with in-order delivery
+            if (m_assembly.size() + (n - sizeof(ch)) > kMaxControlMessageBytes) {
+                RC_LOGW("Control message over %zu bytes: dropped and reassembly reset", kMaxControlMessageBytes);
+                m_assembly.clear();
+                m_assemblyMessage = ~0u;
+                return;
+            }
             m_assembly.append(reinterpret_cast<const char*>(p + sizeof(ch)), n - sizeof(ch));
             if (ch.chunkIndex + 1 == ch.chunkCount) {
                 delivered.push_back(std::move(m_assembly));
@@ -275,39 +314,49 @@ void Connection::SendAck() {
 }
 
 void Connection::HandleAck(const AckPayload& ack) {
-    std::lock_guard lock(m_controlMutex);
-    m_unacked.erase(std::remove_if(m_unacked.begin(), m_unacked.end(),
-                                   [&](const PendingChunk& c) {
-                                       if (SeqLess(c.chunkSeq, ack.cumulative)) return true;
-                                       const uint32_t delta = c.chunkSeq - ack.cumulative - 1;
-                                       return delta < 32 && (ack.selectiveMask & (1u << delta));
-                                   }),
-                    m_unacked.end());
-    const int64_t now = NowNs();
-    while (!m_sendQueue.empty() && m_unacked.size() < kMaxInFlightChunks) {
-        auto chunk = std::move(m_sendQueue.front());
-        m_sendQueue.pop_front();
-        chunk.lastSendNs = now;
-        SendRaw(PacketType::Control, chunk.payload.data(), chunk.payload.size(), nullptr, 0);
-        m_unacked.push_back(std::move(chunk));
+    // A49: unlock before sending - see SendControl.
+    std::vector<std::vector<uint8_t>> toSend;
+    {
+        std::lock_guard lock(m_controlMutex);
+        m_unacked.erase(std::remove_if(m_unacked.begin(), m_unacked.end(),
+                                       [&](const PendingChunk& c) {
+                                           if (SeqLess(c.chunkSeq, ack.cumulative)) return true;
+                                           const uint32_t delta = c.chunkSeq - ack.cumulative - 1;
+                                           return delta < 32 && (ack.selectiveMask & (1u << delta));
+                                       }),
+                        m_unacked.end());
+        const int64_t now = NowNs();
+        while (!m_sendQueue.empty() && m_unacked.size() < kMaxInFlightChunks) {
+            auto chunk = std::move(m_sendQueue.front());
+            m_sendQueue.pop_front();
+            chunk.lastSendNs = now;
+            m_unacked.push_back(std::move(chunk));
+            toSend.push_back(m_unacked.back().payload);  // same order as m_unacked
+        }
     }
+    for (const auto& p : toSend) SendRaw(PacketType::Control, p.data(), p.size(), nullptr, 0);
 }
 
 void Connection::HandlePong(const PongPayload& pong) {
     const int64_t now = NowNs();
     const double rttMs = NsToMs(now - int64_t(pong.originalSenderTimeNs));
     if (rttMs < 0 || rttMs > 5000) return;
-    if (m_srttMs == 0) {
-        m_srttMs = rttMs;
-        m_rttVarMs = rttMs / 2;
+    // A49: compute on locals, publish once - Tick reads these from the tick thread.
+    double srttMs = m_srttMs.load(std::memory_order_relaxed);
+    double rttVarMs = m_rttVarMs.load(std::memory_order_relaxed);
+    if (srttMs == 0) {
+        srttMs = rttMs;
+        rttVarMs = rttMs / 2;
     } else {
-        m_rttVarMs = 0.75 * m_rttVarMs + 0.25 * std::fabs(m_srttMs - rttMs);
-        m_srttMs = 0.875 * m_srttMs + 0.125 * rttMs;
+        rttVarMs = 0.75 * rttVarMs + 0.25 * std::fabs(srttMs - rttMs);
+        srttMs = 0.875 * srttMs + 0.125 * rttMs;
     }
+    m_srttMs.store(srttMs, std::memory_order_relaxed);
+    m_rttVarMs.store(rttVarMs, std::memory_order_relaxed);
     {
         std::lock_guard lock(m_statsMutex);
-        m_stats.rttMs = m_srttMs;
-        m_stats.rttVarMs = m_rttVarMs;
+        m_stats.rttMs = srttMs;
+        m_stats.rttVarMs = rttVarMs;
     }
     // Clock offset: trust samples with near-minimal RTT (least queuing asymmetry).
     // The minimum decays every 10 s so we follow route changes.
@@ -334,7 +383,10 @@ void Connection::Tick(int64_t nowNs) {
         PingPayload ping{uint64_t(nowNs), m_pingId++};
         Send(PacketType::Ping, &ping, sizeof(ping));
     }
-    double rto = m_srttMs > 0 ? m_srttMs + 4 * m_rttVarMs : 100.0;
+    // A49: one atomic snapshot each, no locked send (a lock here would nest with SendRaw).
+    const double srttMs = m_srttMs.load(std::memory_order_relaxed);
+    const double rttVarMs = m_rttVarMs.load(std::memory_order_relaxed);
+    double rto = srttMs > 0 ? srttMs + 4 * rttVarMs : 100.0;
     rto = std::clamp(rto, 15.0, 1000.0);
     const int64_t rtoNs = MsToNs(rto);
 

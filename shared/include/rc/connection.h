@@ -138,8 +138,10 @@ class Connection {
     std::atomic<int64_t> m_lastReceiveNs{0};
     int64_t m_lastPingNs = 0;
     uint32_t m_pingId = 0;
-    double m_srttMs = 0;
-    double m_rttVarMs = 0;
+    // A49: written by the receive thread (HandlePong), read by the tick thread (Tick).
+    // Plain doubles made that a data race (UB); Tick must not read them unlocked.
+    std::atomic<double> m_srttMs{0};
+    std::atomic<double> m_rttVarMs{0};
     double m_minRttMs = 1e9;
     int64_t m_minRttAtNs = 0;
     std::atomic<int64_t> m_clockOffsetNs{0};
