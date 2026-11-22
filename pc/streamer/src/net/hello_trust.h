@@ -4,9 +4,25 @@
 // out of a Hello lives next door, in ../json_field.h.
 #pragma once
 
+#include <cstddef>
 #include <string_view>
 
 namespace rcs {
+
+// Two hex keys are the same key. HexEncode writes lower case, but a settings file written by an
+// older build (or by hand) may hold upper case, and that must not cost the headset its trust.
+// An empty key never matches anything, including another empty one: "no identity" is not an
+// identity, and every caller here would otherwise have to remember that on its own.
+inline bool SameKey(std::string_view a, std::string_view b) {
+    if (a.empty() || a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        char x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'F') x = char(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'F') y = char(y - 'A' + 'a');
+        if (x != y) return false;
+    }
+    return true;
+}
 
 struct HelloTrustQuery {
     bool requireApproval = true;   // Settings::requireApproval
@@ -29,11 +45,24 @@ bool HelloIsTrusted(const HelloTrustQuery& q, const Devices& devices) {
         // entry is upgraded by approving the headset once, which is what returning false here
         // leads to. (Every headset proves an identity since first launch, so this costs the
         // legitimate one a single click and nothing else.)
-        if (!d.publicKey.empty() && d.publicKey == q.deviceKey) return true;
+        if (!d.publicKey.empty() && SameKey(d.publicKey, q.deviceKey)) return true;
     }
     // "Allow" applies to the headset that asked, not to anyone repeating its ID: an approval
     // counts only against a proof carried by this very Hello.
-    return q.approvalLive && !q.deviceKey.empty() && q.approvalKey == q.deviceKey;
+    return q.approvalLive && !q.deviceKey.empty() && SameKey(q.approvalKey, q.deviceKey);
+}
+
+// Whether this Hello may become the identity the pending approval is bound to.
+//
+// A second identity that answers to the same device ID must not take the binding over while the
+// PC is waiting for (or has just granted) the answer: the click blessed the headset that was on
+// screen, and only the key tells the two apart - the name and model are whatever the sender
+// claims. Once the binding is stale (the prompt went unanswered long enough) it may be replaced,
+// so a headset that reinstalled itself and got a new identity is not locked out for good.
+inline bool MayBindApproval(std::string_view bound, std::string_view provenKey, bool awaitingOrGranted) {
+    if (provenKey.empty()) return false;  // no proof, nothing to bind
+    if (bound.empty() || SameKey(bound, provenKey)) return true;
+    return !awaitingOrGranted;
 }
 
 // What to remember about who is asking, so the PC's "Allow" binds to that identity. A Hello

@@ -728,7 +728,10 @@ void StreamClient::Run(ConnectTarget target, json hello) {
             const std::string reason = r.value("reason", "");
             std::lock_guard lock(m_mutex);
             m_status = r.value("message", "The PC refused the connection.");
-            if (reason == "pending_approval") {
+            // "approval_conflict": another identity is asking under this headset's name, so the PC
+            // keeps its approval bound to that one. Wait exactly like a pending approval instead of
+            // giving up - once the user settles it on the PC, the retry connects on its own.
+            if (reason == "pending_approval" || reason == "approval_conflict") {
                 m_state = State::WaitingApproval;
                 deadline = std::max<int64_t>(deadline, now + 120'000'000'000LL);
             } else {

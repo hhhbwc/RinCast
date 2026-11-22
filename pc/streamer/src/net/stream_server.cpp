@@ -34,6 +34,10 @@ void EvictEarliest(Map& m) {
     m.erase(oldest);
 }
 
+// A waiting headset retries a few times a second; this is how long one prompt is considered the
+// thing the user is currently looking at (and therefore what the approval is bound to).
+constexpr int64_t kPromptNs = 15'000'000'000LL;
+
 }  // namespace
 
 bool StreamServer::Start() {
@@ -62,15 +66,16 @@ bool StreamServer::StillAsking(const std::string& deviceId, int64_t withinNs) {
 
 void StreamServer::Stop() {
     m_running = false;
-    DisconnectActive("server_shutdown");
-    // Join before closing: every loop waits on RecvFrom with a timeout (2 ms, 250 ms), so they
-    // notice m_running on their own within a quarter second. Closing a socket while another
-    // thread is still blocked in it is how a handle ends up reused under that thread - and
-    // ClientSession::Close (above) has already joined the session's own threads, so after these
-    // joins nothing else holds the sockets.
+    // Join before touching the session, and only then close the sockets. HandleHello runs on the
+    // receive thread and can install a new session at any moment, so tearing the session down
+    // first leaves a window in which a fresh session is created and then has its socket closed
+    // under it. Every loop waits on RecvFrom with a timeout (2 ms, 250 ms), so they notice
+    // m_running on their own within a quarter second; ClientSession::Close has already joined the
+    // session's own threads, so after these joins nothing else holds the sockets.
     if (m_receiveThread.joinable()) m_receiveThread.join();
     if (m_discoveryThread.joinable()) m_discoveryThread.join();
     if (m_discoveryV6Thread.joinable()) m_discoveryV6Thread.join();
+    DisconnectActive("server_shutdown");
     m_socket.Close();
     m_discovery.Close();
     m_discoveryV6.Close();
@@ -96,6 +101,9 @@ void StreamServer::DisconnectActive(const std::string& reason) {
 void StreamServer::Approve(const std::string& deviceId, bool remember) {
     std::lock_guard lock(m_mutex);
     m_approved[deviceId] = rc::NowNs() + 120'000'000'000LL;
+    // The binding (m_approvalKey) is deliberately kept: it is what makes this grant apply to the
+    // identity the user was shown, and to no other one claiming the same ID. A denial clears it
+    // instead, so the next Hello - whoever sends it - binds afresh and is shown to the user.
     m_denied.erase(deviceId);
     m_promptedAt.erase(deviceId);
     (void)remember;  // persisted by the App when the session starts
@@ -105,6 +113,10 @@ void StreamServer::Deny(const std::string& deviceId) {
     std::lock_guard lock(m_mutex);
     m_denied[deviceId] = rc::NowNs() + 60'000'000'000LL;
     m_approved.erase(deviceId);
+    // Forgetting the binding as well ends the "somebody else already owns this ID" state: after a
+    // denial the next headset to ask gets a fresh prompt. Without this a mistaken Deny (or a
+    // stranger holding the binding) would keep the real headset out for the whole window.
+    m_approvalKey.erase(deviceId);
 }
 
 void StreamServer::ExpectCloudSession(const std::string& sessionId, const ExpectedCloudSession& s) {
@@ -273,16 +285,41 @@ void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAd
         const HelloTrustQuery query{settings.requireApproval, approvalLive, info.deviceId, info.deviceKey,
                                     approvalKey};
         if (!HelloIsTrusted(query, settings.trustedDevices)) {
-            // Bind the pending approval to the identity that asked. An unproven Hello leaves the
-            // binding alone: it is the same packet that is later compared against it.
-            const std::string bind{NextApprovalKey(m_approvalKey[info.deviceId], info.deviceKey)};
-            m_approvalKey[info.deviceId] = bind;
+            // A prompt the user is looking at, or an approval just granted, is bound to the identity
+            // that asked for it. A second identity that merely repeats the same device ID must not
+            // take that binding over in the meantime: the click blessed the headset that was on
+            // screen, and only the key tells the two apart - the name and model are whatever the
+            // sender claims. Past the window the binding is replaced, so a headset that was
+            // reinstalled and now has a new identity can ask again instead of being locked out.
+            const auto boundIt = m_approvalKey.find(info.deviceId);
+            const std::string bound = boundIt == m_approvalKey.end() ? std::string{} : boundIt->second;
+            const auto askedIt = m_askedAt.find(info.deviceId);
+            const bool promptLive = askedIt != m_askedAt.end() && now - askedIt->second < kPromptNs;
+            if (!MayBindApproval(bound, info.deviceKey, approvalLive || promptLive)) {
+                // Deliberately before m_askedAt is refreshed: a rejected claimant must not be able
+                // to hold this window open (or extend it) by asking again, and the headset that
+                // does own the binding keeps the prompt on screen as long as it keeps asking.
+                lock.unlock();
+                RC_LOGW("Hello from %s claims device %s but proves a different identity; leaving the "
+                        "pending approval with the identity it was shown for",
+                        from.ToString().c_str(), info.deviceId.c_str());
+                SendReject(from, "approval_conflict",
+                           "Another device is already asking to connect under this name. Check the "
+                           "RinCast Streamer on your PC.");
+                return;
+            }
+            m_approvalKey[info.deviceId] = NextApprovalKey(bound, info.deviceKey);
             m_askedAt[info.deviceId] = now;
             auto& last = m_promptedAt[info.deviceId];
-            const bool prompt = now - last > 15'000'000'000LL;
-            if (prompt) last = now;
+            const bool prompt = now - last > kPromptNs;
+            ApprovalCallback cb;
+            if (prompt) {
+                last = now;
+                cb = m_onApproval;  // copied under the lock, invoked without it
+            }
             lock.unlock();
-            if (prompt && m_onApproval) m_onApproval(info);
+            // Not called under m_mutex: the handler pushes to the UI and may take other locks.
+            if (cb) cb(info);
             SendReject(from, "pending_approval", "Allow this headset in the RinCast Streamer on your PC.");
             return;
         }

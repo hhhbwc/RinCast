@@ -46,7 +46,10 @@ class StreamServer {
     void Stop();
 
     // Approval UI: the App calls Approve/Deny after asking the user.
-    void SetApprovalCallback(ApprovalCallback cb) { m_onApproval = std::move(cb); }
+    void SetApprovalCallback(ApprovalCallback cb) {
+        std::lock_guard lock(m_mutex);
+        m_onApproval = std::move(cb);
+    }
     // A waiting headset keeps asking, several times a second; when that stops, it has given up.
     bool StillAsking(const std::string& deviceId, int64_t withinNs);
     void Approve(const std::string& deviceId, bool remember);

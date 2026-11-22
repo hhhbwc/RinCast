@@ -81,6 +81,32 @@ int main() {
     Expect(rcs::NextApprovalKey(kKeyA, kKeyB) == kKeyB, "binding: a new proven asker replaces it");
     Expect(rcs::NextApprovalKey("", "") == "", "binding: nothing to remember");
 
+    // A59: hex casing must not decide who gets in. HexEncode writes lower case, but a settings file
+    // written by hand (or by an older build) may hold upper case, and the headset would then be
+    // treated as a stranger on every single connect.
+    const std::string kKeyAUpper(64, 'A');
+    const std::vector<Entry> pinnedUpper{{kId, kKeyAUpper}};
+    Expect(rcs::SameKey(kKeyA, kKeyAUpper), "casing: the same key in two spellings");
+    Expect(!rcs::SameKey(kKeyA, kKeyB), "casing: different keys stay different");
+    Expect(!rcs::SameKey(kKeyA, kKeyA.substr(0, 63)), "casing: a shorter key is not the same key");
+    Expect(!rcs::SameKey("", ""), "casing: two empty strings are not a key");
+    Expect(Trusted(true, kId, kKeyA, false, "", pinnedUpper), "casing: an upper-case pin still trusts the headset");
+    Expect(Trusted(true, kId, kKeyAUpper, true, kKeyA, none), "casing: an approval binds across spellings");
+
+    // A59: the identity a prompt was shown for owns the binding until the window closes. Without
+    // this, the second identity below overwrote the binding between the prompt and the click - and
+    // the click meant for the headset let the stranger in, with the same ID and name on screen.
+    Expect(!rcs::MayBindApproval("", "", true), "binding: an unproven Hello may never bind");
+    Expect(rcs::MayBindApproval("", kKeyA, true), "binding: the first proven asker takes it");
+    Expect(rcs::MayBindApproval(kKeyA, kKeyA, true), "binding: the same identity keeps it");
+    Expect(rcs::MayBindApproval(kKeyAUpper, kKeyA, true), "binding: keeping it is casing-blind");
+    Expect(!rcs::MayBindApproval(kKeyA, kKeyB, true), "binding: a second identity may not take it over");
+    Expect(rcs::MayBindApproval(kKeyA, kKeyB, false), "binding: a stale one is replaced, so a reinstalled headset is not locked out");
+    Expect(!rcs::MayBindApproval(kKeyA, "", false), "binding: a stranger cannot clear it either");
+    // And the outcome of the hijack: with the binding held by A, B's Hello is not trusted even
+    // though an approval is live.
+    Expect(!Trusted(true, kId, kKeyB, true, kKeyA, none), "hijack: the click does not follow a second identity");
+
     // ClampField: bounded, no control characters, and never cut inside a UTF-8 character
     // (json::dump() throws on invalid UTF-8 and SendReject has no try/catch).
     const std::string sixtyFour(64, 'x');
