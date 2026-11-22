@@ -580,6 +580,12 @@ void VrStream::Run() {
         job.submitPcNs = slotCopy.submitPcNs;
         job.predictedDisplayPcNs = flushExact ? flushTracking.targetDisplayPcNs
                                               : slotCopy.submitPcNs + kStalePredictAheadNs;
+        // A75 (TASK-A75-FLUSH-GRACE-2026-11-22): carry the source along with the moment it
+        // produced, for the flush log line. The drop decision does not read it - the
+        // grace is one rule for both paths (rc::kFlushGraceNs, stale_flush.h); this only
+        // makes the next "0-8 ms late" burst answerable as exact or estimated. No extra
+        // seqlock read, no extra synchronisation: `flushExact` is already computed above.
+        job.predictedDisplayExact = flushExact;
         std::memcpy(job.renderOrientation, slotCopy.renderPose.orientation, sizeof(job.renderOrientation));
         std::memcpy(job.renderPosition, slotCopy.renderPose.position, sizeof(job.renderPosition));
         std::memcpy(job.fovTan, slotCopy.fovTan, sizeof(job.fovTan));
@@ -746,6 +752,7 @@ void VrStream::RunEncoder() {
         send.frameIndex = static_cast<uint32_t>(job.frameIndex);  // ROUND19 T1: pass the existing counter through
         send.recovery = recovery;
         send.predictedDisplayPcNs = job.predictedDisplayPcNs;  // A26: the flush gate judges this
+        send.predictedDisplayExact = job.predictedDisplayExact;  // A75: the flush log line names it
         {
             // The one before still going out (a paced send): wait, a dropped frame would break
             // the ones referencing it.
@@ -780,13 +787,15 @@ void VrStream::RunSender() {
             m_send.reset();
         }
         m_sendCv.notify_all();
-        // A26 (stale-frame flush) + A72 (the chain rule): a frame whose display moment has
-        // already passed is late no matter how fast it goes out, and a frame whose
-        // references were dropped with it decodes against a stale picture. So: drop the
-        // expired one, and while the chain is broken let only repair frames (IDR /
-        // recovery) leave - freezing on the last good picture beats one more artifact.
-        // The debt wipe, the two throttles and the log line are A26's, unchanged. In the
-        // steady state nothing here fires: normal frames' display moment sits in the future.
+        // A26 (stale-frame flush) + A72 (the chain rule) + A75 (the grace period): a frame
+        // whose display moment passed more than rc::kFlushGraceNs ago is late no matter how
+        // fast it goes out, and a frame whose references were dropped with it decodes
+        // against a stale picture. So: drop the expired one, and while the chain is broken
+        // let only repair frames (IDR / recovery) leave - freezing on the last good picture
+        // beats one more artifact. The debt wipe, the two throttles and the log line are
+        // A26's, unchanged. In the steady state nothing here fires: normal frames' display
+        // moment sits in the future, and the 0-8 ms of slip the pre-A75 rule turned into
+        // runs of 8/14/16 dropped frames is inside the grace by design.
         const int64_t nowNs = rc::NowNs();
         const rc::FlushGate gate =
             rc::StaleFlushGate(send.frame.keyframe || send.recovery, send.predictedDisplayPcNs,
@@ -804,10 +813,16 @@ void VrStream::RunSender() {
                 // moment had passed" sends the next reader chasing a clock fault that never
                 // happened, and "keyframe requested" was a lie whenever the throttle held.
                 const bool late = rc::FrameExpiredForSend(send.predictedDisplayPcNs, nowNs);
+                // A75 (TASK-A75-FLUSH-GRACE-2026-11-22): the moment has two sources - the
+                // headset's exact target mapped into the PC clock, or the submit + 40 ms
+                // predict-ahead estimate - and a "0-8 ms late" batch means a different bug
+                // in each. One appended word says which produced the number this line
+                // reports; the rule it was judged by, and the grace in it, are the same.
                 RC_LOGI("VR stale flush: dropped %u frame(s) since the last line; last one %s "
-                        "(%lld ms from its display moment); pacer debt wiped, repair %s",
+                        "(%lld ms from its display moment, %s); pacer debt wiped, repair %s",
                         m_staleLogCount, late ? "expired" : "held, chain broken",
                         (long long)((nowNs - send.predictedDisplayPcNs) / 1'000'000),
+                        send.predictedDisplayExact ? "exact" : "estimated",
                         gate.requestKeyframe ? "requested" : "already pending");
                 m_staleLogCount = 0;
             }

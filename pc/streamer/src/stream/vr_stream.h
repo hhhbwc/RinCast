@@ -113,6 +113,14 @@ class VrStream {
         // clock, recovered in Run() from the tracking sample the frame was rendered
         // with (0 = unknown: never expires - see rc/stale_flush.h).
         int64_t predictedDisplayPcNs = 0;
+        // A75 (TASK-A75-FLUSH-GRACE-2026-11-22 §2.2): which of the two prediction paths
+        // (vr_stream.cpp:581-582) produced that moment - the headset's exact target
+        // mapped into the PC clock (true), or the submit + 40 ms predict-ahead estimate
+        // (false). It is Run()'s already-computed `flushExact` (vr_stream.cpp:565),
+        // carried, not re-read: the flush judges both with the same rule
+        // (rc::kFlushGraceNs), and this says in the log which prediction the next
+        // "0-8 ms late" burst came from.
+        bool predictedDisplayExact = false;
         float renderOrientation[4] = {}, renderPosition[3] = {};
         float fovTan[2][4] = {};
         std::vector<uint8_t> motion;  // the motion field, already in its wire form
@@ -128,6 +136,7 @@ class VrStream {
         bool recovery = false;
         uint32_t frameIndex = 0;  // ROUND19 T1: the producer's frame counter, for the diag seq field
         int64_t predictedDisplayPcNs = 0;  // A26: carried from the EncodeJob for the flush gate
+        bool predictedDisplayExact = false;  // A75 §2.2: carried too - names the source in the flush log line
     };
 
     void Run();

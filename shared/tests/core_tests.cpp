@@ -2403,6 +2403,17 @@ static void TestStaleFlush() {
     // F1: the constants are the card's numbers (a silent change re-fails here).
     CHECK(rc::kFlushKeyframeThrottleNs == 300 * kMs);
     CHECK(rc::kFlushLogThrottleNs == 1'000 * kMs);
+    // F1b (A75, TASK-A75-FLUSH-GRACE-2026-11-22 §2.1): the grace period is two 60 fps
+    // frame periods, and it is only defensible because it sits between the two measured
+    // groups - the healthy log's worst lateness (8 ms, streamer.log:2115) below it, the
+    // backlog it must still clear (119 ms, AB9) above it. Pin both ends, not just the
+    // arithmetic: a "tidier" number that breaks either side is a regression, not a refactor.
+    CHECK(rc::kFlushFramePeriodNs == 1'000'000'000 / 60);
+    CHECK(rc::kFlushGraceFramePeriods == 2);
+    CHECK(rc::kFlushGraceNs == 2 * (1'000'000'000 / 60));  // 33'333'332 ns
+    CHECK(rc::kFlushGraceNs > 8 * kMs);     // 4.2x the measured noise: 0/1/8 ms must pass
+    CHECK(rc::kFlushGraceNs > 25 * kMs);    // the neighbouring healthy bursts (streamer.log:53-1427)
+    CHECK(rc::kFlushGraceNs < 119 * kMs);   // 3.6x under the smallest real backlog
     // F2: normal frames pass - the predicted display time sits in the future by
     // design, so the steady state never drops (card §2: 稳态零改动).
     const int64_t t0 = 2'000'000'000;  // arbitrary: the frame was submitted here
@@ -2410,7 +2421,16 @@ static void TestStaleFlush() {
     CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 12 * kMs));   // ... just before sending
     CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 39 * kMs));   // one ns before the moment
     CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 40 * kMs));   // boundary: `<` is strict
-    CHECK(rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 40 * kMs + 1));  // the first ns past it drops
+    // A75 changed what the boundary IS: the old rule dropped the first ns past the display
+    // moment, which is what threw away the healthy run's 0/1/8 ms frames
+    // (streamer.log:2062-2115, card §1). The strict `<` semantics are kept, one grace
+    // period later: inside the grace nothing drops, exactly the grace still does not, the
+    // first ns past it does.
+    CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 40 * kMs + 1));  // 1 ns past the moment
+    CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 40 * kMs + 8 * kMs));  // streamer.log:2115's worst
+    CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 40 * kMs + rc::kFlushGraceNs - 1));
+    CHECK(!rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 40 * kMs + rc::kFlushGraceNs));
+    CHECK(rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 40 * kMs + rc::kFlushGraceNs + 1));
     CHECK(rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 119 * kMs));   // AB9: queue 119 ms
     CHECK(rc::FrameExpiredForSend(t0 + 40 * kMs, t0 + 479 * kMs));   // AB9: queue 479 ms
     // F3: an unknown moment (0, no tracking yet) and a clock anomaly keep the frame -
@@ -2443,14 +2463,19 @@ static void TestStaleFlush() {
     CHECK(rc::FlushSendDebtNs(billedTo, at) == at);              // the debt is gone
     CHECK(rc::FlushSendDebtNs(0, at) == at);                     // and it stays now
     // F6: a burst shaped like the AB9 scene change: a giant frame blocks the send
-    // thread for 900 ms; every frame encoded meanwhile expires when picked up (its
-    // display moment was 10 ms before its pickup), then fresh frames flow again
-    // (F7). 19 expired frames between t and t+900 ms carry exactly 4 keyframe
-    // requests (0/300/600/900 ms stamps) and 1 log line (at t).
+    // thread for 900 ms; every frame encoded meanwhile expires when picked up, then fresh
+    // frames flow again (F7). 19 expired frames between t and t+900 ms carry exactly 4
+    // keyframe requests (0/300/600/900 ms stamps) and 1 log line (at t).
+    // A75: the lateness per frame used to be 10 ms, and 10 ms is inside the new grace
+    // period, so it is 50 ms here - the loop's own pickup interval: each frame is one
+    // interval behind the queue that overtook it. Card §2.3 - the burst's per-frame
+    // lateness must stay above kFlushGraceNs, and the shape (19 frames, 50 ms apart, 900 ms
+    // of blockage) is what F7 and the throttle counts depend on, so it is the lateness that
+    // moved, not the burst. The counts below are unchanged: 19 drops / 4 requests / 1 line.
     int64_t keyframeStamp = 0, logStamp = 0, debtNs = billedTo;
     uint32_t drops = 0, requests = 0, logs = 0;
     for (int64_t t = at; t <= at + 900 * kMs; t += 50 * kMs) {
-        const int64_t predicted = t - 10 * kMs;  // each was overtaken by the queue
+        const int64_t predicted = t - 50 * kMs;  // each was overtaken by the queue (A75: > grace)
         const rc::FlushDecision d = rc::StaleFlushDecide(predicted, t, keyframeStamp, logStamp);
         if (!d.drop) continue;
         drops++;
@@ -2468,6 +2493,26 @@ static void TestStaleFlush() {
     CHECK(requests == 4);  // at +0, +300, +600, +900 ms
     CHECK(logs == 1);      // at +0 ms only
     CHECK(debtNs == at + 900 * kMs);  // the last drop re-baselined to its own now
+    // F6b (A75): the same 19-frame burst with the pre-A75 10 ms lateness - the shape the
+    // user's healthy 60 fps run actually produced (8/14/16-frame runs, 0-8 ms late) - must
+    // now flush nothing at all, and must not touch either throttle stamp or the debt.
+    {
+        int64_t kf6 = 0, log6 = 0, debt6 = billedTo;
+        uint32_t drops6 = 0, requests6 = 0;
+        for (int64_t t = at; t <= at + 900 * kMs; t += 50 * kMs) {
+            const rc::FlushDecision d = rc::StaleFlushDecide(t - 10 * kMs, t, kf6, log6);
+            if (!d.drop) continue;
+            drops6++;
+            if (d.requestKeyframe) {
+                requests6++;
+                kf6 = t;
+            }
+            debt6 = rc::FlushSendDebtNs(debt6, t);
+        }
+        CHECK(drops6 == 0 && requests6 == 0);
+        CHECK(kf6 == 0 && log6 == 0);                     // nothing stamped: no side effects at all
+        CHECK(debt6 == billedTo);                         // the pacer's billing stands as it was
+    }
     // F7: after the burst, the first fresh frame (predicted 30 ms ahead) passes
     // untouched even with the throttle stamps mid-window - and per the wiring its
     // all-false decision means Send proceeds exactly as before the flush existed.
@@ -2487,9 +2532,13 @@ static void TestStaleFlush() {
         }
         CHECK(forced == 3);  // released at drops 30, 60, 90
     }
-    std::printf("stale flush: constants pinned, future/0-prediction frames pass, 40 ms + 1 ns / 119 / 479 ms late drop, "
-                "strict < boundary, debt re-baselines to now, 19-drop burst asks 4 times and logs once; "
-                "A46: clock rollback makes throttles due, 100 consecutive stale drops force 3 frames through\n");
+    std::printf("stale flush: constants pinned (A75 grace = 2 x 60 fps frame periods = %lld ms, "
+                "between the 8 ms measured noise and the 119 ms backlog), future/0-prediction frames pass, "
+                "grace boundary 1 ns / -1 / == / +1 ns of kFlushGraceNs as specified, 119 / 479 ms late drop, "
+                "debt re-baselines to now, 19-drop burst asks 4 times and logs once, "
+                "the same burst 10 ms late flushes nothing; "
+                "A46: clock rollback makes throttles due, 100 consecutive stale drops force 3 frames through\n",
+                (long long)(rc::kFlushGraceNs / kMs));
 }
 
 // A72 (TASK-A72-STALE-FLUSH-2026-11-22 §4.5): the flush's chain rules C1-C8. The card's
@@ -2578,7 +2627,12 @@ static void TestStaleFlushChainGate() {
         int drops = 0, sent = 0, breakers = 0;
         for (int i = 0; i < 30; i++) {
             const int64_t now = t0 + i * 50 * kMs;
-            const rc::FlushGate g = rc::StaleFlushGate(false, now - 10 * kMs, now, s);
+            // A75: this burst was 10 ms late, which the grace period (33.3 ms) now calls
+            // "make the next vsync", not "expired". C6 is about the breaker counting 30
+            // consecutive EXPIRED frames, not about how late they are, so the lateness
+            // moves to the same 40 ms the rest of the AB9-shaped cases here use
+            // (C4/C7b/C8) and every assertion below stays exactly as A72 wrote it.
+            const rc::FlushGate g = rc::StaleFlushGate(false, now - 40 * kMs, now, s);
             if (g.send) sent++;
             else drops++;
             if (g.breaker) breakers++;
@@ -2625,6 +2679,84 @@ static void TestStaleFlushChainGate() {
         std::printf("A72 C8 clock rollback (stamp 500 ms ahead): send=%d req=%d log=%d\n",
                     g.send, g.requestKeyframe, g.log);
     }
+}
+
+// A75 (TASK-A75-FLUSH-GRACE-2026-11-22 §2.3): an offline replay of the runs the flush rule
+// is judged against. One row = one RunSender pickup as the streamer's own log reported it:
+// `lateMs` is the number that log printed ("last N ms late" / "N ms from its display
+// moment"), i.e. how far past its display moment the pickup found the frame. The rows and
+// their source lines in C:\Users\wzy\AppData\Local\RinCast\logs\streamer.log (the user's
+// 23:09-23:11 run, the "stutters, then smears" the card was written from):
+//   2058 + 2062  23:10:16/17  8 frames dropped, last one   1 ms late
+//   2074         23:10:20     14 frames dropped, last one  0 ms late
+//   2089         23:10:25     1 frame  dropped, last one   0 ms late
+//   2106         23:10:30     1 frame  dropped, last one   0 ms late
+//   2115         23:10:32     1 frame  dropped, last one   8 ms late
+//   2094 + 2129  the same counts as 10 s window totals (16 and 3 frames)
+// The encoder lines of that same window (1859-2195) read 60 fps, qp 24.0, 0.4-1.6 Mbps
+// against a 74-90 Mbps ceiling, submit 1.3-6.1 ms, gpu wait 3.9-4.2 ms: nothing was backed
+// up, so all five rows must go OUT. AB9's backlog (rc/stale_flush.h:1-9, the evidence the
+// flush was written for) is the opposite case and is replayed at 119 ms and 479 ms.
+// Each row is replayed through BOTH of vr_stream.cpp's prediction sources - the headset's
+// exact target moment and the submit + 40 ms predict-ahead estimate - and the verdicts must
+// agree, because the replay calls the one judgment point both paths feed (card §2.1). That
+// is what makes card §4.5's V3 (the grace folded into the estimate's own expression, dropped
+// by the judgment point) read red here instead of hiding in a call site the test cannot see.
+static void TestStaleFlushGraceReplay() {
+    const int64_t kMs = 1'000'000;
+    const int64_t t0 = 9'000'000'000;  // arbitrary synthetic anchor: no wall clock, no flake
+    // vr_stream.cpp:82 kStalePredictAheadNs. The sender's copy is file-local, so the
+    // estimate is restated here and the two prediction expressions below mirror
+    // vr_stream.cpp's `flushExact ? targetDisplayPcNs : submitPcNs + kStalePredictAheadNs`.
+    const int64_t kPredictAheadNs = 40 * kMs;
+    struct Row {
+        const char* evidence;  // the log line the lateness was taken from
+        int64_t lateMs;        // how far past the display moment the pickup found the frame
+        bool expectDrop;       // what that log says the stream needed
+    };
+    const Row rows[] = {
+        {"streamer.log:2062 23:10:17 8 frame(s), last 1 ms late", 1, false},
+        {"streamer.log:2074 23:10:20 14 frame(s), last 0 ms late", 0, false},
+        {"streamer.log:2089 23:10:25 1 frame(s), last 0 ms late", 0, false},
+        {"streamer.log:2106 23:10:30 1 frame(s), last 0 ms late", 0, false},
+        {"streamer.log:2115 23:10:32 1 frame(s), last 8 ms late", 8, false},
+        {"AB9 (stale_flush.h:1-9) queue 119 ms", 119, true},
+        {"AB9 (stale_flush.h:1-9) queue 479 ms", 479, true},
+    };
+    uint32_t sent = 0, dropped = 0;
+    for (const Row& r : rows) {
+        const int64_t nowNs = t0 + kPredictAheadNs;  // picked up a full predict-ahead after submit
+        const int64_t targetPcNs = nowNs - r.lateMs * kMs;  // the moment the log measured
+        const int64_t submitPcNs = targetPcNs - kPredictAheadNs;  // ... and the submit behind it
+        // Both sources land on the same moment on purpose: the row replays the measured
+        // lateness, whichever of the two produced the number.
+        const int64_t exactMoment = targetPcNs;              // flushExact: the target itself
+        const int64_t estimatedMoment = submitPcNs + kPredictAheadNs;  // the fallback estimate
+        const bool exactExpired = rc::FrameExpiredForSend(exactMoment, nowNs);
+        const bool estimatedExpired = rc::FrameExpiredForSend(estimatedMoment, nowNs);
+        std::printf("A75 replay %s: %lld ms late -> exact=%d estimated=%d, expected drop=%d\n",
+                    r.evidence, (long long)r.lateMs, exactExpired, estimatedExpired, r.expectDrop);
+        CHECK(exactExpired == r.expectDrop);
+        CHECK(estimatedExpired == r.expectDrop);
+        CHECK(exactExpired == estimatedExpired);  // one grace rule for both sources (card §2.1)
+        // The same rows through the sender's entry point (intact chain, no stamps yet, not a
+        // repair): the healthy rows must leave the flush untouched - no drop, no request,
+        // no log line, no broken chain - and the AB9 rows must still do all of it.
+        rc::StaleFlushState st;
+        const rc::FlushGate g = rc::StaleFlushGate(false, exactMoment, nowNs, st);
+        CHECK(g.send == !r.expectDrop);
+        CHECK(g.requestKeyframe == r.expectDrop);
+        CHECK(g.log == r.expectDrop);
+        CHECK(st.chainBroken == r.expectDrop);
+        CHECK(st.dropStreak == (r.expectDrop ? 1u : 0u));
+        if (r.expectDrop) dropped++;
+        else sent++;
+    }
+    CHECK(sent == 5);     // the whole healthy 0/1/8 ms batch goes out
+    CHECK(dropped == 2);  // both AB9 backlog rows still flush
+    std::printf("A75 grace replay: %u row(s) from the healthy 60 fps log sent, %u AB9 backlog row(s) flushed, "
+                "grace %lld ms (kFlushGraceNs)\n",
+                sent, dropped, (long long)(rc::kFlushGraceNs / kMs));
 }
 
 // TASK-LATENCY-METER-FIX-2026-11-22 §2: the stage accumulator must not drop samples.
@@ -5947,6 +6079,7 @@ int main() {
     TestFrameQueueBound();  // A23 (TASK-QUEUE-BOUND-2026-11-22)
     TestStaleFlush();  // A26 (TASK-BACKLOG-FLUSH-2026-11-22)
     TestStaleFlushChainGate();  // A72 (TASK-A72-STALE-FLUSH-2026-11-22): rules C1-C8
+    TestStaleFlushGraceReplay();  // A75 (TASK-A75-FLUSH-GRACE-2026-11-22): the grace period replayed
     TestLossBrake();
     TestQueueGuard();
     TestL7Autoscale();
