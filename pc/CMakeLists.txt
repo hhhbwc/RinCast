@@ -67,6 +67,12 @@ add_executable(pose-probe ../tools/pose-probe/main.cpp)
 target_include_directories(pose-probe PRIVATE ../third_party)
 target_link_libraries(pose-probe PRIVATE d3d11)
 
+# Developer tool: the rule that decides whether a Hello may open a stream
+# (pc/streamer/src/net/hello_trust.h). Strings only, no socket, no Windows - see
+# TASK-STREAM-SERVER-AUTH-2026-11-22 (A56).
+add_executable(hello-trust-test ../tools/hello-trust-test/main.cpp)
+target_include_directories(hello-trust-test PRIVATE streamer/src ../third_party)
+
 # Developer tool: checks the desktop capture -> YUV pipeline.
 add_executable(capture-test ../tools/capture-test/main.cpp
   streamer/src/capture/desktop_capture.cpp streamer/src/capture/monitors.cpp

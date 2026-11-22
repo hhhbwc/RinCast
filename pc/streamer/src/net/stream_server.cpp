@@ -1,11 +1,13 @@
 #include "stream_server.h"
 
 #include <cstring>
+#include <iterator>
 #include <set>
 
 #include "../app.h"
 #include "../session/client_session.h"
 #include "../settings.h"
+#include "hello_trust.h"
 #include "rc/discovery.h"
 #include "rc/handshake.h"
 #include "rc/platform.h"
@@ -37,6 +39,16 @@ std::string RandomNonce() {
     uint8_t n[16];
     rc::RandomBytes(n, sizeof(n));
     return rc::HexEncode(n, sizeof(n));
+}
+
+// The per-device maps are keyed by a string off the network, so their order says nothing about
+// age: begin() is the alphabetically first entry, not the oldest one.
+template <class Map>
+void EvictEarliest(Map& m) {
+    auto oldest = m.begin();
+    for (auto it = std::next(oldest); it != m.end(); ++it)
+        if (it->second < oldest->second) oldest = it;
+    m.erase(oldest);
 }
 
 }  // namespace
@@ -154,13 +166,21 @@ void StreamServer::PruneDeviceState(int64_t now) {
     // round of "ask again", so the policy is simply: keep the newest handful.
     const size_t kMaxDevices = 64;
     while (m_askedAt.size() > kMaxDevices) {
-        m_approvalKey.erase(m_askedAt.begin()->first);
-        m_promptedAt.erase(m_askedAt.begin()->first);
-        m_askedAt.erase(m_askedAt.begin());
+        auto oldest = m_askedAt.begin();
+        for (auto it = std::next(oldest); it != m_askedAt.end(); ++it)
+            if (it->second < oldest->second) oldest = it;
+        m_approvalKey.erase(oldest->first);
+        m_promptedAt.erase(oldest->first);
+        m_askedAt.erase(oldest);
     }
-    while (m_approved.size() > kMaxDevices) m_approved.erase(m_approved.begin());
-    while (m_denied.size() > kMaxDevices) m_denied.erase(m_denied.begin());
-    while (m_cloudSessions.size() > 32) m_cloudSessions.erase(m_cloudSessions.begin());
+    while (m_approved.size() > kMaxDevices) EvictEarliest(m_approved);
+    while (m_denied.size() > kMaxDevices) EvictEarliest(m_denied);
+    while (m_cloudSessions.size() > 32) {
+        auto oldest = m_cloudSessions.begin();
+        for (auto it = std::next(oldest); it != m_cloudSessions.end(); ++it)
+            if (it->second.expiresNs < oldest->second.expiresNs) oldest = it;
+        m_cloudSessions.erase(oldest);
+    }
 }
 
 void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAddress& from) {
@@ -173,15 +193,19 @@ void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAd
         return;
     }
     HelloInfo info;
-    info.deviceId = j.value("deviceId", "");
-    info.deviceName = j.value("deviceName", "Headset");
-    info.model = j.value("model", "");
-    info.appVersion = j.value("appVersion", "");
-    info.cloudSession = j.value("cloudSession", "");
+    // These are strings off the network that end up in the log, in the web UI and in the Reject
+    // below; bound them here instead of trusting a 2 KB datagram to stay harmless. StrField also
+    // keeps a wrong-typed field from throwing out of the receive thread (see hello_trust.h).
+    info.deviceId = ClampField(StrField(j, "deviceId"), 64);
+    info.deviceName = ClampField(StrField(j, "deviceName"), 64);
+    info.model = ClampField(StrField(j, "model"), 64);
+    info.appVersion = ClampField(StrField(j, "appVersion"), 32);
+    info.cloudSession = ClampField(StrField(j, "cloudSession"), 128);
     info.address = from;
     info.raw = j;
-    if (info.deviceId.empty() || info.deviceId.size() > 64) return;
-    const std::string clientNonce = j.value("nonce", "");
+    if (info.deviceName.empty()) info.deviceName = "Headset";
+    if (info.deviceId.empty()) return;
+    const std::string clientNonce = ClampField(StrField(j, "nonce"), 64);
     const std::string pkHex = rc::HexEncode(hello.publicKey.data(), hello.publicKey.size());
     const Settings settings = SettingsStore::Get().Snapshot();
     const int64_t now = rc::NowNs();
@@ -210,10 +234,12 @@ void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAd
     {
         rc::crypto::Key deviceKey;
         rc::crypto::Signature sig;
-        if (rc::HexDecode(j.value("deviceKey", ""), deviceKey.data(), deviceKey.size()) &&
-            rc::HexDecode(j.value("deviceSig", ""), sig.data(), sig.size()) &&
+        if (rc::HexDecode(StrField(j, "deviceKey"), deviceKey.data(), deviceKey.size()) &&
+            rc::HexDecode(StrField(j, "deviceSig"), sig.data(), sig.size()) &&
             rc::crypto::VerifyConnection(deviceKey, hello.publicKey, clientNonce, sig))
-            info.deviceKey = j.value("deviceKey", "");
+            // Canonical form, not the caller's spelling: the value is compared against the key
+            // pinned in the settings file, and hex casing must not decide who gets in.
+            info.deviceKey = rc::HexEncode(deviceKey.data(), deviceKey.size());
     }
 
     // Authorization.
@@ -227,7 +253,7 @@ void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAd
             SendReject(from, "invalid_session", "This remote session expired. Try connecting again.");
             return;
         }
-        if (j.value("proof", "") != rc::HelloProof(it->second.connectSecret, hello.publicKey)) {
+        if (StrField(j, "proof") != rc::HelloProof(it->second.connectSecret, hello.publicKey)) {
             lock.unlock();
             RC_LOGW("Hello from %s with a wrong remote-session proof", from.ToString().c_str());
             SendReject(from, "invalid_proof", "Authentication failed.");
@@ -250,21 +276,19 @@ void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAd
         return;
     }
     {
-        const bool remote = !info.cloudSession.empty();
-        bool trusted = !settings.requireApproval;
-        for (const auto& t : settings.trustedDevices) {
-            if (t.id != info.deviceId) continue;
-            if (!t.publicKey.empty()) trusted = trusted || t.publicKey == info.deviceKey;
-            // Entries from before identities: the first proof pins the key (see OnSessionStarted).
-            // Over the internet there has to be a proof.
-            else trusted = trusted || !remote || !info.deviceKey.empty();
+        bool approvalLive = false;
+        std::string_view approvalKey;
+        if (auto a = m_approved.find(info.deviceId); a != m_approved.end() && a->second > now) {
+            approvalLive = true;
+            if (auto k = m_approvalKey.find(info.deviceId); k != m_approvalKey.end()) approvalKey = k->second;
         }
-        // "Allow" applies to the headset that asked, not to anyone repeating its ID.
-        if (auto a = m_approved.find(info.deviceId); a != m_approved.end() && a->second > now &&
-            m_approvalKey[info.deviceId] == info.deviceKey)
-            trusted = true;
-        if (!trusted) {
-            m_approvalKey[info.deviceId] = info.deviceKey;
+        const HelloTrustQuery query{settings.requireApproval, approvalLive, info.deviceId, info.deviceKey,
+                                    approvalKey};
+        if (!HelloIsTrusted(query, settings.trustedDevices)) {
+            // Bind the pending approval to the identity that asked. An unproven Hello leaves the
+            // binding alone: it is the same packet that is later compared against it.
+            const std::string bind{NextApprovalKey(m_approvalKey[info.deviceId], info.deviceKey)};
+            m_approvalKey[info.deviceId] = bind;
             m_askedAt[info.deviceId] = now;
             auto& last = m_promptedAt[info.deviceId];
             const bool prompt = now - last > 15'000'000'000LL;
@@ -285,6 +309,20 @@ void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAd
         return;
     }
 
+    // Bound the map before adding to it. Its key is the client's public key, which a Hello is
+    // free to change from one packet to the next, and every new entry costs an X25519 key pair -
+    // so without a cap a single peer can grow this for the full minute the sweep below allows. A
+    // PC never has more than a couple of handshakes in flight at once.
+    constexpr size_t kMaxPendingHandshakes = 8;
+    while (m_handshakes.size() >= kMaxPendingHandshakes) {
+        auto oldest = m_handshakes.end();
+        for (auto it = m_handshakes.begin(); it != m_handshakes.end(); ++it) {
+            if (it->first == pkHex) continue;  // the entry this Hello is about to use
+            if (oldest == m_handshakes.end() || it->second.createdNs < oldest->second.createdNs) oldest = it;
+        }
+        if (oldest == m_handshakes.end()) break;
+        m_handshakes.erase(oldest);
+    }
     auto& hs = m_handshakes[pkHex];
     if (hs.sessionId == 0) {
         hs.serverKeys = rc::crypto::KeyPair::Generate();
