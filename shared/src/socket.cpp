@@ -1,6 +1,7 @@
 #include "rc/socket.h"
 
 #include <cctype>
+#include <cerrno>
 #include <cstring>
 
 #include "rc/platform.h"
@@ -142,9 +143,17 @@ bool NetAddress::Parse(const std::string& host, uint16_t p, NetAddress& out) {
     in6_addr a6{};
     if (inet_pton(AF_INET6, h.c_str(), &a6) == 1) {
         out = {};
-        out.v6 = true;
-        std::memcpy(out.ip6, &a6, 16);
         out.port = p;
+        // A50: an IPv4-mapped literal ("::ffff:192.168.1.10") has to land in the same shape
+        // FromSockaddr produces for the very same peer, or every datagram it sends looks like
+        // a new address and the connection reports constant roaming.
+        const auto* b = reinterpret_cast<const uint8_t*>(&a6);
+        if (std::memcmp(b, kV4MappedPrefix, 12) == 0) {
+            out.ip = (uint32_t(b[12]) << 24) | (uint32_t(b[13]) << 16) | (uint32_t(b[14]) << 8) | b[15];
+        } else {
+            out.v6 = true;
+            std::memcpy(out.ip6, b, 16);
+        }
         return true;
     }
     const auto all = ResolveAll(h, p);
@@ -233,6 +242,18 @@ static bool LooksLikeVm(const std::string& text) {
 static bool IsLinkLocal(uint32_t ip) { return (ip >> 16) == 0xA9FE; }  // 169.254/16: an adapter with no real address
 
 #ifdef _WIN32
+// A50: WideCharToMultiByte into a fixed char[256] left the buffer unterminated whenever the
+// conversion failed or the UTF-8 form needed more than 255 bytes (long Chinese adapter names
+// go over that), and std::string then read past the array. Size it first, then convert.
+static std::string WideToUtf8(const wchar_t* ws) {
+    if (!ws || !*ws) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};  // failure, or an empty name (n == 1 is just the terminator)
+    std::vector<char> buf(size_t(n), '\0');  // writable data() on every standard we build with
+    if (WideCharToMultiByte(CP_UTF8, 0, ws, -1, buf.data(), n, nullptr, nullptr) == 0) return {};
+    return std::string(buf.data(), size_t(n - 1));
+}
+
 // Calls fn(adapter, isVirtual) for each up, non-loopback adapter of `family`.
 template <typename Fn>
 static void ForEachAdapter(ULONG family, Fn fn) {
@@ -241,19 +262,22 @@ static void ForEachAdapter(ULONG family, Fn fn) {
     std::vector<uint8_t> buffer(size);
     auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
     const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-    if (GetAdaptersAddresses(family, flags, nullptr, adapters, &size) == ERROR_BUFFER_OVERFLOW) {
+    // A50: only retry on overflow. The second call used to run unconditionally, so every
+    // enumeration paid for two full kernel walks.
+    ULONG ret = GetAdaptersAddresses(family, flags, nullptr, adapters, &size);
+    if (ret == ERROR_BUFFER_OVERFLOW) {
         buffer.resize(size);
         adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+        ret = GetAdaptersAddresses(family, flags, nullptr, adapters, &size);
     }
-    if (GetAdaptersAddresses(family, flags, nullptr, adapters, &size) != NO_ERROR) return;
+    if (ret != NO_ERROR) return;
     for (auto* a = adapters; a; a = a->Next) {
         if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-        char name[256], desc[256];
-        WideCharToMultiByte(CP_UTF8, 0, a->FriendlyName, -1, name, sizeof(name), nullptr, nullptr);
-        WideCharToMultiByte(CP_UTF8, 0, a->Description, -1, desc, sizeof(desc), nullptr, nullptr);
+        const std::string name = WideToUtf8(a->FriendlyName);
+        const std::string desc = WideToUtf8(a->Description);
         const bool isVirtual = LooksVirtual(name) || LooksVirtual(desc) ||
                                (a->IfType != IF_TYPE_ETHERNET_CSMACD && a->IfType != IF_TYPE_IEEE80211);
-        fn(a, std::string(name), isVirtual);
+        fn(a, name, isVirtual);
     }
 }
 #endif
@@ -294,6 +318,10 @@ bool RoutesThroughTunnel(uint32_t ip) {
 
 std::vector<uint32_t> SubnetHosts(uint32_t ip, uint32_t netmask, size_t maxHosts) {
     std::vector<uint32_t> out;
+    // A50: a /0 mask (what an out-of-range OnLinkPrefixLength now falls back to) means the
+    // whole IPv4 space, which is never a LAN worth sweeping - return nothing instead of
+    // handing the scan 256 arbitrary addresses.
+    if (netmask == 0) return out;
     const uint32_t network = ip & netmask, last = network | ~netmask;
     // Both ends are excluded: they're the network's own address and its broadcast.
     if (last - network < 2) return out;
@@ -317,11 +345,13 @@ std::vector<NetInterface> ListInterfaces() {
             ni.ip = ntohl(reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr)->sin_addr.s_addr);
             ni.isVirtual = isVirtual || IsCgnat(ni.ip);
             // The friendly name can be just "Ethernet 3", so the description counts too.
-            char desc[256];
-            WideCharToMultiByte(CP_UTF8, 0, a->Description, -1, desc, sizeof(desc), nullptr, nullptr);
+            const std::string desc = WideToUtf8(a->Description);
             ni.isVpn = ni.isVirtual && !LooksLikeVm(name) && !LooksLikeVm(desc) && !IsLinkLocal(ni.ip);
             const ULONG prefix = u->OnLinkPrefixLength;
-            ni.netmask = prefix == 0 ? 0 : (0xFFFFFFFFu << (32 - prefix));
+            // A50: a prefix length above 32 (seen on some VPN/TUN adapters) makes the shift
+            // count negative, which is undefined behaviour and can hand the subnet scan a
+            // nonsense mask - the LAN sweep then misses the headset. Treat it as "no mask".
+            ni.netmask = (prefix == 0 || prefix > 32) ? 0 : (0xFFFFFFFFu << (32 - prefix));
             out.push_back(ni);
         }
     });
@@ -357,9 +387,7 @@ std::vector<NetInterfaceV6> ListInterfacesV6() {
         if (!a->Ipv6IfIndex) return;
         NetInterfaceV6 ni;
         ni.name = name;
-        char desc[256];
-        WideCharToMultiByte(CP_UTF8, 0, a->Description, -1, desc, sizeof(desc), nullptr, nullptr);
-        ni.description = desc;
+        ni.description = WideToUtf8(a->Description);
         ni.adapterId = a->AdapterName ? a->AdapterName : "";
         ni.index = a->Ipv6IfIndex;
         ni.usbNcm = isNcm(ni.description);
@@ -469,6 +497,9 @@ bool UdpSocket::Open(uint16_t port, bool broadcast, bool reuse) {
     // The send timeout backstop: sendto would block forever on a full send buffer and
     // there is no other way to interrupt it. 200 ms never fires on ordinary sends -
     // it runs the normal send-failure path when the link has truly stalled.
+    // A50: the call itself was missing here (001d995 added it to OpenV6 only), so the
+    // data socket every stream actually uses had no timeout at all.
+    SetUdpSendTimeout(m_socket);
     if (broadcast)
         setsockopt(RC_SOCK(m_socket), SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
     int bound;
@@ -563,8 +594,11 @@ void UdpSocket::SetBuffers(int sendBytes, int recvBytes) {
 
 void UdpSocket::SetTos(int tos) {
     if (!IsOpen()) return;
-    setsockopt(RC_SOCK(m_socket), IPPROTO_IP, IP_TOS, reinterpret_cast<const char*>(&tos), sizeof(tos));
-    if (m_dualStack)
+    // A50: a v6-only socket has no IPv4 level to set, and it still needs IPV6_TCLASS -
+    // without it the DSCP mark silently never reached the wire for v6 streams.
+    if (!m_v6Only)
+        setsockopt(RC_SOCK(m_socket), IPPROTO_IP, IP_TOS, reinterpret_cast<const char*>(&tos), sizeof(tos));
+    if (m_dualStack || m_v6Only)
         setsockopt(RC_SOCK(m_socket), IPPROTO_IPV6, IPV6_TCLASS, reinterpret_cast<const char*>(&tos), sizeof(tos));
 }
 
@@ -615,7 +649,18 @@ int UdpSocket::RecvFrom(void* buffer, size_t capacity, NetAddress& from, int tim
     const int r = poll(&pfd, 1, timeoutMs);
 #endif
     if (r == 0) return 0;
-    if (r < 0) return -1;
+    if (r < 0) {
+#ifndef _WIN32
+        // A50: Android's ART posts signals that interrupt poll(); that is not a socket
+        // failure and returning -1 there would drop a perfectly healthy read opportunity.
+        if (errno == EINTR) return 0;
+#endif
+        return -1;
+    }
+#ifndef _WIN32
+    // The descriptor was closed underneath us: fail loudly instead of spinning on it.
+    if (pfd.revents & POLLNVAL) return -1;
+#endif
     sockaddr_storage addr{};
     socklen_t len = sizeof(addr);
     const auto n = recvfrom(RC_SOCK(m_socket), static_cast<char*>(buffer), int(capacity), 0,

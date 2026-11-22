@@ -1141,6 +1141,24 @@ static void TestSubnetHosts() {
     printf("subnet hosts OK\n");
 }
 
+// A50 (TASK-SOCKET-HARDEN-2026-11-22): a v4-mapped literal must normalize to the same shape
+// FromSockaddr produces for that peer, and the /0 fallback must not turn into a space sweep.
+static void TestSocketHardening() {
+    NetAddress mapped, plain, ep, real6;
+    CHECK(NetAddress::Parse("::ffff:192.168.1.10", 9999, mapped));
+    CHECK(!mapped.v6 && mapped.ip == 0xC0A8010A && mapped.port == 9999);
+    CHECK(NetAddress::Parse("192.168.1.10", 9999, plain));
+    CHECK(mapped == plain);                    // same peer, same key: no phantom roaming
+    CHECK(mapped.ToString() == "192.168.1.10:9999");
+    CHECK(NetAddress::ParseEndpoint("[::ffff:10.0.0.1]:9999", ep) && !ep.v6 && ep.ip == 0x0A000001);
+    // A genuine v6 literal must still be v6 - the normalization is not a blanket downgrade.
+    CHECK(NetAddress::Parse("::1", 5, real6) && real6.v6);
+    CHECK(NetAddress::Parse("2001:db8::20", 5, real6) && real6.v6 && real6.IsGlobalV6());
+    // An out-of-range OnLinkPrefixLength now yields netmask 0; that is never a LAN to sweep.
+    CHECK(rc::SubnetHosts(0xC0A8010Au, 0, 1000).empty());
+    printf("socket hardening OK\n");
+}
+
 static void TestMotionRuns() {
     std::vector<int8_t> grid(2 * 1000, 0);
     grid[2 * 3] = 5;
@@ -5481,6 +5499,7 @@ int main() {
     TestAddresses();
     TestDiscovery();
     TestSubnetHosts();
+    TestSocketHardening();  // A50 (TASK-SOCKET-HARDEN-2026-11-22)
     TestAudio();
     TestIdentity();
     TestVideoReassemblyOrder();
