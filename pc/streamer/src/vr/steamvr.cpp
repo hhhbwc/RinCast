@@ -70,6 +70,7 @@ std::optional<fs::path> SteamVrPath() {
 bool IsRunning() { return IsProcessRunning(L"vrserver.exe") || IsProcessRunning(L"vrmonitor.exe"); }
 
 static fs::path OpenVrPathsFile();
+static bool ReadJsonFile(const fs::path& path, json& out);
 static void ForceRinCastDriver();
 static void StartForcedDriverWatch();
 static std::atomic<int64_t> g_launchNs{0};
@@ -153,13 +154,13 @@ bool RegisterDriver() {
         }
     }
     // Fallback: edit openvrpaths.vrpath directly.
-    std::vector<uint8_t> bytes;
     json j = json::object();
-    if (ReadFileBytes(OpenVrPathsFile(), bytes)) {
-        try {
-            j = json::parse(bytes.begin(), bytes.end());
-        } catch (...) {
-        }
+    // A file that exists but cannot be parsed is not an empty one: replacing it with an
+    // external_drivers-only object would drop SteamVR's runtime, config and log paths.
+    if (fs::exists(OpenVrPathsFile()) && !ReadJsonFile(OpenVrPathsFile(), j)) {
+        RC_LOGW("openvrpaths.vrpath at %s could not be parsed; not rewriting it",
+                Narrow(OpenVrPathsFile().wstring()).c_str());
+        return false;
     }
     auto drivers = j.value("external_drivers", json::array());
     if (!drivers.is_array()) drivers = json::array();
@@ -213,7 +214,10 @@ static bool ReadJsonFile(const fs::path& path, json& out) {
 static std::string DriverName(const fs::path& dir) {
     json manifest;
     if (!ReadJsonFile(dir / "driver.vrdrivermanifest", manifest)) return {};
-    return manifest.value("name", std::string());
+    // A malformed manifest (a non-string name) must not throw here: this runs on a
+    // detached thread, where an exception would abort the streamer.
+    const auto name = manifest.find("name");
+    return name != manifest.end() && name->is_string() ? name->get<std::string>() : std::string();
 }
 
 // This streamer's driver first among the registered ones (registered if it isn't). Others stay
@@ -260,7 +264,13 @@ static void ForceRinCastDriver() {
     const fs::path file = SteamVrSettingsFile();
     if (file.empty()) return;
     json settings = json::object();
-    ReadJsonFile(file, settings);  // missing: SteamVR never ran with settings changed
+    // Missing is fine (SteamVR never ran with settings changed); present but unreadable is
+    // not: writing an object rebuilt from nothing would drop every setting the user has.
+    if (fs::exists(file) && !ReadJsonFile(file, settings)) {
+        RC_LOGW("SteamVR settings at %s could not be parsed; leaving them untouched",
+                Narrow(file.wstring()).c_str());
+        return;
+    }
     json& steamvr = settings["steamvr"];
     if (!steamvr.is_object()) steamvr = json::object();
     // What to put back: noted only once, so a launch after one that wasn't cleaned up (the
@@ -289,7 +299,8 @@ static void RestoreForcedDriver(int64_t quietNs) {
     if (!file.empty() && ReadJsonFile(file, settings) && settings.contains("steamvr") && settings["steamvr"].is_object()) {
         json& steamvr = settings["steamvr"];
         // Changed since (in SteamVR's settings, by the user): theirs stays.
-        if (steamvr.value("forcedDriver", std::string()) == "rincast") {
+        const auto forced = steamvr.find("forcedDriver");
+        if (forced != steamvr.end() && forced->is_string() && forced->get<std::string>() == "rincast") {
             const json previous = note.value("previous", json());
             if (previous.is_null()) steamvr.erase("forcedDriver");
             else steamvr["forcedDriver"] = previous;
