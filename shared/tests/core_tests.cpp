@@ -4857,6 +4857,321 @@ static void TestPaceBaseKbps() {
 
 #undef A12_CHECK
 
+// ---------------------------------------------------------------------------
+// A45 (TASK-TRANSPORT-ROBUST-2026-11-22): local robustness of the video transport.
+// Every case is a malformed / extreme INPUT (a fuzzer-shaped wire packet or a
+// concurrent setter), and every assertion is on an externally observable result
+// (no crash, no zombie entry, no stats pollution, exact billed bytes). The fixed
+// vector at the end is a byte-for-byte known-answer proof that legal frames are
+// unchanged. Helpers build wire packets by hand - they never call the code under test.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::vector<uint8_t> RFrag(uint8_t streamId, VideoCodec codec, uint8_t flags, uint8_t fecGroupSize,
+                           uint32_t frameIndex, uint16_t fragIndex, uint16_t fragCount, uint32_t frameSize,
+                           const std::vector<uint8_t>& data) {
+    VideoFragmentHeader h{};
+    h.streamId = streamId;
+    h.codec = uint8_t(codec);
+    h.frameFlags = flags;
+    h.fecGroupSize = fecGroupSize;
+    h.frameIndex = frameIndex;
+    h.fragmentIndex = fragIndex;
+    h.fragmentCount = fragCount;
+    h.frameSize = frameSize;
+    std::vector<uint8_t> p(sizeof(h) + data.size());
+    std::memcpy(p.data(), &h, sizeof(h));
+    if (!data.empty()) std::memcpy(p.data() + sizeof(h), data.data(), data.size());
+    return p;
+}
+
+std::vector<uint8_t> RParity(uint8_t streamId, uint8_t fecGroupSize, uint16_t groupIndex, uint32_t frameIndex,
+                             uint16_t fragCount, uint16_t lastFragSize, uint32_t frameSize,
+                             const std::vector<uint8_t>& data) {
+    VideoParityHeader h{};
+    h.streamId = streamId;
+    h.fecGroupSize = fecGroupSize;
+    h.groupIndex = groupIndex;
+    h.frameIndex = frameIndex;
+    h.fragmentCount = fragCount;
+    h.lastFragmentSize = lastFragSize;
+    h.frameSize = frameSize;
+    std::vector<uint8_t> p(sizeof(h) + data.size());
+    std::memcpy(p.data(), &h, sizeof(h));
+    if (!data.empty()) std::memcpy(p.data() + sizeof(h), data.data(), data.size());
+    return p;
+}
+
+}  // namespace
+
+static void TestTransportRobustReassembly() {
+    // --- 1.1: a throwing handler must restore the caller's unique_lock. A broken
+    // state would deadlock/crash on the very next reassembler operation. ---
+    {
+        VideoReassembler r([](ReceivedFrame&&) { throw 42; });
+        auto f = RFrag(1, VideoCodec::HEVC, kVideoKeyframe, 0, 1, 0, 1, 4, {0, 0, 'a', 'b'});
+        bool threw = false;
+        try {
+            r.HandleFragment(f.data(), f.size());
+        } catch (int) {
+            threw = true;
+        }
+        CHECK(threw);  // the exception itself is expected to propagate
+        r.Reset();     // would hang / double-unlock if the mutex state were corrupted
+    }
+    // --- 1.1: an empty handler is skipped, not std::bad_function_call. ---
+    {
+        VideoReassembler r(VideoReassembler::FrameHandler{});
+        auto f = RFrag(1, VideoCodec::HEVC, 0, 0, 1, 0, 1, 4, {0, 0, 'a', 'b'});
+        r.HandleFragment(f.data(), f.size());
+        CHECK(r.TakeStats().framesComplete == 1);
+    }
+
+    // --- 1.4: malformed parity must not create zombie pending entries. ---
+    {
+        VideoReassembler r([](ReceivedFrame&&) {});
+        auto p1 = RParity(1, 2, 100, 1, 2, 3, 6, {1, 2, 3});  // groupIndex out of range
+        auto p2 = RParity(1, 1, 0, 2, 2, 3, 6, {1, 2, 3});     // fecGroupSize = 1
+        auto p3 = RParity(1, 2, 0, 3, 0, 3, 6, {1, 2, 3});     // fragmentCount = 0
+        auto p4 = RParity(1, 2, 0, 4, 2, 3, 6, {});            // header only, no parity data
+        r.HandleParity(p1.data(), p1.size());
+        r.HandleParity(p2.data(), p2.size());
+        r.HandleParity(p3.data(), p3.size());
+        r.HandleParity(p4.data(), p4.size());
+        r.Expire(NowNs() + 1'000'000'000LL, 1);
+        const auto s = r.TakeStats();
+        CHECK(s.framesLost == 0);       // no zombie entry was created
+        CHECK(s.fragmentsReceived == 0);
+    }
+
+    // --- 1.4: a single-member group's parity must not complete a frame. ---
+    {
+        std::vector<ReceivedFrame> done;
+        VideoReassembler r([&](ReceivedFrame&& f) { done.push_back(std::move(f)); });
+        auto p = RParity(1, 2, 0, 1, 1, 4, 4, {1, 2, 3, 4});
+        r.HandleParity(p.data(), p.size());
+        CHECK(done.empty());
+        CHECK(r.TakeStats().framesComplete == 0);
+    }
+
+    // --- 1.4: tail-length underflow is rejected (no bogus recovered fragment). ---
+    {
+        std::vector<ReceivedFrame> done;
+        VideoReassembler r([&](ReceivedFrame&& f) { done.push_back(std::move(f)); });
+        // frameSize=1 but prefix=(count-1)*fragmentPayload=2 => unsigned underflow
+        // used to wrap the recovered tail length to ~SIZE_MAX.
+        auto f0 = RFrag(1, VideoCodec::HEVC, 0, 2, 1, 0, 2, 1, {'a', 'b'});
+        auto par = RParity(1, 2, 0, 1, 2, 2, 1, {0x01, 0x02});
+        r.HandleFragment(f0.data(), f0.size());
+        r.HandleParity(par.data(), par.size());
+        const auto s = r.TakeStats();
+        CHECK(s.fragmentsRecovered == 0);
+        CHECK(s.framesComplete == 0);
+        CHECK(done.empty());
+    }
+
+    // --- 1.4: duplicate / out-of-range fragments must not pollute codec/flags or
+    // inflate receive stats. ---
+    {
+        std::vector<ReceivedFrame> done;
+        VideoReassembler r([&](ReceivedFrame&& f) { done.push_back(std::move(f)); });
+        auto f0 = RFrag(1, VideoCodec::HEVC, kVideoKeyframe, 0, 1, 0, 2, 4, {0, 0});
+        auto f1 = RFrag(1, VideoCodec::HEVC, kVideoKeyframe, 0, 1, 1, 2, 4, {'a', 'b'});
+        r.HandleFragment(f0.data(), f0.size());
+        auto dup = RFrag(1, VideoCodec::H264, 0, 0, 1, 0, 2, 4, {0, 0});  // duplicate of idx 0
+        auto oob = RFrag(1, VideoCodec::H264, 0, 0, 1, 9, 2, 4, {0, 0});  // index >= count
+        r.HandleFragment(dup.data(), dup.size());
+        r.HandleFragment(oob.data(), oob.size());
+        r.HandleFragment(f1.data(), f1.size());
+        CHECK(done.size() == 1);
+        if (!done.empty()) {
+            CHECK(done[0].codec == VideoCodec::HEVC);
+            CHECK(done[0].flags == kVideoKeyframe);
+        }
+        CHECK(r.TakeStats().fragmentsReceived == 2);
+    }
+
+    // --- 1.5: fragmentCount=65535 packets are dropped (bounded per-frame alloc). ---
+    {
+        VideoReassembler r([](ReceivedFrame&&) {});
+        for (uint32_t fi = 1; fi <= 200; fi++) {
+            auto f = RFrag(1, VideoCodec::HEVC, 0, 0, fi, 0, 65535, 4, {0, 0});
+            r.HandleFragment(f.data(), f.size());
+        }
+        const auto s = r.TakeStats();
+        CHECK(s.packetsDropped == 200);
+        CHECK(s.fragmentsReceived == 0);
+    }
+    // --- 1.5: a flood of distinct frame indices keeps m_pending bounded at 64. ---
+    {
+        VideoReassembler r([](ReceivedFrame&&) {});
+        for (uint32_t fi = 1; fi <= 200; fi++) {
+            auto f = RFrag(1, VideoCodec::HEVC, 0, 0, fi, 0, 2, 4, {0, 0});
+            r.HandleFragment(f.data(), f.size());
+        }
+        r.Expire(NowNs() + 1'000'000'000LL, 1);
+        const auto s = r.TakeStats();
+        CHECK(s.framesLost > 0);  // evicted + expired frames were counted, no crash
+        CHECK(s.packetsDropped == 0);
+    }
+
+    // --- 1.6: frame 10 complete, frame 11 partial then expired, frame 12 complete
+    // => framesLost == 1 (not 2: Expire and TryComplete must not double-count). ---
+    {
+        std::vector<ReceivedFrame> done;
+        VideoReassembler r([&](ReceivedFrame&& f) { done.push_back(std::move(f)); });
+        auto ten = RFrag(1, VideoCodec::HEVC, 0, 0, 10, 0, 1, 4, {0, 0});
+        auto eleven = RFrag(1, VideoCodec::HEVC, 0, 0, 11, 0, 2, 4, {0, 0});
+        auto twelve = RFrag(1, VideoCodec::HEVC, 0, 0, 12, 0, 1, 4, {0, 0});
+        r.HandleFragment(ten.data(), ten.size());
+        r.HandleFragment(eleven.data(), eleven.size());
+        r.Expire(NowNs() + 1'000'000'000LL, 1);
+        r.HandleFragment(twelve.data(), twelve.size());
+        const auto s = r.TakeStats();
+        CHECK(s.framesLost == 1);
+        CHECK(s.framesComplete == 2);
+    }
+
+    std::printf("A45 reassembly: no double-unlock/zombie/underflow, bounds hold, framesLost counted once\n");
+}
+
+static void TestTransportRobustPacketizer() {
+    // --- 1.2: MaxPayload() <= header size => SendFrame returns 0, no SIGFPE. ---
+    {
+        UdpSocket a;
+        CHECK(a.Open(0));
+        auto keys = crypto::DeriveSessionKeys(crypto::KeyPair::Generate().secretKey, crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey, crypto::KeyPair::Generate().publicKey, "t");
+        for (size_t payloadCap : {size_t(0), size_t(1), size_t(15), sizeof(VideoFragmentHeader)}) {
+            Connection conn(&a, NetAddress{0x7F000001, 1}, 1, keys, true,
+                            sizeof(PacketHeader) + kMacSize + payloadCap);
+            VideoPacketizer pkt(&conn);
+            DesktopFrameMetadata meta{};
+            uint8_t data[32] = {};
+            CHECK(pkt.SendFrame(1, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), data, sizeof(data)) == 0);
+        }
+    }
+
+    // --- 1.2: count % group == 1 => billed wire bytes equal actual parity count. ---
+    {
+        LoopbackPair l;
+        CHECK(l.Open());
+        std::atomic<int> dataPkts{0}, parityPkts{0};
+        l.recvConn->SetPacketHandler([&](PacketType t, const uint8_t*, size_t) {
+            if (t == PacketType::Video) dataPkts++;
+            else if (t == PacketType::VideoParity) parityPkts++;
+        });
+        l.Start();
+        VideoPacketizer pkt(l.sendConn.get());
+        pkt.SetFecPercent(25);  // group = clamp(100/25) = 4
+        pkt.SetPacingKbps(21600);
+        pkt.SetPacingFrameBudgetNs(13'888'888LL);
+        const size_t fragPayload = l.sendConn->MaxPayload() - sizeof(VideoFragmentHeader);
+        VrFrameMetadata meta{};
+        const size_t count = 5;  // 5 % 4 == 1: single-member final group
+        const size_t bitstreamSize = count * fragPayload - 2 - sizeof(meta);
+        std::vector<uint8_t> frame(bitstreamSize, 0x5A);
+        const size_t total = 2 + sizeof(meta) + bitstreamSize;  // == count * fragPayload
+        const size_t expectedParity = 1;                        // 4-member group only
+        const size_t expectedWire =
+            total + count * sizeof(VideoFragmentHeader) + expectedParity * (sizeof(VideoParityHeader) + fragPayload);
+        pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), frame.data(), frame.size());
+        CHECK(pkt.LastBilledWireBytesForTest() == expectedWire);
+        l.Drain(150);
+        CHECK(dataPkts.load() == int(count));
+        CHECK(parityPkts.load() == int(expectedParity));
+        l.Stop();
+    }
+
+    // --- 1.3: concurrent SetFecPercent(0) and SendFrame must not SIGFPE. ---
+    {
+        LoopbackPair l;
+        CHECK(l.Open());
+        l.Start();
+        VideoPacketizer pkt(l.sendConn.get());
+        pkt.SetFecPercent(5);
+        std::vector<uint8_t> data(1024, 0x33);
+        DesktopFrameMetadata meta{};
+        std::thread flipper([&] {
+            for (int i = 0; i < 2000; i++) pkt.SetFecPercent((i % 3 == 0) ? 0 : (i % 7) + 1);
+        });
+        for (uint32_t f = 1; f <= 2000; f++) {
+            pkt.SendFrame(1, VideoCodec::HEVC, 0, f, &meta, sizeof(meta), data.data(), data.size());
+        }
+        flipper.join();
+        l.Stop();
+        // Reaching this line alive is the assertion: the old TOCTOU could SIGFPE here.
+    }
+
+    // --- 1.7: a single frame's billing is capped; leaving burst mode re-baselines. ---
+    {
+        LoopbackPair l;
+        CHECK(l.Open());
+        l.Start();
+        VideoPacketizer pkt(l.sendConn.get());
+        pkt.SetFecPercent(0);
+        pkt.SetPacingKbps(100);  // absurdly low: one 256 KB frame bills ~22 s uncapped
+        pkt.SetPacingFrameBudgetNs(13'888'888LL);
+        std::vector<uint8_t> big(256 * 1024, 0x7E);
+        DesktopFrameMetadata meta{};
+        pkt.SendFrame(1, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), big.data(), big.size());
+        CHECK(pkt.NextSendNsForTest() <= NowNs() + 40'000'000LL + 2'000'000LL);
+        const uint32_t resets = pkt.ModeSwitchResetsForTest();
+        pkt.SetPacingKbps(0);           // exit burst pacing entirely
+        pkt.SetPacingFrameBudgetNs(0);  // switch back to legacy mode
+        uint8_t tiny[8] = {};
+        pkt.SendFrame(1, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta), tiny, sizeof(tiny));
+        CHECK(pkt.ModeSwitchResetsForTest() == resets + 1);
+        l.Stop();
+    }
+
+    std::printf("A45 packetizer: small MTU safe, parity billing exact, FEC race safe, clock bounded\n");
+}
+
+static void TestTransportRobustFixedVector() {
+    // A45 gate §2.5: a frozen wire vector (fragment + XOR parity + short tail)
+    // reassembles to an exact byte sequence - the legal-frame behaviour proof.
+    {
+        std::vector<ReceivedFrame> done;
+        VideoReassembler r([&](ReceivedFrame&& f) { done.push_back(std::move(f)); });
+        // frame payload = [u16 metaSize=0][A1 A2 A3 A4 A5 A6], frameSize=8,
+        // 3 fragments (3/3/2), FEC group 2. Parity = frag0 XOR frag1 = A2 A3 05.
+        auto par = RParity(1, 2, 0, 1, 3, 2, 8, {0xA2, 0xA3, 0x05});
+        auto f1 = RFrag(1, VideoCodec::HEVC, kVideoKeyframe, 2, 1, 1, 3, 8, {0xA2, 0xA3, 0xA4});
+        auto f2 = RFrag(1, VideoCodec::HEVC, kVideoKeyframe, 2, 1, 2, 3, 8, {0xA5, 0xA6});
+        r.HandleParity(par.data(), par.size());
+        r.HandleFragment(f1.data(), f1.size());  // recovers fragment 0 from parity
+        r.HandleFragment(f2.data(), f2.size());
+        CHECK(done.size() == 1);
+        if (!done.empty()) {
+            const std::vector<uint8_t> expected = {0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6};
+            CHECK(done[0].bitstream == expected);
+            CHECK(done[0].codec == VideoCodec::HEVC);
+            CHECK(done[0].flags == kVideoKeyframe);
+        }
+    }
+    // End-to-end legal frame through the real packetizer: bytes survive unchanged.
+    {
+        LoopbackPair l;
+        CHECK(l.Open());
+        l.Start();
+        VideoPacketizer pkt(l.sendConn.get());
+        pkt.SetFecPercent(0);
+        const std::vector<uint8_t> bits = {0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6};
+        VrFrameMetadata meta{};
+        pkt.SendFrame(1, VideoCodec::HEVC, kVideoKeyframe, 1, &meta, sizeof(meta), bits.data(), bits.size());
+        l.Drain(100);
+        CHECK(l.frames.size() == 1);
+        if (!l.frames.empty()) {
+            CHECK(l.frames[0].bitstream == bits);
+            CHECK(l.frames[0].codec == VideoCodec::HEVC);
+            CHECK(l.frames[0].flags == kVideoKeyframe);
+        }
+        l.Stop();
+    }
+    std::printf("A45 fixed vector: reassembled bitstream A1..A6 byte-identical (legal frame unchanged)\n");
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     TestLinkLocalDiscovery();
@@ -4871,6 +5186,9 @@ int main() {
     TestAudio();
     TestIdentity();
     TestVideoReassemblyOrder();
+    TestTransportRobustReassembly();   // A45 §1.1 / 1.4 / 1.5 / 1.6
+    TestTransportRobustFixedVector();  // A45 gate §2.5: legal frame byte-for-byte unchanged
+    TestTransportRobustPacketizer();   // A45 §1.2 / 1.3 / 1.7
     TestPacing();
     TestPacingBursts();
     TestPacingStop();

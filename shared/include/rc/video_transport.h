@@ -29,7 +29,10 @@ class VideoPacketizer {
 
     // fecPercent: 0 disables FEC; otherwise one parity packet per
     // round(100 / fecPercent) data fragments (clamped to [2, 64]).
-    void SetFecPercent(int fecPercent) { m_fecPercent = fecPercent; }
+    // A45: atomic store - SendFrame takes a single relaxed snapshot before doing
+    // 100 / fecPct, so a concurrent SetFecPercent(0) can never turn the divide
+    // into a SIGFPE (and the old plain int was a C++ data race).
+    void SetFecPercent(int fecPercent) { m_fecPercent.store(fecPercent, std::memory_order_relaxed); }
     // Two roles. Legacy clock (frame budget 0): spreads the datagrams at this rate
     // instead of sending them in one burst, which shallow queues (Wi-Fi, the internet)
     // drop. Token-bucket burst mode (frame budget > 0): the AVERAGE ceiling the mode
@@ -71,6 +74,15 @@ class VideoPacketizer {
     // the congestion guard see nothing - the one loss source neither can explain.
     uint32_t SendFailures() const { return m_sendFailures.load(std::memory_order_relaxed); }
 
+    // A45 test-only observability (read-only; no wire-format or behaviour change).
+    // The transport-robustness fixes bound internal pacing/loss state; these getters
+    // let the core tests assert those bounds deterministically instead of guessing
+    // from wall-clock timing. SendFrame owns this clock on the send thread, so the
+    // plain reads match the existing setters' single-writer discipline.
+    int64_t NextSendNsForTest() const { return m_nextSendNs; }
+    uint64_t LastBilledWireBytesForTest() const { return m_lastBilledWireBytes; }
+    uint32_t ModeSwitchResetsForTest() const { return m_modeSwitchResets; }
+
    private:
     // Waits until dueNs; false means a stop was requested: wrap up at once. precise=true
     // would place fragments at sub-ms intervals instead of the legacy 0.2 ms batch;
@@ -79,7 +91,7 @@ class VideoPacketizer {
     bool WaitDue(int64_t dueNs, bool precise);
 
     Connection* m_connection;
-    int m_fecPercent = 5;
+    std::atomic<int> m_fecPercent{5};
     std::atomic<uint32_t> m_pacingKbps{0};
     std::atomic<int64_t> m_frameBudgetNs{0};
     std::atomic<uint32_t> m_budgetOverruns{0};
@@ -89,6 +101,12 @@ class VideoPacketizer {
     // mode: the earliest moment the next FRAME may START - the running frame's billing
     // at the average ceiling. Stored as void* to keep windows.h out of this header.
     int64_t m_nextSendNs = 0;
+    // A45 §1.7: wire bytes billed into m_nextSendNs by the last burst-mode frame
+    // (test observability) and the mode-switch bookkeeping that re-baselines the
+    // clock when leaving burst mode, so a future-dated start cannot stall the next frame.
+    uint64_t m_lastBilledWireBytes = 0;
+    uint32_t m_modeSwitchResets = 0;
+    bool m_wasBurstMode = false;
     std::atomic<bool> m_stopRequested{false};
     // Timer and stop event for WaitDue. Stored as void* to keep windows.h out
     void* m_paceTimer = nullptr;
@@ -115,6 +133,9 @@ struct ReassemblyStats {
     uint32_t fragmentsLost = 0;
     uint32_t framesComplete = 0;
     uint32_t framesLost = 0;
+    // A45 §1.5: packets rejected at the entry gate (oversize fragment count /
+    // pending table full). A fixed-vector proof that the OOM guards actually fire.
+    uint32_t packetsDropped = 0;
     uint64_t bytesReceived = 0;
     double spreadMsSum = 0;
 };
@@ -145,6 +166,9 @@ class VideoReassembler {
         uint16_t fragmentCount = 0;
         uint8_t fecGroupSize = 0;
         uint32_t frameSize = 0;
+        // A45 §1.4: VideoParityHeader.lastFragmentSize (sent by the packetizer but
+        // previously ignored on receive) - used to reject tail-length underflow.
+        uint16_t lastFragmentSize = 0;
         size_t fragmentPayload = 0;  // bytes per full fragment
         std::vector<std::vector<uint8_t>> fragments;
         std::vector<bool> present;
@@ -154,12 +178,22 @@ class VideoReassembler {
     };
 
     void TryRecover(uint32_t frameIndex, Assembly& a, uint16_t group);
-    void TryComplete(uint32_t frameIndex);
+    // A45 §1.1: the caller's unique_lock is passed in so the handler call unlocks /
+    // relocks THROUGH the lock object. A null or throwing handler can no longer skip
+    // the relock and leave the outer unique_lock to double-unlock on destruction (UB).
+    void TryComplete(uint32_t frameIndex, std::unique_lock<std::mutex>& lock);
+    // A45 §1.6: a single loss watermark - every frameIndex is counted lost at most
+    // once, whether it was dropped by Expire, evicted by TryComplete, or seen as a gap.
+    void MarkLost(uint32_t frameIndex, uint16_t fragmentCount = 0, uint16_t received = 0);
+    // A45 §1.5: caller holds m_mutex; evicts the oldest pending frame when full.
+    void EnsurePendingCapacity(uint32_t frameIndex);
 
     FrameHandler m_handler;
     std::map<uint32_t, Assembly> m_pending;
     uint32_t m_lastComplete = 0;
     bool m_hasComplete = false;
+    uint32_t m_lastCountedFrame = 0;
+    bool m_hasCountedFrame = false;
     bool m_lostSinceExpire = false;
     ReassemblyStats m_stats;
     std::mutex m_mutex;
