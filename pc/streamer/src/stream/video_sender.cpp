@@ -1,6 +1,7 @@
 #include "video_sender.h"
 
 #include <algorithm>
+#include <cstdio>
 
 #include "rc/platform.h"
 
@@ -172,6 +173,32 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
                         m_streamId, m_stats.mbps, m_stats.fps, m_targetKbps.load(),
                         effectiveTarget, wireCap, queueMs, lossAvg * 100);
             }
+            // A81 M1+M2 (TASK-A81-LATENCY-BUDGET-UNITS-2026-11-23): what the profile trade
+            // costs, and where the brake line actually sits. clientDecodeMs/clientLatencyMs
+            // were collected into m_stats in OnFeedback and never printed; the capability
+            // line lies (streamer.log 2026-11-23 01:43:33 pc.streamProfile=2 while
+            // latency-first was in effect from 01:44:55 - 1407 dips against a 21 ms line).
+            // dipAt mirrors queue_guard.h Update() from the LIVE config and the floor the
+            // guard last saw - never a cached copy. cap 0 kbps = uncapped. n/a, not 0, when
+            // the headset does not report: an old APK zero-fills decodeMs/totalLatencyMs
+            // (client_session.cpp memcpys the truncated payload over the -1 defaults).
+            const rc::QueueGuardConfig& cfg = m_guard.Config();
+            const double floorMs = m_queueFloorMs.load(std::memory_order_relaxed);
+            const double dipAt = std::max(cfg.targetMs + cfg.bandMs,
+                                          (floorMs < 0 ? 0.0 : floorMs) + cfg.floorExtraMs);
+            const char* profileName = m_profile == rc::StreamProfile::LowLatency ? "LowLatency"
+                                    : m_profile == rc::StreamProfile::Quality    ? "Quality"
+                                                                                 : "Balanced";
+            char decBuf[16], latBuf[16];
+            if (m_stats.clientDecodeMs > 0) snprintf(decBuf, sizeof(decBuf), "%.1f", m_stats.clientDecodeMs);
+            else snprintf(decBuf, sizeof(decBuf), "n/a");
+            if (m_stats.clientLatencyMs > 0) snprintf(latBuf, sizeof(latBuf), "%.1f", m_stats.clientLatencyMs);
+            else snprintf(latBuf, sizeof(latBuf), "n/a");
+            RC_LOGI("Stream %u latency: clientDec %s ms, clientLat %s ms, queue %.1f ms, "
+                    "profile=%s dipAt %.1f ms cap %u kbps aim %u kbps",
+                    m_streamId, decBuf, latBuf, queueMs, profileName, dipAt,
+                    m_congestionKbps.load(std::memory_order_relaxed),
+                    m_adaptive ? m_maxKbps.load() : m_targetKbps.load());
         }
         m_windowFrames = 0;
         m_windowBytes = 0;
@@ -260,6 +287,9 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
         m_queueBaselineMs = qq < m_queueBaselineMs || m_queueBaselineMs < 0 ? qq : m_queueBaselineMs + 0.01;
     }
     const double queueFloor = m_queueBaselineMs < 0 ? 0 : m_queueBaselineMs;
+    // A81 M2: publish the exact value Update() below receives, for the send thread's
+    // latency readout. Record only - the guard's input and law are untouched.
+    m_queueFloorMs.store(queueFloor, std::memory_order_relaxed);
     if (fb.receivedKbps) m_receivedKbps = m_receivedKbps ? m_receivedKbps * 0.7 + fb.receivedKbps * 0.3 : fb.receivedKbps;
     {
         std::lock_guard lock(m_statsMutex);

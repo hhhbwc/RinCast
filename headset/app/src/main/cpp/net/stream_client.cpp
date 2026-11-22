@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #if defined(__ANDROID__) || defined(__linux__)
@@ -354,6 +355,7 @@ void StreamClient::DelayTracker::Add(int64_t delayNs, int64_t nowNs) {
     }
     bucketMin[bucket] = std::min(bucketMin[bucket], delayNs);
     const int64_t base = *std::min_element(std::begin(bucketMin), std::end(bucketMin));
+    lastBaseNs = base;  // A81 M3: record only, for the local log; sumNs/count below are untouched
     sumNs += double(delayNs - base);
     count++;
 }
@@ -504,6 +506,15 @@ void StreamClient::SendFeedback() {
                 m_rxDiagDecodeMs += fb.decodeMs;
                 m_rxDiagNetworkMs += fb.networkMs;
                 m_rxDiagLatencyMs += fb.totalLatencyMs;
+                // A81 M3: the base behind this window's relative queue. Local log only, NOT
+                // sent: VideoFeedbackPayload's only spare slot is the uint16_t reserved at
+                // offset 2 (rc/protocol.h:321) - too small for a cross-clock value, and the
+                // feedback parse (client_session.cpp) has no gate telling "old APK sent 0"
+                // from a real 0. Freezing the wire is the card's hard constraint.
+                if (fb.queueDelayMs >= 0) {
+                    m_rxDiagBaseMs = double(s.delay.lastBaseNs) / 1e6;
+                    m_rxDiagBaseSeen = true;
+                }
                 ++m_rxDiagSamples;
             }
             feedback.push_back(fb);
@@ -526,16 +537,26 @@ void StreamClient::SendFeedback() {
         const uint32_t n = m_rxDiagSamples;
         const uint32_t fragTotal = m_rxDiagFragRecv + m_rxDiagFragRecovered + m_rxDiagFragLost;
         const double lossPct = fragTotal ? double(m_rxDiagFragLost) * 100.0 / fragTotal : 0.0;
+        // A81 M3: trailing field = what the relative queue is measured against (raw
+        // cross-clock base; a large negative is the clock offset, not a bug). Appended
+        // last so the leading fields stay byte-for-byte for "rc vr rx 1s" greps.
+        char baseBuf[24];
+        if (m_rxDiagBaseSeen) snprintf(baseBuf, sizeof(baseBuf), "%.1f", m_rxDiagBaseMs);
+        else snprintf(baseBuf, sizeof(baseBuf), "n/a");
         RC_LOGI("rc vr rx 1s: %.1f Mbps in, loss %.1f%% (%u frags lost of %u, FEC recovered %u), "
-                "%u frames lost/s, queue %.1f ms, decode %.1f ms, net spread %.1f ms, total latency %.1f ms",
+                "%u frames lost/s, queue %.1f ms, decode %.1f ms, net spread %.1f ms, total latency %.1f ms, "
+                "delayBase %s ms",
                 double(m_rxDiagBytes) * 8.0 / secs / 1e6, lossPct,
                 m_rxDiagFragLost, fragTotal, m_rxDiagFragRecovered,
                 uint32_t(double(m_rxDiagFramesLost) / secs),
-                m_rxDiagQueueMs / n, m_rxDiagDecodeMs / n, m_rxDiagNetworkMs / n, m_rxDiagLatencyMs / n);
+                m_rxDiagQueueMs / n, m_rxDiagDecodeMs / n, m_rxDiagNetworkMs / n, m_rxDiagLatencyMs / n,
+                baseBuf);
         m_rxDiagStartNs = now;
         m_rxDiagBytes = m_rxDiagFragRecv = m_rxDiagFragRecovered = m_rxDiagFragLost = 0;
         m_rxDiagFramesLost = m_rxDiagSamples = 0;
         m_rxDiagQueueMs = m_rxDiagDecodeMs = m_rxDiagNetworkMs = m_rxDiagLatencyMs = 0;
+        m_rxDiagBaseMs = 0;
+        m_rxDiagBaseSeen = false;
         // R3: the quantiles window is defined by TakeDecodeQuantiles' exchange alone; a second
         // 1 Hz reset here would beat against it and drop samples.
     }

@@ -197,6 +197,9 @@ class VideoSender {
     VideoSenderStats m_stats;
     int64_t m_lastStatsLogNs = 0;
     std::atomic<double> m_queueMs{-1};  // smoothed queueing delay reported by the headset
+    // A81 M2: the queueFloor exactly as the guard's Update() receives it, published for
+    // the send thread's latency readout (m_queueBaselineMs is network-thread only).
+    std::atomic<double> m_queueFloorMs{-1};  // -1 = no feedback report yet
     double m_receivedKbps = 0;        // smoothed rate that actually arrives
 };
 

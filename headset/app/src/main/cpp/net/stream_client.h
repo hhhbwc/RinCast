@@ -174,6 +174,10 @@ class StreamClient {
         int bucket = -1;
         double sumNs = 0;  // relative to the baseline at the time
         uint32_t count = 0;
+        // A81 M3 (TASK-A81-LATENCY-BUDGET-UNITS-2026-11-23): the 10 s window minimum the
+        // relative queue is measured against - the self-rebasing baseline. Recorded in Add
+        // for the local log only; never fed back, never sent (M3 note in stream_client.cpp).
+        int64_t lastBaseNs = 0;  // 0 until the first frame with PC send metadata
         void Add(int64_t delayNs, int64_t nowNs);
         float TakeQueueMs();  // average over the frames since the last call; -1 without any
     };
@@ -199,6 +203,11 @@ class StreamClient {
     uint32_t m_rxDiagFragRecv = 0, m_rxDiagFragLost = 0, m_rxDiagFragRecovered = 0;
     uint32_t m_rxDiagFramesLost = 0, m_rxDiagSamples = 0;
     double m_rxDiagQueueMs = 0, m_rxDiagDecodeMs = 0, m_rxDiagNetworkMs = 0, m_rxDiagLatencyMs = 0;
+    // A81 M3: newest DelayTracker base of the VR stream, in ms - the raw cross-clock
+    // difference (firstFragmentNs - pcEncodeEndNs), so its magnitude is the unknown
+    // clock offset and its sign may be negative: exactly the fact the log must show.
+    double m_rxDiagBaseMs = 0;
+    bool m_rxDiagBaseSeen = false;  // false until a window actually measured one
     // ROUND20 L17: the decode-time sample ring behind the diag line's p50/p95 (atomic,
     // lock-free - the receive thread writes and the app's diag tick reads).
     static constexpr size_t kDecodeRing = 512;
