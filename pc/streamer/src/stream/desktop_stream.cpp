@@ -106,6 +106,12 @@ void DesktopStream::Run() {
     bool haveFrame = false;
 
     while (m_running) {
+        // A failed rebuild leaves no encoder: skip frames until one can be created, instead
+        // of dereferencing the null it just assigned.
+        if (!encoder && !initAll()) {
+            rc::SleepMs(500);
+            continue;
+        }
         const int64_t now = rc::NowNs();
         const int64_t interval = (m_active ? frameInterval : frameInterval * 4) * (halfRate ? 2 : 1);
         const int64_t wait = std::max<int64_t>(1'000'000, lastSent + interval - now);
@@ -148,7 +154,7 @@ void DesktopStream::Run() {
         if (!encoder->Encode(converter.Output(), keyframe, out)) {
             RC_LOGW("Desktop encode failed; re-initializing");
             m_sender.RequestKeyframe();
-            initAll();
+            encoder.reset();
             continue;
         }
         const int64_t encEnd = rc::NowNs();
