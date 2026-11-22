@@ -45,17 +45,22 @@ void PutV4Mapped(uint8_t* p, uint32_t ip) {
 }
 
 // One request/response round trip to the gateway with RFC-style retransmission.
-int Exchange(uint32_t gateway, const uint8_t* req, size_t reqSize, uint8_t* resp, size_t cap, uint8_t expectOp) {
+// The cancel flag is polled between 100 ms receive slices so Stop() does not sit
+// out the whole ladder; an aborted exchange reports -1 (treated as failure).
+int Exchange(uint32_t gateway, const uint8_t* req, size_t reqSize, uint8_t* resp, size_t cap, uint8_t expectOp,
+             const std::atomic<bool>& cancel) {
     rc::UdpSocket s;
     if (!s.Open(0, true)) return 0;  // IPv4 socket
     const rc::NetAddress gw{gateway, kPcpPort};
     int timeout = 250;
     for (int attempt = 0; attempt < 4; attempt++, timeout *= 2) {
+        if (cancel) return -1;
         s.SendTo(gw, req, reqSize);
         const int64_t deadline = rc::NowNs() + int64_t(timeout) * 1'000'000;
         while (rc::NowNs() < deadline) {
+            if (cancel) return -1;
             rc::NetAddress from;
-            const int n = s.RecvFrom(resp, cap, from, timeout);
+            const int n = s.RecvFrom(resp, cap, from, 100);
             if (n >= 4 && from.ip == gateway && resp[1] == expectOp) return n;
             if (n > 0 && from.ip == gateway && resp[0] != req[0]) return -1;  // other protocol version: unsupported
         }
@@ -82,6 +87,7 @@ std::string Lower(std::string s) {
 
 void PortMapper::Start(uint16_t internalPort) {
     if (m_running.exchange(true)) return;
+    m_cancelIo = false;
     m_internalPort = internalPort;
     rc::RandomBytes(m_pcpNonce, sizeof(m_pcpNonce));
     m_thread = std::thread([this] { Run(); });
@@ -89,6 +95,7 @@ void PortMapper::Start(uint16_t internalPort) {
 
 void PortMapper::Stop() {
     if (!m_running.exchange(false)) return;
+    m_cancelIo = true;
     m_cv.notify_all();
     if (m_thread.joinable()) m_thread.join();
 }
@@ -151,13 +158,18 @@ bool PortMapper::MapPcp(uint32_t lifetime) {
     Put16(req + 42, m_internalPort);  // suggest the same external port
     PutV4Mapped(req + 44, 0);
     uint8_t resp[1100];
-    const int n = Exchange(m_gateway, req, sizeof(req), resp, sizeof(resp), 0x81);
+    const int n = Exchange(m_gateway, req, sizeof(req), resp, sizeof(resp), 0x81, m_cancelIo);
     if (n < 60 || resp[3] != 0 || std::memcmp(resp + 24, m_pcpNonce, 12) != 0) return false;
     if (lifetime == 0) return true;
+    // RFC 6887 11.2.1: the server may grant a shorter lifetime than we asked for.
+    // Renewing on our own fixed 1800 s would let the mapping lapse silently.
+    const uint32_t granted = Get32(resp + 4);
+    if (granted == 0) return false;  // the server removed the mapping instead
     rc::NetAddress ext{Get32(resp + 56), Get16(resp + 42)};
     std::lock_guard lock(m_mutex);
     m_external = ext;
     m_method = "PCP";
+    m_grantedLifetime = std::min(granted, lifetime);
     return true;
 }
 
@@ -168,7 +180,7 @@ bool PortMapper::MapNatPmp(uint32_t lifetime) {
     uint32_t externalIp = 0;
     if (lifetime) {
         const uint8_t addrReq[2] = {0, 0};
-        const int n = Exchange(m_gateway, addrReq, sizeof(addrReq), resp, sizeof(resp), 128);
+        const int n = Exchange(m_gateway, addrReq, sizeof(addrReq), resp, sizeof(resp), 128, m_cancelIo);
         if (n < 12 || Get16(resp + 2) != 0) return false;
         externalIp = Get32(resp + 8);
     }
@@ -177,18 +189,31 @@ bool PortMapper::MapNatPmp(uint32_t lifetime) {
     Put16(req + 4, m_internalPort);
     Put16(req + 6, lifetime ? m_internalPort : 0);
     Put32(req + 8, lifetime);
-    const int n = Exchange(m_gateway, req, sizeof(req), resp, sizeof(resp), 129);
+    const int n = Exchange(m_gateway, req, sizeof(req), resp, sizeof(resp), 129, m_cancelIo);
     if (n < 16 || Get16(resp + 2) != 0) return false;
     if (lifetime == 0) return true;
+    // RFC 6886 3.3: the mapping response carries the granted lifetime at bytes 12-15.
+    const uint32_t granted = Get32(resp + 12);
+    if (granted == 0) return false;
     std::lock_guard lock(m_mutex);
     m_external = rc::NetAddress{externalIp, Get16(resp + 10)};
     m_method = "NAT-PMP";
+    m_grantedLifetime = std::min(granted, lifetime);
     return true;
 }
 
 // --- UPnP IGD -------------------------------------------------------------------
 
 bool PortMapper::MapUpnp(uint32_t lifetime) {
+    // Deleting with no known control URL: nothing was ever mapped here, and Unmap must
+    // not start a fresh SSDP discovery while the app is quitting.
+    if (lifetime == 0 && m_upnpControlUrl.empty()) return true;
+    auto forget = [this](const char* why) {
+        m_upnpControlUrl.clear();
+        m_upnpService.clear();
+        m_upnpPermanent = false;
+        m_reason = why;
+    };
     if (m_upnpControlUrl.empty()) {
         // SSDP search on the LAN interface.
         SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -213,7 +238,7 @@ bool PortMapper::MapUpnp(uint32_t lifetime) {
         std::vector<std::string> locations;
         const int64_t deadline = rc::NowNs() + 2'500'000'000LL;
         char buf[2048];
-        while (rc::NowNs() < deadline) {
+        while (!m_cancelIo && rc::NowNs() < deadline) {
             WSAPOLLFD pfd{s, POLLRDNORM, 0};
             if (WSAPoll(&pfd, 1, 200) <= 0) continue;
             const int n = recv(s, buf, sizeof(buf) - 1, 0);
@@ -230,7 +255,9 @@ bool PortMapper::MapUpnp(uint32_t lifetime) {
             if (!loc.empty()) locations.push_back(loc);
         }
         closesocket(s);
+        if (m_cancelIo) return false;
         for (const std::string& loc : locations) {
+            if (m_cancelIo) return false;
             const HttpResponse desc = HttpRequest("GET", loc, "", "", 3000, "Accept: text/xml\r\n");
             if (desc.status != 200) continue;
             // First WAN connection service with a control URL.
@@ -287,28 +314,47 @@ bool PortMapper::MapUpnp(uint32_t lifetime) {
     rc::NetAddress ext;
     if (ip.status != 200 || !rc::NetAddress::Parse(Between(ip.body, "<NewExternalIPAddress>", "</NewExternalIPAddress>"),
                                                     m_internalPort, ext)) {
-        m_reason = "the router has no public IPv4 address (DS-Lite / carrier NAT); IPv6 is used instead";
+        if (ip.status == 0) {
+            // The router (or the network) stopped answering: the cached control URL is
+            // worthless now. A DS-Lite diagnosis here would send the user to the wrong
+            // place, and never re-discover.
+            if (!m_cancelIo) forget("the router stopped answering UPnP; discovery will start over");
+        } else if (ip.status == 404) {
+            forget("the router no longer serves the cached UPnP control URL; discovery will start over");
+        } else {
+            m_reason = "the router has no public IPv4 address (DS-Lite / carrier NAT); IPv6 is used instead";
+        }
         return false;
     }
+    if (m_cancelIo) return false;
     HttpResponse r = add(m_upnpPermanent ? 0 : lifetime);
     if (r.status != 200 && r.body.find("<errorCode>725</errorCode>") != std::string::npos) {  // only permanent leases
         m_upnpPermanent = true;
         r = add(0);
     }
     if (r.status != 200) {
-        m_reason = r.body.find("<errorCode>606</errorCode>") != std::string::npos
-                       ? "the router refuses automatic port forwarding for this PC (FRITZ!Box: Internet > Permit "
-                         "Access > this PC > allow independent port sharing)"
-                       : "the router rejected the UPnP port mapping";
+        if (r.status == 0) {
+            if (!m_cancelIo) forget("the router stopped answering UPnP; discovery will start over");
+        } else if (r.status == 404) {
+            forget("the router no longer serves the cached UPnP control URL; discovery will start over");
+        } else {
+            m_reason = r.body.find("<errorCode>606</errorCode>") != std::string::npos
+                           ? "the router refuses automatic port forwarding for this PC (FRITZ!Box: Internet > Permit "
+                             "Access > this PC > allow independent port sharing)"
+                           : "the router rejected the UPnP port mapping";
+        }
         return false;
     }
     std::lock_guard lock(m_mutex);
     m_external = ext;
     m_method = "UPnP";
+    m_grantedLifetime = kLifetime;  // UPnP has no granted-lifetime field
     return true;
 }
 
 void PortMapper::Unmap() {
+    // The router-side delete must still go out, so re-arm the I/O for this call.
+    m_cancelIo = false;
     std::string method;
     {
         std::lock_guard lock(m_mutex);
@@ -342,6 +388,7 @@ void PortMapper::Run() {
         {
             std::lock_guard lock(m_mutex);
             if (!ok) {
+                if (m_cancelIo) break;  // keep m_method so Unmap can still delete the mapping
                 m_method.clear();
                 m_external = {};
                 m_status = "unavailable: " + (m_reason.empty() ? std::string("the router offers no PCP, NAT-PMP or UPnP port mapping") : m_reason);
@@ -354,7 +401,10 @@ void PortMapper::Run() {
                 waitNs = 1800'000'000'000LL;
             } else {
                 m_status = m_method + " " + m_external.ToString();
-                waitNs = int64_t(kLifetime / 2) * 1'000'000'000LL;
+                // Renew halfway through what the router granted. The 5 s floor only guards
+                // against a bogus 1-2 s grant busy-looping the worker; for any grant >= 10 s
+                // (all real routers) it is still renewed before expiry.
+                waitNs = int64_t(std::max(m_grantedLifetime / 2, 5u)) * 1'000'000'000LL;
                 retryNs = 5'000'000'000LL;
             }
             method = m_status;

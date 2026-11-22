@@ -37,6 +37,7 @@ class PortMapper {
     uint16_t m_internalPort = 0;
     std::thread m_thread;
     std::atomic<bool> m_running{false};
+    std::atomic<bool> m_cancelIo{false};  // set by Stop(): in-flight router I/O gives up
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
 
@@ -44,6 +45,7 @@ class PortMapper {
     uint32_t m_localIp = 0;   // host order
     std::string m_method;     // "PCP" | "NAT-PMP" | "UPnP" | ""
     rc::NetAddress m_external;
+    uint32_t m_grantedLifetime = 3600;  // seconds the router actually granted
     uint8_t m_pcpNonce[12] = {};
     std::string m_upnpControlUrl, m_upnpService;
     bool m_upnpPermanent = false;
