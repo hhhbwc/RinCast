@@ -2039,16 +2039,15 @@ static void TestPercentile() {
                 "invalid inputs ignored, 600->512 overwrite, reset\n");
 }
 
-// A23 (TASK-QUEUE-BOUND-2026-11-22): the decode queue bound. The card's semantics,
-// pinned: a frame that queued strictly longer than kQueueDropMs between arrival
-// (receivedNs) and the decode submission point is dropped; exactly kQueueDropMs
-// passes ("超过" is strictly greater, so the boundary is defined, not accidental);
-// a missing timestamp or a negative age never drops. The inputs follow the shape of
-// the real arrival timeline the card was written from (the AB9 session's queue
-// overload: frames arriving 151-479 ms after they were queued for decode). Pure
-// int64 arithmetic - no wall clock, no flake surface. There is no old
-// implementation to run red against: before this card nothing judged frame age at
-// all (the gate's absence was the bug), so red/green here is the compile itself.
+// A23 (queue bound) + A46 (TASK-RECOVERY-GUARD-2026-11-22): the decode queue bound
+// and the recovery-chain fix. A frame that queued strictly longer than kQueueDropMs
+// between arrival (receivedNs) and the decode submission point is dropped; exactly
+// kQueueDropMs passes ("超过" is strictly greater); a missing timestamp or a negative
+// age never drops. A46 adds two scenarios the old gate got wrong: the keyframe
+// request must fire on the FIRST drop (1, 6, 11 ...), not only at 5/10/15, so a
+// 1-4 drop streak interleaved with passing frames still asks; and a queued IDR is
+// never dropped by the age rule (it is the recovery frame itself). The A46 checks
+// below run RED against the A23 implementation - that is the regression guard.
 static void TestFrameQueueBound() {
     const int64_t kMs = 1'000'000;
     // Q1: the constants are the card's numbers (a silent threshold change re-fails here).
@@ -2069,40 +2068,77 @@ static void TestFrameQueueBound() {
     CHECK(!rc::FrameQueueExpired(t0, 0));
     CHECK(!rc::FrameQueueExpired(t0, -5));
     CHECK(!rc::FrameQueueExpired(t0, t0 + kMs));  // negative age
-    // Q4: the keyframe request throttle: every 5th drop of a streak asks, 1-based.
+    // Q4 (A46): the first drop asks immediately, then every 5th (1, 6, 11, 16 ...).
+    // A23 only asked at 5/10/15, so a 1-4 drop streak ending in a passing frame
+    // asked nothing and left the reference chain broken forever under cap100.
     CHECK(!rc::QueueDropRequestKeyframe(0));   // defensive: a reset streak never asks
-    CHECK(!rc::QueueDropRequestKeyframe(1));   // drop 1: quiet
+    CHECK(rc::QueueDropRequestKeyframe(1));    // 连续丢1帧立即请求 (was quiet under A23)
     CHECK(!rc::QueueDropRequestKeyframe(2));
     CHECK(!rc::QueueDropRequestKeyframe(3));
     CHECK(!rc::QueueDropRequestKeyframe(4));
-    CHECK(rc::QueueDropRequestKeyframe(5));    // drop 5: one request
-    CHECK(!rc::QueueDropRequestKeyframe(6));
+    CHECK(!rc::QueueDropRequestKeyframe(5));
+    CHECK(rc::QueueDropRequestKeyframe(6));
     CHECK(!rc::QueueDropRequestKeyframe(9));
-    CHECK(rc::QueueDropRequestKeyframe(10));   // drop 10: the next one
-    // Q5: the caller's streak loop over a burst: 30 expired frames in a row ask
-    // exactly 6 times (at 5, 10, 15, 20, 25, 30); a frame that passes resets the
-    // streak, so a scattered drop never rides an older burst's count.
-    uint32_t streak = 0, requests = 0;
-    for (int i = 0; i < 30; i++) {
-        streak++;
-        if (rc::QueueDropRequestKeyframe(streak)) {
-            requests++;
-            streak = 0;  // as the caller does on a request: a fresh count per 5
-        }
+    CHECK(!rc::QueueDropRequestKeyframe(10));
+    CHECK(rc::QueueDropRequestKeyframe(11));
+    CHECK(rc::QueueDropRequestKeyframe(16));
+    // Q5: cadence over a 30-drop burst: 1, 6, 11, 16, 21, 26 -> 6 requests.
+    uint32_t burstRequests = 0;
+    for (uint32_t streak = 1; streak <= 30; streak++)
+        if (rc::QueueDropRequestKeyframe(streak)) burstRequests++;
+    CHECK(burstRequests == 6);
+    // Q6 (A46): the cap100 jitter pattern - drop 1, pass 1, drop 1. Both drops
+    // request, because the first drop of each streak asks at once.
+    {
+        uint32_t streak = 0, requests = 0;
+        auto drop = [&] { streak++; if (rc::QueueDropRequestKeyframe(streak)) requests++; };
+        auto pass = [&] { streak = 0; };  // a small P frame passes the gate
+        drop();                           // first drop: immediate request
+        pass();                           // A23 cleared the streak here
+        drop();                           // asks again -> the chain can recover
+        CHECK(requests == 2);
     }
-    CHECK(requests == 6);
-    CHECK(streak == 0);
-    streak = 0;
-    for (int i = 0; i < 4; i++) {  // 4 drops: under the throttle, no request
-        streak++;
-        CHECK(!rc::QueueDropRequestKeyframe(streak));
+    // Q7 (A46): the persistent break flag, mirroring App::OnVideoFrame.
+    {
+        bool broken = false;
+        uint32_t streak = 0, requests = 0;
+        auto drop = [&] {
+            const bool firstBreak = !broken;
+            broken = true;
+            streak++;
+            if (firstBreak || rc::QueueDropRequestKeyframe(streak)) requests++;
+        };
+        auto passP = [&] {
+            streak = 0;                       // a frame passed the gate
+            const bool decoderNeedsKeyframe = true;  // gap -> decoder's one-shot flag
+            if (broken || decoderNeedsKeyframe) requests++;
+        };
+        auto submitKeyframe = [&] { broken = false; streak = 0; };
+        drop();
+        CHECK(broken && requests == 1);
+        passP();
+        CHECK(broken && requests == 2);   // 置位期间加强主动请求
+        passP();
+        CHECK(broken && requests == 3);
+        submitKeyframe();                 // a real IDR reached Submit
+        CHECK(!broken && requests == 3);
+        const bool decoderNeedsKeyframe = false;  // no gap after the IDR
+        if (broken || decoderNeedsKeyframe) requests++;
+        CHECK(!broken && requests == 3);  // 收到keyframe后清零不再请求
+        drop();                           // the next break asks immediately again
+        CHECK(broken && requests == 4);
     }
-    CHECK(!rc::QueueDropRequestKeyframe(streak));
-    streak = 0;                     // a frame passes: the streak ends
-    streak++;                       // the next drop is the streak's first again
-    CHECK(!rc::QueueDropRequestKeyframe(streak));
+    // Q8 (A46): IDR exemption. A keyframe queued 150/479 ms is submitted, while
+    // a P frame of the same age is still dropped by the unchanged age rule.
+    CHECK(!rc::FrameQueueExpired(t0 + 150 * kMs, t0, /*isKeyframe=*/true));
+    CHECK(rc::FrameQueueExpired(t0 + 150 * kMs, t0, /*isKeyframe=*/false));
+    CHECK(!rc::FrameQueueExpired(t0 + 479 * kMs, t0, true));
+    CHECK(!rc::FrameQueueExpired(t0 + 100 * kMs + 1, t0, true));
+    CHECK(!rc::FrameQueueExpired(t0, 0, true));
     std::printf("frame queue bound: constants pinned, 0/25/50/99/100 ms pass, 100 ms + 1 ns / 151 / 479 ms drop, "
-                "unknowable ages pass, request on every 5th streak drop, 30-drop burst asks 6 times\n");
+                "unknowable ages pass; A46 recovery chain: first drop asks at once (1,6,11..), "
+                "drop1/pass1/drop1 asks twice, keyframe clears broken state and stops requests, "
+                "IDR queued 150/479 ms is never dropped while a P frame is\n");
 }
 
 // A26 (TASK-BACKLOG-FLUSH-2026-11-22): the sender-side stale-frame flush. The card's
@@ -2143,6 +2179,13 @@ static void TestStaleFlush() {
     CHECK(rc::StaleFlushDecide(at - 40 * kMs, at + 300 * kMs, at, at).requestKeyframe);
     CHECK(!rc::StaleFlushDecide(at - 40 * kMs, at + 999 * kMs, at, at).log);
     CHECK(rc::StaleFlushDecide(at - 40 * kMs, at + 1'000 * kMs, at, at).log);
+    // F4b (A46): clock rollback. A throttle stamp ahead of `now` (clock source reset,
+    // sleep/wake, mixed time bases) made now-lastNs negative and the old due() stayed
+    // false for the whole window, silently swallowing every request/log. A rollback
+    // must count as due.
+    CHECK(rc::StaleFlushDecide(at - 40 * kMs, at, at + 100 * kMs, at + 100 * kMs).requestKeyframe);
+    CHECK(rc::StaleFlushDecide(at - 40 * kMs, at, at, at + 100 * kMs).log);
+    CHECK(!rc::StaleFlushDecide(at - 40 * kMs, at, at - 100 * kMs, at).requestKeyframe);  // a past stamp still throttles
     // F5: the card's reset rule - whatever the giant frames billed is forgiven, the
     // bucket re-baselines to now, so the next frame may start at once.
     const int64_t billedTo = at + 900 * kMs;  // a giant frame's leftover billing
@@ -2180,8 +2223,22 @@ static void TestStaleFlush() {
     const rc::FlushDecision fresh = rc::StaleFlushDecide(at + 930 * kMs + 30 * kMs, at + 930 * kMs,
                                                          keyframeStamp, logStamp);
     CHECK(!fresh.drop && !fresh.requestKeyframe && !fresh.log);
+    // F8 (A46): the circuit breaker. A systematic prediction clock skew makes every
+    // frame expired; after kStaleFlushBreakerDrops consecutive drops the sender must
+    // be forced through instead of dropping 100% forever (black screen).
+    CHECK(rc::kStaleFlushBreakerDrops == 30);
+    CHECK(!rc::StaleFlushBreaker(rc::kStaleFlushBreakerDrops - 1));
+    CHECK(rc::StaleFlushBreaker(rc::kStaleFlushBreakerDrops));
+    {
+        uint32_t streak = 0, forced = 0;
+        for (int i = 0; i < 100; i++) {  // 100 consecutive expired frames
+            if (rc::StaleFlushBreaker(++streak)) { forced++; streak = 0; }
+        }
+        CHECK(forced == 3);  // released at drops 30, 60, 90
+    }
     std::printf("stale flush: constants pinned, future/0-prediction frames pass, 40 ms + 1 ns / 119 / 479 ms late drop, "
-                "strict < boundary, debt re-baselines to now, 19-drop burst asks 4 times and logs once\n");
+                "strict < boundary, debt re-baselines to now, 19-drop burst asks 4 times and logs once; "
+                "A46: clock rollback makes throttles due, 100 consecutive stale drops force 3 frames through\n");
 }
 
 // TASK-LATENCY-METER-FIX-2026-11-22 §2: the stage accumulator must not drop samples.

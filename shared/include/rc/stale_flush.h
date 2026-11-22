@@ -32,6 +32,14 @@ constexpr int64_t kFlushKeyframeThrottleNs = 300'000'000;
 // carrying the drop count accumulated since the last line.
 constexpr int64_t kFlushLogThrottleNs = 1'000'000'000;
 
+// A46 circuit breaker: a prediction/clock offset can make every frame satisfy the
+// expired test, which would drop 100% of frames forever (black screen). After this
+// many consecutive drops the sender forces one frame through and resets the streak.
+constexpr uint32_t kStaleFlushBreakerDrops = 30;
+inline bool StaleFlushBreaker(uint32_t consecutiveDrops) {
+    return consecutiveDrops >= kStaleFlushBreakerDrops;
+}
+
 // True when the frame's display moment has passed: whatever it costs, the headset
 // shows it stale or skips it. `predictedDisplayNs` is the frame's predicted display
 // time in the PC clock (0 = unknown - no tracking yet): an unknown moment never
@@ -65,8 +73,12 @@ struct FlushDecision {
 inline FlushDecision StaleFlushDecide(int64_t predictedDisplayNs, int64_t nowNs,
                                       int64_t lastKeyframeReqNs, int64_t lastLogNs) {
     if (!FrameExpiredForSend(predictedDisplayNs, nowNs)) return {false, false, false};
+    // A46: `now` can go backwards (clock source reset, sleep/wake, mixed time
+    // bases). Without `now < lastNs` the subtraction is negative, the throttle
+    // says "not due" until now catches up, and every keyframe request / log is
+    // silently swallowed for that whole window. A rollback means due now.
     const auto due = [](int64_t lastNs, int64_t now, int64_t windowNs) {
-        return lastNs <= 0 || now - lastNs >= windowNs;
+        return lastNs <= 0 || now < lastNs || now - lastNs >= windowNs;
     };
     return {true,
             due(lastKeyframeReqNs, nowNs, kFlushKeyframeThrottleNs),

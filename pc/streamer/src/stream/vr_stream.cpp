@@ -752,8 +752,19 @@ void VrStream::RunSender() {
         // existing loss path. Normal frames are never touched here: their predicted
         // display time sits in the future, so in the steady state this branch is dead.
         const int64_t nowNs = rc::NowNs();
-        const rc::FlushDecision flush =
+        rc::FlushDecision flush =
             rc::StaleFlushDecide(send.predictedDisplayPcNs, nowNs, m_staleKeyframeNs, m_staleLogNs);
+        // A46 circuit breaker: a tracking fault, clock jump or calibration skew can put
+        // the display prediction systematically behind nowNs, so every fresh frame
+        // satisfies the expired test and the sender drops 100% forever (black screen).
+        // Force one frame through after a bounded streak and warn, breaking the loop.
+        if (flush.drop && rc::StaleFlushBreaker(++m_staleFlushStreak)) {
+            RC_LOGW("VR stale flush circuit breaker: %u consecutive frames were predicted "
+                    "past their display moment; forcing one through to break the drop loop",
+                    m_staleFlushStreak);
+            m_staleFlushStreak = 0;
+            flush = {false, false, false};
+        }
         if (flush.drop) {
             m_flowStaleDrops.fetch_add(1, std::memory_order_relaxed);
             if (flush.requestKeyframe) {
@@ -773,6 +784,7 @@ void VrStream::RunSender() {
             }
             continue;
         }
+        m_staleFlushStreak = 0;  // a frame actually goes out: the drop streak ends
         m_sender.Send(send.frame, send.meta.data(), uint16_t(send.meta.size()), send.flags, send.encodeMs, send.recovery);
         // ROUND19 T1: feed the diag window (telemetry only; relaxed stores, the same cost
         // class as the flow counters). The CAS makes the window's first seq its minimum.

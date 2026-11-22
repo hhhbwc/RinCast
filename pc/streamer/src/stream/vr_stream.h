@@ -178,6 +178,11 @@ class VrStream {
     // (1 s) throttle stamps, and the drop count since the last throttled log line.
     int64_t m_staleKeyframeNs = 0, m_staleLogNs = 0;
     uint32_t m_staleLogCount = 0;
+    // A46 circuit breaker: consecutive stale drops (rc::kStaleFlushBreakerDrops).
+    // When a systematic prediction/clock offset makes every frame look expired, a
+    // bounded streak is forced through instead of dropping 100% forever (black
+    // screen). Reset whenever a frame actually goes out. RunSender-thread-only.
+    uint32_t m_staleFlushStreak = 0;
     int64_t m_flowSinceNs = 0;
     // ROUND19 T1: the diag window's encode-time distribution and frame-seq range. A small
     // lock-free ring the sender thread writes (two relaxed stores per frame, the same cost

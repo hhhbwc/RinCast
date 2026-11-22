@@ -1037,34 +1037,47 @@ void App::OnVideoFrame(rc::ReceivedFrame&& f) {
     auto it = m_decoders.find(f.streamId);
     if (it == m_decoders.end() || !it->second) return;
     if (it->second->Codec() != f.codec) return;
-    // A23 (TASK-QUEUE-BOUND-2026-11-22): the decode queue bound, judged at the decode
+    // A23 (queue bound) + A46 (TASK-RECOVERY-GUARD): judge the queue age at the decode
     // submission point (the Submit call below). A frame that queued longer than
-    // rc::kQueueDropMs from its arrival (completeNs - the receivedNs the decoder books)
-    // to here is dropped instead of decoded: the cost of a queue overload becomes a
-    // momentary freeze (a keyframe resumes the picture) instead of half a second of
-    // queued latency. A drop breaks the frame chain, so the PC learns through the
-    // existing reaction chain: the next frame that reaches Submit hits the gap (it
-    // needs a frame to resume from) and the regular keyframe feedback carries the
-    // requests - both the throttled ones below and Submit's own after the gap.
-    // Fewer than kQueueDropMs queued: exactly the behaviour this had before the gate.
-    if (rc::FrameQueueExpired(rc::NowNs(), f.completeNs)) {
+    // rc::kQueueDropMs from its arrival (completeNs) to here is dropped: a momentary
+    // freeze recovered by a keyframe beats half a second of queued latency.
+    // A46: the recovery IDR is exempt - it is far larger than a P frame, so it queues
+    // longer. Dropping it here threw away the very frame that rebuilds the chain,
+    // which is why cap100 sessions never recovered (11-13%).
+    const bool isKeyframe = (f.flags & rc::kVideoKeyframe) != 0;
+    const int64_t nowNs = rc::NowNs();
+    if (rc::FrameQueueExpired(nowNs, f.completeNs, isKeyframe)) {
         m_queueDrops++;
         m_queueDropStreak++;
-        if (rc::QueueDropRequestKeyframe(m_queueDropStreak)) m_client.RequestKeyframe(f.streamId);
-        const int64_t nowNs = rc::NowNs();
+        // Persistent PER-STREAM break state: a drop breaks the chain no matter how many
+        // small P frames slip through the gate afterwards. The first break requests a
+        // keyframe immediately - no longer gated on the streak reaching 5.
+        const bool firstBreak = !m_refChainBroken[f.streamId];
+        m_refChainBroken[f.streamId] = true;
+        if (firstBreak || rc::QueueDropRequestKeyframe(m_queueDropStreak))
+            m_client.RequestKeyframe(f.streamId);
         if (nowNs - m_queueDropLogNs >= 5'000'000'000LL) {
             m_queueDropLogNs = nowNs;
             RC_LOGW("Decode queue overflow: %u frame(s) dropped after >%d ms queued so far "
-                    "(keyframe every %u drops, streak %u)",
+                    "(keyframe first + every %u drops, streak %u)",
                     m_queueDrops, int(rc::kQueueDropMs), rc::kQueueDropKeyframeEvery, m_queueDropStreak);
         }
         return;
     }
+    // A frame passed the gate: the request *cadence* starts over, but "broken" does not -
+    // only a real keyframe reaching Submit clears that. The old code cleared here, so a
+    // 1-4 frame drop streak interleaved with passing frames never asked for a keyframe.
     m_queueDropStreak = 0;
-    it->second->Submit(f.frameIndex, (f.flags & rc::kVideoKeyframe) != 0, (f.flags & rc::kVideoRecovery) != 0,
+    it->second->Submit(f.frameIndex, isKeyframe, (f.flags & rc::kVideoRecovery) != 0,
                        std::move(f.bitstream), std::move(f.metadata), f.completeNs);
     m_client.SetLastGoodFrame(f.streamId, it->second->LastGoodFrame());
-    if (it->second->NeedsKeyframe()) m_client.RequestKeyframe(f.streamId);
+    if (isKeyframe) m_refChainBroken[f.streamId] = false;
+    // While broken, actively re-request on every passing frame. NeedsKeyframe() is the
+    // decoder's one-shot gap flag (kept as double insurance); OR-ing the persistent
+    // state means recovery no longer depends on that flag being re-armed.
+    const bool decoderNeedsKeyframe = it->second->NeedsKeyframe();
+    if (m_refChainBroken[f.streamId] || decoderNeedsKeyframe)
+        m_client.RequestKeyframe(f.streamId);
 }
 
 void App::ConfigureDesktopStreams(const json& streams) {
