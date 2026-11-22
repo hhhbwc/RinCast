@@ -241,7 +241,7 @@ json App::StateJson() {
           {"os", WindowsVersion()},
           {"encoder",
            {{"backend", m_caps.backend}, {"h264", m_caps.h264}, {"hevc", m_caps.hevc}, {"av1", m_caps.av1},
-            {"hevc10", m_caps.hevc10}}},
+            {"hevc10", m_caps.hevc10}, {"hwFallback", m_caps.hwFallback}}},
           {"steamvr",
            {{"installed", svr.has_value()}, {"running", steamvr::IsRunning()},
             {"driverRegistered", steamvr::IsDriverRegistered()}}},

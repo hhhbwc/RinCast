@@ -124,6 +124,10 @@ struct EncoderCaps {
     bool av110 = false;
     uint32_t maxWidth = 4096;
     uint32_t maxHeight = 4096;
+    // A52: the adapter has a hardware encoder but it could not be opened (old driver, encoder
+    // busy, GPU in a VM). We still stream on Media Foundation, but the user needs to know why
+    // it feels slow - this is the difference between "my PC is weak" and "my driver is old".
+    bool hwFallback = false;
 };
 
 // Probes what the adapter's hardware encoder supports.

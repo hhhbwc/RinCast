@@ -330,6 +330,9 @@ function health() {
   const issues = [];
   if (!sys.encoder.backend || !(sys.encoder.hevc || sys.encoder.av1 || sys.encoder.h264)) {
     issues.push({ level: "blocked", title: t("issue.encoder.title"), text: t("issue.encoder.text") });
+  } else if (sys.encoder.hwFallback) {
+    // A52: still streams, but on the software encoder - the usual reason "it got slower".
+    issues.push({ level: "warn", title: t("issue.hwFallback.title"), text: t("issue.hwFallback.text") });
   }
   if (!sys.steamvr.installed) {
     issues.push({ level: "info", title: t("issue.steamvrMissing.title"), text: t("issue.steamvrMissing.text") });

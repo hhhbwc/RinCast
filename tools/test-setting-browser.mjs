@@ -241,6 +241,20 @@ try {
     persistedAfterReload: keptMode.mode,
   });
 
+  // A52: a machine whose vendor encoder failed still streams on Media Foundation. The home
+  // page has to say so, otherwise "it got slower after a driver update" has no visible cause.
+  // The assertion is language-independent on purpose: the UI follows the browser locale.
+  await fresh(false, 1100, 1000, null);
+  const readIssues = `[...document.querySelectorAll('#issues li')].map(e=>({level:e.className, text:e.innerText.slice(0,40)}))`;
+  const issuesBefore = await js(readIssues);
+  await js(`__bridge.emit({...__bridge.base, system:{...__bridge.base.system, encoder:{...__bridge.base.system.encoder, hwFallback:true}}})`);
+  await wait(180);
+  const issuesAfter = await js(readIssues);
+  assert.equal(issuesAfter.length, issuesBefore.length + 1, 'hwFallback did not add a new home-page issue');
+  assert.equal(issuesAfter.filter(i => i.level === 'warn').length,
+               issuesBefore.filter(i => i.level === 'warn').length + 1, 'the new issue is not a warning');
+  check('hw_fallback_issue_visible', { before: issuesBefore.length, after: issuesAfter.map(i => i.level) });
+
   await fresh(); await js('__bridge.auto=false');
   await click(selector('tenBit'));
   await js('window.earlyReply=__bridge.apply(0)');

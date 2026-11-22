@@ -313,6 +313,8 @@ const STRINGS = {
 
     "issue.encoder.title": "This PC can't encode video",
     "issue.encoder.text": "RinCast needs the video encoder of an NVIDIA, AMD or Intel graphics card. Update your graphics driver, then restart RinCast.",
+    "issue.hwFallback.title": "Hardware encoding unavailable",
+    "issue.hwFallback.text": "Running on the software encoder, so the picture is softer and slower. Usually an outdated graphics driver - update it, then restart RinCast.",
     "issue.steamvrMissing.title": "SteamVR isn't installed",
     "issue.steamvrMissing.text": "You need it for VR games, not for the desktop. Get it from Steam.",
     "issue.driver.title": "RinCast isn't in SteamVR yet",
@@ -684,6 +686,8 @@ const STRINGS = {
 
     "issue.encoder.title": "这台电脑无法编码视频",
     "issue.encoder.text": "RinCast 需要 NVIDIA、AMD 或 Intel 显卡的视频编码器。更新显卡驱动后重启 RinCast。",
+    "issue.hwFallback.title": "硬件编码没启用",
+    "issue.hwFallback.text": "现在用软件编码，画面更糊、延迟更高。多半是显卡驱动太旧，更新后重启 RinCast 就能恢复。",
     "issue.steamvrMissing.title": "未安装 SteamVR",
     "issue.steamvrMissing.text": "玩 VR 游戏需要它，桌面串流不需要。可从 Steam 获取。",
     "issue.driver.title": "RinCast 尚未加入 SteamVR",
@@ -1027,6 +1031,8 @@ const STRINGS = {
 
     "issue.encoder.title": "這台電腦無法編碼影片",
     "issue.encoder.text": "RinCast 需要 NVIDIA、AMD 或 Intel 顯示卡的影片編碼器。更新顯示卡驅動程式後重新啟動 RinCast。",
+    "issue.hwFallback.title": "硬體編碼沒啟用",
+    "issue.hwFallback.text": "現在用軟體編碼，畫面更糊、延遲更高。多半是顯示卡驅動程式太舊，更新後重新啟動 RinCast 就能恢復。",
     "issue.steamvrMissing.title": "未安裝 SteamVR",
     "issue.steamvrMissing.text": "玩 VR 遊戲需要它，桌面串流不需要。可從 Steam 取得。",
     "issue.driver.title": "RinCast 尚未加入 SteamVR",
@@ -1370,6 +1376,8 @@ const STRINGS = {
 
     "issue.encoder.title": "Dieser PC kann kein Video kodieren",
     "issue.encoder.text": "RinCast braucht den Video-Encoder einer NVIDIA-, AMD- oder Intel-Grafikkarte. Aktualisiere deinen Grafiktreiber und starte RinCast neu.",
+    "issue.hwFallback.title": "Hardware-Encoding nicht verfügbar",
+    "issue.hwFallback.text": "Läuft über den Software-Encoder: weicheres Bild, höhere Latenz. Meist ein veralteter Grafiktreiber - aktualisieren und RinCast neu starten.",
     "issue.steamvrMissing.title": "SteamVR ist nicht installiert",
     "issue.steamvrMissing.text": "Du brauchst es für VR-Spiele, nicht für den Desktop. Hol es bei Steam.",
     "issue.driver.title": "RinCast ist noch nicht in SteamVR",
@@ -1713,6 +1721,8 @@ const STRINGS = {
 
     "issue.encoder.title": "Este PC no puede codificar vídeo",
     "issue.encoder.text": "RinCast necesita el codificador de vídeo de una tarjeta gráfica NVIDIA, AMD o Intel. Actualiza tu driver gráfico y reinicia RinCast.",
+    "issue.hwFallback.title": "Codificación por hardware no disponible",
+    "issue.hwFallback.text": "Se está usando el codificador por software: imagen más borrosa y más latencia. Suele ser un driver gráfico antiguo; actualízalo y reinicia RinCast.",
     "issue.steamvrMissing.title": "SteamVR no está instalado",
     "issue.steamvrMissing.text": "Lo necesitas para juegos VR, no para el escritorio. Consíguelo en Steam.",
     "issue.driver.title": "RinCast aún no está en SteamVR",
@@ -2056,6 +2066,8 @@ const STRINGS = {
 
     "issue.encoder.title": "Ce PC ne peut pas encoder de vidéo",
     "issue.encoder.text": "RinCast a besoin de l'encodeur vidéo d'une carte graphique NVIDIA, AMD ou Intel. Mettez à jour votre pilote graphique, puis redémarrez RinCast.",
+    "issue.hwFallback.title": "Encodage matériel indisponible",
+    "issue.hwFallback.text": "RinCast utilise l'encodeur logiciel : image plus floue et latence plus élevée. C'est souvent un pilote graphique trop ancien ; mettez-le à jour et relancez RinCast.",
     "issue.steamvrMissing.title": "SteamVR n'est pas installé",
     "issue.steamvrMissing.text": "Vous en avez besoin pour les jeux VR, pas pour le bureau. Obtenez-le sur Steam.",
     "issue.driver.title": "RinCast n'est pas encore dans SteamVR",
@@ -2399,6 +2411,8 @@ const STRINGS = {
 
     "issue.encoder.title": "この PC は動画をエンコードできません",
     "issue.encoder.text": "RinCast には NVIDIA、AMD、Intel 製グラフィックスカードの動画エンコーダーが必要です。グラフィックスドライバーを更新してから RinCast を再起動してください。",
+    "issue.hwFallback.title": "ハードウェアエンコードが使えません",
+    "issue.hwFallback.text": "ソフトウェアエンコーダーで動作中のため、画質が甘く遅延も増えます。多くはグラフィックスドライバーが古いためです。更新して RinCast を再起動してください。",
     "issue.steamvrMissing.title": "SteamVR がインストールされていません",
     "issue.steamvrMissing.text": "VR ゲームに必要です(デスクトップには不要)。Steam から入手してください。",
     "issue.driver.title": "RinCast がまだ SteamVR に追加されていません",

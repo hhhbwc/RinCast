@@ -16,10 +16,14 @@ const char* CodecName(rc::VideoCodec codec) {
 EncoderCaps ProbeEncoderCaps(ID3D11Device* device, UINT vendorId) {
     EncoderCaps caps;
     if (vendorId == 0x10DE && NvencProbe(device, caps)) return caps;
+    // A52: remember that we wanted the vendor encoder and did not get it, so the UI can say
+    // "hardware encoding unavailable, falling back to software" instead of silently limping.
+    const bool wantedHw = vendorId == 0x10DE || vendorId == 0x1002;
     caps = {};
     if (vendorId == 0x1002 && AmfProbe(device, caps)) return caps;
     caps = {};
     MfProbe(device, caps);
+    caps.hwFallback = wantedHw;
     return caps;
 }
 
