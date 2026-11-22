@@ -395,6 +395,54 @@ static void TestDiscovery() {
     CHECK(legacy.accountLinked && legacy.accountName == "someone@cloud");  // tolerated in, never broadcast out
 }
 
+// A51 (TASK-DISCOVERY-PLATFORM-2026-11-22): every byte here arrives from the LAN, so a
+// malformed body has to be rejected, not thrown out of the parser.
+static std::vector<uint8_t> DiscoveryWire(DiscoveryType type, const std::string& body) {
+    DiscoveryHeader header{kDiscoveryMagic, kProtocolVersion, uint8_t(type), 0};
+    std::vector<uint8_t> out(sizeof(header) + body.size());
+    std::memcpy(out.data(), &header, sizeof(header));
+    std::memcpy(out.data() + sizeof(header), body.data(), body.size());
+    return out;
+}
+
+static void TestDiscoveryHardening() {
+    DiscoveryProbe p;
+    DiscoveryAnnounce a;
+    // A type mismatch used to throw json::type_error straight through these functions, which
+    // means std::terminate - one unauthenticated broadcast packet killed the process.
+    // Type mismatches throw inside json::value(), so these must come back false rather than
+    // terminate the process.
+    for (const char* body : {R"({"deviceId":123})", R"({"deviceName":[1,2]})", R"({"nonce":"abc"})",
+                             R"({"deviceId":null})", R"({"nonce":{"a":1}})"}) {
+        const auto wire = DiscoveryWire(DiscoveryType::Probe, body);
+        CHECK(!ParseProbe(wire.data(), wire.size(), p));
+    }
+    // Numbers convert leniently rather than throwing (nlohmann semantics, not a crash):
+    // pin the behaviour so a future library bump that starts rejecting them is noticed.
+    {
+        const auto wire = DiscoveryWire(DiscoveryType::Probe, R"({"nonce":-1})");
+        CHECK(ParseProbe(wire.data(), wire.size(), p) && p.nonce == 0xFFFFFFFFu);  // wraps, no throw
+        const auto frac = DiscoveryWire(DiscoveryType::Probe, R"({"nonce":1.5})");
+        CHECK(ParseProbe(frac.data(), frac.size(), p) && p.nonce == 1u);  // truncates, no throw
+    }
+    for (const char* body : {R"({"serverId":"x","busy":1})", R"({"serverId":"x","port":70000})",
+                             R"({"serverId":"x","port":-5})", R"({"serverId":42})",
+                             R"({"serverId":"x","name":{"a":1}})"}) {
+        const auto wire = DiscoveryWire(DiscoveryType::Announce, body);
+        CHECK(!ParseAnnounce(wire.data(), wire.size(), a));
+    }
+    // A rejected packet must not leave a half-written result behind.
+    a = {};
+    a.serverId = "keep-me";
+    const auto bad = DiscoveryWire(DiscoveryType::Announce, R"({"serverId":"other","busy":1})");
+    CHECK(!ParseAnnounce(bad.data(), bad.size(), a) && a.serverId == "keep-me");
+    // A well-formed packet still parses, port included.
+    const auto ok = DiscoveryWire(DiscoveryType::Announce,
+                                  R"({"serverId":"abc","name":"PC","port":38711,"busy":false})");
+    CHECK(ParseAnnounce(ok.data(), ok.size(), a) && a.serverId == "abc" && a.streamPort == 38711);
+    printf("discovery hardening OK\n");
+}
+
 static void TestAudio() {
     AudioEncoder enc;
     AudioDecoder dec;
@@ -5498,6 +5546,7 @@ int main() {
     NetInit();
     TestAddresses();
     TestDiscovery();
+    TestDiscoveryHardening();  // A51 (TASK-DISCOVERY-PLATFORM-2026-11-22)
     TestSubnetHosts();
     TestSocketHardening();  // A50 (TASK-SOCKET-HARDEN-2026-11-22)
     TestAudio();

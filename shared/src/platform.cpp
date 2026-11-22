@@ -1,7 +1,10 @@
 #include "rc/platform.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -52,13 +55,27 @@ void SleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)
 
 void RandomBytes(void* out, size_t size) {
 #ifdef _WIN32
-    BCryptGenRandom(nullptr, static_cast<PUCHAR>(out), static_cast<ULONG>(size), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    // A51: the return value used to be discarded. On failure the caller's buffer stayed
+    // uninitialized and that stack memory became a session key or a nonce. There is no
+    // safe fallback for "the OS would not give me randomness", so fail loudly instead.
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, static_cast<PUCHAR>(out), static_cast<ULONG>(size),
+                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        std::abort();
+    }
 #else
     static int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    // A51: with fd == -1 read() fails forever and the old `n <= 0 -> continue` spun at 100%
+    // CPU, hanging the handshake instead of reporting anything. A zero-length read is the
+    // same trap, so treat both as fatal rather than looping.
+    if (fd < 0) std::abort();
     auto* p = static_cast<uint8_t*>(out);
     while (size > 0) {
         const ssize_t n = read(fd, p, size);
-        if (n <= 0) continue;
+        if (n < 0) {
+            if (errno == EINTR) continue;  // a signal is not a failure
+            std::abort();
+        }
+        if (n == 0) std::abort();
         p += n;
         size -= size_t(n);
     }
@@ -95,9 +112,13 @@ void SetLogSink(LogSink sink) { g_sink = sink; }
 
 void Log(LogLevel level, const char* fmt, ...) {
     char buffer[2048];
+    // A51: vsnprintf is allowed to leave the buffer untouched when it fails (e.g. an
+    // encoding error in a %ls), and the old code then handed uninitialized stack memory -
+    // which may hold key material - to the sink and to stderr.
+    buffer[0] = '\0';
     va_list args;
     va_start(args, fmt);
-    std::vsnprintf(buffer, sizeof(buffer), fmt, args);
+    if (std::vsnprintf(buffer, sizeof(buffer), fmt, args) < 0) buffer[0] = '\0';
     va_end(args);
     if (auto sink = g_sink.load()) {
         sink(level, buffer);
