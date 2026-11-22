@@ -197,12 +197,34 @@ void VrStream::LogFrameFlow(int64_t now) {
         const int64_t sendSince = m_sendSinceNs.load(std::memory_order_relaxed);
         const double jobAgeMs = jobSince ? double(now - jobSince) / 1e6 : -1.0;
         const double sendAgeMs = sendSince ? double(now - sendSince) / 1e6 : -1.0;
+        // A83 phase M (reading only), appended at the END - logpair.py PC_DIAG :39 and
+        // analyze_dual.py RE_DIAG1S :46 are not end-anchored. submitGap = deltas of
+        // consecutive driver-written submitPcNs (driver.cpp:846): the producer's cadence,
+        // independent of our pull loop, so it alone separates H4a (producer gave ~56/s)
+        // from H4b (it gave 90/s, we took 56/s); arrival1s = our side, same window.
+        // n/a = no valid sample (submitPcNs == 0 excluded, never a 0 min). Signed: a
+        // negative falsifies the cross-process QPC assumption - never abs()'d. %.1f per M4.
+        const auto fmtRange = [](char* b, size_t n, const char* name, uint32_t samples, int64_t minNs, int64_t maxNs) {
+            if (samples) snprintf(b, n, ", %s %.1f-%.1f ms", name, double(minNs) / 1e6, double(maxNs) / 1e6);
+            else snprintf(b, n, ", %s n/a", name);
+        };
+        char arrPart[64], subPart[64], s2jPart[64];
+        fmtRange(arrPart, sizeof(arrPart), "arrival1s", m_cadArrivalSamples, m_cadArrivalMinNs, m_cadArrivalMaxNs);
+        fmtRange(subPart, sizeof(subPart), "submitGap", m_cadSubmitSamples, m_cadSubmitMinNs, m_cadSubmitMaxNs);
+        if (m_cadSubmitToJobSamples)
+            snprintf(s2jPart, sizeof(s2jPart), ", submitToJob avg %.1f/max %.1f ms",
+                     double(m_cadSubmitToJobSumNs) / m_cadSubmitToJobSamples / 1e6,
+                     double(m_cadSubmitToJobMaxNs) / 1e6);
+        else snprintf(s2jPart, sizeof(s2jPart), ", submitToJob n/a");
         RC_LOGI("rc diag 1s: game %.0f/s enc %.0f/s drop %.0f/s, halfRate %s, target %u kbps, wire %.1f Mbps, "
                 "queue %.0f ms, qp %.1f, render %ux%u enc %ux%u%s, enc p50/p95 %.1f/%.1f ms"
-                ", sendBacklog %.1f ms, overruns %u, jobAge %.1f ms, sendAge %.1f ms",
+                ", sendBacklog %.1f ms, overruns %u, jobAge %.1f ms, sendAge %.1f ms%s%s%s",
                 s.gameFps, s.encFps, s.droppedFps, m_halfRateActive.load(std::memory_order_relaxed) ? "ON" : "OFF",
                 m_sender.TargetBitrateKbps(), s.mbps, s.queueMs, s.qp, s.srcWidth, s.srcHeight, s.encWidth, s.encHeight,
-                seqPart, p50, p95, backlogMs, overruns, jobAgeMs, sendAgeMs);
+                seqPart, p50, p95, backlogMs, overruns, jobAgeMs, sendAgeMs, arrPart, subPart, s2jPart);
+        m_cadArrivalSamples = 0; m_cadArrivalMinNs = m_cadArrivalMaxNs = 0;
+        m_cadSubmitSamples = 0; m_cadSubmitMinNs = m_cadSubmitMaxNs = 0;
+        m_cadSubmitToJobSamples = 0; m_cadSubmitToJobSumNs = m_cadSubmitToJobMaxNs = 0;
         // ROUND19 T1: sparse slow-frame trace, only under pressure, at most 8 per window.
         if ((s.droppedFps > 0.0 || (periodMs > 0 && p95 > periodMs)) && !frames.empty()) {
             std::vector<std::pair<uint32_t, double>> worst(frames);
@@ -330,6 +352,7 @@ void VrStream::Run() {
     const auto resetProducerCaches = [&] {
         lastFrameIndex = 0;
         m_diagArrivalPrevNs = 0;
+        m_cadPrevSubmitNs = 0;  // A83: the next frame becomes the cadence baseline again
         motionViews.clear();  // the SRVs pin the previous generation's textures
         motion.Reset();
         m_motionGridPrev.clear();
@@ -405,8 +428,28 @@ void VrStream::Run() {
                 const uint32_t gapMs = uint32_t((now - m_diagArrivalPrevNs) / 1'000'000);
                 if (m_diagGapMin == 0 || gapMs < m_diagGapMin) m_diagGapMin = gapMs;
                 if (gapMs > m_diagGapMax) m_diagGapMax = gapMs;
+                // A83 phase M: our-side gap on the 1 s diag window (the 10 s %u-%u above untouched).
+                const int64_t gapNs = now - m_diagArrivalPrevNs;
+                if (!m_cadArrivalSamples || gapNs < m_cadArrivalMinNs) m_cadArrivalMinNs = gapNs;
+                if (!m_cadArrivalSamples || gapNs > m_cadArrivalMaxNs) m_cadArrivalMaxNs = gapNs;
+                m_cadArrivalSamples++;
             }
             m_diagArrivalPrevNs = now;
+            // A83 phase M: the producer's own cadence - the driver writes submitPcNs
+            // (driver.cpp:846) whether or not our loop keeps up, which is why this delta
+            // separates H4a/H4b while arrivalGap cannot. submitPcNs == 0 drops the
+            // baseline instead of entering the statistics as 0; the delta stays signed.
+            if (fs.submitPcNs == 0) {
+                m_cadPrevSubmitNs = 0;
+            } else {
+                if (m_cadPrevSubmitNs) {
+                    const int64_t d = fs.submitPcNs - m_cadPrevSubmitNs;
+                    if (!m_cadSubmitSamples || d < m_cadSubmitMinNs) m_cadSubmitMinNs = d;
+                    if (!m_cadSubmitSamples || d > m_cadSubmitMaxNs) m_cadSubmitMaxNs = d;
+                    m_cadSubmitSamples++;
+                }
+                m_cadPrevSubmitNs = fs.submitPcNs;
+            }
         }
 
         if (m_paused) {
@@ -484,8 +527,13 @@ void VrStream::Run() {
         // the driver still holds the shared texture, which used to be invisible.
         const int64_t lockWaitStart = rc::NowNs();
         const bool lockOk = !mutex || rcvr::AcquireKeyed(mutex.Get(), 100);
+        // A83 phase M (reading only): this frame's OWN acquire wait, for the flush line -
+        // the 10 s avg/max below cannot attribute a single late frame. Timeout (100) and
+        // the success decision untouched. -1 = no keyed mutex, printed n/a.
+        int64_t frameLockWaitNs = -1;
         if (mutex) {
             const int64_t waited = rc::NowNs() - lockWaitStart;
+            frameLockWaitNs = waited;
             ++m_diagLockSamples;
             m_diagLockSumNs += waited;
             if (waited > m_diagLockMaxNs) m_diagLockMaxNs = waited;
@@ -613,14 +661,30 @@ void VrStream::Run() {
         const int64_t convertNs = rc::NowNs() - convertStart;
         m_flowConvertNs += convertNs;
         convertAvgNs = convertAvgNs ? (convertAvgNs * 7 + convertNs) / 8 : convertNs;
+        // A83 phase M (reading only): this frame's age over the segment A79's jobAge cannot
+        // see - driver submit (driver.cpp:846) until m_job entry. rc::NowNs() and
+        // rcvr::QpcNowNs() (vr_bridge.h:231) are the same QPC conversion, so the
+        // cross-process subtraction holds; kept signed so a negative falsifies it at
+        // runtime. submitPcNs == 0 -> -1 (n/a), out of the statistics.
+        const int64_t jobEnterNs = rc::NowNs();
+        const int64_t submitToJobNs = slotCopy.submitPcNs ? jobEnterNs - slotCopy.submitPcNs : -1;
+        job.submitToJobNs = submitToJobNs;
+        job.lockWaitNs = frameLockWaitNs;
+        if (submitToJobNs >= 0) {
+            m_cadSubmitToJobSumNs += submitToJobNs;
+            if (!m_cadSubmitToJobSamples || submitToJobNs > m_cadSubmitToJobMaxNs)
+                m_cadSubmitToJobMaxNs = submitToJobNs;
+            m_cadSubmitToJobSamples++;
+        }
         {
             std::lock_guard lock(m_jobMutex);
             // The encoder hasn't taken the one before: this newer frame replaces it.
             if (m_job) m_flowReplacedQueue++;
             m_job = std::move(job);
             // A79 phase M: stamp the slot-entry moment at the slot's only write point
-            // (the lock is the existing one; the diag reader never takes it).
-            m_jobSinceNs.store(rc::NowNs(), std::memory_order_relaxed);
+            // (the lock is the existing one; the diag reader never takes it). A83: taken
+            // once above, so submitToJob ends exactly where jobAge begins.
+            m_jobSinceNs.store(jobEnterNs, std::memory_order_relaxed);
         }
         m_jobReady.notify_one();
 
@@ -773,6 +837,8 @@ void VrStream::RunEncoder() {
         send.recovery = recovery;
         send.predictedDisplayPcNs = job.predictedDisplayPcNs;  // A26: the flush gate judges this
         send.predictedDisplayExact = job.predictedDisplayExact;  // A75: the flush log line names it
+        send.submitToJobNs = job.submitToJobNs;  // A83 phase M: the flush line reports this frame's own upstream ages
+        send.lockWaitNs = job.lockWaitNs;
         {
             // The one before still going out (a paced send): wait, a dropped frame would break
             // the ones referencing it.
@@ -850,16 +916,28 @@ void VrStream::RunSender() {
                 // point (video_transport.cpp), so a wiped backlog reads as what it was.
                 const int64_t flushJobSince = m_jobSinceNs.load(std::memory_order_relaxed);
                 const int64_t flushSendSince = m_sendSinceNs.load(std::memory_order_relaxed);
+                // A83 phase M (reading only): the dropped frame's OWN upstream values -
+                // the diag window averages hide single-shot events. n/a: submitPcNs was 0
+                // / no keyed mutex. Appended at the END; no parser matches this line.
+                const auto fmtMs = [](char* b, size_t n, int64_t v) {
+                    if (v >= 0) snprintf(b, n, "%.1f ms", double(v) / 1e6);
+                    else snprintf(b, n, "n/a");
+                };
+                char s2jPart[32], lwPart[32];
+                fmtMs(s2jPart, sizeof(s2jPart), send.submitToJobNs);
+                fmtMs(lwPart, sizeof(lwPart), send.lockWaitNs);
                 RC_LOGI("VR stale flush: dropped %u frame(s) since the last line; last one %s "
                         "(%lld ms from its display moment, %s); pacer debt wiped, repair %s"
-                        "; sendBacklog %.1f ms, overruns %u, jobAge %.1f ms, sendAge %.1f ms",
+                        "; sendBacklog %.1f ms, overruns %u, jobAge %.1f ms, sendAge %.1f ms"
+                        ", submitToJob %s, lockWait %s",
                         m_staleLogCount, late ? "expired" : "held, chain broken",
                         (long long)((nowNs - send.predictedDisplayPcNs) / 1'000'000),
                         send.predictedDisplayExact ? "exact" : "estimated",
                         gate.requestKeyframe ? "requested" : "already pending",
                         double(m_sender.SendBacklogNs()) / 1e6, m_sender.BudgetOverruns(),
                         flushJobSince ? double(nowNs - flushJobSince) / 1e6 : -1.0,
-                        flushSendSince ? double(nowNs - flushSendSince) / 1e6 : -1.0);
+                        flushSendSince ? double(nowNs - flushSendSince) / 1e6 : -1.0,
+                        s2jPart, lwPart);
                 m_staleLogCount = 0;
             }
             if (gate.breaker)

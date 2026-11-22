@@ -109,6 +109,13 @@ class VrStream {
         uint64_t frameIndex = 0;
         uint64_t headsetTargetNs = 0;
         int64_t submitPcNs = 0;
+        // A83 phase M (reading only): this frame's own upstream ages, carried to the flush
+        // line - the rc diag window averages hide single-shot events (A79 item 4 died on
+        // that ranking math). submitToJobNs = driver submit (driver.cpp:846) -> m_job entry,
+        // the segment before A79's jobAge begins; lockWaitNs = this frame's keyed-mutex
+        // acquire. -1 = n/a (submitPcNs was 0 / no keyed mutex); signed, never abs()'d.
+        int64_t submitToJobNs = -1;
+        int64_t lockWaitNs = -1;
         // A26 (stale-frame flush): this frame's predicted display moment in the PC
         // clock, recovered in Run() from the tracking sample the frame was rendered
         // with (0 = unknown: never expires - see rc/stale_flush.h).
@@ -137,6 +144,8 @@ class VrStream {
         uint32_t frameIndex = 0;  // ROUND19 T1: the producer's frame counter, for the diag seq field
         int64_t predictedDisplayPcNs = 0;  // A26: carried from the EncodeJob for the flush gate
         bool predictedDisplayExact = false;  // A75 §2.2: carried too - names the source in the flush log line
+        int64_t submitToJobNs = -1;  // A83 phase M: carried for the flush line's per-frame upstream age
+        int64_t lockWaitNs = -1;     // A83 phase M: carried for the flush line's per-frame lock wait
     };
 
     void Run();
@@ -218,6 +227,17 @@ class VrStream {
     uint32_t m_diagGapMin = 0, m_diagGapMax = 0;  // arrival gaps (ms) in this window
     uint32_t m_diagLockSamples = 0;
     int64_t m_diagLockSumNs = 0, m_diagLockMaxNs = 0;  // keyed-mutex acquire wait
+    // A83 phase M (reading only): the 1 s window behind the fields appended to `rc diag
+    // 1s`. submitGap = deltas of consecutive driver-written submitPcNs (driver.cpp:846),
+    // the producer's cadence - measured without our pull loop, so it alone separates "the
+    // game gave 56/s" from "it gave 90/s and we took 56/s"; arrival1s = our side, same
+    // window. Run()-thread-only like m_diagGap*/m_diagLock* above - no new primitive.
+    // Signed on purpose: a negative submitGap falsifies the cross-process QPC assumption.
+    int64_t m_cadPrevSubmitNs = 0;  // last frame's submitPcNs (0 = no baseline yet)
+    uint32_t m_cadSubmitSamples = 0, m_cadArrivalSamples = 0, m_cadSubmitToJobSamples = 0;
+    int64_t m_cadSubmitMinNs = 0, m_cadSubmitMaxNs = 0;
+    int64_t m_cadArrivalMinNs = 0, m_cadArrivalMaxNs = 0;
+    int64_t m_cadSubmitToJobSumNs = 0, m_cadSubmitToJobMaxNs = 0;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_streaming{false};
     std::atomic<bool> m_paused{false};
