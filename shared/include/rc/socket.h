@@ -61,6 +61,11 @@ std::vector<uint32_t> SubnetHosts(uint32_t ip, uint32_t netmask, size_t maxHosts
 bool IsPrivateLan(uint32_t ip);
 // True for 100.64.0.0/10 (carrier NAT, also used by Tailscale).
 bool IsCgnat(uint32_t ip);
+// True when a packet from `from` can only have come from this machine's own network: private IPv4,
+// carrier NAT / Tailscale, link-local or loopback, and for IPv6 link-local, unique-local or ::1.
+// Everything else is the internet. The stream server applies this to every Hello and every
+// discovery probe, so it is also the rule for what the PC answers at all.
+bool IsLocalSource(const NetAddress& from);
 // Enumerates up, non-loopback IPv4 interfaces.
 std::vector<NetInterface> ListInterfaces();
 // Global (2000::/3) IPv6 addresses of physical adapters, with `port` filled in.

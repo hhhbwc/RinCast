@@ -217,6 +217,17 @@ bool IsPrivateLan(uint32_t ip) {
 
 bool IsCgnat(uint32_t ip) { return (ip >> 22) == ((100u << 2) | 1); }  // 100.64.0.0/10 (Tailscale etc.)
 
+bool IsLocalSource(const NetAddress& from) {
+    if (from.v6) {
+        // Link-local (fe80::/10), which is all a headset on a USB cable has, unique local
+        // (fc00::/7) and loopback. A global IPv6 address counts as the internet.
+        static const uint8_t kLoopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+        return from.IsLinkLocalV6() || (from.ip6[0] & 0xFE) == 0xFC || std::memcmp(from.ip6, kLoopback, 16) == 0;
+    }
+    const uint32_t ip = from.ip;
+    return IsPrivateLan(ip) || IsCgnat(ip) || (ip >> 24) == 127 || (ip >> 16) == ((169u << 8) | 254);
+}
+
 static bool LooksVirtual(const std::string& text) {
     std::string t = text;
     for (char& ch : t) ch = char(std::tolower(static_cast<unsigned char>(ch)));

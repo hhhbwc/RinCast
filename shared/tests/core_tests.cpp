@@ -1207,6 +1207,37 @@ static void TestSocketHardening() {
     printf("socket hardening OK\n");
 }
 
+// A58 (TASK-DISCOVERY-REPLY-2026-11-22): one predicate decides both who may open a session and
+// who gets a discovery reply, so its table is worth pinning: the boundaries are where a LAN ends
+// and the internet begins.
+static void TestLocalSource() {
+    const auto ip4 = [](uint32_t ip) {
+        NetAddress a;
+        a.ip = ip;
+        a.port = 1;
+        return a;
+    };
+    CHECK(rc::IsLocalSource(ip4(0x0A000001u)));   // 10.0.0.1
+    CHECK(rc::IsLocalSource(ip4(0xAC100001u)));   // 172.16.0.1, the low end of 172.16/12
+    CHECK(rc::IsLocalSource(ip4(0xAC1FFFFFu)));   // 172.31.255.255, the high end
+    CHECK(!rc::IsLocalSource(ip4(0xAC200001u)));  // 172.32.0.1 is already the internet
+    CHECK(rc::IsLocalSource(ip4(0xC0A80105u)));   // 192.168.1.5
+    CHECK(!rc::IsLocalSource(ip4(0xC0A90105u)));  // 192.169.1.5 is not
+    CHECK(rc::IsLocalSource(ip4(0x7F000001u)));   // loopback, for a local test tool
+    CHECK(rc::IsLocalSource(ip4(0xA9FE0101u)));   // 169.254.1.1, link-local
+    CHECK(rc::IsLocalSource(ip4(0x64400001u)));   // 100.64.0.1, CGNAT / Tailscale, low end
+    CHECK(rc::IsLocalSource(ip4(0x647FFFFFu)));   // 100.127.255.255, high end
+    CHECK(!rc::IsLocalSource(ip4(0x64800001u)));  // 100.128.0.1 is not
+    CHECK(!rc::IsLocalSource(ip4(0x08080808u)));  // 8.8.8.8
+
+    NetAddress v6;
+    CHECK(NetAddress::Parse("fe80::1", 1, v6) && rc::IsLocalSource(v6));        // USB cable
+    CHECK(NetAddress::Parse("fd12:3456::1", 1, v6) && rc::IsLocalSource(v6));   // unique local
+    CHECK(NetAddress::Parse("::1", 1, v6) && rc::IsLocalSource(v6));
+    CHECK(NetAddress::Parse("2001:db8::1", 1, v6) && !rc::IsLocalSource(v6));   // global = internet
+    printf("local source OK\n");
+}
+
 static void TestMotionRuns() {
     std::vector<int8_t> grid(2 * 1000, 0);
     grid[2 * 3] = 5;
@@ -5575,6 +5606,7 @@ int main() {
     TestDiscoveryHardening();  // A51 (TASK-DISCOVERY-PLATFORM-2026-11-22)
     TestSubnetHosts();
     TestSocketHardening();  // A50 (TASK-SOCKET-HARDEN-2026-11-22)
+    TestLocalSource();      // A58 (TASK-DISCOVERY-REPLY-2026-11-22)
     TestAudio();
     TestIdentity();
     TestVideoReassemblyOrder();

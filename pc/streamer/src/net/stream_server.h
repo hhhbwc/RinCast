@@ -52,7 +52,13 @@ class StreamServer {
     void Approve(const std::string& deviceId, bool remember);
     void Deny(const std::string& deviceId);
 
-    void ExpectCloudSession(const std::string& sessionId, const ExpectedCloudSession& s);    void SetRendezvousHandler(RendezvousHandler h) { m_onRendezvous = std::move(h); }
+    void ExpectCloudSession(const std::string& sessionId, const ExpectedCloudSession& s);
+    // Set after the receive thread is already running (App::Start starts the server first), so
+    // the handler is written under the same mutex the receive loop reads it with.
+    void SetRendezvousHandler(RendezvousHandler h) {
+        std::lock_guard lock(m_mutex);
+        m_onRendezvous = std::move(h);
+    }
 
     rc::UdpSocket& Socket() { return m_socket; }
     std::shared_ptr<ClientSession> ActiveSession();

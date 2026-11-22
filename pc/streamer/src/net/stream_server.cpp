@@ -18,24 +18,6 @@ namespace rcs {
 
 namespace {
 
-// Local (non-cloud) sessions are only accepted from private address space.
-bool IsPrivateAddress(const rc::NetAddress& from) {
-    if (from.v6) {
-        // Link-local (fe80::/10), which is all a headset on a USB cable has, unique local
-        // (fc00::/7) and loopback. Global IPv6 addresses count as the internet.
-        static const uint8_t kLoopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-        return from.IsLinkLocalV6() || (from.ip6[0] & 0xFE) == 0xFC || std::memcmp(from.ip6, kLoopback, 16) == 0;
-    }
-    const uint32_t ip = from.ip;
-    const uint8_t a = uint8_t(ip >> 24), b = uint8_t(ip >> 16);
-    if (a == 10 || a == 127) return true;
-    if (a == 172 && b >= 16 && b <= 31) return true;
-    if (a == 192 && b == 168) return true;
-    if (a == 169 && b == 254) return true;
-    if (a == 100 && b >= 64 && b <= 127) return true;  // CGNAT / Tailscale
-    return false;
-}
-
 std::string RandomNonce() {
     uint8_t n[16];
     rc::RandomBytes(n, sizeof(n));
@@ -81,12 +63,17 @@ bool StreamServer::StillAsking(const std::string& deviceId, int64_t withinNs) {
 void StreamServer::Stop() {
     m_running = false;
     DisconnectActive("server_shutdown");
-    m_socket.Close();
-    m_discovery.Close();
-    m_discoveryV6.Close();
+    // Join before closing: every loop waits on RecvFrom with a timeout (2 ms, 250 ms), so they
+    // notice m_running on their own within a quarter second. Closing a socket while another
+    // thread is still blocked in it is how a handle ends up reused under that thread - and
+    // ClientSession::Close (above) has already joined the session's own threads, so after these
+    // joins nothing else holds the sockets.
     if (m_receiveThread.joinable()) m_receiveThread.join();
     if (m_discoveryThread.joinable()) m_discoveryThread.join();
     if (m_discoveryV6Thread.joinable()) m_discoveryV6Thread.join();
+    m_socket.Close();
+    m_discovery.Close();
+    m_discoveryV6.Close();
 }
 
 std::shared_ptr<ClientSession> StreamServer::ActiveSession() {
@@ -262,7 +249,7 @@ void StreamServer::HandleHello(const uint8_t* data, size_t size, const rc::NetAd
         }
         connectSecret = it->second.connectSecret;
     } else {
-        if (!IsPrivateAddress(from)) {
+        if (!rc::IsLocalSource(from)) {
             lock.unlock();
             SendReject(from, "remote_requires_account",
                        "Connections from outside your local network require signing in to a RinCast account.");
@@ -399,7 +386,14 @@ void StreamServer::ReceiveLoop() {
         if (n > 0) {
             const uint8_t* d = buffer.data();
             if (n >= 4 && std::memcmp(d, "RCRV", 4) == 0) {
-                if (m_onRendezvous) m_onRendezvous(d, size_t(n), from);
+                // Copied out under the lock, called without it: this can be set while the loop is
+                // already running, and the handler takes other locks of its own.
+                RendezvousHandler cb;
+                {
+                    std::lock_guard lock(m_mutex);
+                    cb = m_onRendezvous;
+                }
+                if (cb) cb(d, size_t(n), from);
             } else if (rc::IsHandshakeDatagram(d, size_t(n))) {
                 rc::PacketHeader h;
                 std::memcpy(&h, d, sizeof(h));
@@ -428,11 +422,14 @@ void StreamServer::ReceiveLoop() {
 std::vector<uint8_t> StreamServer::MakeAnnounce(uint32_t nonce) {
     const Settings s = SettingsStore::Get().Snapshot();
     rc::DiscoveryAnnounce a;
-    a.serverId = s.serverId;
-    a.name = s.pcName;
-    a.version = App::Get().Version();
-    a.os = WindowsVersion();
-    a.gpu = App::Get().Gpu().name;
+    // Broadcast to the whole LAN every 3 s, and it has to fit one datagram: a PC name the user
+    // typed (or a GPU string) is not allowed to push it past the MTU. ClampField keeps UTF-8
+    // whole while it cuts.
+    a.serverId = ClampField(s.serverId, 64);
+    a.name = ClampField(s.pcName, 64);
+    a.version = ClampField(App::Get().Version(), 32);
+    a.os = ClampField(WindowsVersion(), 48);
+    a.gpu = ClampField(App::Get().Gpu().name, 96);
     a.streamPort = m_socket.LocalPort();
     a.accountLinked = !s.cloudUserName.empty();
     // ROUND20 T1 (B1): the account name stays on this PC - the announce only says
@@ -483,6 +480,7 @@ void StreamServer::DiscoveryLoop() {
     std::vector<uint8_t> buffer(2048);
     rc::NetAddress from;
     int64_t lastAnnounce = 0;
+    int64_t lastReply = 0;
     auto makeAnnounce = [this](uint32_t nonce) { return MakeAnnounce(nonce); };
     while (m_running) {
         const int n = m_discovery.RecvFrom(buffer.data(), buffer.size(), from, 250);
@@ -491,14 +489,22 @@ void StreamServer::DiscoveryLoop() {
             rc::SleepMs(250);
             continue;
         }
+        const int64_t now = rc::NowNs();
         if (n > 0) {
             rc::DiscoveryProbe probe;
-            if (rc::ParseProbe(buffer.data(), size_t(n), probe)) {
+            // Answer only address space a session could come from - the same rule the Hello path
+            // applies. An announce carries the PC name, GPU, OS and the busy state, and it is
+            // several times the size of the probe that asks for it, so replying to a spoofed
+            // source would turn this into a reflector. Capping replies at 50/s bounds that and a
+            // flood alike. A headset on the LAN, on a USB link-local address or behind Tailscale
+            // is private; from anywhere else the connect would be refused anyway.
+            if (rc::IsLocalSource(from) && now - lastReply >= 20'000'000LL &&
+                rc::ParseProbe(buffer.data(), size_t(n), probe)) {
+                lastReply = now;
                 auto reply = makeAnnounce(probe.nonce);
                 m_discovery.SendTo(from, reply.data(), reply.size());
             }
         }
-        const int64_t now = rc::NowNs();
         if (now - lastAnnounce > 3'000'000'000LL) {
             lastAnnounce = now;
             auto announce = makeAnnounce(0);
