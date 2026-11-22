@@ -165,6 +165,16 @@ class VrStream {
     std::condition_variable m_jobReady;
     std::condition_variable m_jobTaken;
     std::optional<EncodeJob> m_job;  // the newest converted frame, not yet taken by the encoder
+    // A79 phase M (stale-flush attribution, reading only): when the frame now sitting in
+    // m_job / m_send entered its slot (NowNs; 0 = slot empty). Each is stored at the
+    // slot's existing write point, under the lock that already guards it (Run stores
+    // m_jobSinceNs, RunEncoder clears it when it takes the job; RunEncoder stores
+    // m_sendSinceNs, RunSender clears it when it takes the frame), and read relaxed by
+    // the once-a-second diag tick and the flush line WITHOUT any lock - no new
+    // synchronisation. A read racing a handoff is off by at most one slot occupancy,
+    // which is below the resolution these ages are judged at.
+    std::atomic<int64_t> m_jobSinceNs{0};
+    std::atomic<int64_t> m_sendSinceNs{0};
     ID3D11Texture2D* m_encoding = nullptr;  // the YUV target the encoder is reading
     // When the encoder started its frame and how long a frame usually takes it: the conversion
     // thread takes the game's next frame just in time for the encoder (see Run).

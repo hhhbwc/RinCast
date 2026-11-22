@@ -51,6 +51,16 @@ class VideoPacketizer {
     // socket or the path backed the burst up (the token-bucket wait itself doesn't count).
     uint32_t BudgetOverruns() const { return m_budgetOverruns.load(std::memory_order_relaxed); }
 
+    // A79 phase M (stale-flush attribution, reading only): the send-side pacing backlog,
+    // max(m_nextSendNs - now, 0). m_nextSendNs is a plain send-thread-only int64_t (the
+    // discipline note below), so reading it from the stats thread would be a data race;
+    // SendFrame instead stores a relaxed snapshot at the one point where the burst clock
+    // is re-anchored every frame, and this getter decays that snapshot against NowNs().
+    // 0 = the billing has elapsed, no burst-mode frame anchored the clock yet, or the
+    // stream runs the legacy clock (which the card leaves unsnapshotted). No new
+    // synchronisation: a relaxed load of a single-writer snapshot.
+    int64_t SendBacklogNs() const;
+
     // A26 (stale-frame flush, rc/stale_flush.h): re-baselines the pacing clock to
     // `nowNs`, wiping whatever the backlog billed (card §1.3: the debt is forgiven
     // so the next frame may start at once). Send-thread only - SendFrame owns this
@@ -101,6 +111,10 @@ class VideoPacketizer {
     // mode: the earliest moment the next FRAME may START - the running frame's billing
     // at the average ceiling. Stored as void* to keep windows.h out of this header.
     int64_t m_nextSendNs = 0;
+    // A79 phase M: relaxed snapshot of m_nextSendNs, stored at the burst-mode anchor
+    // point in SendFrame (the only write point) so SendBacklogNs() can be read from
+    // the stats/diag threads without a race and without any lock.
+    std::atomic<int64_t> m_nextSendNsPublished{0};
     // A45 §1.7: wire bytes billed into m_nextSendNs by the last burst-mode frame
     // (test observability) and the mode-switch bookkeeping that re-baselines the
     // clock when leaving burst mode, so a future-dated start cannot stall the next frame.

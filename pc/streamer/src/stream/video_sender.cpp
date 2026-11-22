@@ -164,14 +164,22 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
             const uint32_t wireCap = m_wireCapKbps.load(std::memory_order_relaxed);
             const double queueMs = m_queueMs.load(std::memory_order_relaxed);
             const double lossAvg = m_lossAvg.load(std::memory_order_relaxed);
+            // A79 phase M (reading only): the send-side pacing backlog and the burst
+            // overrun counter on the same line - the pair that separates "the clock was
+            // pushed ahead by debt" (backlog high, overruns flat) from "the socket held
+            // the burst back" (overruns climb). Appended after the leading fields, which
+            // stay byte-for-byte for the log parsers (tools/logpair.py PC_THROUGHPUT,
+            // tools/diagnostics/analyze_dual.py RE_THROUGHPUT - neither is end-anchored).
+            const double backlogMs = double(m_packetizer.SendBacklogNs()) / 1e6;
+            const uint32_t overruns = m_packetizer.BudgetOverruns();
             if (refused) {
-                RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps, %u datagrams refused, effective %u kbps, wireCap %u kbps, queue %.0f ms, loss %.1f%%",
+                RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps, %u datagrams refused, effective %u kbps, wireCap %u kbps, queue %.0f ms, loss %.1f%%, sendBacklog %.1f ms, overruns %u",
                         m_streamId, m_stats.mbps, m_stats.fps, m_targetKbps.load(), refused,
-                        effectiveTarget, wireCap, queueMs, lossAvg * 100);
+                        effectiveTarget, wireCap, queueMs, lossAvg * 100, backlogMs, overruns);
             } else {
-                RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps, effective %u kbps, wireCap %u kbps, queue %.0f ms, loss %.1f%%",
+                RC_LOGI("Stream %u throughput: %.1f Mbps actual, %.0f fps, target %u kbps, effective %u kbps, wireCap %u kbps, queue %.0f ms, loss %.1f%%, sendBacklog %.1f ms, overruns %u",
                         m_streamId, m_stats.mbps, m_stats.fps, m_targetKbps.load(),
-                        effectiveTarget, wireCap, queueMs, lossAvg * 100);
+                        effectiveTarget, wireCap, queueMs, lossAvg * 100, backlogMs, overruns);
             }
             // A81 M1+M2 (TASK-A81-LATENCY-BUDGET-UNITS-2026-11-23): what the profile trade
             // costs, and where the brake line actually sits. clientDecodeMs/clientLatencyMs

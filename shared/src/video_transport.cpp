@@ -72,6 +72,13 @@ void VideoPacketizer::RequestStop() {
 #endif
 }
 
+int64_t VideoPacketizer::SendBacklogNs() const {
+    // A79 phase M (reading only): the snapshot decays against the caller's now, so an
+    // idle or legacy-paced stream reads 0 once the last burst billing has elapsed.
+    const int64_t remain = m_nextSendNsPublished.load(std::memory_order_relaxed) - NowNs();
+    return remain > 0 ? remain : 0;
+}
+
 bool VideoPacketizer::WaitDue(int64_t dueNs, bool precise) {
     if (m_stopRequested.load(std::memory_order_relaxed)) return false;
     // Legacy mode keeps the 0.2 ms "due now" window (fragments inside it leave together).
@@ -237,6 +244,11 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
         // A45 §1.7: cap a single frame's billing so one huge frame cannot push the
         // next-frame start arbitrarily far into the future (A26 stale-flush intent).
         m_nextSendNs = frameStartNs + std::min<int64_t>(int64_t(double(wireBytes) * nsPerByte), kMaxFrameDebtNs);
+        // A79 phase M (reading only): publish the re-anchored clock as a relaxed snapshot
+        // for SendBacklogNs(). This is the one point where the burst clock is anchored
+        // every frame; m_nextSendNs itself stays send-thread-only (header discipline
+        // note), so the stats/diag threads read the snapshot, never the raw field.
+        m_nextSendNsPublished.store(m_nextSendNs, std::memory_order_relaxed);
     } else if (paced) {
         const int64_t now = NowNs();
         if (m_nextSendNs == 0 || m_nextSendNs < now - kPaceIdleResetNs) m_nextSendNs = now;

@@ -90,6 +90,12 @@ class VideoSender {
     // pacer's billing so the next frame leaves at once instead of repaying the
     // backlog's debt (rc/stale_flush.h). Send-thread only, same as Send.
     void ResetPacingDebt(int64_t nowNs) { m_packetizer.ResetPacingDebtNs(nowNs); }
+    // A79 phase M (stale-flush attribution, reading only): the packetizer's pacing
+    // readouts, so the stream diag lines can print them. SendBacklogNs reads a relaxed
+    // snapshot the send thread publishes at the burst-mode anchor point; BudgetOverruns
+    // is an existing relaxed counter. Both are race-free from any thread, no new lock.
+    int64_t SendBacklogNs() const { return m_packetizer.SendBacklogNs(); }
+    uint32_t BudgetOverruns() const { return m_packetizer.BudgetOverruns(); }
     // True if the headset is waiting for a frame (keyframe or loss recovery), so one
     // should be encoded even if the picture didn't change.
     bool WantsFrame();

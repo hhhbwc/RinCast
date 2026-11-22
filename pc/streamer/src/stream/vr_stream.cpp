@@ -182,11 +182,27 @@ void VrStream::LogFrameFlow(int64_t now) {
         char seqPart[32];
         if (seqMax) snprintf(seqPart, sizeof(seqPart), ", seq %u-%u", seqMin, seqMax);
         else snprintf(seqPart, sizeof(seqPart), ", seq -");
+        // A79 phase M (stale-flush attribution, reading only): the send-side pacing
+        // backlog and the burst-overrun counter on the same line (the pair that
+        // separates "the clock was pushed ahead by debt" from "the socket held the
+        // burst back"), plus the in-slot age of the frame now sitting in m_job and in
+        // the send slot (-1.0 = the slot was empty at the tick). All are relaxed reads
+        // of snapshots their owning threads store at the existing write points; no
+        // lock, no new primitive. Appended AFTER the leading fields, which stay
+        // byte-for-byte for tools/logpair.py PC_DIAG and analyze_dual.py RE_DIAG1S
+        // (neither regex is end-anchored, so an append cannot break them).
+        const double backlogMs = double(m_sender.SendBacklogNs()) / 1e6;
+        const uint32_t overruns = m_sender.BudgetOverruns();
+        const int64_t jobSince = m_jobSinceNs.load(std::memory_order_relaxed);
+        const int64_t sendSince = m_sendSinceNs.load(std::memory_order_relaxed);
+        const double jobAgeMs = jobSince ? double(now - jobSince) / 1e6 : -1.0;
+        const double sendAgeMs = sendSince ? double(now - sendSince) / 1e6 : -1.0;
         RC_LOGI("rc diag 1s: game %.0f/s enc %.0f/s drop %.0f/s, halfRate %s, target %u kbps, wire %.1f Mbps, "
-                "queue %.0f ms, qp %.1f, render %ux%u enc %ux%u%s, enc p50/p95 %.1f/%.1f ms",
+                "queue %.0f ms, qp %.1f, render %ux%u enc %ux%u%s, enc p50/p95 %.1f/%.1f ms"
+                ", sendBacklog %.1f ms, overruns %u, jobAge %.1f ms, sendAge %.1f ms",
                 s.gameFps, s.encFps, s.droppedFps, m_halfRateActive.load(std::memory_order_relaxed) ? "ON" : "OFF",
                 m_sender.TargetBitrateKbps(), s.mbps, s.queueMs, s.qp, s.srcWidth, s.srcHeight, s.encWidth, s.encHeight,
-                seqPart, p50, p95);
+                seqPart, p50, p95, backlogMs, overruns, jobAgeMs, sendAgeMs);
         // ROUND19 T1: sparse slow-frame trace, only under pressure, at most 8 per window.
         if ((s.droppedFps > 0.0 || (periodMs > 0 && p95 > periodMs)) && !frames.empty()) {
             std::vector<std::pair<uint32_t, double>> worst(frames);
@@ -602,6 +618,9 @@ void VrStream::Run() {
             // The encoder hasn't taken the one before: this newer frame replaces it.
             if (m_job) m_flowReplacedQueue++;
             m_job = std::move(job);
+            // A79 phase M: stamp the slot-entry moment at the slot's only write point
+            // (the lock is the existing one; the diag reader never takes it).
+            m_jobSinceNs.store(rc::NowNs(), std::memory_order_relaxed);
         }
         m_jobReady.notify_one();
 
@@ -647,6 +666,7 @@ void VrStream::RunEncoder() {
             if (!m_running) break;
             job = std::move(*m_job);
             m_job.reset();
+            m_jobSinceNs.store(0, std::memory_order_relaxed);  // A79 phase M: slot empty again
             m_encoding = job.yuv.Get();
             m_encodeStartNs = rc::NowNs();
         }
@@ -760,6 +780,8 @@ void VrStream::RunEncoder() {
             m_sendCv.wait(lock, [this] { return !m_running || !m_send; });
             if (!m_running) break;
             m_send = std::move(send);
+            // A79 phase M: stamp the send-slot entry moment at the slot's only fill point.
+            m_sendSinceNs.store(rc::NowNs(), std::memory_order_relaxed);
         }
         m_sendCv.notify_all();
         out = {};
@@ -785,6 +807,7 @@ void VrStream::RunSender() {
             if (!m_running) break;
             send = std::move(*m_send);
             m_send.reset();
+            m_sendSinceNs.store(0, std::memory_order_relaxed);  // A79 phase M: slot empty again
         }
         m_sendCv.notify_all();
         // A26 (stale-frame flush) + A72 (the chain rule) + A75 (the grace period): a frame
@@ -818,12 +841,25 @@ void VrStream::RunSender() {
                 // predict-ahead estimate - and a "0-8 ms late" batch means a different bug
                 // in each. One appended word says which produced the number this line
                 // reports; the rule it was judged by, and the grace in it, are the same.
+                // A79 phase M (reading only): the same four pacing/age readouts the 1 s
+                // diag line carries, measured at the flush instant itself, appended after
+                // the leading fields (byte-for-byte preserved; no parser is end-anchored
+                // on this line). sendBacklog here reflects the LAST SENT frame's billing
+                // anchor - the debt wipe above writes the raw send-thread clock, and the
+                // snapshot is deliberately only published at the packetizer's one anchor
+                // point (video_transport.cpp), so a wiped backlog reads as what it was.
+                const int64_t flushJobSince = m_jobSinceNs.load(std::memory_order_relaxed);
+                const int64_t flushSendSince = m_sendSinceNs.load(std::memory_order_relaxed);
                 RC_LOGI("VR stale flush: dropped %u frame(s) since the last line; last one %s "
-                        "(%lld ms from its display moment, %s); pacer debt wiped, repair %s",
+                        "(%lld ms from its display moment, %s); pacer debt wiped, repair %s"
+                        "; sendBacklog %.1f ms, overruns %u, jobAge %.1f ms, sendAge %.1f ms",
                         m_staleLogCount, late ? "expired" : "held, chain broken",
                         (long long)((nowNs - send.predictedDisplayPcNs) / 1'000'000),
                         send.predictedDisplayExact ? "exact" : "estimated",
-                        gate.requestKeyframe ? "requested" : "already pending");
+                        gate.requestKeyframe ? "requested" : "already pending",
+                        double(m_sender.SendBacklogNs()) / 1e6, m_sender.BudgetOverruns(),
+                        flushJobSince ? double(nowNs - flushJobSince) / 1e6 : -1.0,
+                        flushSendSince ? double(nowNs - flushSendSince) / 1e6 : -1.0);
                 m_staleLogCount = 0;
             }
             if (gate.breaker)
