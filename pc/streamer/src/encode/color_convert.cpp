@@ -29,12 +29,23 @@ float2 psUV(V i) : SV_Target {
 )";
 
 bool ColorConverter::Init(ID3D11Device* device, UINT width, UINT height, bool tenBit) {
+    // A47: a failed re-Init (resolution change / device loss) must not leave half
+    // of the old object graph alive beside freshly created objects. Reset every
+    // member up front so any FAILED return below leaves a single clean state.
     m_device = device;
     m_width = width;
     m_height = height;
     m_tenBit = tenBit;
-    m_lastInput = nullptr;
+    m_yuv.Reset();
+    m_rtvY.Reset();
+    m_rtvUV.Reset();
+    m_vs.Reset();
+    m_psY.Reset();
+    m_psUV.Reset();
+    m_sampler.Reset();
+    m_raster.Reset();
     m_inputSrv.Reset();
+    m_lastInput = nullptr;
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = width;
@@ -60,34 +71,53 @@ bool ColorConverter::Init(ID3D11Device* device, UINT width, UINT height, bool te
     auto psY = CompileShader(kShader, "psY", "ps_5_0");
     auto psUV = CompileShader(kShader, "psUV", "ps_5_0");
     if (!vs || !psY || !psUV) return false;
-    device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &m_vs);
-    device->CreatePixelShader(psY->GetBufferPointer(), psY->GetBufferSize(), nullptr, &m_psY);
-    device->CreatePixelShader(psUV->GetBufferPointer(), psUV->GetBufferSize(), nullptr, &m_psUV);
+    // A47: device loss / OOM makes these Create* fail; ignoring the HRESULT let
+    // Init() report success and Convert() bind null objects. Check all of them.
+    if (FAILED(device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &m_vs))) return false;
+    if (FAILED(device->CreatePixelShader(psY->GetBufferPointer(), psY->GetBufferSize(), nullptr, &m_psY))) return false;
+    if (FAILED(device->CreatePixelShader(psUV->GetBufferPointer(), psUV->GetBufferSize(), nullptr, &m_psUV))) return false;
 
     D3D11_SAMPLER_DESC sd{};
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    device->CreateSamplerState(&sd, &m_sampler);
+    if (FAILED(device->CreateSamplerState(&sd, &m_sampler))) return false;
     D3D11_RASTERIZER_DESC rs{};
     rs.FillMode = D3D11_FILL_SOLID;
     rs.CullMode = D3D11_CULL_NONE;
     rs.DepthClipEnable = TRUE;
-    device->CreateRasterizerState(&rs, &m_raster);
+    if (FAILED(device->CreateRasterizerState(&rs, &m_raster))) return false;
     return true;
 }
 
 bool ColorConverter::Convert(ID3D11DeviceContext* ctx, ID3D11Texture2D* rgb) {
+    // NOTE (A47): the upstream VR capture surface is a fixed 2-3 texture swapchain,
+    // so a live texture is never freed/reallocated at the same address while it is
+    // still the current input. A true ABA (new texture reusing an old address) would
+    // still defeat this bare-pointer cache; if allocation ever becomes dynamic,
+    // replace it with a map<ID3D11Texture2D*, ComPtr<ID3D11ShaderResourceView>> plus
+    // an InvalidateInputCache() on texture rebuild. The failure-path inconsistency
+    // below is fixed regardless.
     if (rgb != m_lastInput) {
+        // A47: Reset the cached pointer together with the SRV. Otherwise a failed
+        // CreateShaderResourceView below leaves m_lastInput on the OLD texture; the
+        // next call passing that same pointer skips this block and binds an empty
+        // m_inputSrv -> silent all-black frames.
         m_inputSrv.Reset();
+        m_lastInput = nullptr;
         D3D11_TEXTURE2D_DESC desc;
         rgb->GetDesc(&desc);
         D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
         sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         sd.Texture2D.MipLevels = 1;
         // Shared VR textures are typeless; read the raw (gamma-encoded) values.
-        sd.Format = desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS   ? DXGI_FORMAT_R8G8B8A8_UNORM
-                    : desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ? DXGI_FORMAT_B8G8R8A8_UNORM
-                                                                   : desc.Format;
+        // A47: 10-bit / HDR typeless sources must be given a concrete UNORM view
+        // or CreateShaderResourceView returns E_INVALIDARG.
+        sd.Format = desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS      ? DXGI_FORMAT_R8G8B8A8_UNORM
+                    : desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS    ? DXGI_FORMAT_B8G8R8A8_UNORM
+                    : desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS ? DXGI_FORMAT_R10G10B10A2_UNORM
+                    : desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS
+                        ? DXGI_FORMAT_R16G16B16A16_UNORM
+                        : desc.Format;
         if (FAILED(m_device->CreateShaderResourceView(rgb, &sd, &m_inputSrv))) return false;
         m_lastInput = rgb;
     }

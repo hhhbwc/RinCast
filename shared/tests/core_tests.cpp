@@ -4467,8 +4467,11 @@ static void TestVrConfigComboSweep() {
                     A12_CHECK(mf.meanBitRate > 0 && mf.meanBitRate == ec.bitrateKbps * 1000u, "A8-encoder", b, n,
                               gazeFovea, slowPath, "MF mean bitrate wrong/overflowed");
                     A12_CHECK(mf.bufferSize > 0, "A8-encoder", b, n, gazeFovea, slowPath, "MF buffer size not positive");
-                    A12_CHECK(mf.frameRateNum == uint32_t(ec.fps * 1000.0f) && mf.frameRateNum > 0, "A8-encoder", b, n,
-                              gazeFovea, slowPath, "MF frame rate wrong");
+                    // A47: DeriveMfParams rounds (lround) instead of truncating, so
+                    // 59.94 fps -> 59940 rather than 59939. The sweep's fps values
+                    // are integral, so both agree here; update the oracle to match.
+                    A12_CHECK(mf.frameRateNum == uint32_t(std::lround(double(ec.fps) * 1000.0)) && mf.frameRateNum > 0,
+                              "A8-encoder", b, n, gazeFovea, slowPath, "MF frame rate wrong");
                     // MF's hardware caps ceiling (MfProbe): 4096 - a config above it could
                     // never construct; the sweep's sizes stay inside it.
                     A12_CHECK(ec.width <= 4096 && ec.height <= 4096, "A8-encoder", b, n, gazeFovea, slowPath,
@@ -5229,6 +5232,47 @@ static void TestTransportRobustFixedVector() {
     std::printf("A45 fixed vector: reassembled bitstream A1..A6 byte-identical (legal frame unchanged)\n");
 }
 
+// A47 (TASK-ENCODE-CONVERT-FIX-2026-11-22 §1.3): DeriveMfParams feeds the MF
+// codec API directly. CODECAPI_AVEncCommonBufferSize is BYTES/frame, but the old
+// code wrote bits/frame (an 8x-too-large VBV buffer), and fps<=0 divided by zero.
+// Known-answer checks on the pure function - no device or MFT required.
+static void TestDeriveMfParams() {
+    rcs::EncoderConfig c;
+    c.bitrateKbps = 100000;
+    c.fps = 72;
+    c.desktop = false;
+    rcs::MfEncoderParams m = rcs::DeriveMfParams(c);
+    // 100000 kbps = 12,500,000 bytes/s; /72 fps = 173,611 bytes/frame
+    // (the old bits/frame expression produced 1,388,888 - 8x too large).
+    CHECK(m.meanBitRate == 100000000u);
+    CHECK(m.bufferSize == 173611u);
+    CHECK(m.frameRateNum == 72000u);
+
+    // Desktop mode budgets two frames of VBV.
+    c.desktop = true;
+    m = rcs::DeriveMfParams(c);
+    CHECK(m.bufferSize == 347222u);
+
+    // fps<=0 used to yield inf -> uint32 UB; now clamped to the 72 fps default.
+    c.desktop = false;
+    c.fps = 0.0f;
+    m = rcs::DeriveMfParams(c);
+    CHECK(m.bufferSize == 173611u && m.bufferSize > 0);
+
+    // Fractional fps rounds instead of truncating (59.94 -> 59940, not 59939).
+    c.fps = 59.94f;
+    m = rcs::DeriveMfParams(c);
+    CHECK(m.frameRateNum == 59940u);
+
+    // 64-bit intermediate: the ceiling kbps survives intact in the MF UINT32 rate.
+    c.fps = 72;
+    c.bitrateKbps = 4000000;
+    m = rcs::DeriveMfParams(c);
+    CHECK(m.meanBitRate == 4000000000u);
+
+    std::printf("A47 DeriveMfParams: bytes/frame 100Mbps@72=173611 (desktop=347222), fps=0 finite, 59.94->59940\n");
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     TestLinkLocalDiscovery();
@@ -5302,6 +5346,7 @@ int main() {
     // (no GPU, no real encode session); the card requires the sweep to finish in
     // under 60 s, asserted inside the test itself.
     TestVrConfigComboSweep();
+    TestDeriveMfParams();  // A47 (TASK-ENCODE-CONVERT-FIX-2026-11-22 §1.3)
     TestConfigCouplingCases();
     TestH264CapsFallback();  // TASK-CAPS-GUARD: the H264 width-cap fallback cases
     TestFecWireBillingLoopback();

@@ -3,6 +3,7 @@
 
 #include <d3d11_4.h>
 
+#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
@@ -76,9 +77,17 @@ struct MfEncoderParams {
 
 inline MfEncoderParams DeriveMfParams(const EncoderConfig& c) {
     MfEncoderParams p;
-    p.meanBitRate = c.bitrateKbps * 1000;
-    p.bufferSize = uint32_t(c.bitrateKbps * 1000.0 / c.fps * (c.desktop ? 2 : 1));
-    p.frameRateNum = uint32_t(c.fps * 1000);
+    // A47: keep a 64-bit intermediate so an abnormal ceiling cannot wrap before
+    // narrowing into the MF UINT32 rate field (callers validate <= 4,000,000 kbps).
+    p.meanBitRate = uint32_t(uint64_t(c.bitrateKbps) * 1000);
+    // A47: CODECAPI_AVEncCommonBufferSize is BYTES per frame, not bits. The old
+    // kbps*1000/fps was bits/frame -> an 8x too-large VBV buffer (8 frames instead
+    // of 1, 16 in desktop mode), raising rate-control latency and burst jitter.
+    // safeFps removes the fps<=0 divide-by-zero -> inf/uint32 UB.
+    const double safeFps = c.fps > 0.0f ? double(c.fps) : 72.0;
+    p.bufferSize = uint32_t(double(c.bitrateKbps) * 1000.0 / 8.0 / safeFps * (c.desktop ? 2.0 : 1.0));
+    // A47: round instead of truncate, so 59.94 fps -> 59940 (was 59939).
+    p.frameRateNum = uint32_t(std::lround(double(c.fps) * 1000.0));
     return p;
 }
 
