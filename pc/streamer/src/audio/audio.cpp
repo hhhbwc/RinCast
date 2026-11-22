@@ -75,7 +75,7 @@ ComPtr<IMMDevice> FindEndpoint(EDataFlow flow, const wchar_t* name) {
     col->GetCount(&count);
     for (UINT i = 0; i < count; i++) {
         ComPtr<IMMDevice> d;
-        col->Item(i, &d);
+        if (FAILED(col->Item(i, &d)) || !d) continue;
         // Friendly names look like "RinCast Speaker (RinCast Virtual Audio)". Match the
         // endpoint name exactly so "RinCast Microphone" never matches "... Feed".
         const std::wstring fn = FriendlyName(d.Get());
@@ -430,7 +430,12 @@ void AudioStreamer::Run() {
             continue;
         }
         WAVEFORMATEX* mix = nullptr;
-        client->GetMixFormat(&mix);
+        const HRESULT mixHr = client->GetMixFormat(&mix);
+        if (FAILED(mixHr) || !mix) {
+            RC_LOGW("Audio loopback mix format unavailable: %s", HResultString(mixHr).c_str());
+            rc::SleepMs(1000);
+            continue;
+        }
         FormatReader reader;
         reader.Init(mix);
         const double ratio = double(mix->nSamplesPerSec) / rc::kAudioSampleRate;
@@ -487,7 +492,7 @@ void AudioStreamer::Run() {
                     lastR = r;
                 }
                 capture->ReleaseBuffer(frames);
-                capture->GetNextPacketSize(&packetFrames);
+                if (FAILED(capture->GetNextPacketSize(&packetFrames))) break;  // device lost
             }
             while (pcm.size() >= size_t(kFrame) * 2) {
                 rc::AudioPacketHeader h{};
@@ -568,7 +573,12 @@ void MicPlayer::Run() {
             continue;
         }
         WAVEFORMATEX* mix = nullptr;
-        client->GetMixFormat(&mix);
+        const HRESULT mixHr = client->GetMixFormat(&mix);
+        if (FAILED(mixHr) || !mix) {
+            RC_LOGW("Microphone mix format unavailable: %s", HResultString(mixHr).c_str());
+            rc::SleepMs(1000);
+            continue;
+        }
         HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         const auto* m = reinterpret_cast<const uint8_t*>(mix);
         const std::vector<uint8_t> format(m, m + sizeof(WAVEFORMATEX) + mix->cbSize);
@@ -624,6 +634,9 @@ void MicPlayer::Run() {
                 const float v = (prev + (cur - prev) * float(pos)) / 32768.f * level.Next();
                 pos += step;
                 uint8_t* frame = out + size_t(i) * blockAlign;
+                // GetBuffer hands back uninitialized memory: formats we don't convert (24-bit)
+                // play silence instead of whatever was in the render buffer.
+                std::memset(frame, 0, blockAlign);
                 for (UINT c = 0; c < channels; c++) {
                     if (fmt.isFloat)
                         reinterpret_cast<float*>(frame)[c] = v;
