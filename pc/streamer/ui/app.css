@@ -69,27 +69,33 @@ nav button[aria-current="page"], nav button[aria-current="page"]:hover,
 main { overflow-y: auto; padding: 24px 32px 32px; min-height: 0; }
 .page { display: none; max-width: 1100px; }
 .page.active { display: block; }
-.cols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 40px; }
+/* Two columns that grow on their own. A grid puts both in one shared row: the taller
+   column set the row height and the other box was stretched to it, so content added on
+   the right dragged the left column's box (and everything under the pair) down. Flex with
+   align-items:flex-start lets each column keep its own height. */
+.cols { display: flex; align-items: flex-start; gap: 0 40px; }
+.cols > div { flex: 1 1 0; min-width: 0; }
 .cols:first-of-type > div > h2:first-child { margin-top: 0; }
 
-/* ---- streaming: standard / expert view ---- */
-.mode-bar { display: inline-flex; margin: 0 0 4px; border: 1px solid var(--edge); border-radius: 3px; overflow: hidden; }
-.mode-bar button {
-  font: 600 14px var(--font); color: var(--muted); background: #000; border: 0;
-  border-right: 1px solid var(--edge); padding: 7px 16px; cursor: pointer;
-}
-.mode-bar button:last-child { border-right: 0; }
-.mode-bar button:hover { background: var(--row-hover); color: var(--text); }
-.mode-bar button[aria-pressed="true"], .mode-bar button[aria-pressed="true"]:hover { background: var(--accent); color: #000; }
 #videoPage .card { margin-top: 18px; }
 #videoPage .card > h2:first-child { margin-top: 0; }
 #videoPage .card + .card { border-top: 1px solid var(--line); padding-top: 18px; }
 #videoPage .row { margin-top: 14px; }
 #videoPage .row > h3:first-child { margin-top: 0; }
-
-/* 硬门禁：控制粒度是区块，不是行。标准模式整块移除专家区（标题与内容同生共死）。 */
-#videoPage[data-mode="standard"] .expert-only { display: none; }
-/* 兜底：任何卡片只要没有可见行，连 h2 一起消失；能力探测只置灰不藏行。 */
+/* The one slider the user drives: its two ends say what turning it means. */
+.ends { display: flex; justify-content: space-between; gap: 12px; margin-top: 2px; color: var(--muted); font-size: 14px; }
+/* 高级 (A74): the bottom-most block of the streaming page. Collapsed it is just its own
+   heading; opening it only grows downwards, so nothing above it ever moves. The body carries
+   [hidden] (display:none, not visibility/height:0), so its controls leave the Tab sequence too. */
+#videoPage .fold-title > button { display: flex; align-items: center; gap: 12px; width: 100%; margin: 0; padding: 4px 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+#videoPage .fold-title > button::after { content: ""; flex: none; margin-left: auto; width: 8px; height: 8px; border-right: 2px solid var(--edge); border-bottom: 2px solid var(--edge); transform: rotate(45deg); }
+#videoPage .fold-title > button[aria-expanded="true"]::after { transform: rotate(-135deg); }
+#videoPage .fold-body { padding-top: 4px; }
+/* 硬门禁：控制粒度是区块，不是行。 */
+/* 兜底：任何卡片只要没有可见行，连 h2 一起消失；能力探测只置灰不藏行。
+   「高级」折叠区收起时 .fold-body 是 display:none，但里面的 .row 自身没有 hidden 属性，
+   :has() 只看结构与属性、不看渲染，所以这张卡不会被本规则吃掉 - 由
+   tools/test-setting-browser.mjs 的 U3 用例用真实高度拦住，而不是靠看截图。 */
 .card:not(:has(.row:not([hidden]))) { display: none; }
 h1 { font: 600 30px/1.2 var(--display); letter-spacing: -0.01em; margin-bottom: 18px; }
 .top h1 { margin-bottom: 0; }
@@ -272,7 +278,8 @@ dialog p { color: var(--muted); }
   .rail { padding: 14px 6px; }
   .brand { padding: 0 8px 14px; font-size: 16px; }
   nav button { padding: 0 8px; font-size: 15px; }
-  .cols { grid-template-columns: minmax(0, 1fr); }
+  .cols { flex-direction: column; align-items: stretch; }
+  .cols > div { flex: 0 0 auto; }
   .cols:first-of-type > div + div > h2:first-child { margin-top: 34px; }
   main { padding: 20px; }
   .top { flex-wrap: wrap; }
@@ -302,7 +309,7 @@ dialog p { color: var(--muted); }
   input[type="range"]::-webkit-slider-thumb { background: CanvasText; }
   .btn { border: 1px solid ButtonText; }
   .btn[disabled] { border-color: GrayText; }
-  .mode-bar button[aria-pressed="true"] { background: Highlight; color: HighlightText; }
+  #videoPage .fold-title > button::after { border-color: CanvasText; }
   #headline::before { forced-color-adjust: none; }
   .toast { border: 1px solid CanvasText; }
   :focus-visible { outline-color: Highlight; }

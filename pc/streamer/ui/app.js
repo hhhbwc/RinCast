@@ -180,8 +180,20 @@ function bindSettings() {
     if (el.type === "range") updateRangeLabel(el);
   });
 }
+// A slider says what its number means. Bitrate ones show Mbps; the picture-priority
+// slider has no unit at all - it names the stop you are on ("Balanced"), because "1 Mbps"
+// was never what the three-tier choice was about. Dispatch by data-unit, so a control
+// never has to know its own setting key.
+const PROFILE_STOPS = ["video.profileLatency", "video.profileBalanced", "video.profileQuality"];
+function rangeText(el) {
+  if (el.dataset.unit === "profile") {
+    const stop = Math.max(0, Math.min(PROFILE_STOPS.length - 1, Math.round(Number(el.value) || 0)));
+    return t(PROFILE_STOPS[stop]);
+  }
+  return `${el.value} Mbps`;
+}
 function updateRangeLabel(el) {
-  const text = `${el.value} Mbps`;
+  const text = rangeText(el);
   el.parentElement.querySelector("output").textContent = text;
   el.setAttribute("aria-valuetext", text);
   el.style.setProperty("--fill", `${((el.value - el.min) / (el.max - el.min)) * 100}%`);
@@ -259,7 +271,7 @@ function renderAutoscale() {
   const line = $("#l7LevelLine");
   if (!line) return;
   const on = document.querySelector('[data-setting="l7Autoscale"]')?.checked;
-  // 等级行跟随开关；整块可见性由 .expert-only 的 data-mode 门禁控制，不再用行级 hidden。
+  // 等级行跟随开关；底层项整块收在页面最末的「高级」折叠区，不再用行级 hidden 掏空标题。
   line.hidden = !on;
   const lvl = state?.session?.vr?.autoscaleLevel;
   $("#l7Level").textContent = lvl != null ? lvl + "%" : "—";
@@ -662,25 +674,23 @@ function setOff(row, off) {
   row.querySelector("input").disabled = off;
 }
 
-// ---------------------------------------------------------------- streaming view mode
-// 区块级切换：标准模式整块隐藏 .expert-only（含 h2），不存在行级 hidden 掏空标题的问题。
-// 同一套 DOM 切换 data-mode，表单状态天然保留。localStorage 非法值回退 standard。
-const STREAM_MODE_KEY = "rincast.streamMode";
-function readStreamMode() {
-  try { return localStorage.getItem(STREAM_MODE_KEY) === "expert" ? "expert" : "standard"; }
-  catch { return "standard"; }
+// ---------------------------------------------------------------- streaming: advanced fold
+// 「高级」 is the bottom-most block of the page and starts shut. Shut is the `hidden`
+// attribute on its body, i.e. display:none - visibility or height:0 tricks would leave the
+// tuning controls in the tab order inside a zero-height box. The title is a plain button, so
+// Tab reaches it and Enter/Space toggle it with no key handling here; aria-expanded is the
+// state AT announces, which is why it is written from the one place that changes `hidden`.
+// Nothing else touches it: the fold is the user's choice, and the per-second state refresh
+// (renderAll -> bindSettings) writes values, never disclosure state.
+const advancedHead = $("#advancedHead");
+const advancedBody = $("#advancedBody");
+if (advancedHead && advancedBody) {
+  advancedHead.addEventListener("click", () => {
+    advancedBody.hidden = !advancedBody.hidden;
+    advancedHead.setAttribute("aria-expanded", String(!advancedBody.hidden));
+  });
+  advancedHead.setAttribute("aria-expanded", String(!advancedBody.hidden));
 }
-function applyStreamMode(mode) {
-  const page = $("#videoPage");
-  if (!page) return;
-  page.dataset.mode = mode;
-  $$("#videoPage [data-set-mode]").forEach((b) =>
-    b.setAttribute("aria-pressed", String(b.dataset.setMode === mode)));
-  try { localStorage.setItem(STREAM_MODE_KEY, mode); } catch {}
-}
-$$("#videoPage [data-set-mode]").forEach((b) =>
-  b.addEventListener("click", () => applyStreamMode(b.dataset.setMode)));
-applyStreamMode(readStreamMode());  // defer 执行，DOM 已就绪；首帧即定模式，避免闪现
 
 function renderDependents() {
   const enc = state.system.encoder;

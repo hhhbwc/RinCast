@@ -144,33 +144,71 @@ try {
   }
   const selector = key => `[data-setting="${key}"]`;
   const value = key => js(`(() => {const a=[...document.querySelectorAll(${JSON.stringify(selector(key))})];const el=a.find(x=>x.type!=='radio'||x.checked);return el.type==='checkbox'?el.checked:el.type==='range'||/^\\d+$/.test(el.value)?Number(el.value):el.value;})()`);
-  // Progressive disclosure (A48): the streaming page has two views over the SAME DOM.
-  // Driving the mode with real clicks keeps every later per-setting test deterministic
-  // no matter what a previous run left in localStorage.
-  async function setMode(mode) {
-    await click(`#videoPage [data-set-mode="${mode}"]`);
+  // A74 removed the two view modes: the streaming page has one view, and the tuning block is a
+  // fold at the very bottom of it. Opening it is one real click on its title button, and the
+  // state it must leave behind is `#advancedBody` un-hidden plus aria-expanded="true".
+  // The baseline UI has no fold at all (its tuning hung off the mode bar), so callers skip it.
+  async function setAdvanced(open) {
+    if (await js(`document.querySelector('#advancedBody').hidden`) === open) await click('#advancedHead');
     await wait(40);
-    assert.equal(await js(`document.querySelector('#videoPage').dataset.mode`), mode);
+    assert.equal(await js(`document.querySelector('#advancedBody').hidden`), !open, `advanced did not ${open ? 'open' : 'close'}`);
+    assert.equal(await js(`document.querySelector('#advancedHead').getAttribute('aria-expanded')`), String(open));
+  }
+  // A key that is meant to *activate* something has to carry its character text: Blink only
+  // turns Enter/Space into a click when the keyboard event has text, so a bare keyDown would
+  // look like a working disclosure in the DOM and do nothing on screen.
+  async function pressKey(key, vk, text) {
+    await page('Input.dispatchKeyEvent', { type: 'keyDown', key, code: key, windowsVirtualKeyCode: vk, ...(text ? { text } : {}) });
+    await page('Input.dispatchKeyEvent', { type: 'keyUp', key, code: key, windowsVirtualKeyCode: vk });
+  }
+  const enter = () => pressKey('Enter', 13, '\r');
+  const focusName = `(() => {const e=document.activeElement;if(!e||e===document.body)return null;return e.dataset.setting||e.id||(e.tagName+':'+(e.getAttribute('data-i18n')||''));})()`;
+  // Walks the real Tab order until something matches and reports how many presses it took.
+  // A control that can only be reached with a mouse is not a control.
+  async function tabUntil(hits, max = 30) {
+    for (let i = 1; i <= max; i++) {
+      await pressKey('Tab', 9);
+      const at = await js(focusName);
+      if (hits.includes(at)) return { presses: i, at };
+    }
+    throw Error(`Tab order never reached ${hits.join('/')}; stuck at ${await js(focusName)}`);
   }
   async function cardReport() {
     return js(`(() => {
       const page = document.querySelector('#videoPage');
       const cards = [...page.querySelectorAll('.card')];
+      const fold = page.querySelector('#advanced');
       const visible = cards.filter(c => c.getBoundingClientRect().height > 0);
       const titleOf = c => (c.querySelector('h2')?.innerText || '').trim();
+      const rowsOf = c => [...c.querySelectorAll('.row')].filter(r => r.getBoundingClientRect().height > 0).length;
       return {
-        mode: page.dataset.mode,
         cards: cards.length,
         visible: visible.length,
-        // A visible title with no visible control under it is the "empty shell" bug.
+        // A visible title with no visible control under it is the "empty shell" bug. The fold
+        // is meant to have no rows showing while collapsed, so it gets its own line below
+        // instead of being excused here: collapsed => a real title of its own, expanded => rows.
         danglingTitles: visible.filter(c => !titleOf(c)).length,
-        emptyCards: visible.filter(c => ![...c.querySelectorAll('.row')].some(r => r.getBoundingClientRect().height > 0)).length,
-        expertShown: page.querySelector('.expert-only').getBoundingClientRect().height > 0,
+        emptyCards: visible.filter(c => c !== fold && rowsOf(c) === 0).length,
+        foldIsLast: page.lastElementChild === fold,
+        foldHeight: +fold.getBoundingClientRect().height.toFixed(2),
+        foldTitle: titleOf(fold),
+        foldRows: rowsOf(fold),
         keys: new Set([...page.querySelectorAll('[data-setting]')].map(e => e.dataset.setting)).size,
       };
     })()`);
   }
-  async function fresh(old = false, width = 1100, height = 1000, mode = 'expert') {
+  // Every control's current value, so a disclosure toggle can be proven not to reset the form.
+  const snapshot = () => js(`(() => {
+    const out = {};
+    for (const el of document.querySelectorAll('#videoPage [data-setting]')) {
+      const k = el.dataset.setting;
+      if (el.type === 'checkbox') out[k] = el.checked;
+      else if (el.type === 'radio') { if (el.checked) out[k] = el.value; }
+      else out[k] = el.value;
+    }
+    return out;
+  })()`);
+  async function fresh(old = false, width = 1100, height = 1000, advanced = true) {
     useBaseline = old;
     await page('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
     await page('Page.navigate', { url });
@@ -179,8 +217,7 @@ try {
     await wait(60);
     assert.equal(await js(`document.querySelector('.page.active').dataset.page`), 'video');
     assert.deepEqual(await js('__bridge.pageErrors'), []);
-    // The baseline app.js predates the mode switcher, so only the candidate gets driven.
-    if (!old && mode) await setMode(mode);
+    if (!old && advanced !== null) await setAdvanced(advanced);
   }
   async function shot(name) {
     const { data } = await page('Page.captureScreenshot', { format: 'png' });
@@ -208,38 +245,178 @@ try {
     check(old ? 'baseline_20_real_clicks' : 'candidate_20_real_clicks_last_intent', { clicks: 20, ms, inflightRequests: count, totalRequests: await js('__bridge.changes().length') });
   }
 
-  // A48 progressive disclosure: standard view must hide the whole tuning block (title
-  // included - never a bare heading over nothing), expert view must show every control,
-  // and the choice must survive a reload. Same DOM both ways, so settings never reset.
-  await js(`localStorage.removeItem('rincast.streamMode')`);
-  await fresh(false, 1100, 1000, null);  // null = don't drive the mode: observe the real first-run default
-  const stdMode = await cardReport();
-  assert.equal(stdMode.mode, 'standard');
-  assert.equal(stdMode.expertShown, false);
-  assert.equal(stdMode.visible, 2);
-  assert.equal(stdMode.danglingTitles, 0);
-  assert.equal(stdMode.emptyCards, 0);
-  assert.equal(stdMode.keys, 18);  // hidden, not removed: the form state survives a mode flip
-  await setMode('expert');
-  const expMode = await cardReport();
-  assert.equal(expMode.expertShown, true);
-  assert.equal(expMode.visible, 3);
-  assert.equal(expMode.danglingTitles, 0);
-  assert.equal(expMode.emptyCards, 0);
-  assert.equal(expMode.keys, 18);
-  await fresh(false, 1100, 1000, null);
-  const keptMode = await cardReport();
-  assert.equal(keptMode.mode, 'expert');  // remembered across reloads
-  assert.equal(keptMode.expertShown, true);
-  await setMode('standard');
-  const backMode = await cardReport();
-  assert.equal(backMode.expertShown, false);
-  assert.equal(backMode.visible, 2);
-  check('progressive_disclosure_standard_vs_expert', {
-    standard: { visibleCards: stdMode.visible, danglingTitles: stdMode.danglingTitles, controls: stdMode.keys },
-    expert: { visibleCards: expMode.visible, danglingTitles: expMode.danglingTitles, controls: expMode.keys },
-    persistedAfterReload: keptMode.mode,
+  // A48 progressive disclosure, re-pointed at A74's single bottom-of-page fold. What has to
+  // hold unchanged: hiding a block hides its heading with it, a heading never stands over
+  // nothing, the same DOM serves both states so no toggle can reset the form, and the empty
+  // card rule (app.css:99) must not eat a collapsed block whole - that is what foldHeight and
+  // foldTitle measure with real pixels instead of a screenshot.
+  await fresh(false, 1100, 1000, null);  // null = don't touch the fold: observe the real first-load state
+  const shut = await cardReport();
+  // U1: the expert/standard switch is gone from the DOM, not merely hidden.
+  assert.deepEqual(await js(`(() => ({
+    setModeButtons: document.querySelectorAll('[data-set-mode]').length,
+    modeBars: document.querySelectorAll('.mode-bar').length,
+    dataMode: document.querySelector('#videoPage').hasAttribute('data-mode'),
+    expertBlocks: document.querySelectorAll('.expert-only').length,
+    ariaPressed: document.querySelectorAll('#videoPage [aria-pressed]').length,
+  }))()`), { setModeButtons: 0, modeBars: 0, dataMode: false, expertBlocks: 0, ariaPressed: 0 });
+  // A closed fold is still a block the user can see and open.
+  assert(shut.foldHeight > 0, 'the collapsed advanced block has zero height: app.css:99 ate it');
+  assert(shut.foldTitle.length > 0, 'the collapsed advanced block has no visible title');
+  assert.equal(shut.foldIsLast, true);
+  assert.equal(shut.foldRows, 0, 'a collapsed fold still shows rows');
+  assert.equal(shut.cards, 3);
+  assert.equal(shut.visible, 3);
+  assert.equal(shut.danglingTitles, 0);
+  assert.equal(shut.emptyCards, 0);
+  assert.equal(shut.keys, 18);  // hidden, not removed: the form state survives a toggle
+  const valuesShut = await snapshot();
+
+  // U5: automatic tuning was buried in the tuning block; it now lives under the slider, so it
+  // has to be visible and focusable while 高级 is shut (and outside the fold in the DOM).
+  const autoTune = await js(`(() => {
+    const el = document.querySelector('[data-setting="autoTune"]');
+    const r = el.getBoundingClientRect();
+    return { insideFold: !!el.closest('#advanced'), h: +r.height.toFixed(2), rendered: el.offsetParent !== null,
+      aboveFold: r.top < document.querySelector('#advanced').getBoundingClientRect().top };
+  })()`);
+  assert.equal(autoTune.insideFold, false);
+  assert.equal(autoTune.rendered, true);
+  assert(autoTune.h > 2 && autoTune.aboveFold, JSON.stringify(autoTune));
+  await js(`document.querySelector('.rail-foot [data-page="account"]').focus()`);
+  const toAutoTune = await tabUntil(['autoTune'], 4);  // one Tab past the slider: the two are neighbours
+  check('u5_auto_tune_always_visible', { ...autoTune, tabPressesFromRail: toAutoTune.presses });
+
+  // U6: shut means really shut - nothing inside the body can take focus, by script or by
+  // keyboard. offsetParent is null only for a display:none subtree, which is what [hidden]
+  // gives here; a visibility/height:0 fold would keep its controls focusable and fail this.
+  const shutFocus = await js(`(() => {
+    const inside = [...document.querySelectorAll('#advancedBody input, #advancedBody select, #advancedBody button')];
+    inside.forEach(el => el.focus());
+    return { count: inside.length, unfocusable: inside.every(el => el.offsetParent === null),
+      active: document.activeElement.closest('#advanced') !== null };
+  })()`);
+  assert(shutFocus.count > 10 && shutFocus.unfocusable && !shutFocus.active, JSON.stringify(shutFocus));
+
+  // U3: opening it must not move a single always-visible control, at any scroll position.
+  // Tops are measured in document space (rect.top + the scroller's offset), because "被顶下去"
+  // is a layout fact: plain viewport rects also move when the browser scrolls something into
+  // view, which is what Tab does to reach the fold, and that scroll is the page behaving well.
+  const anchorTops = () => js(`(() => {
+    const page = document.querySelector('#videoPage');
+    const main = document.querySelector('#main');
+    const at = sel => { const el = page.querySelector(sel); return el ? +(el.getBoundingClientRect().top + main.scrollTop).toFixed(2) : null; };
+    return { slider: at('[data-setting="streamProfile"]'), autoTune: at('[data-setting="autoTune"]'),
+      bitrate: at('[data-setting="vrBitrateMbps"]'), adaptive: at('[data-setting="adaptiveBitrate"]'),
+      codec: at('#codecOptions'), desktop: at('[data-setting="desktopMaxHeight"]'),
+      desktopBitrate: at('[data-setting="desktopBitrateMbps"]'),
+      scrollTop: +main.scrollTop.toFixed(2),
+      mainScroll: main.scrollHeight, bodyScroll: document.body.scrollHeight };
+  })()`);
+  const beforeOpen = await anchorTops();
+  // Reach the fold with the keyboard only, and open it with a real Enter - a disclosure that
+  // only answers to a mouse is not one. The walk starts from a known element, so the number of
+  // presses it reports is a fact about the tab order rather than about the previous test.
+  await js(`document.querySelector('.rail-foot [data-page="account"]').focus()`);
+  const toHead = await tabUntil(['advancedHead'], 30);
+  const headAttrs = await js(`(() => { const s = document.querySelector('#advancedHead');
+    return { expanded: s.getAttribute('aria-expanded'), label: document.getElementById(s.getAttribute('aria-labelledby'))?.innerText.trim().length > 0,
+      body: !!document.getElementById(s.getAttribute('aria-controls')) }; })()`);
+  assert.equal(headAttrs.expanded, 'false');
+  assert(headAttrs.label && headAttrs.body);
+  await enter();
+  await wait(40);
+  const open = await cardReport();
+  assert.equal(open.foldRows, 11, 'expanding showed a different number of rows than the block owns');
+  assert.equal(open.foldHeight > shut.foldHeight, true);
+  assert.equal(open.keys, 18);
+  assert.equal(open.danglingTitles, 0);
+  assert.equal(open.emptyCards, 0);
+  const afterOpen = await anchorTops();
+  const moved = Object.keys(beforeOpen).filter(k => !['mainScroll', 'bodyScroll', 'scrollTop'].includes(k) && beforeOpen[k] !== afterOpen[k]);
+  assert.deepEqual(moved, [], `expanding 高级 moved: ${moved.map(k => `${k} ${beforeOpen[k]}->${afterOpen[k]}`).join(', ')}`);
+  assert(afterOpen.mainScroll > beforeOpen.mainScroll, 'the page did not grow at all: nothing was expanded');
+  assert.deepEqual(await snapshot(), valuesShut, 'the disclosure toggle changed a control value');
+  const openHead = await js(`document.querySelector('#advancedHead').getAttribute('aria-expanded')`);
+  assert.equal(openHead, 'true');
+  await enter();  // and closes again the same way
+  await wait(40);
+  assert.equal(await js(`document.querySelector('#advancedBody').hidden`), true);
+  assert.equal(await js(`document.querySelector('#advancedHead').getAttribute('aria-expanded')`), 'false');
+  check('u1_no_expert_mode', await js(`(() => ({ setModeButtons: document.querySelectorAll('[data-set-mode]').length, modeBars: document.querySelectorAll('.mode-bar').length, dataMode: document.querySelector('#videoPage').hasAttribute('data-mode'), expertBlocks: document.querySelectorAll('.expert-only').length }))()`));
+  check('progressive_disclosure_advanced_fold', {
+    collapsed: { visibleCards: shut.visible, foldHeight: shut.foldHeight, foldTitle: shut.foldTitle, foldRows: shut.foldRows, danglingTitles: shut.danglingTitles, controls: shut.keys },
+    expanded: { visibleCards: open.visible, foldHeight: open.foldHeight, foldRows: open.foldRows, danglingTitles: open.danglingTitles, controls: open.keys },
+    valuesUnchangedByToggle: true, reopenedWithKeyboard: toHead.presses,
   });
+  check('u3_advanced_last_and_grows_down', {
+    isLastSibling: open.foldIsLast, tabPressesToFold: toHead.presses,
+    anchorsUnmoved: Object.fromEntries(Object.keys(beforeOpen).filter(k => !['mainScroll', 'bodyScroll', 'scrollTop'].includes(k)).map(k => [k, +(afterOpen[k] - beforeOpen[k]).toFixed(2)])),
+    foldHeight: { collapsed: shut.foldHeight, expanded: open.foldHeight },
+    mainScrollHeight: { collapsed: beforeOpen.mainScroll, expanded: afterOpen.mainScroll },
+    bodyScrollHeight: { collapsed: beforeOpen.bodyScroll, expanded: afterOpen.bodyScroll },
+    // Recorded, not asserted: Tab scrolling the fold into view is correct behaviour, and the
+    // anchors above are in document space precisely so this cannot hide a layout shift.
+    scrollTop: { beforeKeyboardWalk: beforeOpen.scrollTop, afterOpen: afterOpen.scrollTop },
+  });
+  check('u6_collapsed_controls_unfocusable', shutFocus);
+
+  // U2: the three-tier radio row is one slider now. Drive it with the keyboard only and check
+  // the number that reaches the wire is a number, and that its label names the stop.
+  await fresh(false, 1100, 1000, false);
+  const sliderShape = await js(`(() => {
+    const a = document.querySelectorAll('input[data-setting="streamProfile"]');
+    const el = a[0];
+    return { count: a.length, type: el.type, min: el.min, max: el.max, step: el.step,
+      radioLeft: document.querySelectorAll('input[name="streamProfile"]').length,
+      insideFold: !!el.closest('#advanced'), unit: el.dataset.unit,
+      describedBy: document.getElementById(el.getAttribute('aria-describedby'))?.id,
+      labelledBy: document.getElementById(el.getAttribute('aria-labelledby'))?.innerText.trim().length > 0,
+      ends: [...document.querySelectorAll('#videoPage .ends span')].map(s => s.innerText.trim()) };
+  })()`);
+  assert.equal(sliderShape.count, 1, 'the profile control must exist exactly once');
+  assert.deepEqual({ type: sliderShape.type, min: sliderShape.min, max: sliderShape.max, step: sliderShape.step }, { type: 'range', min: '0', max: '2', step: '1' });
+  assert.equal(sliderShape.radioLeft, 0, 'the old three-way radio row is still in the DOM (must be gone)');
+  assert.equal(sliderShape.insideFold, false);
+  assert.equal(sliderShape.unit, 'profile');
+  assert.equal(sliderShape.describedBy, 'profileNote');
+  assert.equal(sliderShape.labelledBy, true, 'the slider has no accessible name from the heading');
+  assert.equal(sliderShape.ends.length, 2);
+  assert(sliderShape.ends.every(s => s.length > 0));
+  await js(`__bridge.state({ streamProfile: 0 })`);
+  await js(`document.querySelector('.rail-foot [data-page="account"]').focus()`);
+  const toSlider = await tabUntil(['streamProfile'], 2);  // the streaming page's first control
+  const stopText = () => js(`(() => { const el = document.querySelector('[data-setting="streamProfile"]');
+    return { value: el.value, text: el.parentElement.querySelector('output').textContent, aria: el.getAttribute('aria-valuetext'),
+      fill: el.style.getPropertyValue('--fill') }; })()`);
+  const at0 = await stopText();
+  await pressKey('ArrowRight', 39);
+  await wait(60);
+  const at1 = await stopText();
+  await pressKey('ArrowRight', 39);
+  await wait(60);
+  const at2 = await stopText();
+  // Both presses, counted after they have all landed: what goes over the wire must still be
+  // the plain number 0/1/2, with one request per stop.
+  const sliderWrites = await js(`(() => { const m = __bridge.changes().filter(x => 'streamProfile' in x.settings);
+    return { requests: m.length, values: m.map(x => x.settings.streamProfile), types: m.map(x => typeof x.settings.streamProfile) }; })()`);
+  assert.equal(at0.value, '0');
+  assert.equal(at1.value, '1');
+  assert.equal(at2.value, '2');
+  assert.deepEqual(sliderWrites, { requests: 2, values: [1, 2], types: ['number', 'number'] });
+  assert(!at0.text.includes('Mbps') && !at1.text.includes('Mbps') && !at2.text.includes('Mbps'), `the slider label still says Mbps: ${at1.text}`);
+  assert.equal(at1.text, at1.aria, 'aria-valuetext and the visible stop name disagree');
+  assert.equal(at0.text, sliderShape.ends[0], 'stop 0 does not read as the left end of the scale');
+  assert.equal(at2.text, sliderShape.ends[1], 'stop 2 does not read as the right end of the scale');
+  assert(at1.text !== at0.text && at1.text !== at2.text, 'the three stops are not three distinct names');
+  assert.equal(at0.fill, '0%');
+  assert.equal(at1.fill, '50%');
+  assert.equal(at2.fill, '100%');
+  // The bitrate sliders must not have noticed any of this.
+  const bitrateLabels = await js(`(() => { const one = k => { const el = document.querySelector('[data-setting="' + k + '"]'); return el.parentElement.querySelector('output').textContent; };
+    return { vr: one('vrBitrateMbps'), desktop: one('desktopBitrateMbps') }; })()`);
+  assert(/ Mbps$/.test(bitrateLabels.vr) && / Mbps$/.test(bitrateLabels.desktop), JSON.stringify(bitrateLabels));
+  check('u2_profile_slider_keyboard', { tabPresses: toSlider.presses, stops: [at0, at1, at2], ...sliderWrites, bitrateLabels, ends: sliderShape.ends });
 
   // A52: a machine whose vendor encoder failed still streams on Media Foundation. The home
   // page has to say so, otherwise "it got slower after a driver update" has no visible cause.
@@ -330,7 +507,12 @@ try {
         const nextValue = await js(`[...document.querySelectorAll(${JSON.stringify(selector(key))})].find(e=>!e.checked&&!e.disabled).value`);
         await click(selector(key) + `[value="${nextValue}"]`);
       } else if (type === 'range') {
-        const point = await js(`(() => {const el=document.querySelector(${JSON.stringify(selector(key))});if(el.disabled)throw Error('Disabled slider');el.scrollIntoView({block:'center'});const r=el.getBoundingClientRect();return {x:r.x+r.width*${i % 2 ? 0.65 : 0.3},y:r.y+r.height/2};})()`);
+        // A click sets whatever value the pointer lands on, so the two test positions have to be
+        // far enough apart to hit two different stops: on a three-stop slider 30% and 65% are
+        // the same stop, and the loop would click ten times and assert on nothing.
+        const stops = await js(`(() => {const el=document.querySelector(${JSON.stringify(selector(key))});return (el.max-el.min)/el.step;})()`);
+        const [a, b] = stops <= 4 ? [0.1, 0.9] : [0.3, 0.65];
+        const point = await js(`(() => {const el=document.querySelector(${JSON.stringify(selector(key))});if(el.disabled)throw Error('Disabled slider');el.scrollIntoView({block:'center'});const r=el.getBoundingClientRect();return {x:r.x+r.width*${i % 2 ? b : a},y:r.y+r.height/2};})()`);
         await page('Input.dispatchMouseEvent', { type:'mousePressed', button:'left', clickCount:1, ...point });
         await page('Input.dispatchMouseEvent', { type:'mouseReleased', button:'left', clickCount:1, ...point });
       } else await click(selector(key));
@@ -358,6 +540,64 @@ try {
   assert.equal(await js(`document.querySelector('.page.active').dataset.page`), 'account');
   assert.equal(await js(`document.querySelector('.rail-foot [data-page="account"]').getAttribute('aria-current')`), 'page');
   check('navigation_after_stress', { mainSections: 5, railFoot: 1, pages: await js(`document.querySelectorAll('.page').length`) });
+  // U4 (the M-a measurement, re-taken against the new columns): .cols used to be a grid, which
+  // puts both columns in one shared row - the taller one set the row height and the other box
+  // was stretched to match, dragging everything below the pair down. Two flex columns may not
+  // do that: no control in the left column moves, and the left column's own box keeps its
+  // height, whatever the right column grows into.
+  for (const [width, height] of [[1280, 800], [720, 900]]) {
+    await fresh(false, width, height, null);
+    await click('.rail [data-page="general"]'); await wait(80);
+    const cols = await js(`(() => {
+      const box = document.querySelector('.page[data-page="general"] .cols');
+      const left = box.children[0], right = box.children[1];
+      const ctl = left.querySelector('input,select,button,label');
+      const read = () => ({ top: +ctl.getBoundingClientRect().top.toFixed(2), left: +left.getBoundingClientRect().height.toFixed(2), cols: +box.getBoundingClientRect().height.toFixed(2) });
+      const at = read();
+      const probe = document.createElement('div'); probe.style.height = '200px';
+      right.appendChild(probe);
+      const with200 = read();
+      probe.style.height = '600px';
+      const with600 = read();
+      probe.remove();
+      const back = read();
+      const lb = left.getBoundingClientRect(), rb = right.getBoundingClientRect();
+      // The visual separation of two stacked columns is the heading margin INSIDE the second
+      // column box, so the distance between the boxes is legitimately 0. Measure the content
+      // instead: last thing shown in the left column, first thing shown in the right one.
+      const firstShown = el => { const k = [...el.children].find(x => x.getBoundingClientRect().height > 0); return k ? firstShown(k) : el; };
+      const lastShown = el => { const k = [...el.children].reverse().find(x => x.getBoundingClientRect().height > 0); return k ? lastShown(k) : el; };
+      const contentGap = +(firstShown(right).getBoundingClientRect().top - lastShown(left).getBoundingClientRect().bottom).toFixed(2);
+      const style = getComputedStyle(box);
+      return { display: style.display, flexDirection: style.flexDirection, alignItems: style.alignItems,
+        firstControl: ctl.id || ctl.tagName, firstControlTop: at.top,
+        controlDelta: { plus200: +(with200.top - at.top).toFixed(2), plus600: +(with600.top - at.top).toFixed(2), afterRemoval: +(back.top - at.top).toFixed(2) },
+        leftBoxHeight: { plain: at.left, plus200: with200.left, plus600: with600.left },
+        colsHeight: { plain: at.cols, plus600: with600.cols },
+        sideBySide: Math.abs(rb.top - lb.top) < 0.5, stacked: rb.top >= lb.bottom - 0.5, stackGap: +(rb.top - lb.bottom).toFixed(2), contentGap,
+        widthsEqual: Math.abs(lb.width - rb.width) < 0.5, columnWidth: +lb.width.toFixed(2) };
+    })()`);
+    assert.equal(cols.display, 'flex');
+    // The computed spelling of `align-items: flex-start` is `flow-start` in this Chrome (CSS Box
+    // Alignment serialization). Side by side the cross axis must be top-aligned - `normal`/
+    // `stretch` is exactly what dragged the short column down to the tall one. Once stacked there
+    // is no cross axis to align, so full-width `stretch` is the right value there.
+    if (cols.flexDirection === 'column') assert.equal(cols.alignItems, 'stretch', 'the stacked columns stopped filling the width');
+    else assert(['flex-start', 'flow-start', 'start'].includes(cols.alignItems), `the columns are top-aligned as ${JSON.stringify(cols.alignItems)}: the taller one will stretch the other`);
+    assert.equal(cols.controlDelta.plus200, 0, `the right column still pushes the left one down: ${JSON.stringify(cols.controlDelta)}`);
+    assert.equal(cols.controlDelta.plus600, 0, `the right column still pushes the left one down: ${JSON.stringify(cols.controlDelta)}`);
+    assert.equal(cols.controlDelta.afterRemoval, 0);
+    assert.equal(cols.leftBoxHeight.plus200, cols.leftBoxHeight.plain, `the left column is still stretched to the right one: ${JSON.stringify(cols.leftBoxHeight)}`);
+    assert.equal(cols.leftBoxHeight.plus600, cols.leftBoxHeight.plain, `the left column is still stretched to the right one: ${JSON.stringify(cols.leftBoxHeight)}`);
+    assert.equal(cols.widthsEqual, true, 'the two columns stopped being equal width');
+    if (width >= 1000) assert.equal(cols.sideBySide, true, 'the columns did not sit side by side in a wide window');
+    else {
+      assert.equal(cols.stacked, true, 'the columns did not fall back to one column in a narrow window');
+      assert(cols.contentGap >= 20, `the stacked columns run into each other: ${cols.contentGap}px of content gap`);
+    }
+    check(`u4_columns_independent_${width}x${height}`, cols);
+  }
+
   // The viewport checks measure a Streaming control, so go back to the page that owns it.
   await click('.rail [data-page="video"]'); await wait(60);
   for (const [width,height] of [[1100,1000],[760,560]]) {
