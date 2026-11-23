@@ -718,7 +718,10 @@ void ClientSession::HandleMessage(const json& m) {
         // autoTune drives the same ladder while the user has not locked a manual
         // scale (encodeScalePct > 0 keeps it off - DECISION-TABLE §3.1).
         const Settings pcAuto = SettingsStore::Get().Snapshot();
-        if (pcAuto.l7Autoscale || (pcAuto.autoTune && pcAuto.encodeScalePct == 0)) {
+        // A89: the old autoTune half of this gate was always true (no key, no UI
+        // switch), so only the user's explicit encode-scale choice can hold the
+        // ladder back now.
+        if (pcAuto.l7Autoscale || pcAuto.encodeScalePct == 0) {
             rc::L7Autoscale::Config c;
             const double hintMs = m_caps.maxFpsAtMaxRes > 0 ? 1000.0 / m_caps.maxFpsAtMaxRes : 0.0;
             c.decodeBudgetMs = hintMs > 0 ? hintMs * 0.8 : 20.0;
@@ -1001,31 +1004,15 @@ void ClientSession::OnMonitorsChanged() {
 }
 
 void ClientSession::OnSettingsChanged(const json& changed) {
-    // PLAN-AUTO-TUNE: a manual write of a dimension auto owns locks that
-    // dimension until autoTune is turned off and back on (DECISION-TABLE §3.1).
-    // Enabling autoTune itself is the hand-over, so it clears last.
-    // A86 (user, 2026-11-23): streamProfile is no longer a settings key at all - the
-    // tier is the tuner's, so there is no floor write to announce and no lock to clear
-    // on that dimension. Cbr and Fovea keep the pre-A86 rule untouched.
-    bool rebuild = false;
+    // A89: a manual write of a dimension auto owns locks that dimension until
+    // ClearLocks() (DECISION-TABLE §3.1). The old "turn autoTune off and back on"
+    // hand-over is gone with the switch and the persisted key - there is no
+    // longer any write that clears a lock. Cbr and Fovea keep the lock rule.
     {
         std::lock_guard lock(m_mutex);
         if (changed.contains("qualityProfileCbr")) m_autoTune.MarkManual(rc::AutoDim::Cbr);
         if (changed.contains("foveatedEncoding")) m_autoTune.MarkManual(rc::AutoDim::Fovea);
-        if (changed.contains("autoTune")) {
-            const bool on = changed.value("autoTune", false);
-            if (on) m_autoTune.ClearLocks();  // the hand-over: every dimension is auto's again
-            // A86: neither UI has this switch any more, so this branch is the
-            // settings-file escape hatch (remote support). Off pins the stream at
-            // the start rung - EffectiveProfileRung's !autoTuneOn branch - and on
-            // makes the tuner choose again from scratch.
-            m_autoProfileEff = -1;
-            rebuild = !on;
-        }
     }
-    // app.cpp's rebuild list has no autoTune in it, so the switch that stops auto
-    // moving the picture has to rebuild the picture itself.
-    if (rebuild) OnStreamProfileChanged();
     if (changed.contains("desktopInput")) ApplyInputSetting(true);
     if (changed.contains("streamAudio") || changed.contains("micPassthrough") ||
         changed.contains("audioDevices") || changed.contains("playOnPcToo") || changed.contains("switchDefaultAudio"))
@@ -1115,7 +1102,7 @@ void ClientSession::LogAutoCapability() {
             "vrBitrateMbps=%d pcBitrateWins=%d adaptiveBitrate=%d codec=%s tenBit=%d effProfile=%d",
             m_hello.model.c_str(), m_hello.deviceId.c_str(), caps.h264, caps.hevc, caps.hevc10, caps.av1,
             caps.av110, caps.maxDecodeWidth, caps.maxDecodeHeight, caps.maxFpsAtMaxRes, rates.c_str(),
-            caps.recommendedEyeWidth, caps.recommendedEyeHeight, int(pc.autoTune), pc.encodeScalePct,
+            caps.recommendedEyeWidth, caps.recommendedEyeHeight, 1 /* A89: always on */, pc.encodeScalePct,
             int(pc.l7Autoscale), pc.streamProfile, int(pc.qualityProfileCbr), 0,  // A86b: profileControlsVideo removed
             int(pc.foveatedEncoding), pc.vrBitrateMbps, int(pc.pcBitrateWins), int(pc.adaptiveBitrate),
             pc.codec.c_str(), int(pc.tenBit), effProfile);
@@ -1129,7 +1116,7 @@ void ClientSession::RunAutoTune() {
     // left below reads the same stored flag back, so the layer is still the one
     // place that decides, and this call site only skips gathering signals and
     // printing the 30 s line for an install that opted out (DECISION-TABLE §4).
-    m_autoTune.SetEnabled(pc.autoTune);
+    m_autoTune.SetEnabled(true);  // A89: always on; no settings key or UI switch exists
     if (!m_autoTune.Enabled()) return;
     const ClientStreamSettings st = m_settings;
     const auto vs = m_vr ? m_vr->Stats() : VideoSenderStats{};

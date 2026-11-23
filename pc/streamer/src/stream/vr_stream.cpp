@@ -790,7 +790,11 @@ void VrStream::RunEncoder() {
         // slightly wrong picture for the ~46 s black screen a rebuild used to cost.
         if (const uint32_t q = m_pendingMinQp.exchange(0, std::memory_order_relaxed)) {
             if (!encoder->SetMinQp(q))
-                RC_LOGW("VR: encoder refused QP floor %u; keeping the previous one (no rebuild)", q);
+                // The congestion guard is already capping the bitrate on this very
+                // signal (the 10:17 log walked 90800 -> 37968 kbps), which forces
+                // rate control to raise QP anyway. A second, independent cap here
+                // would fight the guard for the same budget - so just say so.
+                RC_LOGW("VR: encoder refused QP floor %u; keeping the old one, the congestion guard still caps the bitrate (no rebuild)", q);
         }
 
         // Half rate pays nothing extra here. The encoder tracks the interval between the

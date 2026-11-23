@@ -95,15 +95,12 @@ struct Settings {
     bool l7Autoscale = false;
     // PLAN-AUTO-TUNE: the automatic tuner (rc/auto_tune.h). When on, it reads
     // the existing signals (decode hint, queue, loss, wire fill, QP) and acts
-    // for the user on the dimensions they have not written themselves: the L7
-    // ladder, CBR off, foveation on, and (A84) the picture profile BOTH ways.
-    // A84 (TASK-A84-PROFILE-FLOOR-TWO-WAY-AUTOTUNE-2026-11-23) flipped the
-    // default to ON: the product decision is that the user states a preference
-    // on one slider and the system picks the parameters - with the switch off
-    // nothing runs and the slider is an absolute choice again, which is the
-    // pre-A84 branch. See AUTO-TUNE-2026-11-19/
-    // DECISION-TABLE.md for every threshold's evidence.
-    bool autoTune = true;
+    // A89: Settings::autoTune is gone. It was never written after A86b (the UI
+    // switch and the persisted key were both deleted) and could not be turned
+    // off, so leaving a permanently-true field here would only mislead the next
+    // reader into thinking there is still a way to stop the tuner. The layer is
+    // enabled unconditionally at its single feed point in client_session.cpp;
+    // RINCAST_FORCE_RUNG is the process-lifetime override for support work.
     // L17 fill mode: when on, the encoder frame-rate rung may follow the slow fps
     // EMA down (floor 45) so a low-fps heavy scene keeps its full per-frame budget.
     // Default on: the real-device A/B (AUTO-TUNE-2026-11-19/ACCEPTANCE-C.md) held

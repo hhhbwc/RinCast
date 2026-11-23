@@ -5497,7 +5497,6 @@ rcs::Settings A12PcSettings(const bool* b, const A12Num& n) {
     pc.tenBit = b[A12TenBit];
     pc.adaptiveQuantization = b[A12AdaptiveQuantization];
     pc.twoPassEncoding = b[A12TwoPassEncoding];
-    pc.autoTune = b[A12AutoTune];
     pc.desktopInput = b[A12DesktopInput];
     pc.streamAudio = b[A12StreamAudio];
     pc.micPassthrough = b[A12MicPassthrough];
@@ -6026,11 +6025,11 @@ static void TestConfigCouplingCases() {
                     bpp);
     }
 
-    // 4. autoTune on + a user hand-write: the manual lock wins for that dimension,
-    //    other dims stay auto's; a decode-bound tick moves nothing by hand.
+    // 4. A user hand-write: the manual lock wins for that dimension, other dims
+    //    stay auto's; a decode-bound tick moves nothing by hand. A89: the tuner
+    //    is always on, so there is no switch to state here.
     {
         rcs::Settings pc;
-        pc.autoTune = true;
         pc.qualityProfileCbr = true;   // effective CBR on (below)
         pc.streamProfile = 2;
         st.tenBit = false;
