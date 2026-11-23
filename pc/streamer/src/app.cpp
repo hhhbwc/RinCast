@@ -344,7 +344,7 @@ std::string App::ApplySettingSideEffects(const json& changed) {
             changed.contains("desktopBitrateMbps") || changed.contains("adaptiveBitrate") ||
             changed.contains("videoPacingMode") || changed.contains("qualityProfileCbr") ||
             changed.contains("fillMode") ||
-            changed.contains("profileControlsVideo") || changed.contains("fecPercent") ||
+            changed.contains("fecPercent") ||
             changed.contains("foveatedEncoding") || changed.contains("adaptiveQuantization") ||
             changed.contains("twoPassEncoding") || changed.contains("encodeScalePct") ||
             changed.contains("l7Autoscale") ||

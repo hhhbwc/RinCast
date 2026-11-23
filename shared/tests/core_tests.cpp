@@ -2548,43 +2548,32 @@ static void TestGuardRecoveryCost() {
     }
 }
 
-// The per-profile fovea gradient (0.6 / 0.7 / 0.8): each profile floors the share
-// when it may drive video settings, never lowers it, and passes through when the
-// switch is off. Encoded widths on the 2176 panel: 1744 / 1856 / 1952.
+// A86b: foveation does NOT follow an (invisible) rung any more. A rung-driven
+// fovea radius changed edge sharpness in step with link noise - visible flicker.
+// The chosen share is passed through untouched; the geometry below is unchanged.
 static void TestProfileFoveaGradient() {
-    // Each profile gets its own floor.
-    CHECK(rcs::QualityProfileFoveaFor(0.6f, true, 0) == 0.6f);
-    CHECK(rcs::QualityProfileFoveaFor(0.6f, true, 1) == 0.7f);
-    CHECK(rcs::QualityProfileFoveaFor(0.6f, true, 2) == 0.8f);
-    // Switch off: pass-through for every profile.
-    CHECK(rcs::QualityProfileFoveaFor(0.6f, false, 1) == 0.6f);
-    CHECK(rcs::QualityProfileFoveaFor(0.6f, false, 2) == 0.6f);
-    // Never lowers: a higher headset/user choice stays.
-    CHECK(rcs::QualityProfileFoveaFor(0.9f, true, 1) == 0.9f);
-    CHECK(rcs::QualityProfileFoveaFor(0.9f, true, 2) == 0.9f);
-    // The latency floor is a small raise only for eye-tracked headsets (0.45).
-    CHECK(rcs::QualityProfileFoveaFor(0.45f, true, 0) == 0.6f);
-    // The gradient's encoded widths on the 2176 panel.
+    CHECK(rcs::QualityProfileFoveaFor(0.6f) == 0.6f);
+    CHECK(rcs::QualityProfileFoveaFor(0.9f) == 0.9f);
+    CHECK(rcs::QualityProfileFoveaFor(0.45f) == 0.45f);
+    // Encoded widths still follow the chosen share on the 2176 panel.
     const uint32_t w1 = uint32_t(std::lround(2176.0 * (0.6 + 0.4 * 0.5) / 16.0)) * 16;
     const uint32_t w2 = uint32_t(std::lround(2176.0 * (0.7 + 0.3 * 0.5) / 16.0)) * 16;
     CHECK(w1 == 1744);
     CHECK(w2 == 1856);
-    std::printf("ProfileFoveaGradient: 0.6/0.7/0.8 -> 1744/1856/1952 per eye, only-raise, switch-off passes through\n");
+    std::printf("fovea share passes through (no tier coupling); geometry 1744/1856 per eye\n");
 }
 
 // The bitrate ceiling: the headset's choice wins unless the PC user overrides, and
-// a missing headset number always falls back to the PC. The quality-profile CBR:
-// opt-in switch AND the profile AND the takeover switch.
+// a missing headset number always falls back to the PC. A86b: CBR is a plain
+// independent opt-in switch - never switched on by a rung auto happened to climb to.
 static void TestBitrateSwitches() {
     CHECK(rcs::EffectiveVrBitrate(140, 123, false) == 123);
     CHECK(rcs::EffectiveVrBitrate(140, 123, true) == 140);
     CHECK(rcs::EffectiveVrBitrate(140, 0, false) == 140);
     CHECK(rcs::EffectiveVrBitrate(140, 0, true) == 140);
-    CHECK(rcs::QualityProfileCbr(true, true, true) == true);
-    CHECK(rcs::QualityProfileCbr(true, true, false) == false);
-    CHECK(rcs::QualityProfileCbr(true, false, true) == false);
-    CHECK(rcs::QualityProfileCbr(false, true, true) == false);
-    std::printf("bitrate switches: headset wins by default, CBR is opt-in quality-only\n");
+    CHECK(rcs::QualityProfileCbr(true) == true);
+    CHECK(rcs::QualityProfileCbr(false) == false);
+    std::printf("bitrate switches: headset wins by default, CBR is independent opt-in\n");
 }
 
 // The loss brake: a loss cut holds the rate down even when the loss reads zero for
@@ -4528,7 +4517,6 @@ static void TestAutoTuneProfileFloor() {
         rc::AutoTune g;
         g.Configure(cfg);
         rc::AutoTuneInput in;
-        in.profileFloorId = 1;  // the slider: balanced is the worst picture accepted
         in.profileId = 2;       // the stream runs one rung sharper than the floor
         in.dipAtMs = dip(2);
         rc::AutoTune::Result r{};
@@ -4563,7 +4551,6 @@ static void TestAutoTuneProfileFloor() {
         rc::AutoTune g;
         g.Configure(cfg);
         rc::AutoTuneInput in;
-        in.profileFloorId = 0;
         in.profileId = 0;
         in.dipAtMs = dip(0);
         int ups = 0, downs = 0, rung = 0;
@@ -4585,22 +4572,19 @@ static void TestAutoTuneProfileFloor() {
         CHECK(firstUpNs == 30 * S);   // 0 -> 1: the 30 s Ok streak; no action to wait out
         CHECK(secondUpNs == 75 * S);  // 1 -> 2: the 45 s climb cooldown, NOT the 30 s streak
     }
-    // 3. The reversal: a manual floor raise clears the Profile lock by itself.
+    // 3. A86b: with no tier slider there is no floor write to clear a Profile
+    // lock. ClearLocks() (the hand-over when the tuner is re-enabled) is the ONLY
+    // way back, and a lock must hold through both calm and pressure until then.
     {
         rc::AutoTune g;
         g.Configure(cfg);
-        g.MarkManual(rc::AutoDim::Profile);  // what a manual write still does pre-A84
+        g.MarkManual(rc::AutoDim::Profile);
         rc::AutoTuneInput in;
-        in.profileFloorId = 0;
         in.profileId = 0;
         in.dipAtMs = dip(0);
-        // A lock holds while the floor does not move: 60 s of headroom, no climb.
-        for (int64_t t = 0; t <= 60 * S; t += S)
-            CHECK(g.Update(calm, in, t).action == rc::AutoAction::None);
-        // The user moves the slider 0 -> 1. No ClearLocks(), no turning autoTune off and
-        // on again - the floor write IS the hand-over. (The session lifts the live stream
-        // to the new floor on the rebuild that write triggers; EffectiveProfileLocked.)
-        in.profileFloorId = 1;
+        for (int64_t t = 0; t <= 66 * S; t += S)
+            CHECK(g.Update(t <= 60 * S ? calm : pressed, in, t).action == rc::AutoAction::None);
+        g.ClearLocks();
         in.profileId = 1;
         in.dipAtMs = dip(1);
         rc::AutoTune::Result r{};
@@ -4630,7 +4614,6 @@ static void TestAutoTuneProfileFloor() {
         rc::AutoTune g;
         g.Configure(cfg);
         rc::AutoTuneInput in;
-        in.profileFloorId = 1;
         in.profileId = 2;
         in.dipAtMs = dip(2);
         int ups = 0, downs = 0;
@@ -4707,7 +4690,6 @@ static void TestAutoTuneProfileFloor() {
             c.enabled = enabled;
             g.Configure(c);
             rc::AutoTuneInput in;
-            in.profileFloorId = 0;
             in.profileId = 0;  // case 2's shape: the stream starts at the floor
             in.dipAtMs = dip(0);
             Out o{0, 0, 0};
@@ -4735,7 +4717,6 @@ static void TestAutoTuneProfileFloor() {
         c.enabled = false;
         g.Configure(c);
         rc::AutoTuneInput in;
-        in.profileFloorId = 0;
         in.profileId = 0;
         in.dipAtMs = dip(0);
         int offActions = 0;
@@ -4772,7 +4753,6 @@ static void TestAutoTuneProfileFloor() {
         g.Configure(cfg);
         rc::AutoTuneInput in;
         in.profileId = 0;
-        in.profileFloorId = 2;  // the floor is established first, while nothing is locked
         in.dipAtMs = dip(0);
         (void)g.Update(calm, in, 0);  // the tick that states the floor: no lock to hand back yet
         g.MarkManual(rc::AutoDim::Profile);  // the user wrote this dimension
@@ -4787,12 +4767,15 @@ static void TestAutoTuneProfileFloor() {
         // erases it on the first of them - this CHECK goes red there.
         const int sameFloor[] = {5, 6, 9, 5};
         for (int i = 0; i < 4; i++) {
-            in.profileFloorId = sameFloor[i];
             CHECK(g.Update(calm, in, (41 + i) * S).action == rc::AutoAction::None);
         }
-        // And a floor that really is different is still the hand-over: 2 -> 1.
-        in.profileFloorId = 1;
-        const auto r = g.Update(calm, in, 50 * S);
+        // A86b: no floor number can clear this lock any more - the old 5/6/9/5
+        // "different floors" trick is gone. Only ClearLocks() hands the dimension
+        // back, after which the already-long Ok streak climbs on the next tick.
+        g.ClearLocks();  // also restarts the Ok streak (ResetEpisodesLocked)
+        for (int64_t t = 46 * S; t < 76 * S; t += S)
+            CHECK(g.Update(calm, in, t).action == rc::AutoAction::None);
+        const auto r = g.Update(calm, in, 76 * S);  // 46 s + the 30 s climb streak
         CHECK(r.action == rc::AutoAction::ProfileUp && r.profileId == 1);
     }
     std::printf("ok\n");
@@ -4830,46 +4813,19 @@ static void TestHasUsableSignals() {
 
 static void TestEffectiveProfileRung() {
     std::printf("effective profile rung: ");
-    // autoTune OFF is the pre-A84 branch, byte for byte: the slider is an absolute
-    // choice, so the effective rung IS the floor and auto's last choice is ignored.
-    CHECK(rc::EffectiveProfileRung(-1, 1, false) == 1);
-    CHECK(rc::EffectiveProfileRung(0, 1, false) == 1);
-    CHECK(rc::EffectiveProfileRung(2, 0, false) == 0);
-    // ON, nothing chosen yet: auto starts at the user's floor, not under it.
-    CHECK(rc::EffectiveProfileRung(-1, 0, true) == 0);
-    CHECK(rc::EffectiveProfileRung(-1, 2, true) == 2);
-    // ON: the rule is `the rung auto chose`, and A84c is why it may be UNDER the
-    // floor. Until then this function took a max with the floor, and ClientSession
-    // wrote its answer back into the very state it read - so AutoTune's link-bound
-    // cut below the floor was cancelled on the next line: the session logged
-    // `profile 1 -> 0 down`, called OnStreamProfileChanged, and rebuilt the stream at
-    // the rung it had just been running at. A floor is where auto RETURNS (that is
-    // what both slider labels say), not a line the read may not cross.
-    for (int floorId = 0; floorId <= 2; floorId++)
-        for (int autoRung = 0; autoRung <= 2; autoRung++) {
-            const int eff = rc::EffectiveProfileRung(autoRung, floorId, true);
-            CHECK(eff == autoRung);  // the answer is the choice, never a clamp of it
-            CHECK(eff <= 2);
-        }
-    // The one move the max() was standing in for is now explicit, and it is the
-    // direction the USER owns: raising the floor lifts the live stream to it at once,
-    // with no cooldown and no Ok streak to wait out. Lowering it lifts nothing -
-    // auto goes down on its own evidence, and a dip already in progress stays there
-    // until the link calms (ClimbProfile).
-    CHECK(rc::LiftRungToNewFloor(0, 1, 2) == 2);  // floor 1 -> 2 while dipped: lifted
-    CHECK(rc::LiftRungToNewFloor(1, 1, 2) == 2);  // same for a rung merely below it
-    CHECK(rc::LiftRungToNewFloor(2, 1, 2) == 2);  // already at the new floor: unchanged
-    CHECK(rc::LiftRungToNewFloor(0, 2, 1) == 0);  // LOWERING the floor leaves the rung alone
-    CHECK(rc::LiftRungToNewFloor(0, 1, 1) == 0);  // an unchanged floor is not an event
-    CHECK(rc::LiftRungToNewFloor(1, 0, 0) == 1);  // ... not even when it is the first floor seen
-    CHECK(rc::LiftRungToNewFloor(-1, 1, 2) == -1);  // auto has not chosen: nothing to lift
-    CHECK(rc::LiftRungToNewFloor(0, -1, 2) == 0);   // no previous floor: nothing moved
-    CHECK(rc::LiftRungToNewFloor(0, 5, 6) == 0);    // both out of range = the same floor 2
-    CHECK(rc::LiftRungToNewFloor(0, 1, 9) == 2);    // a wild new floor still lands on the ladder
-    // Neither seat can leave the 0/1/2 ladder, whatever a caller passes in.
-    CHECK(rc::EffectiveProfileRung(9, 1, true) == 2);
-    CHECK(rc::EffectiveProfileRung(-1, 9, true) == 2);
-    CHECK(rc::EffectiveProfileRung(9, -3, false) == 0);
+    // A86b: no slider and no floor. -1 is the only sentinel: auto has not chosen
+    // yet, so a new stream starts at 1 (balanced - smooth AND sharp before any
+    // evidence exists). It is a start point, not a line the tuner may not cross.
+    CHECK(rc::EffectiveProfileRung(-1) == 1);
+    // Every stored choice is clamped to the 0/1/2 ladder. Running at 0 under
+    // pressure and climbing to 2 with headroom are both ordinary - there is no
+    // floor to "violate" any more, so none of these needs a lift-back rule.
+    for (int rung = 0; rung <= 2; rung++) {
+        CHECK(rc::EffectiveProfileRung(rung) == rung);
+        CHECK(rc::EffectiveProfileRung(rung) <= 2);
+    }
+    CHECK(rc::EffectiveProfileRung(9) == 2);
+    CHECK(rc::EffectiveProfileRung(-3) == 1);  // any negative is "not chosen yet" -> start rung
     std::printf("ok\n");
 }
 
@@ -5534,7 +5490,6 @@ rcs::Settings A12PcSettings(const bool* b, const A12Num& n) {
     rcs::Settings pc;  // defaults, then the swept switches
     pc.fillMode = b[A12FillMode];
     pc.qualityProfileCbr = b[A12QualityProfileCbr];
-    pc.profileControlsVideo = b[A12ProfileControlsVideo];
     pc.l7Autoscale = b[A12L7Autoscale];
     pc.adaptiveBitrate = b[A12AdaptiveBitrate];
     pc.pcBitrateWins = b[A12PcBitrateWins];
@@ -5711,19 +5666,20 @@ static void TestVrConfigComboSweep() {
                           "bits-per-pixel not finite/positive");
 
                 // ---- §1.4 + §1.5: CBR gate, one gate, fill floor ----
-                const bool gate = pc.profileControlsVideo && !slowPath;  // match=false in the sweep
-                const bool cbrExpected = pc.qualityProfileCbr && gate && cfg.profile == rc::StreamProfile::Quality;
+                // A86b: CBR is a plain independent switch - no tier gate, no takeover
+                // gate. A rung-driven CBR switch oscillated against the tuner.
+                const bool cbrExpected = pc.qualityProfileCbr;
                 A12_CHECK(cfg.cappedVbr == !cbrExpected, "A4-A5-cbr-gate", b, n, gazeFovea, slowPath,
-                          "CBR state disagrees with (cbr x takeover x quality)");
-                if (!cfg.cappedVbr)
-                    A12_CHECK(cfg.profile == rc::StreamProfile::Quality, "A4-A5-cbr-gate", b, n, gazeFovea, slowPath,
-                              "CBR outside the quality profile");
+                          "CBR state disagrees with the independent switch");
+                // A86b: CBR is independent - it may be on at ANY rung, and it never
+                // turns itself on because auto happened to climb to the sharp one.
                 if (gazeFovea && cfg.encodeScale >= 1.0f) {
-                    const float base = st.eyesTracked ? rcs::Foveator::kFoveaSize : rcs::Foveator::kFixedFoveaSize;
-                    const float floor_ = int(cfg.profile) == 2 ? 0.8f : int(cfg.profile) == 1 ? 0.7f : 0.6f;
-                    const float expected = gate && floor_ > base ? floor_ : base;
+                    // A86b: the fovea share no longer follows a rung - that made
+                    // edge sharpness flicker in step with link noise.
+                    const float expected = st.eyesTracked ? rcs::Foveator::kFoveaSize
+                                                          : rcs::Foveator::kFixedFoveaSize;
                     A12_CHECK(cfg.foveaSize == expected, "A5-fovea-floor", b, n, gazeFovea, slowPath,
-                              "fovea floor disagrees with the takeover gate");
+                              "fovea share changed without the user's setting");
                 } else {
                     A12_CHECK(cfg.foveaSize == rcs::Foveator::kFoveaSize, "A5-fovea-floor", b, n, gazeFovea, slowPath,
                               "foveaSize touched without the fovea path");
@@ -6038,7 +5994,6 @@ static void TestConfigCouplingCases() {
     {
         rcs::Settings pc;
         pc.qualityProfileCbr = true;
-        pc.profileControlsVideo = true;
         pc.streamProfile = 2;
         pc.fillMode = true;
         pc.vrBitrateMbps = 20;   // the lower-bound extreme
@@ -6077,7 +6032,6 @@ static void TestConfigCouplingCases() {
         rcs::Settings pc;
         pc.autoTune = true;
         pc.qualityProfileCbr = true;   // effective CBR on (below)
-        pc.profileControlsVideo = true;
         pc.streamProfile = 2;
         st.tenBit = false;
         const auto in = rcs::BuildAutoTuneInput(pc, st, false);

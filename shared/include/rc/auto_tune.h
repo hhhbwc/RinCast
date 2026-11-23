@@ -153,47 +153,18 @@ enum class AutoDim : uint8_t { Cbr, Fovea, Profile };
 // auto does may name a rung outside it, whatever a caller passes in.
 inline int ClampProfileId(int id) { return id < 0 ? 0 : (id > 2 ? 2 : id); }
 
-// A84b §4 (TASK-A84b): the rule that turns the slider (a FLOOR) plus what auto
-// last chose into the rung a stream is BUILT at, as a pure function. It is the
-// product rule ClientSession::EffectiveProfileLocked applies - moved here because
-// rincast-core-tests links the shared headers only, so a rule that lives in
-// client_session.cpp has no test that can go red on it, and the periodic log
-// reading of §4 is exactly this pair of numbers. `autoRung` is the caller's stored
-// choice, -1 = auto has not chosen yet. A84c added LiftRungToNewFloor beside it for
-// the one thing a pure read cannot do: notice that the floor itself just moved.
-//
-// Invariants the floor semantics are built on, each one asserted in core_tests:
-//   - off  -> the floor, always (the pre-A84 branch: the slider is an absolute
-//     choice again, so effective == floor and never anything else);
-//   - on, nothing chosen yet -> the floor, so auto starts from the user's choice;
-//   - on -> the rung auto chose, clamped to the ladder and NOTHING else. It may sit
-//     under the floor: that is the escape a link-bound stream needs when the floor
-//     itself is what the wire cannot carry (the 5 s + 30 s brake at AutoAction::
-//     ProfileDown), and the climb is then obliged to undo the deviation. A max() with
-//     the floor stood here until A84c and made that whole branch a no-op: the tuner
-//     proposed the cut, the caller stored it, and this line answered with the floor,
-//     so the rebuild fired while nothing moved. A floor is where auto RETURNS, which
-//     is what the slider copy in both UIs says; it is not a floor it cannot break.
-//   - both inputs clamped, so a caller can never leave the 0/1/2 ladder.
-// Because nothing here lifts, the caller owes one thing instead: see LiftRungToNewFloor.
-inline int EffectiveProfileRung(int autoRung, int floorId, bool autoTuneOn) {
-    if (!autoTuneOn || autoRung < 0) return ClampProfileId(floorId);
-    return ClampProfileId(autoRung);
-}
-
-// A84c: the other half of the floor rule, and the half `EffectiveProfileRung` used to
-// do by accident. When the user RAISES the floor above the rung the streams run at,
-// the stream moves to the new floor on the spot - the slider is the one control in
-// this page that has to look alive the moment it is touched, and auto's own climb
-// waits 30 s of headroom plus a 45 s cooldown. Lowering the floor (or leaving it
-// alone) changes nothing here: a dip already in progress stays dipped until the link
-// calms, and a rung above the old floor is above the new one too.
-// `autoRung` -1 (auto has not chosen) and `prevFloorId` -1 (floor never read) pass
-// through untouched so the caller can feed this unconditionally on every read.
-inline int LiftRungToNewFloor(int autoRung, int prevFloorId, int newFloorId) {
-    if (autoRung < 0 || prevFloorId < 0) return autoRung;
-    const int floor = ClampProfileId(newFloorId);
-    return ClampProfileId(prevFloorId) < floor ? std::max(ClampProfileId(autoRung), floor) : autoRung;
+// A86b (user, 2026-11-23): the tier slider is gone from both UIs, so there is no
+// floor left to feed this. It is now purely "which rung does the stream run at":
+//   - autoRung == -1 means the tuner has not chosen yet, and the stream starts at
+//     rung 1 (balanced). That is a START POINT, not a floor: a new user gets a
+//     picture that is both smooth and sharp before any evidence exists.
+//   - otherwise the tuner's stored choice, clamped to the 0/1/2 ladder.
+// Running at 0 under sustained pressure and climbing to 2 with headroom are both
+// normal - neither is a "floor violation" any more. Keeping the old two/three
+// argument form just to preserve tests whose feature was deleted would leave a
+// dead concept in the only shared header the whole product builds against.
+inline int EffectiveProfileRung(int autoRung) {
+    return ClampProfileId(autoRung < 0 ? 1 : autoRung);
 }
 
 struct AutoTuneInput {
@@ -205,10 +176,8 @@ struct AutoTuneInput {
     bool foveaPossible = true;
     int profileId = 1;     // the profile the LIVE stream is built at (A84: the
                            // effective one - the user's slider is profileFloorId)
-    // A84 §2: the user's slider - the LOWEST picture profile they accept, not the
-    // one they asked to run. Writing it is the user speaking about this dimension,
-    // so a change here clears the Profile manual lock (the reversal).
-    int profileFloorId = 0;
+    // A86b: profileFloorId was removed with the slider. The only profile input is
+    // `profileId`, the rung the live streams are built at; auto owns it outright.
     // A84 §2 / A81 §M1-M2: the brake line the CURRENT profile pays, i.e. the
     // `dipAt` the latency log line prints (queue_guard.h's formula, read from the
     // live config - never a copy of the guard's state). 0 = unknown: an unknown
@@ -316,20 +285,9 @@ class AutoTune {
         // which is the half the old call-site gate could not be made to prove.
         if (!m_cfg.enabled) return r;
         r.cls = ClassifyBottleneck(s);
-        // A84 §2: the slider moving IS the manual write reaching this layer. It
-        // re-floors and hands the profile dimension back - the opposite of the
-        // pre-A84 "one write locks it forever". A caller that never passes a floor
-        // (the default 0, e.g. the sweep's BuildAutoTuneInput) never triggers this
-        // and keeps the old lock semantics.
-        // A84b §3: the comparison is clamped on BOTH sides, so m_profileFloor is the
-        // rung the layer actually works to rather than a echo of whatever the caller
-        // sent. An out-of-range floor (5, then 6 - both clamped to 2) states the same
-        // floor and must not clear the lock once per tick; an unclamped comparison did.
-        const int floorId = ClampProfileId(in.profileFloorId);
-        if (floorId != m_profileFloor) {
-            m_profileFloor = floorId;
-            m_manual.erase(AutoDim::Profile);
-        }
+        // A86b: the floor-write branch is gone with the slider. There is no user
+        // write on the Profile dimension any more - auto owns it for the session;
+        // Cbr and Fovea keep their manual-lock rules below.
         // Session-level peak of what the wire actually carried: the closest
         // thing to an observed link capacity without new telemetry.
         m_peakMbps = std::max(m_peakMbps, s.mbps);
@@ -472,7 +430,6 @@ class AutoTune {
     bool m_over = false;         // the current class has held continuously
     int64_t m_overSinceNs = 0;
     int64_t m_okSinceNs = -1;      // A84: the clean streak the climb reads, -1 = none
-    int m_profileFloor = 0;      // A84: the last floor the slider stated (see Update)
     int64_t m_lastActionNs = 0;  // any action by this layer or the ladder
     bool m_loggedGameBound = false;
     bool m_loggedCeilingHint = false;

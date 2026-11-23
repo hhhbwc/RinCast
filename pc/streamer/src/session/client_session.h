@@ -135,15 +135,12 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     // RunAutoTune on every tick whatever the switch says.
     void LogAutoCapability();
     void RunAutoTune();
-    // A84 (TASK-A84-PROFILE-FLOOR-TWO-WAY-AUTOTUNE-2026-11-23 §2): the profile a
-    // stream is BUILT at. Settings::streamProfile (and the synced wire key, and the
-    // slider on both sides) is now the FLOOR - the worst picture the user accepts -
-    // so the effective rung is session state and never written back: auto moving it
-    // cannot move the user's choice, and the user moving it cannot be fought.
-    // autoTune off = the floor, exactly the pre-A84 branch. The Locked variant runs
-    // with m_mutex held (RunAutoTune); the other takes it (the stream builds).
-    int EffectiveProfile(int floorId, bool autoTuneOn);
-    int EffectiveProfileLocked(int floorId, bool autoTuneOn);
+    // A86b: the picture tier is session state owned by the tuner - no slider, no
+    // floor, no settings write-back. The Locked variant runs with m_mutex held
+    // (RunAutoTune); the other takes it (the stream builds). -1 means "not chosen
+    // yet" and resolves to 1 (balanced), the starting rung, not a lower bound.
+    int EffectiveProfile();
+    int EffectiveProfileLocked();
     // A stream-build snapshot with the effective rung substituted: identical to the
     // saved settings except for streamProfile. Takes m_mutex, so it must not be
     // called from under it (RunAutoTune uses EffectiveProfileLocked for that).
@@ -188,16 +185,11 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     rc::AutoTune m_autoTune;      // PLAN-AUTO-TUNE / A84b §1: Settings::autoTune is
                                   // fed in as Config::enabled by RunAutoTune, and the
                                   // layer is what goes inert - no gate at this site
-    // A84: the profile auto has put the live streams at (-1 = it has not chosen
-    // yet, so the floor rules). Guarded by m_mutex like m_autoTune.
-    // A84c: it may sit BELOW the floor while a link-bound episode holds - the escape
-    // rc::AutoTune's ProfileDown is there for. Nothing clamps it back up; the only
-    // thing that raises it is the user moving the floor itself (m_autoProfileFloor).
+    // A86b: the rung auto has put the live streams at (-1 = not chosen yet).
+    // Guarded by m_mutex like m_autoTune. Nothing else writes it now: auto may move
+    // it down under pressure and up with headroom, and the apply path is in-place
+    // (A87), so no stream rebuild is involved.
     int m_autoProfileEff = -1;
-    // A84c: the floor as of the last EffectiveProfileLocked read (-1 = not read yet).
-    // The delta against it is what makes "the user raised the slider" an event, which
-    // is the one thing rc::EffectiveProfileRung cannot see from a pure read.
-    int m_autoProfileFloor = -1;
     int64_t m_autoSignalLogNs = 0;  // the 30 s AUTO: signals cadence
     // The synced settings the PC currently owns (key -> the value it pushed). The
     // headset takes a key back by sending a different value for it.

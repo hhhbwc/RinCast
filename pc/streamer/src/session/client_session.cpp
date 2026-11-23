@@ -36,6 +36,27 @@ namespace {
 // the size still brings it down below.
 constexpr double kMaxVrScale = 1.5;
 
+// A86b: `profileFloor=` stays in the periodic AUTO line and the tier-transition
+// line byte-for-byte (analyze_dual.py reads by position). With the slider gone it
+// is the tuner's START rung, not a user-set floor - a fixed 1 (balanced). Do not
+// remove or rename the field just because the concept behind it was deleted.
+constexpr int kStartRungForLog = 1;
+
+// A86b: the settings-file escape hatch is gone (a stale "autoTune": false with no
+// UI to reverse it was a silent trap). Remote support can still pin a rung with
+// RINCAST_FORCE_RUNG=0|1|2; read once per process, never written to disk, and an
+// invalid value is ignored rather than clamped into a different picture.
+int ForcedRung() {
+    static const int rung = [] {
+        const char* text = std::getenv("RINCAST_FORCE_RUNG");
+        if (!text || !*text) return -1;
+        char* end = nullptr;
+        const long value = std::strtol(text, &end, 10);
+        return (end && *end == '\0' && value >= 0 && value <= 2) ? int(value) : -1;
+    }();
+    return rung;
+}
+
 // ---------------------------------------------------------------------------
 // TASK-A80 stage M1: geometry SHAPE readings. Diagnostics only - nothing below
 // changes a size, a field of view, or any decision (the card forbids it, and the
@@ -1037,38 +1058,24 @@ void ClientSession::ResetAutoscale() {
 // Design authority: AUTO-TUNE-2026-11-19/DECISION-TABLE.md.
 // ---------------------------------------------------------------------------
 
-// A84 §2: the profile a stream is built at. See the declaration in
-// client_session.h for why the slider and the running rung are two different
-// numbers now. Caller rule: the Locked variant runs with m_mutex held.
-int ClientSession::EffectiveProfileLocked(int floorId, bool autoTuneOn) {
-    // A84b §4: the rule itself is rc::EffectiveProfileRung now, so the core_tests
-    // can bind it (this file is not linked into rincast-core, and a rule only
-    // reachable from here has no test that could go red on it). What stays here is
-    // the half that needs session state: remembering the rung, and adopting the
-    // floor when auto has not chosen yet or when a RAISED floor arrives - the user
-    // speaking, so the live stream lifts to it on the rebuild that write triggers,
-    // with no cooldown and no episode to wait out.
-    // A84c: the lift is no longer a side effect of the read. The read used to take a
-    // max with the floor, which is also what made an auto cut BELOW the floor
-    // impossible - the exact escape a link-bound stream at the floor needs, and the
-    // reason the log line at the profile transition says "allowed to sit under". So
-    // the max moved here, where it runs only on the tick the floor itself moves.
-    const int floor = rc::ClampProfileId(floorId);
-    m_autoProfileEff = rc::LiftRungToNewFloor(m_autoProfileEff, m_autoProfileFloor, floor);
-    m_autoProfileFloor = floor;
-    const int rung = rc::EffectiveProfileRung(m_autoProfileEff, floor, autoTuneOn);
-    if (autoTuneOn) m_autoProfileEff = rung;
-    return rung;
+// A86b: the user-facing slider and its floor are gone. What stays here is the one
+// piece of session state the pure rc::EffectiveProfileRung cannot hold: which rung
+// auto last chose. -1 = not chosen yet, which the pure rule turns into 1 (balanced).
+// Caller rule: the Locked variant runs with m_mutex held.
+int ClientSession::EffectiveProfileLocked() {
+    if (const int forced = ForcedRung(); forced >= 0) return m_autoProfileEff = forced;
+    m_autoProfileEff = rc::EffectiveProfileRung(m_autoProfileEff);
+    return m_autoProfileEff;
 }
 
-int ClientSession::EffectiveProfile(int floorId, bool autoTuneOn) {
+int ClientSession::EffectiveProfile() {
     std::lock_guard lock(m_mutex);
-    return EffectiveProfileLocked(floorId, autoTuneOn);
+    return EffectiveProfileLocked();
 }
 
 Settings ClientSession::EffectiveSettings(const Settings& pc) {
     Settings eff = pc;
-    eff.streamProfile = EffectiveProfile(pc.streamProfile, pc.autoTune);
+    eff.streamProfile = EffectiveProfile();
     return eff;
 }
 
@@ -1101,7 +1108,7 @@ void ClientSession::LogAutoCapability() {
     // matter: a latency-first slider (streamProfile=0) on a link with room. Appended
     // at the END of this line - logpair.py / analyze_dual.py anchor on the fields
     // before it, and the parser regexes here are not end-anchored.
-    const int effProfile = EffectiveProfile(pc.streamProfile, pc.autoTune);
+    const int effProfile = EffectiveProfile();
     RC_LOGI("AUTO: capability device=%s serial=%s decoders=h264:%d hevc:%d hevc10:%d av1:%d av110:%d "
             "maxDecode=%ux%u maxFpsAtMaxRes=%u refresh=[%s] eye=%ux%u | autoTune=%d encodeScalePct=%d "
             "l7Autoscale=%d streamProfile=%d qualityProfileCbr=%d profileControlsVideo=%d foveatedEncoding=%d "
@@ -1109,7 +1116,7 @@ void ClientSession::LogAutoCapability() {
             m_hello.model.c_str(), m_hello.deviceId.c_str(), caps.h264, caps.hevc, caps.hevc10, caps.av1,
             caps.av110, caps.maxDecodeWidth, caps.maxDecodeHeight, caps.maxFpsAtMaxRes, rates.c_str(),
             caps.recommendedEyeWidth, caps.recommendedEyeHeight, int(pc.autoTune), pc.encodeScalePct,
-            int(pc.l7Autoscale), pc.streamProfile, int(pc.qualityProfileCbr), int(pc.profileControlsVideo),
+            int(pc.l7Autoscale), pc.streamProfile, int(pc.qualityProfileCbr), 0,  // A86b: profileControlsVideo removed
             int(pc.foveatedEncoding), pc.vrBitrateMbps, int(pc.pcBitrateWins), int(pc.adaptiveBitrate),
             pc.codec.c_str(), int(pc.tenBit), effProfile);
 }
@@ -1157,9 +1164,8 @@ void ClientSession::RunAutoTune() {
     // A84b §3: BuildAutoTuneInput no longer takes the key-ownership flag - the
     // floor above carries the intent it guarded, see stream_config.h.
     Settings eff = pc;
-    eff.streamProfile = EffectiveProfileLocked(pc.streamProfile, pc.autoTune);
+    eff.streamProfile = EffectiveProfileLocked();
     rc::AutoTuneInput in = BuildAutoTuneInput(eff, st, m_slowPath);
-    in.profileFloorId = pc.streamProfile;
     in.dipAtMs = ProfileDipAtMs(eff.streamProfile);
 
     // A88: a paused/absent stream reports qp=-1, wire=0, queue=-1, gameFps=0. That
@@ -1191,7 +1197,7 @@ void ClientSession::RunAutoTune() {
                 "decode=%.1f/%.1f ms dropped=%.1f effProfile=%d profileFloor=%d",
                 rc::BottleneckName(r.cls), vs.fps, vs.gameFps, vs.qp, vs.mbps, vs.bitrateKbps, vs.queueMs,
                 vs.lossAvg * 100.0, sig.decodeMs, sig.decodeBudgetMs, vs.droppedFps, eff.streamProfile,
-                in.profileFloorId);
+                kStartRungForLog);
         if (nominalClamped)
             RC_LOGW("Refresh clamp (autoTune mirror of the StartVr stream-build clamp): %.0f Hz requested, not in "
                     "the device's enumerated list [%s] - nominal %.0f Hz (the top entry)",
@@ -1238,7 +1244,7 @@ void ClientSession::RunAutoTune() {
             RC_LOGI("AUTO: profile %d -> %d %s (floor %d, %s held %.0f s, dipAt %.0f ms, queue %.0f ms, "
                     "decode %.1f ms, classifier %s)",
                     from, m_autoProfileEff, r.action == rc::AutoAction::ProfileUp ? "up" : "down",
-                    in.profileFloorId, r.action == rc::AutoAction::ProfileUp ? "headroom" : "pressure",
+                    kStartRungForLog, r.action == rc::AutoAction::ProfileUp ? "headroom" : "pressure",
                     double(r.evidenceNs) / 1e9, in.dipAtMs, sig.queueMs, sig.decodeMs,
                     rc::BottleneckName(r.cls));
             // m_mutex is held by RunAutoTune, so m_vr is safe to touch here. The

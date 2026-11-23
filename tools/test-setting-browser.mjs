@@ -41,7 +41,7 @@ function bridgeFixture() {
   Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN'] });
   const base = {
     type: 'state', version: 'ROUND8 browser fixture', downloadUrl: '', downloadSite: '',
-    settings: { _revision: 1, pcName: 'Browser fixture', codec: 'auto', tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, profileControlsVideo: true, qualityProfileCbr: false, pcBitrateWins: true, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: 'auto', autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: false, preventSleep: true, cloudUrl: '', trustedDevices: [] },
+    settings: { _revision: 1, pcName: 'Browser fixture', codec: 'auto', tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, qualityProfileCbr: false, pcBitrateWins: true, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: 'auto', autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: false, preventSleep: true, cloudUrl: '', trustedDevices: [] },
     cloud: { signedIn: false },
     system: { gpu: 'NVIDIA test fixture', port: 38711, addresses: [], vpnAddresses: [], firewall: { otherNetworksOpen: true }, encoder: { backend: 'nvenc', h264: true, hevc: true, av1: true, hevc10: true }, steamvr: { installed: true, running: false, driverRegistered: true }, openxr: { rincastAvailable: false, rincastActive: false, steamvrActive: true }, audioDriver: { speaker: false, microphone: false, steam: { speaker: true, microphone: true }, active: { speaker: 'steam', microphone: 'steam' } } },
     session: { deviceName: 'Fixture headset', model: 'Fixture', address: '127.0.0.1', connectedSeconds: 60, rttMs: 3, vrState: 'idle', headsetBitrateMbps: 0, headsetCodec: 'auto', desktop: [], client: {} },
@@ -280,7 +280,7 @@ try {
   assert.equal(shut.visible, 3);
   assert.equal(shut.danglingTitles, 0);
   assert.equal(shut.emptyCards, 0);
-  assert.equal(shut.keys, 16);  // A86: 18 - the tier slider and its switch; hidden, not removed
+  assert.equal(shut.keys, 15);  // A86b: 18 - slider - switch - tier-driven-video; hidden, not removed
   const valuesShut = await snapshot();
 
   // A86 (user, 2026-11-23): the tuner's on/off switch is gone from this page. The
@@ -338,9 +338,9 @@ try {
   await enter();
   await wait(40);
   const open = await cardReport();
-  assert.equal(open.foldRows, 11, 'expanding showed a different number of rows than the block owns');
+  assert.equal(open.foldRows, 10, 'A86b: 11 - the "Quality follows profile" row; expanding showed a different number of rows than the block owns');
   assert.equal(open.foldHeight > shut.foldHeight, true);
-  assert.equal(open.keys, 16);  // A86: same 16, nothing appears when the fold opens
+  assert.equal(open.keys, 15);  // A86b: same 15, nothing appears when the fold opens
   assert.equal(open.danglingTitles, 0);
   assert.equal(open.emptyCards, 0);
   const afterOpen = await anchorTops();
@@ -449,15 +449,14 @@ try {
     assert.equal(await js(`document.querySelector('#vrBitrateBar input').disabled`), disabled);
     assert.equal(await js(`document.querySelector('#vrBitrateBar output').textContent`), `${disabled ? headset : 100} Mbps`);
   }
-  // A86: the CBR row used to be gated on the tier (it only made sense at the sharpest one).
-  // The tier is the tuner's and is not on this page any more, so the row is live whenever
-  // the user asked the tier to drive video settings and the link allows it - the profile
-  // number no longer decides anything here, which is what the 0/1/2 case below pins down.
-  for (const [profileValue, controls, match, slow, disabled] of [[2,true,false,false,false],[2,true,true,false,true],[2,true,false,true,true],[0,true,false,false,false],[2,false,false,false,true]]) {
-    await js(`__bridge.state({streamProfile:${profileValue},profileControlsVideo:${controls}},{matchSteamVr:${match},slowPath:${slow}})`);
+  // A86b: CBR is an independent switch. Neither a tier number nor a "let the tier
+  // drive video" checkbox exists on this page any more - that coupling made the
+  // link oscillate. Only the link gates remain.
+  for (const [match, slow, disabled] of [[false,false,false],[true,false,true],[false,true,true]]) {
+    await js(`__bridge.state({qualityProfileCbr:true},{matchSteamVr:${match},slowPath:${slow}})`);
     assert.equal(await js(`document.querySelector('#cbrRow input').disabled`), disabled);
   }
-  check('round7_real_dom_gates', { pcLimitCases: 3, cbrCases: 5, earlyPushes: 'stats/firewall/vrState before state on every fresh load' });
+  check('round7_real_dom_gates', { pcLimitCases: 3, cbrCases: 3, earlyPushes: 'stats/firewall/vrState before state on every fresh load' });
 
   await fresh(); await js('__bridge.auto=false');
   const before = await js('__bridge.changes().length');
@@ -477,13 +476,13 @@ try {
   assert.deepEqual(keys.slice().sort(), [
     'adaptiveBitrate', 'adaptiveQuantization', 'codec', 'desktopBitrateMbps',
     'desktopMaxHeight', 'encodeScalePct', 'fecPercent', 'fillMode', 'foveatedEncoding',
-    'l7Autoscale', 'pcBitrateWins', 'profileControlsVideo', 'qualityProfileCbr',
+    'l7Autoscale', 'pcBitrateWins', 'qualityProfileCbr',
     'tenBit', 'twoPassEncoding', 'vrBitrateMbps',
   ]);
   const stressStart = performance.now();
   const framesBefore = await js('__bridge.frames');
   for (const key of keys) {
-    await js(`__bridge.state({codec:'auto',profileControlsVideo:true,pcBitrateWins:true},{headsetBitrateMbps:0,headsetGazeFoveation:false,matchSteamVr:false,slowPath:false})`);
+    await js(`__bridge.state({codec:'auto',qualityProfileCbr:false,pcBitrateWins:true},{headsetBitrateMbps:0,headsetGazeFoveation:false,matchSteamVr:false,slowPath:false})`);
     const startCount = await js('__bridge.changes().length');
     for (let i = 0; i < 10; i++) {
       const type = await js(`document.querySelector(${JSON.stringify(selector(key))}).type`);

@@ -118,9 +118,9 @@ inline VrStreamBuild BuildVrStreamConfig(const Settings& pc, const ClientStreamS
     // profile used to turn it on by itself (and the page greyed it out), which
     // surprised users who had deliberately left it off; the user decides.
     cfg.twoPass = pc.twoPassEncoding;
-    // CBR is the quality profile's "spend exactly this" mode; opt-in, quality only.
-    cfg.cappedVbr = !rcs::QualityProfileCbr(pc.qualityProfileCbr, pc.profileControlsVideo && !match && !slowPath,
-                                            cfg.profile == rc::StreamProfile::Quality);
+    // A86b: CBR is a plain independent opt-in switch, never a side effect of the
+    // tier auto happens to be on (that coupling oscillated - see settings.h).
+    cfg.cappedVbr = !rcs::QualityProfileCbr(pc.qualityProfileCbr);
     cfg.fillMode = pc.fillMode;
     cfg.motionField = st.frameGeneration;
     // ROUND18 L2-FIX2: the real encoded PER-EYE size after encodeScale. One value
@@ -136,8 +136,8 @@ inline VrStreamBuild BuildVrStreamConfig(const Settings& pc, const ClientStreamS
         // and only ever raises; matched-SteamVR sizes and the slow internet path pick
         // their own. This runs BEFORE the EncodedSize calls, so the sizes encoded - and
         // the share sent to the headset - come from the same value.
-        cfg.foveaSize = QualityProfileFoveaFor(cfg.foveaSize, pc.profileControlsVideo && !match && !slowPath,
-                                               int(cfg.profile));
+        // A86b: foveation no longer follows a (now invisible) rung.
+        cfg.foveaSize = QualityProfileFoveaFor(cfg.foveaSize);
         cfg.foveatedEyeWidth = Foveator::EncodedSize(cfg.eyeWidth, cfg.foveaSize);
         cfg.foveatedEyeHeight = Foveator::EncodedSize(cfg.eyeHeight, cfg.foveaSize);
         codedEyeW = rc::ScaledEncodeSize(cfg.foveatedEyeWidth * 2, cfg.encodeScale) / 2;
@@ -251,8 +251,7 @@ inline DesktopStreamConfig BuildDesktopStreamConfig(const Settings& pc, const Cl
 inline rc::AutoTuneInput BuildAutoTuneInput(const Settings& pc, const ClientStreamSettings& st, bool slowPath) {
     const bool match = st.matchSteamVr && !slowPath;  // StartVr's own condition
     rc::AutoTuneInput in;
-    in.cbrOn = rcs::QualityProfileCbr(pc.qualityProfileCbr, pc.profileControlsVideo && !match && !slowPath,
-                                      pc.streamProfile == int(rc::StreamProfile::Quality));
+    in.cbrOn = rcs::QualityProfileCbr(pc.qualityProfileCbr);
     // Both gates must hold for a fovea to exist in the built stream.
     in.foveaOn = pc.foveatedEncoding && st.gazeFoveation;
     // The headset's own switch; auto never writes synced keys.

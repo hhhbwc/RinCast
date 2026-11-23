@@ -110,12 +110,10 @@ struct Settings {
     // the same fps band at +56% bytes per frame, QP>=20 windows 11 -> 1, zero
     // dropped frames. See L17-FILL-DESIGN-2026-11-19/DESIGN.md for the design.
     bool fillMode = true;
-    // When the user lets the Best-picture profile drive video settings, it may raise
-    // video-side choices on its own (right now: the fovea's full-density share, see
-    // QualityProfileFovea below). It only ever raises; a higher choice of the user's
-    // or the headset's stays. Default off: profiles then change rate control only,
-    // exactly like the builds before it.
-    bool profileControlsVideo = false;
+    // A86b: profileControlsVideo was removed. CBR is now the independent
+    // qualityProfileCbr switch and foveation no longer follows a tier. An old
+    // settings.json key is ignored; the field is gone rather than left as a
+    // dead switch a reader would wonder about.
     int fecPercent = 5;
     bool foveatedEncoding = false;  // VR: fewer bits towards the lens edges
     bool adaptiveQuantization = true;
@@ -165,17 +163,18 @@ constexpr float ProfileFoveaFloor(int profile) {
            : profile == 1 ? kBalancedProfileFovea
                           : kLatencyProfileFovea;
 }
-constexpr float QualityProfileFoveaFor(float current, bool profileControlsVideo, int profile) {
-    return profileControlsVideo && current < ProfileFoveaFloor(profile) ? ProfileFoveaFloor(profile) : current;
-}
+// A86b: foveation no longer follows a tier. There is no user-visible tier to
+// follow, and raising the fovea radius every time auto climbs changes the edge
+// sharpness in sync with link noise - exactly the kind of visible flicker that
+// makes people motion sick. The user's own setting stands on its own.
+constexpr float QualityProfileFoveaFor(float current) { return current; }
 
-// CBR for the Best-picture profile: every frame costs exactly the limit. Measured
-// on real headset frames at +7.5% on stills vs capped VBR (encode-bench,
-// 2026-11-15) - the queue risk that retired CBR is back with it, so the switch is
-// opt-in, off by default, and the congestion guard carries the fixed rate.
-constexpr bool QualityProfileCbr(bool cbrSwitch, bool profileControlsVideo, bool qualityProfile) {
-    return cbrSwitch && profileControlsVideo && qualityProfile;
-}
+// A86b: CBR used to switch ON only at the sharpest tier. With auto free to move
+// the tier, that made the rate-control mode oscillate: a climb turned CBR on,
+// filler data filled the link, 5 s of pressure cut the tier and turned it off,
+// headroom climbed again - a positive-feedback sawtooth. It is now a plain,
+// independent opt-in switch (off by default); the guard still carries the rate.
+constexpr bool QualityProfileCbr(bool cbrSwitch) { return cbrSwitch; }
 
 // Which ceiling a VR stream runs at: the headset's choice wins unless the PC user
 // explicitly overrides it (rcs::Settings::pcBitrateWins). A headset that asked for

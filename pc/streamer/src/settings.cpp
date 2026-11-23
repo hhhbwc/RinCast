@@ -32,12 +32,15 @@ json Settings::ToJson(bool forUi) const {
         // with the fixed start rung and the stale value is simply dropped on the next
         // save. The field itself stays (Settings::streamProfile) because EffectiveSettings
         // overwrites it with the live rung for the stream builders; see client_session.cpp.
-        {"profileControlsVideo", profileControlsVideo},
+        // A86b: profileControlsVideo was removed with the tier slider - CBR is
+        // now a plain independent switch (qualityProfileCbr).
         {"videoPacingMode", videoPacingMode},
         {"qualityProfileCbr", qualityProfileCbr},
         {"encodeScalePct", encodeScalePct},
         {"l7Autoscale", l7Autoscale},
-        {"autoTune", autoTune},
+        // A86b: autoTune is deliberately NOT serialized. With no tier slider left,
+        // an old file that still says "autoTune": false would silently pin the
+        // machine to one rung with no UI anywhere to turn it back on.
         {"fillMode", fillMode},
         {"pcBitrateWins", pcBitrateWins},
         {"fecPercent", fecPercent},
@@ -90,12 +93,12 @@ void Settings::FromJson(const json& j) {
     get("adaptiveBitrate", adaptiveBitrate);
     // A86: "streamProfile" is deliberately NOT read - see the note in ToJson. An old
     // settings file keeps its key, but it can no longer pin the tuner's start rung.
-    get("profileControlsVideo", profileControlsVideo);
+    // A86b: "profileControlsVideo" is not read; use qualityProfileCbr directly.
     get("videoPacingMode", videoPacingMode);
     get("qualityProfileCbr", qualityProfileCbr);
     get("encodeScalePct", encodeScalePct);
     get("l7Autoscale", l7Autoscale);
-    get("autoTune", autoTune);
+    // A86b: "autoTune" is not read - see ToJson. The field keeps its true default.
     get("fillMode", fillMode);
     get("pcBitrateWins", pcBitrateWins);
     get("fecPercent", fecPercent);
@@ -116,22 +119,9 @@ void Settings::FromJson(const json& j) {
     get("cloudRefreshTokenProtected", cloudRefreshTokenProtected);
     get("cloudUserName", cloudUserName);
     get("cloudEmail", cloudEmail);
-    // A84 Q-persist (TASK-A84 §4): the ONE-TIME migration behind the flipped
-    // autoTune default. A file with no schema stamp was last written by a build
-    // whose default was off, and SaveLocked dumps EVERY key - so its
-    // "autoTune": false proves nothing about what the user wanted. A stamped file
-    // rules exactly as written, so a user who turns the tuner off keeps it off over
-    // restarts.
-    // A84b §2: the comparison is rc::MigrateAutoTuneOn (shared/include/rc/
-    // settings_migration.h), asserted in core_tests; what stays here is only the
-    // read, type-checked like every other field in FromJson because this also runs
-    // on the app thread (the UI's read-modify-write merge), where a throw from a
-    // hand-edited value would be fatal. The read's whole contract is the sentinel:
-    // absent key or wrong type leaves rc::kSettingsSchemaUnstamped, so both migrate.
-    int savedSchema = rc::kSettingsSchemaUnstamped;
-    if (const auto it = j.find("settingsSchema"); it != j.end() && it->is_number())
-        savedSchema = it->get<int>();
-    if (rc::MigrateAutoTuneOn(savedSchema)) autoTune = true;
+    // A86b: the autoTune schema migration is gone with the persisted key. There is
+    // no file state to migrate any more - the tuner is always on, and the only way
+    // to force a rung is a process-lifetime environment variable (see app.cpp).
     if (j.contains("trustedDevices") && j["trustedDevices"].is_array()) {
         trustedDevices.clear();
         for (const auto& d : j["trustedDevices"]) {

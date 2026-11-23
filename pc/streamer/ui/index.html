@@ -150,13 +150,9 @@
             <label class="check sub" id="l7Row"><input type="checkbox" data-setting="l7Autoscale"><span data-i18n="video.l7Autoscale">Shrink size when decoding is slow</span><small data-i18n="video.l7AutoscaleHint">Steps down only; the reset climbs back.</small></label>
             <p class="note" id="l7LevelLine" hidden><span data-i18n="video.l7Level">Current size</span>: <b id="l7Level">—</b> <button id="l7Reset" data-i18n="video.l7Reset">Reset to 100%</button></p>
           </div>
-          <div class="row">
-            <label class="check sub" id="profileVideoRow">
-              <input type="checkbox" data-setting="profileControlsVideo">
-              <span data-i18n="video.profileVideo">Quality follows profile</span>
-              <small id="profileVideoHint" data-i18n="video.profileVideoHint">Only sharper, never worse.</small>
-            </label>
-          </div>
+          <!-- A86b: "Quality follows profile" is gone with the tier it followed.
+               CBR stands on its own now: it never turns itself on because auto
+               climbed a rung (that coupling made the link oscillate). -->
           <div class="row">
             <label class="check sub" id="cbrRow"><input type="checkbox" data-setting="qualityProfileCbr"><span data-i18n="video.cbr">Full bitrate every frame</span><small data-i18n="video.cbrHint">Steadier, but always uses the full link.</small></label>
           </div>

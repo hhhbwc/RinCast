@@ -775,13 +775,11 @@ function renderDependents() {
   setOff($("#twoPassRow"), !tunable);
   // CBR only takes effect when the profile drives video settings, the headset isn't
   // following SteamVR's resolution, and the link isn't remote/slow (server-side gates).
-  // A86: this row used to grey out unless the stream ran at the sharpest tier, because
-  // CBR was the sharp tier's own rate-control mode. The tier is the tuner's now (and is
-  // not even on this page), so gating the checkbox on a number the user cannot see would
-  // be a lock with no visible reason. It is live whenever the user asked the tier to
-  // drive video settings and the link allows it; the build decides the rest.
+  // A86b: CBR is a plain independent switch now. It used to be gated on the sharpest
+  // tier AND on a "let the tier drive video" checkbox; both are gone, because a
+  // tier-driven CBR switch oscillated against the tuner. Only the link gates remain.
   const cbrBlockedByLink = !!session && (!!session.matchSteamVr || !!session.slowPath);
-  setOff($("#cbrRow"), !state.settings.profileControlsVideo || cbrBlockedByLink);
+  setOff($("#cbrRow"), cbrBlockedByLink);
   setOff($("#playOnPcRow"), !state.settings.streamAudio);
   setOff($("#micRow"), state.settings.audioDevices === "system");
 }
