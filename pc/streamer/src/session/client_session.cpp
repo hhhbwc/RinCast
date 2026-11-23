@@ -1204,6 +1204,7 @@ void ClientSession::RunAutoTune() {
     RC_LOGI("AUTO: %s (qp %.1f, wire %.1f of %u kbps, queue %.0f ms, loss %.1f%%) -> %s (%s)",
             rc::BottleneckName(r.cls), sig.qp, sig.mbps, sig.ceilingKbps, sig.queueMs, sig.loss * 100.0, dimName,
             r.reason);
+    bool needRebuild = true;
     switch (r.action) {
         case rc::AutoAction::CbrOff:
             SettingsStore::Get().Update([](Settings& s) { s.qualityProfileCbr = false; });
@@ -1213,8 +1214,12 @@ void ClientSession::RunAutoTune() {
             break;
         // A84: the picture rung is NOT a settings write any more. Moving the synced
         // key would move the user's floor with it - which is how the slider became a
-        // ceiling nobody could climb back over. It is session state, and the rebuild
-        // below reads it through EffectiveProfile.
+        // ceiling nobody could climb back over. It is session state.
+        // A87 (user, 2026-11-23): it used to fall through to the rebuild below. That
+        // rebuilt StopVr()+StartVr(), and the 10:17 log shows the cost: 46 s with no
+        // VR frame because SteamVR had to reopen the shared textures the game waits
+        // on. A tier move only changes the QP floor and the queue-brake line, both
+        // of which the live stream can take in place (see VrStream::ApplyProfileRung).
         case rc::AutoAction::ProfileDown:
         case rc::AutoAction::ProfileUp: {
             const int from = eff.streamProfile;
@@ -1230,14 +1235,19 @@ void ClientSession::RunAutoTune() {
                     in.profileFloorId, r.action == rc::AutoAction::ProfileUp ? "headroom" : "pressure",
                     double(r.evidenceNs) / 1e9, in.dipAtMs, sig.queueMs, sig.decodeMs,
                     rc::BottleneckName(r.cls));
+            // m_mutex is held by RunAutoTune, so m_vr is safe to touch here. The
+            // QP floor is handed to the encoder thread; only the brake is set now.
+            if (m_vr) m_vr->ApplyProfileRung(m_autoProfileEff);
+            RC_LOGI("AUTO: tier applied in place - no stream rebuild, no black frame");
+            needRebuild = false;
             break;
         }
         default:
             return;
     }
-    // The user's own channel: the same rebuild path a manual settings write
-    // takes (App::ApplySettingSideEffects -> OnStreamProfileChanged).
-    OnStreamProfileChanged();
+    // CBR/foveation are settings writes: the user's own channel takes this same
+    // rebuild path (App::ApplySettingSideEffects -> OnStreamProfileChanged).
+    if (needRebuild) OnStreamProfileChanged();
 }
 
 void ClientSession::RestartVideoForProfile(bool vr, bool desktop) {

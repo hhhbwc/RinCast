@@ -398,6 +398,41 @@ class NvencEncoder final : public VideoEncoder {
         m_requestedKbps = kbps;
     }
 
+    bool SetMinQp(uint32_t qp) override {
+        // A87: the picture-tier change only moves the QP floor (the ceiling stays the
+        // same - see the 2026-11-23 10:17 log, 100000 kbps on both sides of 1 -> 0).
+        // Reconfiguring the session is enough: no encoder destroy, no new D3D textures,
+        // so SteamVR never has to reopen the shared surface and the game never stalls.
+        if (!m_encoder || !m_cappedVbr || !m_encodeConfig.rcParams.enableMinQP) {
+            // A driver that fell back to CBR at init explicitly turned MinQP off
+            // (line ~270). Enabling it through reconfigure is rejected by some
+            // drivers; report the refusal and keep the floor we already have.
+            return false;
+        }
+        auto candidateConfig = m_encodeConfig;  // full copy: a partial config is rejected
+        const uint32_t q = std::clamp(qp, 1u, 51u);
+        candidateConfig.rcParams.minQP.qpInterP = q;
+        candidateConfig.rcParams.minQP.qpInterB = q;
+        candidateConfig.rcParams.minQP.qpIntra = q;
+        auto candidateInit = m_init;
+        candidateInit.encodeConfig = &candidateConfig;
+        NV_ENC_RECONFIGURE_PARAMS re{};
+        re.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+        re.reInitEncodeParams = candidateInit;
+        // resetEncoder/forceIDR stay zero: only RC params changed, no resolution or GOP
+        // change, so the decoder keeps its reference frames and there is no black frame.
+        if (NvencLib::Get().api.nvEncReconfigureEncoder(m_encoder, &re) != NV_ENC_SUCCESS) {
+            RC_LOGW("NVENC: QP-floor reconfigure to %u refused (%s); keeping the old floor",
+                    q, NvencLib::Get().api.nvEncGetLastErrorString(m_encoder));
+            return false;
+        }
+        m_encodeConfig = candidateConfig;
+        m_init = candidateInit;
+        m_init.encodeConfig = &m_encodeConfig;
+        RC_LOGI("NVENC: QP floor retuned to %u in place (no session reset)", q);
+        return true;
+    }
+
     bool InvalidateAfter(uint64_t timestamp) override {
         if (!m_encoder || !m_canInvalidate || m_frameCount == 0) return false;
         // The good frame must still be in the DPB, and not from before the last intra frame.

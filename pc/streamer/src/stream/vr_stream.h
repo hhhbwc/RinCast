@@ -66,6 +66,18 @@ class VrStream {
     bool Start();
     void Stop();
     void RequestKeyframe() { m_sender.RequestKeyframe(); }
+    // A87: a picture-tier move is the QP floor plus the queue-brake line - neither
+    // needs a new stream. The brake is set here (on the session's message thread,
+    // where the old rebuild path ran) and the QP floor travels to the encoder's own
+    // thread through an atomic. Nothing here touches sockets, textures or SteamVR's
+    // shared surface, so the picture does not go black while it applies.
+    void ApplyProfileRung(int rung) {
+        const rc::StreamProfile profile = rc::ProfileFromId(rung);
+        // VideoSender::m_guard has no lock and belongs to the sender thread, so the
+        // brake line is queued there too - never written from this (session) thread.
+        m_pendingProfile.store(rung, std::memory_order_relaxed);
+        m_pendingMinQp.store(rc::ProfileParams(profile).minQp, std::memory_order_relaxed);
+    }
     // The headset left the VR view: nothing is encoded or sent, but the game's frames still
     // count for Running(). Resuming starts with a keyframe.
     void SetPaused(bool paused) {
@@ -241,6 +253,12 @@ class VrStream {
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_streaming{false};
     std::atomic<bool> m_paused{false};
+    // A87: 0 = no pending change; otherwise the QP floor RunEncoder must apply on
+    // the encoder session. Written on the session thread, consumed on the encode thread.
+    std::atomic<uint32_t> m_pendingMinQp{0};
+    // -1 = no pending change; otherwise the rung for RunSender to set on its own
+    // VideoSender (m_guard is not thread-safe). Same writer, different consumer.
+    std::atomic<int> m_pendingProfile{-1};
     std::mutex m_gazeMutex;
     rc::GazePayload m_gaze{};
     int64_t m_gazeNs = 0;

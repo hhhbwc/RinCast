@@ -778,6 +778,16 @@ void VrStream::RunEncoder() {
             }
         }
 
+        // A87: apply a tier change to the LIVE encoder instead of rebuilding the stream.
+        // The queue-brake half was already set by ApplyProfileRung on the session thread;
+        // this is the QP-floor half, which must touch the encoder on its own thread. If the
+        // driver refuses it, we keep the old floor and carry on streaming - trading a
+        // slightly wrong picture for the ~46 s black screen a rebuild used to cost.
+        if (const uint32_t q = m_pendingMinQp.exchange(0, std::memory_order_relaxed)) {
+            if (!encoder->SetMinQp(q))
+                RC_LOGW("VR: encoder refused QP floor %u; keeping the previous one (no rebuild)", q);
+        }
+
         // Half rate pays nothing extra here. The encoder tracks the interval between the
         // frames it actually sees (the slow EMA in nvenc_encoder reconfigures frameRateNum
         // to the real rate), so halving the frames already doubles the per-frame budget by
@@ -866,6 +876,11 @@ void VrStream::RunSender() {
     if (mmcss) AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_HIGH);
     bool firstSent = false;
     while (m_running) {
+        // A87: VideoSender::m_guard is not locked, so the tier's new queue-brake line is
+        // installed here on the sender's own thread. The QP floor goes to the encoder
+        // thread separately; neither path stops the transport.
+        const int pendingProfile = m_pendingProfile.exchange(-1, std::memory_order_relaxed);
+        if (pendingProfile >= 0) m_sender.SetProfile(rc::ProfileFromId(pendingProfile));
         SendJob send;
         {
             std::unique_lock lock(m_sendMutex);
