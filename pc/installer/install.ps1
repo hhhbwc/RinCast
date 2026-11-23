@@ -15,6 +15,11 @@
     5. Installs the RinCast Speaker / RinCast Microphone audio driver, if this
        package has one. Release packages normally don't.
     6. Creates a Start menu shortcut and an uninstaller entry.
+
+  Only step 1 can stop the install: without its files there is nothing to register. Every step
+  after it that the streamer can still do by itself (firewall rules, the two registrations,
+  audio, shortcuts) reports what failed and carries on with the rest, so a partial install is
+  reported as one instead of as "not installed".
 #>
 [CmdletBinding()]
 param(
@@ -34,15 +39,56 @@ function Close-Window {
     if ($Elevated) { Read-Host 'Press Enter to close this window' | Out-Null }
 }
 
-trap {
-    Write-Host "`nRinCast was not installed: $_" -ForegroundColor Red
-    Close-Window
-    exit 1
-}
-
 function Step($text) { Write-Host "-> $text" -ForegroundColor Cyan }
 # Not Write-Warning: its prefix is translated, and RinCast's setup looks for these.
 function Warn($text) { Write-Host "!  $text" -ForegroundColor Yellow }
+
+# Where a failure came from. The setup program quotes only the text after
+# "RinCast was not installed: ", so a message that is just a localized Windows string -
+# "The system cannot find the file specified" said nothing about which command, on which line,
+# with which code, and the firewall step was where it stopped.
+function Get-ErrorAt($record) {
+    if ($record.InvocationInfo -and $record.InvocationInfo.ScriptName) {
+        return "$(Split-Path -Leaf $record.InvocationInfo.ScriptName):$($record.InvocationInfo.ScriptLineNumber)"
+    }
+    return 'unknown line'
+}
+function Get-ErrorDetail($e) {
+    # A CIM failure carries a reason name on the outer exception and the real Win32 code on the
+    # exception inside it, so a number found anywhere in the chain wins over a reason name.
+    $reason = ''
+    for ($x = $e; $x; $x = $x.InnerException) {
+        $code = $x.PSObject.Properties['NativeErrorCode']
+        if ($code -and $code.Value) {
+            if ($code.Value -is [int] -or $code.Value -is [long] -or $code.Value -is [uint32]) { return "win32=$($code.Value)" }
+            if (-not $reason) { $reason = "$($code.Value)" }
+        }
+    }
+    if ($reason) { return "cim=$reason" }
+    if ($e -and $e.HResult) { return ('hresult=0x{0:X8}' -f $e.HResult) }
+    return 'no error code'
+}
+
+$issues = @()
+# Runs one step's work. It failing costs that step, nothing else; the streamer's own health
+# check reports a closed firewall, and RinCast Streamer re-registers the driver it needs.
+function Invoke-Guarded {
+    param([string]$what, [scriptblock]$body)
+    try {
+        & $body | Out-Null
+        return $true
+    } catch {
+        Warn "$what failed [$(Get-ErrorAt $_), $($_.Exception.GetType().Name), $(Get-ErrorDetail $_.Exception)]: $($_.Exception.Message)"
+        $script:issues += $what
+        return $false
+    }
+}
+
+trap {
+    Write-Host "`nRinCast was not installed: $($_.Exception.Message) [at $(Get-ErrorAt $_), $($_.Exception.GetType().Name), $(Get-ErrorDetail $_.Exception)]" -ForegroundColor Red
+    Close-Window
+    exit 1
+}
 
 # An elevated PowerShell can run as a different account than the person at the
 # desktop, and then HKCU and %LOCALAPPDATA% belong to that admin account.
@@ -113,45 +159,73 @@ $exe = Join-Path $InstallDir 'RinCast Streamer.exe'
 # 2. Firewall ----------------------------------------------------------------
 Step 'Adding firewall rules'
 # Someone who allowed Public networks in RinCast Streamer keeps that choice.
-$hadPublic = @(Get-NetFirewallRule -DisplayName 'RinCast Streamer' -ErrorAction SilentlyContinue |
-    Where-Object { "$($_.Profile)" -match 'Public|Any' }).Count -gt 0
+$hadPublic = $false
+$null = Invoke-Guarded 'Reading the Public-network choice' {
+    $script:hadPublic = @(Get-NetFirewallRule -DisplayName 'RinCast Streamer' -ErrorAction SilentlyContinue |
+        Where-Object { "$($_.Profile)" -match 'Public|Any' }).Count -gt 0
+}
 $programProfiles = if ($AllowPublic -or $hadPublic) { 'Private', 'Domain', 'Public' } else { 'Private', 'Domain' }
 $profiles = 'Private', 'Domain'
-Get-NetFirewallRule -Group 'RinCast' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-# The rule RinCast Streamer writes itself has the same name, outside the group.
-Get-NetFirewallRule -DisplayName 'RinCast Streamer' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-# Dismissing Windows' firewall prompt leaves "Block" rules for the exe, which win over Allow rules.
-Get-NetFirewallRule -DisplayName 'rincast streamer.exe' -ErrorAction SilentlyContinue |
-    Where-Object Action -eq 'Block' | Remove-NetFirewallRule
-New-NetFirewallRule -DisplayName 'RinCast Streamer' -Group 'RinCast' -Direction Inbound -Action Allow `
-    -Program $exe -Protocol UDP -Profile $programProfiles | Out-Null
-New-NetFirewallRule -DisplayName 'RinCast discovery (UDP 38710)' -Group 'RinCast' -Direction Inbound -Action Allow `
-    -Protocol UDP -LocalPort 38710 -Profile $profiles | Out-Null
-New-NetFirewallRule -DisplayName 'RinCast streaming (UDP 38711)' -Group 'RinCast' -Direction Inbound -Action Allow `
-    -Protocol UDP -LocalPort 38711 -Profile $profiles | Out-Null
+$null = Invoke-Guarded 'Replacing the old firewall rules' {
+    # A95: read the names first, then delete one at a time. Get-NetFirewallRule piped into
+    # Remove-NetFirewallRule deletes out of the enumerator it is still walking, and once the
+    # store shifts under it the next MoveNext is the "file not specified" failure. Two identical
+    # 'RinCast Streamer' rules were left behind that way, so this also deduplicates on the way in.
+    # The rule RinCast Streamer writes itself has the same name, outside the group, and dismissing
+    # Windows' firewall prompt leaves "Block" rules for the exe, which win over Allow rules.
+    $names = @(Get-NetFirewallRule -Group 'RinCast' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+    $names += @(Get-NetFirewallRule -DisplayName 'RinCast Streamer' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+    $names += @(Get-NetFirewallRule -DisplayName 'rincast streamer.exe' -ErrorAction SilentlyContinue |
+        Where-Object Action -eq 'Block' | Select-Object -ExpandProperty Name)
+    $left = @()
+    foreach ($name in ($names | Where-Object { $_ } | Select-Object -Unique)) {
+        try { Remove-NetFirewallRule -Name $name -ErrorAction Stop } catch { $left += "$name ($($_.Exception.Message))" }
+    }
+    if ($left) { Warn "Old firewall rules could not be removed and stay in place: $($left -join '; ')" }
+    New-NetFirewallRule -DisplayName 'RinCast Streamer' -Group 'RinCast' -Direction Inbound -Action Allow `
+        -Program $exe -Protocol UDP -Profile $programProfiles -ErrorAction Stop | Out-Null
+    New-NetFirewallRule -DisplayName 'RinCast discovery (UDP 38710)' -Group 'RinCast' -Direction Inbound -Action Allow `
+        -Protocol UDP -LocalPort 38710 -Profile $profiles -ErrorAction Stop | Out-Null
+    New-NetFirewallRule -DisplayName 'RinCast streaming (UDP 38711)' -Group 'RinCast' -Direction Inbound -Action Allow `
+        -Protocol UDP -LocalPort 38711 -Profile $profiles -ErrorAction Stop | Out-Null
+}
+# A95: say it out loud rather than leave a hole. A rule that reported success but never landed,
+# or one an old Block rule still covers, looks exactly like a working install from here.
+$null = Invoke-Guarded 'Checking the firewall rules took effect' {
+    $absent = @('RinCast Streamer', 'RinCast discovery (UDP 38710)', 'RinCast streaming (UDP 38711)') |
+        Where-Object { -not @(Get-NetFirewallRule -Group 'RinCast' -DisplayName $_ -ErrorAction SilentlyContinue) }
+    if ($absent) { throw "still missing: $($absent -join ', ')" }
+    $blocked = @(Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue |
+        Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' })
+    if ($blocked) { throw "$($blocked.Count) inbound Block rule(s) still cover $exe, and those win over the Allow rules" }
+}
 
 # 3. OpenXR runtime (local builds only) ---------------------------------------
 if (Test-Path (Join-Path $source 'openxr\rincast-openxr.json')) {
     Step 'Registering the RinCast XR OpenXR runtime'
-    $manifest = Join-Path $InstallDir 'openxr\rincast-openxr.json'
-    $xrKey = 'HKLM:\SOFTWARE\Khronos\OpenXR\1\AvailableRuntimes'
-    New-Item -Force $xrKey | Out-Null
-    New-ItemProperty -Path $xrKey -Name $manifest -Value 0 -PropertyType DWord -Force | Out-Null
+    $null = Invoke-Guarded 'Registering the RinCast XR OpenXR runtime' {
+        $manifest = Join-Path $InstallDir 'openxr\rincast-openxr.json'
+        $xrKey = 'HKLM:\SOFTWARE\Khronos\OpenXR\1\AvailableRuntimes'
+        New-Item -Force $xrKey -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path $xrKey -Name $manifest -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+    }
 }
 
 # 4. SteamVR driver -----------------------------------------------------------
 $driverDir = Join-Path $InstallDir 'driver\rincast'
-$userSid = Get-DesktopUserSid
-$steam = (Get-ItemProperty "Registry::HKEY_USERS\$userSid\Software\Valve\Steam" -ErrorAction SilentlyContinue).SteamPath
-$vrpathreg = if ($steam) { Join-Path $steam 'steamapps\common\SteamVR\bin\win64\vrpathreg.exe' }
-if ($userSid -ne $id.User.Value) {
-    # vrpathreg writes to the profile of the account it runs as, which is the wrong one here.
-    Write-Host '   RinCast Streamer registers the SteamVR driver the first time it starts.' -ForegroundColor DarkGray
-} elseif ($vrpathreg -and (Test-Path $vrpathreg)) {
-    Step 'Registering the SteamVR driver'
-    & $vrpathreg adddriver $driverDir | Out-Null
-} else {
-    Write-Host '   SteamVR not found; RinCast Streamer registers the driver once SteamVR is installed.' -ForegroundColor DarkGray
+$null = Invoke-Guarded 'Registering the SteamVR driver' {
+    $userSid = Get-DesktopUserSid
+    $steam = (Get-ItemProperty "Registry::HKEY_USERS\$userSid\Software\Valve\Steam" -ErrorAction SilentlyContinue).SteamPath
+    $vrpathreg = if ($steam) { Join-Path $steam 'steamapps\common\SteamVR\bin\win64\vrpathreg.exe' }
+    if ($userSid -ne $id.User.Value) {
+        # vrpathreg writes to the profile of the account it runs as, which is the wrong one here.
+        Write-Host '   RinCast Streamer registers the SteamVR driver the first time it starts.' -ForegroundColor DarkGray
+    } elseif ($vrpathreg -and (Test-Path $vrpathreg)) {
+        Step 'Registering the SteamVR driver'
+        & $vrpathreg adddriver $driverDir | Out-Null
+    } else {
+        Write-Host '   SteamVR not found; RinCast Streamer registers the driver once SteamVR is installed.' -ForegroundColor DarkGray
+    }
 }
 
 # 5. Audio driver -------------------------------------------------------------
@@ -159,22 +233,24 @@ if (-not $SkipAudio) {
     if (Test-Path (Join-Path $source 'audio\RinCastAudio.inf')) {
         $inf = Join-Path $InstallDir 'audio\RinCastAudio.inf'
         Step 'Installing RinCast Speaker and RinCast Microphone'
-        $cert = Join-Path $InstallDir 'audio\RinCastTest.cer'
-        if (Test-Path $cert) {
-            # Test-signed development build: trust the test certificate on this machine.
-            Import-Certificate -FilePath $cert -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-            Import-Certificate -FilePath $cert -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
-            $bcd = (bcdedit /enum '{current}') -join "`n"
-            if ($bcd -notmatch 'testsigning\s+Yes') {
-                Warn ('The audio driver is test-signed. Enable test signing with "bcdedit /set testsigning on", ' +
-                    'reboot, and run "rincast-audio-setup.exe install audio\RinCastAudio.inf" again.')
+        $null = Invoke-Guarded 'Installing RinCast Speaker and RinCast Microphone' {
+            $cert = Join-Path $InstallDir 'audio\RinCastTest.cer'
+            if (Test-Path $cert) {
+                # Test-signed development build: trust the test certificate on this machine.
+                Import-Certificate -FilePath $cert -CertStoreLocation Cert:\LocalMachine\Root -ErrorAction Stop | Out-Null
+                Import-Certificate -FilePath $cert -CertStoreLocation Cert:\LocalMachine\TrustedPublisher -ErrorAction Stop | Out-Null
+                $bcd = (bcdedit /enum '{current}') -join "`n"
+                if ($bcd -notmatch 'testsigning\s+Yes') {
+                    Warn ('The audio driver is test-signed. Enable test signing with "bcdedit /set testsigning on", ' +
+                        'reboot, and run "rincast-audio-setup.exe install audio\RinCastAudio.inf" again.')
+                }
             }
-        }
-        & (Join-Path $InstallDir 'rincast-audio-setup.exe') install $inf
-        switch ($LASTEXITCODE) {
-            0 { }
-            3010 { Warn 'Restart Windows to finish installing the audio driver.' }
-            default { Warn "Audio driver setup failed (exit code $LASTEXITCODE). Audio uses Steam's streaming devices instead, if Steam has installed them." }
+            & (Join-Path $InstallDir 'rincast-audio-setup.exe') install $inf
+            switch ($LASTEXITCODE) {
+                0 { }
+                3010 { Warn 'Restart Windows to finish installing the audio driver.' }
+                default { Warn "Audio driver setup failed (exit code $LASTEXITCODE). Audio uses Steam's streaming devices instead, if Steam has installed them." }
+            }
         }
     } else {
         Write-Host "   This package has no RinCast audio driver. Audio uses Steam's streaming devices (Steam Streaming Speakers and Steam Streaming Microphone)." -ForegroundColor DarkGray
@@ -183,37 +259,45 @@ if (-not $SkipAudio) {
 
 # 6. Shortcuts and uninstall entry --------------------------------------------
 Step 'Creating shortcuts'
-$shell = New-Object -ComObject WScript.Shell
-$lnk = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'RinCast Streamer.lnk'))
-$lnk.TargetPath = $exe
-$lnk.WorkingDirectory = $InstallDir
-$lnk.Save()
-
-$un = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RinCast'
-New-Item -Force $un | Out-Null
-# Apps > Installed apps runs the uninstaller program where there is one (setup packages).
-$uninstaller = Join-Path $InstallDir 'Uninstall RinCast.exe'
-$uninstall = if (Test-Path $uninstaller) { "`"$uninstaller`"" } else { "powershell.exe -ExecutionPolicy Bypass -File `"$InstallDir\uninstall.ps1`"" }
-$sizeKb = [int]((Get-ChildItem $InstallDir -Recurse -File | Measure-Object Length -Sum).Sum / 1KB)
-$props = @{
-    DisplayName     = 'RinCast'
-    DisplayVersion  = $version
-    Publisher       = 'RinCast contributors'
-    DisplayIcon     = $exe
-    InstallLocation = $InstallDir
-    UninstallString = $uninstall
-    URLInfoAbout    = 'https://rincast.com'
-    EstimatedSize   = $sizeKb
-    NoModify        = 1
-    NoRepair        = 1
-}
-if (Test-Path $uninstaller) { $props.QuietUninstallString = "`"$uninstaller`" --quiet" }
-foreach ($k in $props.Keys) {
-    $type = if ($props[$k] -is [int]) { 'DWord' } else { 'String' }
-    New-ItemProperty -Path $un -Name $k -Value $props[$k] -PropertyType $type -Force | Out-Null
+$null = Invoke-Guarded 'Creating the Start menu shortcut' {
+    $shell = New-Object -ComObject WScript.Shell
+    $lnk = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'RinCast Streamer.lnk'))
+    $lnk.TargetPath = $exe
+    $lnk.WorkingDirectory = $InstallDir
+    $lnk.Save()
 }
 
-Write-Host "`nRinCast $version is installed." -ForegroundColor Green
+$null = Invoke-Guarded 'Registering the uninstall entry' {
+    $un = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RinCast'
+    New-Item -Force $un -ErrorAction Stop | Out-Null
+    # Apps > Installed apps runs the uninstaller program where there is one (setup packages).
+    $uninstaller = Join-Path $InstallDir 'Uninstall RinCast.exe'
+    $uninstall = if (Test-Path $uninstaller) { "`"$uninstaller`"" } else { "powershell.exe -ExecutionPolicy Bypass -File `"$InstallDir\uninstall.ps1`"" }
+    $sizeKb = [int]((Get-ChildItem $InstallDir -Recurse -File | Measure-Object Length -Sum).Sum / 1KB)
+    $props = @{
+        DisplayName     = 'RinCast'
+        DisplayVersion  = $version
+        Publisher       = 'RinCast contributors'
+        DisplayIcon     = $exe
+        InstallLocation = $InstallDir
+        UninstallString = $uninstall
+        URLInfoAbout    = 'https://rincast.com'
+        EstimatedSize   = $sizeKb
+        NoModify        = 1
+        NoRepair        = 1
+    }
+    if (Test-Path $uninstaller) { $props.QuietUninstallString = "`"$uninstaller`" --quiet" }
+    foreach ($k in $props.Keys) {
+        $type = if ($props[$k] -is [int]) { 'DWord' } else { 'String' }
+        New-ItemProperty -Path $un -Name $k -Value $props[$k] -PropertyType $type -Force -ErrorAction Stop | Out-Null
+    }
+}
+
+if ($issues) {
+    Write-Host "`nRinCast $version is installed, with $($issues.Count) step(s) that need a look: $($issues -join '; ')" -ForegroundColor Yellow
+} else {
+    Write-Host "`nRinCast $version is installed." -ForegroundColor Green
+}
 # Through Explorer, so the streamer runs as the desktop user and not elevated.
 if (-not $NoStart) { Start-Process explorer.exe -ArgumentList "`"$exe`"" }
 Close-Window

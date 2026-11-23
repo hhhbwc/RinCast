@@ -82,9 +82,21 @@ if ($active -and ($active -ieq $manifest)) {
 }
 
 # Firewall, autostart, shortcuts, uninstall entry
-Get-NetFirewallRule -Group 'RinCast' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-Get-NetFirewallRule -DisplayName 'RinCast Streamer' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-Get-NetFirewallRule -DisplayName 'RinCast Streamer (USB cable)' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+# A95: read the names first, then delete one at a time. Deleting straight out of the
+# Get-NetFirewallRule enumerator fails with "the system cannot find the file specified" once the
+# store shifts under it, and here that failure was quiet: rules survived the uninstall. The
+# 'rincast streamer.exe' name is what dismissing Windows' own firewall prompt leaves behind.
+$names = @(Get-NetFirewallRule -Group 'RinCast' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+foreach ($display in 'RinCast Streamer', 'RinCast Streamer (USB cable)', 'rincast streamer.exe') {
+    $names += @(Get-NetFirewallRule -DisplayName $display -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+}
+foreach ($name in ($names | Where-Object { $_ } | Select-Object -Unique)) { Remove-NetFirewallRule -Name $name -ErrorAction SilentlyContinue }
+$still = @(Get-NetFirewallRule -Group 'RinCast' -ErrorAction SilentlyContinue) +
+    @(Get-NetFirewallRule -DisplayName 'RinCast Streamer' -ErrorAction SilentlyContinue)
+if ($still) {
+    Write-Host ("!  Firewall rules were left behind: " + (($still | Select-Object -ExpandProperty DisplayName | Select-Object -Unique) -join ', ') +
+        ' - remove them in Windows Defender Firewall with Advanced Security.') -ForegroundColor Yellow
+}
 Remove-ItemProperty "$userHive\Software\Microsoft\Windows\CurrentVersion\Run" -Name 'RinCast Streamer' -ErrorAction SilentlyContinue
 Remove-Item (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'RinCast Streamer.lnk') -ErrorAction SilentlyContinue
 Remove-Item $un -Recurse -ErrorAction SilentlyContinue
