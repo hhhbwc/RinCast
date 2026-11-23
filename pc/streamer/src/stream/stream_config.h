@@ -224,10 +224,31 @@ inline DesktopStreamConfig BuildDesktopStreamConfig(const Settings& pc, const Cl
 }
 
 // The decision layer's per-session input, moved verbatim from
-// ClientSession::RunAutoTune (the AutoTuneInput fill). `pcOwnsProfile` is the
-// session's m_ownedSettings.count(rc::synced::kStreamProfile) != 0.
-inline rc::AutoTuneInput BuildAutoTuneInput(const Settings& pc, const ClientStreamSettings& st, bool slowPath,
-                                            bool pcOwnsProfile) {
+// ClientSession::RunAutoTune (the AutoTuneInput fill).
+//
+// A84b §3 (TASK-A84b): the `pcOwnsProfile` parameter this took is GONE. It used to
+// pin in.profileId to 0 whenever the PC did not own the synced streamProfile key,
+// which is PLAN-AUTO-TUNE's "a profile the headset owns is not auto's to move".
+// A84 made that guard both unnecessary and wrong, and passing it `true` to keep the
+// build compiling left a parameter nothing could turn off - the third state the
+// card forbids. The evidence for deleting it rather than restoring the guard:
+//   - the guard protected the headset's VALUE of the synced key, and auto can no
+//     longer write that key at all: both profile actions move session state only
+//     (ClientSession::m_autoProfileEff) and rebuild through OnStreamProfileChanged,
+//     which only enqueues a restart (client_session.cpp). Whatever the headset last
+//     sent stays in the settings file untouched;
+//   - the headset's choice is not ignored either - it IS the input now. The PC
+//     adopts a headset-owned streamProfile into its settings
+//     (AdoptHeadsetOwnedSettings), and RunAutoTune feeds that same number as
+//     AutoTuneInput::profileFloorId, so the headset's pick is the floor auto works
+//     above and must climb back to;
+//   - restoring the old form would switch the feature off on exactly the machine it
+//     is for (the headset slider is the tuning surface since A85, so the PC does not
+//     own the key there), and it would corrupt the rung: in.profileId is the RUNG
+//     the live stream is built at, and 0 is a lie about it whenever the stream runs
+//     at 1 or 2 - the climb would then step up from 0 and the cut would land on a
+//     rung the stream is not at.
+inline rc::AutoTuneInput BuildAutoTuneInput(const Settings& pc, const ClientStreamSettings& st, bool slowPath) {
     const bool match = st.matchSteamVr && !slowPath;  // StartVr's own condition
     rc::AutoTuneInput in;
     in.cbrOn = rcs::QualityProfileCbr(pc.qualityProfileCbr, pc.profileControlsVideo && !match && !slowPath,
@@ -236,8 +257,9 @@ inline rc::AutoTuneInput BuildAutoTuneInput(const Settings& pc, const ClientStre
     in.foveaOn = pc.foveatedEncoding && st.gazeFoveation;
     // The headset's own switch; auto never writes synced keys.
     in.foveaPossible = st.gazeFoveation;
-    // A profile the headset owns (no PC-owned copy) is not auto's to move.
-    in.profileId = pcOwnsProfile ? pc.streamProfile : 0;
+    // A84b §3 above: `pc` is the EFFECTIVE snapshot (see ClientSession::RunAutoTune),
+    // so this is the rung the live streams are built at - the only thing auto may move.
+    in.profileId = pc.streamProfile;
     return in;
 }
 

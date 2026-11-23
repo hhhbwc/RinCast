@@ -59,6 +59,10 @@
 #include "rc/stream_profile.h"
 #include "rc/video_transport.h"
 #include "rc/wire_ceiling.h"
+// A84b §2 (TASK-A84b): the settings-file migration predicate. It is here because
+// Settings::FromJson, the code that used to hold it inline, compiles into
+// rincast-streamer only - nothing below could reach the judgement.
+#include "rc/settings_migration.h"
 
 // WP1a: the pure fovea override the VR session feeds Foveator::EncodedSize. The
 // relative include keeps the test target free of pc-side link dependencies: the
@@ -4485,6 +4489,398 @@ static void TestAutoTuneDecide() {
     std::printf("ok\n");
 }
 
+// A84 (TASK-A84-PROFILE-FLOOR-TWO-WAY-AUTOTUNE-2026-11-23 §5): the timeline cases
+// for the two-way profile tuner. The slider is a FLOOR, the picture the stream runs
+// at is an effective rung auto may move in both directions, and a manual write to
+// the floor hands the dimension back instead of locking it.
+//
+// These cases drive rc::AutoTune the way ClientSession::RunAutoTune does: one tick
+// per second, and after a move the caller re-feeds the RUNG it now builds at plus
+// that rung's brake line (`AutoTuneInput::dipAtMs`). The two signals are the
+// classifier's own R2 evidence: a 500 ms queue is link-bound, 5 ms with the headset
+// decoding inside the L7 budget is Ok (nothing else can fire: qp, the ceiling and
+// the game rate stay at their unknown sentinels, so R3/R4 are unreachable). The
+// brake lines are queue_guard.h's formula READ at its no-feedback floor
+// (stream_profile.h: 15+6 vs 15 -> 21, 45+12 vs 25 -> 57, 60+12 vs 30 -> 72 ms) -
+// the same numbers ProfileDipAtMs() in client_session.cpp prints and the A81
+// latency line logs. No guard state is touched here and none is copied.
+static void TestAutoTuneProfileFloor() {
+    rc::AutoTune::Config cfg{};  // the A84 defaults: 5 s over / 30 s down, 30 s Ok / 45 s up
+    const int64_t S = 1000000000LL;
+    const auto pressed = [] {
+        rc::BottleneckSignal s;
+        s.queueMs = 500.0;
+        return s;
+    }();
+    const auto calm = [] {
+        rc::BottleneckSignal s;
+        s.queueMs = 5.0;
+        s.decodeMs = 8.0;
+        s.decodeBudgetMs = 16.0;
+        return s;
+    }();
+    auto dip = [](int id) { return id == 0 ? 21.0 : (id == 1 ? 57.0 : 72.0); };
+    std::printf("auto-tune profile floor: ");
+
+    // 1. The headline: pressure cuts the picture down to the floor, and a link that
+    //    calms climbs it back over the floor, one rung at a time, stopping at 2.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::AutoTuneInput in;
+        in.profileFloorId = 1;  // the slider: balanced is the worst picture accepted
+        in.profileId = 2;       // the stream runs one rung sharper than the floor
+        in.dipAtMs = dip(2);
+        rc::AutoTune::Result r{};
+        for (int64_t t = 0; t < 5 * S; t += S) r = g.Update(pressed, in, t);
+        CHECK(r.action == rc::AutoAction::None);  // 4 s of pressure is not yet evidence
+        r = g.Update(pressed, in, 5 * S);
+        CHECK(r.action == rc::AutoAction::ProfileDown && r.profileId == 1);  // exactly on the floor
+        CHECK(r.evidenceNs == 5 * S);  // §6: how long that evidence had been continuous
+        in.profileId = 1;
+        in.dipAtMs = dip(1);
+        // Calm from 6 s on. The climb is the later of two waits: 30 s of continuous Ok
+        // (36 s) and the shared 45 s cooldown anchor (50 s) - so nothing moves before.
+        for (int64_t t = 6 * S; t < 50 * S; t += S) {
+            const auto rr = g.Update(calm, in, t);
+            CHECK(rr.action == (t == 6 * S ? rc::AutoAction::LogOnly : rc::AutoAction::None));
+            CHECK(rr.recovered == (t == 6 * S));
+        }
+        r = g.Update(calm, in, 50 * S);
+        CHECK(r.action == rc::AutoAction::ProfileUp && r.profileId == 2);
+        CHECK(r.evidenceNs == 44 * S);  // the Ok streak that paid for it, not the cooldown
+        in.profileId = 2;
+        in.dipAtMs = dip(2);
+        int ups = 0;  // 2 is the ceiling: however clean the link stays, nothing past it
+        for (int64_t t = 51 * S; t <= 200 * S; t += S)
+            if (g.Update(calm, in, t).action == rc::AutoAction::ProfileUp) ups++;
+        CHECK(ups == 0);
+    }
+    // 2. The field machine's revival path: floor 0 (latency-first, the position that
+    //    crushed the user's bitrate) on a link that always had room. Nothing but Ok
+    //    ticks, and the picture still walks itself up to 2.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::AutoTuneInput in;
+        in.profileFloorId = 0;
+        in.profileId = 0;
+        in.dipAtMs = dip(0);
+        int ups = 0, downs = 0, rung = 0;
+        int64_t firstUpNs = 0, secondUpNs = 0;
+        for (int64_t t = 0; t <= 200 * S; t += S) {
+            const auto r = g.Update(calm, in, t);
+            if (r.action == rc::AutoAction::ProfileUp) {
+                ups++;
+                if (!firstUpNs) firstUpNs = t;
+                else secondUpNs = t;
+                rung = r.profileId;
+                in.profileId = rung;
+                in.dipAtMs = dip(rung);
+            } else if (r.action == rc::AutoAction::ProfileDown) {
+                downs++;
+            }
+        }
+        CHECK(ups == 2 && downs == 0 && rung == 2);
+        CHECK(firstUpNs == 30 * S);   // 0 -> 1: the 30 s Ok streak; no action to wait out
+        CHECK(secondUpNs == 75 * S);  // 1 -> 2: the 45 s climb cooldown, NOT the 30 s streak
+    }
+    // 3. The reversal: a manual floor raise clears the Profile lock by itself.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        g.MarkManual(rc::AutoDim::Profile);  // what a manual write still does pre-A84
+        rc::AutoTuneInput in;
+        in.profileFloorId = 0;
+        in.profileId = 0;
+        in.dipAtMs = dip(0);
+        // A lock holds while the floor does not move: 60 s of headroom, no climb.
+        for (int64_t t = 0; t <= 60 * S; t += S)
+            CHECK(g.Update(calm, in, t).action == rc::AutoAction::None);
+        // The user moves the slider 0 -> 1. No ClearLocks(), no turning autoTune off and
+        // on again - the floor write IS the hand-over. (The session lifts the live stream
+        // to the new floor on the rebuild that write triggers; EffectiveProfileLocked.)
+        in.profileFloorId = 1;
+        in.profileId = 1;
+        in.dipAtMs = dip(1);
+        rc::AutoTune::Result r{};
+        for (int64_t t = 61 * S; t <= 66 * S; t += S) r = g.Update(pressed, in, t);
+        CHECK(r.action == rc::AutoAction::ProfileDown && r.profileId == 0);  // the unlocked answer
+        CHECK(r.evidenceNs == 5 * S);  // pressure since the 61 s tick that changed class
+        in.profileId = 0;
+        in.dipAtMs = dip(0);
+        // ... and it works ABOVE the new floor right away: the cut sits under the floor
+        // only while the pressure pins it, then climbs back over it (Ok from 67 s, last
+        // action at 66 s -> the later of the two waits ends at 111 s).
+        for (int64_t t = 67 * S; t <= 110 * S; t += S) {
+            const auto rr = g.Update(calm, in, t);
+            CHECK(rr.action == (t == 67 * S ? rc::AutoAction::LogOnly : rc::AutoAction::None));
+        }
+        r = g.Update(calm, in, 111 * S);
+        CHECK(r.action == rc::AutoAction::ProfileUp && r.profileId == 1);
+    }
+    // 4. Q-oscillation: the card's five 6 s pressure episodes 20 s apart, then a long
+    //    calm stretch in which the picture climbs back and the pressure returns. The
+    //    bound is the defensible one: ONE anchor (`m_lastActionNs`) gates both
+    //    directions, so no two rung changes may sit closer than the 30 s brake cooldown
+    //    (45 s for a climb), and over the 300 s timeline below that is at most 10 moves
+    //    - the observed answer is 6, with the two directional floors asserted
+    //    separately because they are exactly what Q-oscillation asks about.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::AutoTuneInput in;
+        in.profileFloorId = 1;
+        in.profileId = 2;
+        in.dipAtMs = dip(2);
+        int ups = 0, downs = 0;
+        int64_t prevChangeNs = -1, minGapNs = 0;
+        bool prevWasUp = false;
+        int64_t minUpToDownNs = 0, minDownToUpNs = 0;
+        for (int64_t t = 0; t <= 300 * S; t += S) {
+            // Part A (t <= 100 s): 6 s episodes at 0/20/40/60/80 s, Ok in between - the
+            // 14 s windows are far too short for the 30 s a climb needs. Part B: the
+            // link calms for good from 101 s, pressure returns for 35 s at 181 s, then
+            // the link is clean to the end.
+            const int64_t ts = t / S;
+            const bool pressWindow = ts <= 100 ? (ts % 20) < 6 : (ts >= 181 && ts <= 215);
+            const auto r = g.Update(pressWindow ? pressed : calm, in, t);
+            if (r.action == rc::AutoAction::ProfileUp || r.action == rc::AutoAction::ProfileDown) {
+                const bool up = r.action == rc::AutoAction::ProfileUp;
+                if (up) ups++;
+                else downs++;
+                if (prevChangeNs >= 0) {
+                    const int64_t gap = t - prevChangeNs;
+                    if (minGapNs == 0 || gap < minGapNs) minGapNs = gap;
+                    if (prevWasUp && !up && (minUpToDownNs == 0 || gap < minUpToDownNs)) minUpToDownNs = gap;
+                    if (!prevWasUp && up && (minDownToUpNs == 0 || gap < minDownToUpNs)) minDownToUpNs = gap;
+                }
+                prevWasUp = up;
+                prevChangeNs = t;
+                in.profileId = r.profileId;
+                in.dipAtMs = dip(r.profileId);
+            }
+        }
+        // Part A's cuts land at 5 s (2 -> 1) and 45 s (1 -> 0): the episodes at 20 s and
+        // 60 s arrive inside the 30 s cooldown, the one at 80 s has no rung left to give
+        // up (0 is latency, the bottom of the ladder), and no Ok window there is 30 s
+        // long, so not one climb fires. Part B: the picture climbs 0 -> 1 at 131 s and
+        // 1 -> 2 at 176 s (45 s apart - the climb's own cooldown, not the 30 s streak);
+        // the pressure that returns at 181 s cannot take a rung back before 206 s, i.e.
+        // 30 s after that climb and never immediately; and 251 s the picture is back at
+        // the ceiling for good.
+        CHECK(ups == 3 && downs == 3);
+        CHECK(in.profileId == 2);   // it ends at the ceiling, which is what §2 asks for
+        CHECK(minGapNs == 30 * S);  // the tightest pair in the whole timeline: never 0
+        CHECK(ups + downs <= 10);   // the 300 s bound stated above
+        CHECK(minUpToDownNs == 30 * S);  // a cut may not follow a climb with no hysteresis
+        CHECK(minDownToUpNs == 45 * S);  // a climb waits out its own 45 s cooldown
+        CHECK(prevChangeNs == 251 * S);
+    }
+    // 5. The enable switch, decided INSIDE the layer (A84b §1). The case A84 left
+    //    here was a tautology: `gated(false, ...)` was a lambda that returned the
+    //    "off" answer itself, so CHECK(actions == 0) could not go red and the real
+    //    off branch - the `if (!pc.autoTune)` in front of the layer's only feed in
+    //    the product - was covered by nothing. The switch is
+    //    rc::AutoTune::Config::enabled now, enforced in Update(), which this binary
+    //    reaches, so both directions of the same claim are asserted on the SAME
+    //    timeline and neither half can pass by the harness declining to run:
+    //      enabled  -> the 200 s headroom stretch moves the picture twice (0 -> 1 at
+    //                  30 s, 1 -> 2 at 75 s): a gate stuck shut is red here;
+    //      disabled -> the identical stretch moves it zero times: a gate stuck open,
+    //                  or inverted, is red here.
+    //    The third block is the one A84's comment only claimed: disabled is INERT,
+    //    not merely silent. 200 s of disabled Ok ticks leave no streak and no
+    //    cooldown anchor behind, so the tick the switch turns on at is the streak's
+    //    first and the climb lands a full 30 s later. If the gate merely muted the
+    //    action while the episodes kept accumulating, the first enabled tick would
+    //    climb at once and that CHECK goes red.
+    {
+        struct Out {
+            int actions;
+            int64_t firstUpNs;
+            int rung;
+        };
+        auto run = [&](bool enabled, int64_t toNs) {
+            rc::AutoTune g;
+            rc::AutoTune::Config c = cfg;
+            c.enabled = enabled;
+            g.Configure(c);
+            rc::AutoTuneInput in;
+            in.profileFloorId = 0;
+            in.profileId = 0;  // case 2's shape: the stream starts at the floor
+            in.dipAtMs = dip(0);
+            Out o{0, 0, 0};
+            for (int64_t t = 0; t <= toNs; t += S) {
+                const auto r = g.Update(calm, in, t);
+                if (r.action == rc::AutoAction::None) continue;
+                o.actions++;
+                if (r.action != rc::AutoAction::ProfileUp) continue;
+                if (!o.firstUpNs) o.firstUpNs = t;
+                o.rung = int(r.profileId);
+                in.profileId = r.profileId;  // the caller rebuilds at the new rung
+                in.dipAtMs = dip(r.profileId);
+            }
+            return o;
+        };
+        const Out on = run(true, 200 * S);
+        const Out off = run(false, 200 * S);
+        CHECK(on.firstUpNs == 30 * S);  // the direction the old case never tested
+        CHECK(on.actions == 2 && on.rung == 2);
+        CHECK(off.actions == 0 && off.firstUpNs == 0 && off.rung == 0);
+        // One tuner, switch moved at 200 s: the product feeds SetEnabled from the
+        // settings snapshot and the layer decides, so that is all a re-enable is.
+        rc::AutoTune g;
+        rc::AutoTune::Config c = cfg;
+        c.enabled = false;
+        g.Configure(c);
+        rc::AutoTuneInput in;
+        in.profileFloorId = 0;
+        in.profileId = 0;
+        in.dipAtMs = dip(0);
+        int offActions = 0;
+        for (int64_t t = 0; t < 200 * S; t += S)
+            if (g.Update(calm, in, t).action != rc::AutoAction::None) offActions++;
+        CHECK(offActions == 0);
+        c.enabled = true;
+        g.Configure(c);
+        int afterEnable = 0;
+        int64_t upNs = 0;
+        for (int64_t t = 200 * S; t <= 300 * S; t += S) {
+            const auto r = g.Update(calm, in, t);
+            if (r.action == rc::AutoAction::None) continue;
+            afterEnable++;
+            if (r.action != rc::AutoAction::ProfileUp) continue;
+            if (!upNs) upNs = t;
+            in.profileId = r.profileId;
+            in.dipAtMs = dip(r.profileId);
+        }
+        CHECK(upNs == 230 * S);     // 30 s of Ok counted from the FIRST enabled tick
+        CHECK(afterEnable == 2);    // 230 s and 275 s, then 2 is the ceiling
+    }
+    // 5b. The floor the manual-lock hand-over is detected against is the RUNG the
+    //     floor clamps to, not the raw number the caller sent (A84b §3). A84 compared
+    //     the raw value against a clamped one, so a settings file carrying an
+    //     out-of-range slider (hand-edited: -3, 5, 9) "moved the floor" on a tick
+    //     where nothing about the floor moved, and cleared the user's manual lock
+    //     every time the number jittered. Both halves are asserted, and they are
+    //     opposites: the same-clamp sequence must keep the lock (A84's comparison
+    //     breaks it and starts a climb), a genuinely different floor must hand the
+    //     dimension back.
+    {
+        rc::AutoTune g;
+        g.Configure(cfg);
+        rc::AutoTuneInput in;
+        in.profileId = 0;
+        in.profileFloorId = 2;  // the floor is established first, while nothing is locked
+        in.dipAtMs = dip(0);
+        (void)g.Update(calm, in, 0);  // the tick that states the floor: no lock to hand back yet
+        g.MarkManual(rc::AutoDim::Profile);  // the user wrote this dimension
+        // The lock holds through a whole minute of headroom. This is the shape the
+        // rest of the block is measured against, and it is also what makes the next
+        // half sharp: the Ok streak is over 30 s by then, so a lock that is wrongly
+        // erased below climbs on the spot instead of quietly waiting.
+        for (int64_t t = 1; t <= 40 * S; t += S)
+            CHECK(g.Update(calm, in, t).action == rc::AutoAction::None);
+        // 5, 6, 9, 5: four different numbers, one floor (all clamp to 2), so the
+        // lock is still the answer on every tick. A84's raw-vs-clamped comparison
+        // erases it on the first of them - this CHECK goes red there.
+        const int sameFloor[] = {5, 6, 9, 5};
+        for (int i = 0; i < 4; i++) {
+            in.profileFloorId = sameFloor[i];
+            CHECK(g.Update(calm, in, (41 + i) * S).action == rc::AutoAction::None);
+        }
+        // And a floor that really is different is still the hand-over: 2 -> 1.
+        in.profileFloorId = 1;
+        const auto r = g.Update(calm, in, 50 * S);
+        CHECK(r.action == rc::AutoAction::ProfileUp && r.profileId == 1);
+    }
+    std::printf("ok\n");
+}
+
+// A84b §4 (TASK-A84b-CLOSE-AUTOTUNE-GAPS): rc::EffectiveProfileRung, the one rule
+// that says what rung the live streams are BUILT at, and therefore the rule behind
+// the periodic log reading the field round needs (`effProfile=` beside
+// `profileFloor=` on the 30 s AUTO signals line). It is the rule
+// ClientSession::EffectiveProfileLocked applies, extracted into rc/auto_tune.h
+// because client_session.cpp is not linked into rincast-core and a rule only
+// reachable from there has no test that could go red - which is exactly how A84
+// ended up with an effProfile nobody had ever checked.
+static void TestEffectiveProfileRung() {
+    std::printf("effective profile rung: ");
+    // autoTune OFF is the pre-A84 branch, byte for byte: the slider is an absolute
+    // choice, so the effective rung IS the floor and auto's last choice is ignored.
+    CHECK(rc::EffectiveProfileRung(-1, 1, false) == 1);
+    CHECK(rc::EffectiveProfileRung(0, 1, false) == 1);
+    CHECK(rc::EffectiveProfileRung(2, 0, false) == 0);
+    // ON, nothing chosen yet: auto starts at the user's floor, not under it.
+    CHECK(rc::EffectiveProfileRung(-1, 0, true) == 0);
+    CHECK(rc::EffectiveProfileRung(-1, 2, true) == 2);
+    // ON: the rule is `the rung auto chose`, and A84c is why it may be UNDER the
+    // floor. Until then this function took a max with the floor, and ClientSession
+    // wrote its answer back into the very state it read - so AutoTune's link-bound
+    // cut below the floor was cancelled on the next line: the session logged
+    // `profile 1 -> 0 down`, called OnStreamProfileChanged, and rebuilt the stream at
+    // the rung it had just been running at. A floor is where auto RETURNS (that is
+    // what both slider labels say), not a line the read may not cross.
+    for (int floorId = 0; floorId <= 2; floorId++)
+        for (int autoRung = 0; autoRung <= 2; autoRung++) {
+            const int eff = rc::EffectiveProfileRung(autoRung, floorId, true);
+            CHECK(eff == autoRung);  // the answer is the choice, never a clamp of it
+            CHECK(eff <= 2);
+        }
+    // The one move the max() was standing in for is now explicit, and it is the
+    // direction the USER owns: raising the floor lifts the live stream to it at once,
+    // with no cooldown and no Ok streak to wait out. Lowering it lifts nothing -
+    // auto goes down on its own evidence, and a dip already in progress stays there
+    // until the link calms (ClimbProfile).
+    CHECK(rc::LiftRungToNewFloor(0, 1, 2) == 2);  // floor 1 -> 2 while dipped: lifted
+    CHECK(rc::LiftRungToNewFloor(1, 1, 2) == 2);  // same for a rung merely below it
+    CHECK(rc::LiftRungToNewFloor(2, 1, 2) == 2);  // already at the new floor: unchanged
+    CHECK(rc::LiftRungToNewFloor(0, 2, 1) == 0);  // LOWERING the floor leaves the rung alone
+    CHECK(rc::LiftRungToNewFloor(0, 1, 1) == 0);  // an unchanged floor is not an event
+    CHECK(rc::LiftRungToNewFloor(1, 0, 0) == 1);  // ... not even when it is the first floor seen
+    CHECK(rc::LiftRungToNewFloor(-1, 1, 2) == -1);  // auto has not chosen: nothing to lift
+    CHECK(rc::LiftRungToNewFloor(0, -1, 2) == 0);   // no previous floor: nothing moved
+    CHECK(rc::LiftRungToNewFloor(0, 5, 6) == 0);    // both out of range = the same floor 2
+    CHECK(rc::LiftRungToNewFloor(0, 1, 9) == 2);    // a wild new floor still lands on the ladder
+    // Neither seat can leave the 0/1/2 ladder, whatever a caller passes in.
+    CHECK(rc::EffectiveProfileRung(9, 1, true) == 2);
+    CHECK(rc::EffectiveProfileRung(-1, 9, true) == 2);
+    CHECK(rc::EffectiveProfileRung(9, -3, false) == 0);
+    std::printf("ok\n");
+}
+
+// A84b §2 (TASK-A84b): the one-time settings migration behind A84's flipped
+// autoTune default. Settings::FromJson - the code that reads the stamp and applies
+// this - compiles into rincast-streamer only (core_tests.cpp names neither
+// FromJson, ToJson nor SettingsStore), so the judgement moved to
+// rc/settings_migration.h and is asserted here.
+static void TestSettingsSchemaMigration() {
+    std::printf("settings schema migration: ");
+    // 1. No stamp = a file last written when the default was still off, which proves
+    //    nothing about what the user wanted (every save dumps the whole struct, so
+    //    the file says "autoTune": false regardless). The migration must fire, and
+    //    the sentinel the streamer's read falls back to for an absent key AND for a
+    //    hand-edited non-number must be under the threshold so both migrate.
+    CHECK(rc::MigrateAutoTuneOn(rc::kSettingsSchemaUnstamped));
+    CHECK(rc::kSettingsSchemaUnstamped < rc::kSettingsSchemaAutoTuneOn);
+    // An unreadable stamp must never be able to latch the tuner off by accident.
+    CHECK(rc::MigrateAutoTuneOn(-7));
+    // 2. A stamped file rules exactly as written: turn the switch off on this build
+    //    and it stays off across restarts, so the migration must not fire at or
+    //    above the threshold, nor for a future schema.
+    CHECK(!rc::MigrateAutoTuneOn(rc::kSettingsSchemaAutoTuneOn));
+    CHECK(!rc::MigrateAutoTuneOn(rc::kSettingsSchemaAutoTuneOn + 1));
+    // 3. And the stamp this build writes must itself be trusted, or every save would
+    //    re-migrate and the switch could never be turned off at all (this is the
+    //    check that makes the two constants' relationship, not just their values,
+    //    part of the contract).
+    CHECK(rc::kCurrentSettingsSchema >= rc::kSettingsSchemaAutoTuneOn);
+    CHECK(!rc::MigrateAutoTuneOn(rc::kCurrentSettingsSchema));
+    std::printf("ok\n");
+}
+
 // VD-OFFLINE (TASK 2026-11-20 §2.1): the full/half+generate pace policy. Pure
 // state machine - every case drives UpdateLinkPolicy directly with synthetic
 // 1 Hz ticks. The rule numbers in the comments refer to TASK-VD-OFFLINE §2.1.
@@ -5340,7 +5736,7 @@ static void TestVrConfigComboSweep() {
 
                 // ---- §1.6: autoTune agreement (full) + decision probes (stride) ----
                 {
-                    const rc::AutoTuneInput in = rcs::BuildAutoTuneInput(pc, st, slowPath, /*pcOwnsProfile=*/true);
+                    const rc::AutoTuneInput in = rcs::BuildAutoTuneInput(pc, st, slowPath);
                     A12_CHECK(in.cbrOn == !cfg.cappedVbr, "A6-autotune-input", b, n, gazeFovea, slowPath,
                               "autoTune's CBR view disagrees with the built config");
                     A12_CHECK(in.foveaOn == (pc.foveatedEncoding && gazeFovea), "A6-autotune-input", b, n, gazeFovea,
@@ -5377,20 +5773,28 @@ static void TestVrConfigComboSweep() {
                         A12_CHECK(lr.action != rc::AutoAction::CbrOff && lr.action != rc::AutoAction::FoveaOn &&
                                       lr.action != rc::AutoAction::ProfileDown,
                                   "A6-autotune-actions", b, n, gazeFovea, slowPath, "a manual lock was overridden");
-                        // LinkBound: profile down only for a PC-owned profile.
+                        // LinkBound: one rung down, and only while there is a rung to
+                        // give. A84b §3 retired BuildAutoTuneInput's `pcOwnsProfile`
+                        // (see stream_config.h for the evidence), so this probe is no
+                        // longer about who owns the synced key - it is about the rung:
+                        // profileId is the built config's own profile here, so 0 is
+                        // the bottom of the ladder and nothing may step below it.
                         rc::AutoTune link;
                         rc::BottleneckSignal linkSig;
                         linkSig.queueMs = 150.0;
                         linkSig.nominalFps = double(cfg.fps);
-                        const rc::AutoTuneInput owned = rcs::BuildAutoTuneInput(pc, st, slowPath, false);
-                        (void)link.Update(linkSig, owned, 0);
-                        const auto lr2 = link.Update(linkSig, owned, 6'000'000'000LL);
-                        if (owned.profileId > 0)
-                            A12_CHECK(lr2.action == rc::AutoAction::ProfileDown && lr2.profileId == owned.profileId - 1,
+                        const rc::AutoTuneInput linkIn = rcs::BuildAutoTuneInput(pc, st, slowPath);
+                        A12_CHECK(linkIn.profileId == int(cfg.profile), "A6-autotune-input", b, n, gazeFovea,
+                                  slowPath, "autoTune's rung is not the profile the config builds at");
+                        (void)link.Update(linkSig, linkIn, 0);
+                        const auto lr2 = link.Update(linkSig, linkIn, 6'000'000'000LL);
+                        if (linkIn.profileId > 0)
+                            A12_CHECK(lr2.action == rc::AutoAction::ProfileDown &&
+                                          lr2.profileId == linkIn.profileId - 1,
                                       "A6-autotune-actions", b, n, gazeFovea, slowPath, "LinkBound did not step down");
                         else
                             A12_CHECK(lr2.action == rc::AutoAction::None, "A6-autotune-actions", b, n, gazeFovea,
-                                      slowPath, "headset-owned profile was moved");
+                                      slowPath, "stepped below the bottom rung");
                         // DecodeBound: this layer never acts (the L7 ladder's class).
                         rc::AutoTune dec;
                         rc::BottleneckSignal decSig;
@@ -5654,7 +6058,7 @@ static void TestConfigCouplingCases() {
         pc.profileControlsVideo = true;
         pc.streamProfile = 2;
         st.tenBit = false;
-        const auto in = rcs::BuildAutoTuneInput(pc, st, false, true);
+        const auto in = rcs::BuildAutoTuneInput(pc, st, false);
         CHECK(in.cbrOn);
         CHECK(in.profileId == pc.streamProfile);
         rc::AutoTune tuner;
@@ -6551,6 +6955,9 @@ int main() {
     TestAutoTuneClassify();
     TestAutoTuneClassifyEdgeCases();  // TASK-ROBUST-EDGES-2026-11-20 §2
     TestAutoTuneDecide();
+    TestAutoTuneProfileFloor();  // A84 (TASK-A84-PROFILE-FLOOR-TWO-WAY-AUTOTUNE-2026-11-23 §5)
+    TestEffectiveProfileRung();  // A84b §4 (TASK-A84b): the rule behind the periodic effProfile
+    TestSettingsSchemaMigration();  // A84b §2: the autoTune default migration, out of settings.cpp
     TestLinkPolicy();
     TestSuggestStartFps();
     TestSessionDisconnectReconnect();

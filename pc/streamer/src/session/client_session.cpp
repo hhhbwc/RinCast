@@ -575,19 +575,36 @@ void ClientSession::HandleMessage(const json& m) {
     if (type == "_serverInfo") return SendServerInfo();
     if (type == rc::msg::kClientInfo) {
         ApplyClientInfo(m);
-        // PLAN-AUTO-TUNE: a streamProfile the headset picked at connect is as
-        // manual as a UI click - auto never fights it (DECISION-TABLE §3.1).
-        // Same condition AdoptHeadsetOwnedSettings below uses for the profile.
+        // A84 §2 (was PLAN-AUTO-TUNE's MarkManual here): a streamProfile the
+        // headset picked at connect is the USER'S FLOOR, not a lock. Auto keeps
+        // working above it; EffectiveProfile lifts the live streams to it at once
+        // if auto had been running lower. Same condition AdoptHeadsetOwnedSettings
+        // below uses for the profile.
+        //
+        // A84b §3: the line used to print m_settings.streamProfile BEFORE the adopt,
+        // which is the number the headset sent, not the number the tuner is then fed
+        // (that is Settings::streamProfile, and the adopt can decline). It now only
+        // records THAT the floor arrived here and what it replaced; the value is read
+        // back off the settings after AdoptHeadsetOwnedSettings, so what is logged is
+        // what AutoTuneInput::profileFloorId gets.
+        bool floorFromHeadset = false;
+        int floorBefore = 0;
         {
             const Settings adopted = SettingsStore::Get().Snapshot();
             std::lock_guard lock(m_mutex);
             if (!m_ownedSettings.count(rc::synced::kStreamProfile) &&
-                adopted.streamProfile != m_settings.streamProfile)
-                m_autoTune.MarkManual(rc::AutoDim::Profile);
+                adopted.streamProfile != m_settings.streamProfile) {
+                floorFromHeadset = true;
+                floorBefore = adopted.streamProfile;
+            }
         }
         // First connect: adopt the headset's profile/bitrate picks before StartVr
         // builds cfg from the PC copy, so the page and the encoder agree from frame 1.
         AdoptHeadsetOwnedSettings();
+        if (floorFromHeadset)
+            RC_LOGI("AUTO: profile floor %d -> %d taken from the headset (auto works above it, never below "
+                    "unless the link forces it)",
+                    rc::ClampProfileId(floorBefore), rc::ClampProfileId(SettingsStore::Get().Snapshot().streamProfile));
         LogAutoCapability();
         SendServerInfo();
         SendMonitors();
@@ -607,15 +624,13 @@ void ClientSession::HandleMessage(const json& m) {
             RC_LOGI("Headset moved refreshRate %.0f -> %.0f Hz (its panel's actual rate) - the stream rebuilds at it",
                     before.refreshRate, after.refreshRate);
         AdoptHeadsetOwnedSettings();
-        // PLAN-AUTO-TUNE: a streamProfile the headset sends with a value the PC
-        // never pushed (or one that differs from its pushed copy) is the
-        // headset's own pick - auto steps aside (DECISION-TABLE §3.1).
-        if (m.contains("settings") && m["settings"].contains(rc::synced::kStreamProfile)) {
-            std::lock_guard lock(m_mutex);
-            const auto it = m_ownedSettings.find(rc::synced::kStreamProfile);
-            if (it == m_ownedSettings.end() || it->second != m["settings"][rc::synced::kStreamProfile])
-                m_autoTune.MarkManual(rc::AutoDim::Profile);
-        }
+        // A84 §2 (was PLAN-AUTO-TUNE's MarkManual here): a streamProfile the
+        // headset sends with a value the PC never pushed is the user moving their
+        // slider, which now STATES A FLOOR and hands the dimension back - it does
+        // not lock auto out of it. The floor reaches the tuner as
+        // AutoTuneInput::profileFloorId, where the change itself clears the lock.
+        // (The synced key is still never written by auto: it moves only the
+        // session's effective profile, so there is nothing left to fight over.)
         const bool profileChanged = before.streamProfile != after.streamProfile;
         const bool videoChanged = before.codec != after.codec || before.tenBit != after.tenBit ||
                                   before.vrQuality != after.vrQuality || before.vrScale != after.vrScale ||
@@ -727,8 +742,14 @@ void ClientSession::HandleMessage(const json& m) {
                 OnStreamProfileChanged();
             }
         }
-        // PLAN-AUTO-TUNE: the decision layer, dormant unless Settings::autoTune.
-        if (pcAuto.autoTune) RunAutoTune();
+        // PLAN-AUTO-TUNE / A84b §1: the decision layer, called on every stats tick
+        // whatever the switch says. The `if (pcAuto.autoTune)` that used to sit here
+        // was a second place deriving the enable decision from the settings, and a
+        // gate living in a call site no test binary links can never be covered;
+        // RunAutoTune now feeds Settings::autoTune into rc::AutoTune (Config::enabled)
+        // and the layer decides. The ladder gate above is a different question
+        // (which scale is allowed to step - DECISION-TABLE §3.1), not this one.
+        RunAutoTune();
         return;
     }
 }
@@ -988,13 +1009,33 @@ void ClientSession::OnSettingsChanged(const json& changed) {
     // PLAN-AUTO-TUNE: a manual write of a dimension auto owns locks that
     // dimension until autoTune is turned off and back on (DECISION-TABLE §3.1).
     // Enabling autoTune itself is the hand-over, so it clears last.
+    // A84 §2 REVERSES this for streamProfile: the slider is a floor, so writing it
+    // re-floors and clears the lock (the value reaches the tuner as
+    // AutoTuneInput::profileFloorId; EffectiveProfile lifts the live stream to a
+    // raised floor on the rebuild this write triggers - see app.cpp's rebuild list).
+    // Cbr and Fovea keep the old rule untouched.
+    bool handBackToFloor = false;
     {
         std::lock_guard lock(m_mutex);
-        if (changed.contains("streamProfile")) m_autoTune.MarkManual(rc::AutoDim::Profile);
+        if (changed.contains("streamProfile"))
+            RC_LOGI("AUTO: profile floor set to %d by the PC (the worst picture the user accepts; auto runs "
+                    "above it while the link has room)",
+                    rc::ClampProfileId(SettingsStore::Get().Snapshot().streamProfile));
         if (changed.contains("qualityProfileCbr")) m_autoTune.MarkManual(rc::AutoDim::Cbr);
         if (changed.contains("foveatedEncoding")) m_autoTune.MarkManual(rc::AutoDim::Fovea);
-        if (changed.contains("autoTune") && changed.value("autoTune", false)) m_autoTune.ClearLocks();
+        if (changed.contains("autoTune")) {
+            const bool on = changed.value("autoTune", false);
+            if (on) m_autoTune.ClearLocks();  // the hand-over: every dimension is auto's again
+            // Either way auto's own rung is gone: enabling starts at the user's
+            // floor and climbs on evidence, disabling hands the stream back to the
+            // rung the slider names (A84 §5 case 5 - off is the pre-A84 branch).
+            m_autoProfileEff = -1;
+            handBackToFloor = !on;
+        }
     }
+    // app.cpp's rebuild list has no autoTune in it, so the switch that stops auto
+    // moving the picture has to rebuild the picture itself.
+    if (handBackToFloor) OnStreamProfileChanged();
     if (changed.contains("desktopInput")) ApplyInputSetting(true);
     if (changed.contains("streamAudio") || changed.contains("micPassthrough") ||
         changed.contains("audioDevices") || changed.contains("playOnPcToo") || changed.contains("switchDefaultAudio"))
@@ -1021,10 +1062,58 @@ void ClientSession::ResetAutoscale() {
 // summarising the device's own capability answers and the PC settings auto may
 // move. RunAutoTune: called from the kStats handler with m_mutex held, only
 // when Settings::autoTune is on - it classifies the tick, logs the signals
-// line on a 30 s cadence, and applies at most one action through the same
-// SettingsStore + OnStreamProfileChanged channel a manual UI write takes.
+// line on a 30 s cadence, and applies at most one action: a settings write plus
+// OnStreamProfileChanged for CBR/foveation, the session's own effective profile
+// for the picture rung (A84 - auto never writes the slider).
 // Design authority: AUTO-TUNE-2026-11-19/DECISION-TABLE.md.
 // ---------------------------------------------------------------------------
+
+// A84 §2: the profile a stream is built at. See the declaration in
+// client_session.h for why the slider and the running rung are two different
+// numbers now. Caller rule: the Locked variant runs with m_mutex held.
+int ClientSession::EffectiveProfileLocked(int floorId, bool autoTuneOn) {
+    // A84b §4: the rule itself is rc::EffectiveProfileRung now, so the core_tests
+    // can bind it (this file is not linked into rincast-core, and a rule only
+    // reachable from here has no test that could go red on it). What stays here is
+    // the half that needs session state: remembering the rung, and adopting the
+    // floor when auto has not chosen yet or when a RAISED floor arrives - the user
+    // speaking, so the live stream lifts to it on the rebuild that write triggers,
+    // with no cooldown and no episode to wait out.
+    // A84c: the lift is no longer a side effect of the read. The read used to take a
+    // max with the floor, which is also what made an auto cut BELOW the floor
+    // impossible - the exact escape a link-bound stream at the floor needs, and the
+    // reason the log line at the profile transition says "allowed to sit under". So
+    // the max moved here, where it runs only on the tick the floor itself moves.
+    const int floor = rc::ClampProfileId(floorId);
+    m_autoProfileEff = rc::LiftRungToNewFloor(m_autoProfileEff, m_autoProfileFloor, floor);
+    m_autoProfileFloor = floor;
+    const int rung = rc::EffectiveProfileRung(m_autoProfileEff, floor, autoTuneOn);
+    if (autoTuneOn) m_autoProfileEff = rung;
+    return rung;
+}
+
+int ClientSession::EffectiveProfile(int floorId, bool autoTuneOn) {
+    std::lock_guard lock(m_mutex);
+    return EffectiveProfileLocked(floorId, autoTuneOn);
+}
+
+Settings ClientSession::EffectiveSettings(const Settings& pc) {
+    Settings eff = pc;
+    eff.streamProfile = EffectiveProfile(pc.streamProfile, pc.autoTune);
+    return eff;
+}
+
+// A84 §2's clean-side evidence, from the same two readings A81 put in the log:
+// the brake line the CURRENT rung pays and the device's own idle queue. This is
+// queue_guard.h's `dipAt` formula READ (never copied state, never the guard's
+// numbers touched) with the floor term at its no-feedback value: the real line
+// only ever sits higher (max with floor + floorExtraMs), so demanding the queue
+// be under this one is the strict side of the pair - exactly what video_sender.cpp
+// prints when the guard has not seen a report yet.
+static double ProfileDipAtMs(int profileId) {
+    const rc::StreamProfileParams p = rc::ProfileParams(rc::ProfileFromId(profileId));
+    return std::max(p.targetQueueMs + p.bandMs, p.floorExtraMs);
+}
 
 void ClientSession::LogAutoCapability() {
     ClientCaps caps;
@@ -1038,21 +1127,34 @@ void ClientSession::LogAutoCapability() {
         if (!rates.empty()) rates += '/';
         rates += std::to_string(int(r + 0.5f));
     }
+    // A84 §6: what the slider means now (a floor) and what the streams run at. The
+    // pair is printed together because they differ during exactly the sessions that
+    // matter: a latency-first slider (streamProfile=0) on a link with room. Appended
+    // at the END of this line - logpair.py / analyze_dual.py anchor on the fields
+    // before it, and the parser regexes here are not end-anchored.
+    const int effProfile = EffectiveProfile(pc.streamProfile, pc.autoTune);
     RC_LOGI("AUTO: capability device=%s serial=%s decoders=h264:%d hevc:%d hevc10:%d av1:%d av110:%d "
             "maxDecode=%ux%u maxFpsAtMaxRes=%u refresh=[%s] eye=%ux%u | autoTune=%d encodeScalePct=%d "
             "l7Autoscale=%d streamProfile=%d qualityProfileCbr=%d profileControlsVideo=%d foveatedEncoding=%d "
-            "vrBitrateMbps=%d pcBitrateWins=%d adaptiveBitrate=%d codec=%s tenBit=%d",
+            "vrBitrateMbps=%d pcBitrateWins=%d adaptiveBitrate=%d codec=%s tenBit=%d effProfile=%d",
             m_hello.model.c_str(), m_hello.deviceId.c_str(), caps.h264, caps.hevc, caps.hevc10, caps.av1,
             caps.av110, caps.maxDecodeWidth, caps.maxDecodeHeight, caps.maxFpsAtMaxRes, rates.c_str(),
             caps.recommendedEyeWidth, caps.recommendedEyeHeight, int(pc.autoTune), pc.encodeScalePct,
             int(pc.l7Autoscale), pc.streamProfile, int(pc.qualityProfileCbr), int(pc.profileControlsVideo),
             int(pc.foveatedEncoding), pc.vrBitrateMbps, int(pc.pcBitrateWins), int(pc.adaptiveBitrate),
-            pc.codec.c_str(), int(pc.tenBit));
+            pc.codec.c_str(), int(pc.tenBit), effProfile);
 }
 
 void ClientSession::RunAutoTune() {
     const Settings pc = SettingsStore::Get().Snapshot();
-    if (!pc.autoTune) return;
+    // A84b §1: this used to be `if (!pc.autoTune) return;` - the enable decision
+    // made here, where no test can reach it. The decision is fed INTO the layer
+    // (rc::AutoTune::Config::enabled) and enforced in rc::AutoTune::Update; what is
+    // left below reads the same stored flag back, so the layer is still the one
+    // place that decides, and this call site only skips gathering signals and
+    // printing the 30 s line for an install that opted out (DECISION-TABLE §4).
+    m_autoTune.SetEnabled(pc.autoTune);
+    if (!m_autoTune.Enabled()) return;
     const ClientStreamSettings st = m_settings;
     const auto vs = m_vr ? m_vr->Stats() : VideoSenderStats{};
 
@@ -1081,8 +1183,15 @@ void ClientSession::RunAutoTune() {
     sig.queueMs = vs.queueMs;
     sig.loss = vs.lossAvg;
 
-    rc::AutoTuneInput in = BuildAutoTuneInput(pc, st, m_slowPath,
-                                              m_ownedSettings.count(rc::synced::kStreamProfile) != 0);
+    // A84 §2: the tuner is fed the RUNG the live stream is built at (the only thing
+    // it may move), the slider as the FLOOR, and the brake line that rung pays.
+    // A84b §3: BuildAutoTuneInput no longer takes the key-ownership flag - the
+    // floor above carries the intent it guarded, see stream_config.h.
+    Settings eff = pc;
+    eff.streamProfile = EffectiveProfileLocked(pc.streamProfile, pc.autoTune);
+    rc::AutoTuneInput in = BuildAutoTuneInput(eff, st, m_slowPath);
+    in.profileFloorId = pc.streamProfile;
+    in.dipAtMs = ProfileDipAtMs(eff.streamProfile);
 
     const int64_t now = rc::NowNs();
     const auto r = m_autoTune.Update(sig, in, now);
@@ -1091,10 +1200,23 @@ void ClientSession::RunAutoTune() {
     // opted-out install sees nothing new beyond the one capability line.
     if (!m_autoSignalLogNs || now - m_autoSignalLogNs >= 30'000'000'000LL) {
         m_autoSignalLogNs = now;
+        // A84b §4 (TASK-A84b): the profile pair rides this line because it is the
+        // only PERIODIC line this file owns, and the whole point of A84 was to make
+        // the next field round attributable. The capability line that used to carry
+        // effProfile is printed once per session, and a reader who sees 1407 guard
+        // dips cannot tell from it what the streams were built at four minutes later.
+        // effProfile is the rung the streams ARE built at (the same number
+        // StartVr/StartDesktop feed the encoder, the same word the capability line
+        // uses, and the same thing the 3 s `Stream N latency: profile=` field
+        // already names - it is built from EffectiveSettings now); profileFloor is
+        // the slider the user set, which is the number you need beside it to tell an
+        // auto move from a user move. Appended at the END: the existing field names
+        // and order are byte-for-byte what the log readers anchor on.
         RC_LOGI("AUTO: signals %s fps=%.0f game=%.0f qp=%.1f wire=%.1f ceiling=%u queue=%.0f loss=%.1f%% "
-                "decode=%.1f/%.1f ms dropped=%.1f",
+                "decode=%.1f/%.1f ms dropped=%.1f effProfile=%d profileFloor=%d",
                 rc::BottleneckName(r.cls), vs.fps, vs.gameFps, vs.qp, vs.mbps, vs.bitrateKbps, vs.queueMs,
-                vs.lossAvg * 100.0, sig.decodeMs, sig.decodeBudgetMs, vs.droppedFps);
+                vs.lossAvg * 100.0, sig.decodeMs, sig.decodeBudgetMs, vs.droppedFps, eff.streamProfile,
+                in.profileFloorId);
         if (nominalClamped)
             RC_LOGW("Refresh clamp (autoTune mirror of the StartVr stream-build clamp): %.0f Hz requested, not in "
                     "the device's enumerated list [%s] - nominal %.0f Hz (the top entry)",
@@ -1108,6 +1230,7 @@ void ClientSession::RunAutoTune() {
     }
     const char* dimName = r.action == rc::AutoAction::CbrOff    ? "qualityProfileCbr=false"
                           : r.action == rc::AutoAction::FoveaOn ? "foveatedEncoding=true"
+                          : r.action == rc::AutoAction::ProfileUp ? "streamProfile up"
                                                                 : "streamProfile down";
     RC_LOGI("AUTO: %s (qp %.1f, wire %.1f of %u kbps, queue %.0f ms, loss %.1f%%) -> %s (%s)",
             rc::BottleneckName(r.cls), sig.qp, sig.mbps, sig.ceilingKbps, sig.queueMs, sig.loss * 100.0, dimName,
@@ -1119,9 +1242,27 @@ void ClientSession::RunAutoTune() {
         case rc::AutoAction::FoveaOn:
             SettingsStore::Get().Update([](Settings& s) { s.foveatedEncoding = true; });
             break;
+        // A84: the picture rung is NOT a settings write any more. Moving the synced
+        // key would move the user's floor with it - which is how the slider became a
+        // ceiling nobody could climb back over. It is session state, and the rebuild
+        // below reads it through EffectiveProfile.
         case rc::AutoAction::ProfileDown:
-            SettingsStore::Get().Update([&](Settings& s) { s.streamProfile = r.profileId; });
+        case rc::AutoAction::ProfileUp: {
+            const int from = eff.streamProfile;
+            m_autoProfileEff = rc::ClampProfileId(r.profileId);
+            // A84 §6: the transition gets its own line, so the one above keeps every
+            // field name and order the log readers anchor on. Old -> new, the
+            // direction, how long the evidence behind it had been continuous, the
+            // floor it is allowed to sit under only until the link calms, and the
+            // two A81 readings that justified it.
+            RC_LOGI("AUTO: profile %d -> %d %s (floor %d, %s held %.0f s, dipAt %.0f ms, queue %.0f ms, "
+                    "decode %.1f ms, classifier %s)",
+                    from, m_autoProfileEff, r.action == rc::AutoAction::ProfileUp ? "up" : "down",
+                    in.profileFloorId, r.action == rc::AutoAction::ProfileUp ? "headroom" : "pressure",
+                    double(r.evidenceNs) / 1e9, in.dipAtMs, sig.queueMs, sig.decodeMs,
+                    rc::BottleneckName(r.cls));
             break;
+        }
         default:
             return;
     }
@@ -1174,13 +1315,18 @@ void ClientSession::StartDesktop(const json& m) {
     double totalPixels = 0;
     for (auto* mon : selected) totalPixels += double(mon->width) * mon->height;
 
+    // A84: the saved streamProfile is the FLOOR, the stream is built at the effective
+    // rung auto may have raised or lowered. Everything else in the snapshot is copied
+    // verbatim, and nothing is written back to Settings (the floor is the only value
+    // the persisted key, the UI slider and the headset ever see).
+    const Settings eff = EffectiveSettings(pc);
     json streams = json::array();
     std::map<uint8_t, std::unique_ptr<DesktopStream>> created;
     for (auto* mon : selected) {
         // The settings -> config synthesis is a pure function now (stream_config.h,
         // TASK-COMBO-SWEEP-2026-11-21); the fps / bitrate / decode-limit fill moved
         // there VERBATIM. Monitor selection, stream ids and creation stay here.
-        const DesktopStreamConfig cfg = BuildDesktopStreamConfig(pc, st, codec, m_slowPath, m_vr != nullptr, *mon,
+        const DesktopStreamConfig cfg = BuildDesktopStreamConfig(eff, st, codec, m_slowPath, m_vr != nullptr, *mon,
                                                                  totalPixels, int(selected.size()), caps);
         const uint8_t streamId = uint8_t(rc::kFirstMonitorStreamId + mon->index);
         if (streamId >= rc::kMaxStreams) continue;
@@ -1346,7 +1492,10 @@ void ClientSession::StartVr() {
     // (TASK-CAPS-GUARD) moves an H264 stream whose full frame exceeds NVENC's 4096 px
     // width onto HEVC instead of an encoder that could never open; the session owns
     // the log line, the header stays log-free.
-    const VrStreamBuild vrBuild = BuildVrStreamConfigGuarded(pc, st, codec, m_slowPath, match, autoscalePct,
+    // A84: built from the effective-rung snapshot (see StartDesktop) - the floor stays
+    // in pc for every other reader of the settings.
+    const Settings eff = EffectiveSettings(pc);
+    const VrStreamBuild vrBuild = BuildVrStreamConfigGuarded(eff, st, codec, m_slowPath, match, autoscalePct,
                                                             dc.eyeWidth, dc.eyeHeight, rate, App::Get().Caps(), caps);
     if (vrBuild.h264WidthFallback) {
         RC_LOGW("H264 unsupported at %upx, falling back to HEVC", vrBuild.h264RejectedWidth);

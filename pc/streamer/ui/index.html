@@ -83,13 +83,13 @@
               <div class="ends"><span data-i18n="video.profileLatency">Low latency</span><span data-i18n="video.profileQuality">Best picture</span></div>
               <p class="note" id="profileNote"></p>
             </div>
-            <!-- 自动调参在后端已经落地（rc::AutoTune，只降不升，手动改回某项即接管），
-                 A74 把它从底层区提到滑杆正下方，让用户真的能打开它。 -->
+            <!-- 自动调参在后端已经落地（rc::AutoTune：链路有余量时它会把降下去的档位升回去，
+                 滑杆只是它要退回的地板），A74 把它从底层区提到滑杆正下方，让用户真的能打开它。 -->
             <div class="row auto-tune" id="autoTuneBox">
               <label class="check" id="autoTuneRow">
                 <input type="checkbox" data-setting="autoTune">
                 <span data-i18n="video.autoTune">Automatic tuning</span>
-                <small data-i18n="video.autoTuneHint">The system keeps the stream smooth: it may lower picture size, profile, CBR or foveation on its own. It only steps down; changing one yourself takes that setting back.</small>
+                <small data-i18n="video.autoTuneHint">The system tunes the stream itself: under pressure it may step picture size, profile, CBR or foveation down, and it climbs them back when the link has room. The slider sets the floor it returns to - moving it does not switch the tuning off.</small>
               </label>
             </div>
             <div class="row">

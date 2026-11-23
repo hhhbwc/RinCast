@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "rc/settings_migration.h"
 #include "util.h"
 
 namespace rcs {
@@ -17,6 +18,23 @@ struct TrustedDevice {
     int64_t lastSeen = 0;
     std::string publicKey;  // hex; pinned the first time the headset proves one
 };
+
+// A84 Q-persist (TASK-A84 §4): the file is saved WHOLE - SettingsStore::SaveLocked
+// dumps every key through ToJson, so an existing install already carries an
+// explicit "autoTune": false written back when that was still the default. A
+// flipped default alone would therefore never reach the machines that predate it.
+// The file now stamps which settings schema wrote it: a file with no stamp was
+// written before A84 and gets the one-time migration, while a choice made on a
+// stamped file (turning the tuner off in the UI) rules from then on, across
+// restarts.
+//
+// A84b §2: the stamp value, the threshold and the judgement moved to
+// rc/settings_migration.h - Settings::FromJson compiles into rincast-streamer only,
+// so nothing in rincast-core-tests could reach the comparison and the migration had
+// no test that could fail. Read that header for why the schema starts at 1 (there
+// is no v1 anywhere in this repository, so a 2 was an unsourced magic number) and
+// for what an unstamped file means.
+constexpr int kSettingsSchema = rc::kCurrentSettingsSchema;
 
 struct Settings {
     // Identity
@@ -44,6 +62,10 @@ struct Settings {
     // What the automatic-bitrate switch now selects: 0 = latency, 1 = balanced,
     // 2 = picture quality. Stored as an int so the settings file stays readable.
     // See rc/stream_profile.h for what each value actually changes.
+    // A84 changed the MEANING, not the key or the values: this is the profile the
+    // user will accept as the WORST the stream gets (a floor), not the one they
+    // asked to run. With autoTune on, the effective profile is auto's and only
+    // ever sits at or above this while the link is calm (rc/auto_tune.h).
     int streamProfile = 1;
     // How a LAN stream paces its datagrams (PLAN-pacing-fix): 0 = auto (burst on the
     // LAN, the legacy follow on a remote path), 1 = off, 2 = follow the guard cap
@@ -70,10 +92,14 @@ struct Settings {
     // PLAN-AUTO-TUNE: the automatic tuner (rc/auto_tune.h). When on, it reads
     // the existing signals (decode hint, queue, loss, wire fill, QP) and acts
     // for the user on the dimensions they have not written themselves: the L7
-    // ladder, CBR off, foveation on, profile down. Default off: nothing runs,
-    // exactly like the builds before it. See AUTO-TUNE-2026-11-19/
+    // ladder, CBR off, foveation on, and (A84) the picture profile BOTH ways.
+    // A84 (TASK-A84-PROFILE-FLOOR-TWO-WAY-AUTOTUNE-2026-11-23) flipped the
+    // default to ON: the product decision is that the user states a preference
+    // on one slider and the system picks the parameters - with the switch off
+    // nothing runs and the slider is an absolute choice again, which is the
+    // pre-A84 branch. See AUTO-TUNE-2026-11-19/
     // DECISION-TABLE.md for every threshold's evidence.
-    bool autoTune = false;
+    bool autoTune = true;
     // L17 fill mode: when on, the encoder frame-rate rung may follow the slow fps
     // EMA down (floor 45) so a low-fps heavy scene keeps its full per-frame budget.
     // Default on: the real-device A/B (AUTO-TUNE-2026-11-19/ACCEPTANCE-C.md) held

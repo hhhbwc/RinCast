@@ -15,6 +15,7 @@
 
 #include "../capture/monitors.h"
 #include "../net/stream_server.h"
+#include "../settings.h"  // A84: EffectiveSettings works on a Settings snapshot
 #include "../util.h"
 #include "rc/auto_tune.h"
 #include "rc/autoscale.h"
@@ -53,7 +54,8 @@ struct ClientStreamSettings {
     int desktopBitrateMbps = 0;
     int desktopFps = 0;
     bool adaptiveBitrate = true;
-    int streamProfile = 1;             // 0 latency, 1 balanced, 2 best picture (the headset may pick it)
+    int streamProfile = 1;             // 0 latency, 1 balanced, 2 best picture (the headset may pick it;
+                                       // A84: this is the floor - see EffectiveProfile)
     bool streamAudio = true;
     bool micPassthrough = true;
 };
@@ -124,11 +126,28 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     void UpdateAudio();
     void ApplyClientInfo(const json& m);
     // PLAN-AUTO-TUNE P1: the one-per-session capability summary (read-only) and
-    // the decision layer behind Settings::autoTune (default off). RunAutoTune
+    // the decision layer behind Settings::autoTune (A84: default ON - settings.h;
+    // an install that turns it off is the pre-A84 branch, in which nothing here
+    // runs). RunAutoTune
     // runs under m_mutex from the kStats handler; LogAutoCapability from the
-    // kClientInfo handler.
+    // kClientInfo handler. A84b §1: the enable decision is stored in rc::AutoTune
+    // (fed here from the settings snapshot), and the kStats handler calls
+    // RunAutoTune on every tick whatever the switch says.
     void LogAutoCapability();
     void RunAutoTune();
+    // A84 (TASK-A84-PROFILE-FLOOR-TWO-WAY-AUTOTUNE-2026-11-23 §2): the profile a
+    // stream is BUILT at. Settings::streamProfile (and the synced wire key, and the
+    // slider on both sides) is now the FLOOR - the worst picture the user accepts -
+    // so the effective rung is session state and never written back: auto moving it
+    // cannot move the user's choice, and the user moving it cannot be fought.
+    // autoTune off = the floor, exactly the pre-A84 branch. The Locked variant runs
+    // with m_mutex held (RunAutoTune); the other takes it (the stream builds).
+    int EffectiveProfile(int floorId, bool autoTuneOn);
+    int EffectiveProfileLocked(int floorId, bool autoTuneOn);
+    // A stream-build snapshot with the effective rung substituted: identical to the
+    // saved settings except for streamProfile. Takes m_mutex, so it must not be
+    // called from under it (RunAutoTune uses EffectiveProfileLocked for that).
+    Settings EffectiveSettings(const Settings& pc);
     // The headset's picks for these PC-backed synced keys (profile, adaptive bitrate)
     // win: persist them so the encoder, which reads the PC copy, runs what the UI shows.
     // Used on both first connect (kClientInfo) and later changes (kUpdateSettings).
@@ -166,7 +185,19 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     ClientCaps m_caps;
     ClientStreamSettings m_settings;
     rc::L7Autoscale m_autoscale;  // ROUND19 T3: stepped down by decode pressure, reset by hand
-    rc::AutoTune m_autoTune;      // PLAN-AUTO-TUNE: dormant unless Settings::autoTune
+    rc::AutoTune m_autoTune;      // PLAN-AUTO-TUNE / A84b §1: Settings::autoTune is
+                                  // fed in as Config::enabled by RunAutoTune, and the
+                                  // layer is what goes inert - no gate at this site
+    // A84: the profile auto has put the live streams at (-1 = it has not chosen
+    // yet, so the floor rules). Guarded by m_mutex like m_autoTune.
+    // A84c: it may sit BELOW the floor while a link-bound episode holds - the escape
+    // rc::AutoTune's ProfileDown is there for. Nothing clamps it back up; the only
+    // thing that raises it is the user moving the floor itself (m_autoProfileFloor).
+    int m_autoProfileEff = -1;
+    // A84c: the floor as of the last EffectiveProfileLocked read (-1 = not read yet).
+    // The delta against it is what makes "the user raised the slider" an event, which
+    // is the one thing rc::EffectiveProfileRung cannot see from a pure read.
+    int m_autoProfileFloor = -1;
     int64_t m_autoSignalLogNs = 0;  // the 30 s AUTO: signals cadence
     // The synced settings the PC currently owns (key -> the value it pushed). The
     // headset takes a key back by sending a different value for it.

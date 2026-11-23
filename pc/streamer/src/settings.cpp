@@ -52,6 +52,11 @@ json Settings::ToJson(bool forUi) const {
         {"allowRemote", allowRemote},
         {"cloudUserName", cloudUserName},
         {"cloudEmail", cloudEmail},
+        // A84: the stamp every save carries, so FromJson can tell "this file was
+        // written when autoTune still defaulted to off" from "the user chose it".
+        // Written as the constant (not a field) so the UI's read-modify-write round
+        // trip in app.cpp (merged = ToJson, patch, FromJson) always re-stamps.
+        {"settingsSchema", kSettingsSchema},
     };
     if (!forUi) j["cloudRefreshTokenProtected"] = cloudRefreshTokenProtected;
     return j;
@@ -105,6 +110,22 @@ void Settings::FromJson(const json& j) {
     get("cloudRefreshTokenProtected", cloudRefreshTokenProtected);
     get("cloudUserName", cloudUserName);
     get("cloudEmail", cloudEmail);
+    // A84 Q-persist (TASK-A84 §4): the ONE-TIME migration behind the flipped
+    // autoTune default. A file with no schema stamp was last written by a build
+    // whose default was off, and SaveLocked dumps EVERY key - so its
+    // "autoTune": false proves nothing about what the user wanted. A stamped file
+    // rules exactly as written, so a user who turns the tuner off keeps it off over
+    // restarts.
+    // A84b §2: the comparison is rc::MigrateAutoTuneOn (shared/include/rc/
+    // settings_migration.h), asserted in core_tests; what stays here is only the
+    // read, type-checked like every other field in FromJson because this also runs
+    // on the app thread (the UI's read-modify-write merge), where a throw from a
+    // hand-edited value would be fatal. The read's whole contract is the sentinel:
+    // absent key or wrong type leaves rc::kSettingsSchemaUnstamped, so both migrate.
+    int savedSchema = rc::kSettingsSchemaUnstamped;
+    if (const auto it = j.find("settingsSchema"); it != j.end() && it->is_number())
+        savedSchema = it->get<int>();
+    if (rc::MigrateAutoTuneOn(savedSchema)) autoTune = true;
     if (j.contains("trustedDevices") && j["trustedDevices"].is_array()) {
         trustedDevices.clear();
         for (const auto& d : j["trustedDevices"]) {
