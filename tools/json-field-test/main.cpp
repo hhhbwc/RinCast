@@ -111,6 +111,19 @@ int main() {
     Expect(rcs::ClampField(std::string(200, 'x'), 64).size() == 64, "clamp: stops at the limit");
     Expect(rcs::ClampField("a\nb", 64) == "a b", "clamp: a newline cannot forge a log line");
 
+    // A91: the cloud client walks server-supplied "events"/"peers" arrays and
+    // keeps named fallbacks on its error strings. value(key, json::array())
+    // throws on `{"events":{}}`, and value(key, std::string(fallback)) throws
+    // on `{"message":123}` - both on worker threads, both fatal.
+    const json cloud = json::parse(R"({"arr":[1,2],"notArr":{},"text":"hello","num":123})");
+    Expect(rcs::ArrayField(cloud, "arr").size() == 2, "A91 array: a real array passes through");
+    Expect(rcs::ArrayField(cloud, "notArr").empty(), "A91 array: an object reads as empty, not a throw");
+    Expect(rcs::ArrayField(cloud, "text").empty(), "A91 array: a string reads as empty");
+    Expect(rcs::ArrayField(json::object(), "arr").empty(), "A91 array: a missing key reads as empty");
+    Expect(rcs::StrFieldOr(cloud, "text", "fallback") == "hello", "A91 string-or: a real string passes through");
+    Expect(rcs::StrFieldOr(cloud, "missing", "fallback") == "fallback", "A91 string-or: missing uses the fallback");
+    Expect(rcs::StrFieldOr(cloud, "num", "fallback") == "fallback", "A91 string-or: a number uses the fallback");
+
     if (failures) {
         std::printf("\n%d check(s) FAILED\n", failures);
         return 1;

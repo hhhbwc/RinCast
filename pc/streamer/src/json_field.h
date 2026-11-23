@@ -71,6 +71,23 @@ inline const nlohmann::json& ObjectField(const nlohmann::json& j, const char* ke
     return it != j.end() && it->is_object() ? *it : kEmpty;
 }
 
+// A91: a string field with a caller-supplied fallback. The cloud client reads fields whose
+// default is a specific non-empty string (an error message, a marker) - StrField alone would
+// silently turn those into "" and change what the log says.
+inline std::string StrFieldOr(const nlohmann::json& j, const char* key, const std::string& fallback) {
+    const auto it = j.find(key);
+    return it != j.end() && it->is_string() ? it->get<std::string>() : fallback;
+}
+
+// A91: an array field; a missing key or any other type reads as an empty array. The cloud
+// event loop iterates this straight from an HTTP response on a worker thread, so a single
+// `"events": {}` would throw out of value() and terminate the process.
+inline const nlohmann::json& ArrayField(const nlohmann::json& j, const char* key) {
+    static const nlohmann::json kEmpty = nlohmann::json::array();
+    const auto it = j.find(key);
+    return it != j.end() && it->is_array() ? *it : kEmpty;
+}
+
 // A number field of an array: element i of `arr` when it is a number, else the fallback. Bounds
 // are checked first, so a short or oddly shaped array (an fov of 2x2, say) reads as defaults
 // instead of indexing past the end.

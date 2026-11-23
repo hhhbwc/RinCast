@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "../app.h"
+#include "../json_field.h"  // A91: no-throw reads for every field that came off the wire
 #include "../net/stream_server.h"
 #include "../session/client_session.h"
 #include "../settings.h"
@@ -18,7 +19,7 @@ namespace rcs {
 static std::string ErrorMessage(const HttpResponse& r, const char* fallback) {
     if (r.status == 0) return "Can't reach the RinCast server. Check your internet connection.";
     const json j = r.Json();
-    return j.value("message", std::string(fallback));
+    return StrFieldOr(j, "message", fallback);
 }
 
 // ---------------------------------------------------------------------------
@@ -73,16 +74,25 @@ void CloudClient::Wake() {
 }
 
 void CloudClient::StoreTokens(const json& tokens) {
-    const std::string refresh = tokens.value("refreshToken", "");
-    const json user = tokens.value("user", json::object());
+    // A91: every one of these came from the server's login response. A single
+    // `"expiresIn": "3600"` used to throw type_error on the UI thread.
+    const std::string refresh = StrField(tokens, "refreshToken");
+    const json user = ObjectField(tokens, "user");
     SettingsStore::Get().Update([&](Settings& s) {
         if (!refresh.empty()) s.cloudRefreshTokenProtected = ProtectString(refresh);
-        if (user.contains("name")) s.cloudUserName = user.value("name", "");
-        if (user.contains("email")) s.cloudEmail = user.value("email", "");
+        const std::string name = StrField(user, "name");
+        const std::string email = StrField(user, "email");
+        if (!name.empty()) s.cloudUserName = name;
+        if (!email.empty()) s.cloudEmail = email;
     });
     std::lock_guard lock(m_mutex);
-    m_accessToken = tokens.value("accessToken", "");
-    m_accessExpiresNs = rc::NowNs() + int64_t(tokens.value("expiresIn", 3600) - 60) * 1'000'000'000LL;
+    m_accessToken = StrField(tokens, "accessToken");
+    // A91: clamp before the 60 s early-refresh margin, then before the nanosecond
+    // multiply. An unchecked 1e15-second lifetime overflows int64_t (UB) and a
+    // negative one makes every request look expired -> a refresh storm.
+    const int64_t raw = IntField(tokens, "expiresIn", 3600);
+    const int64_t safe = std::max<int64_t>(60, std::min<int64_t>(raw, 31'536'000));  // <= 1 year
+    m_accessExpiresNs = rc::NowNs() + (safe - 60) * 1'000'000'000LL;
 }
 
 std::string CloudClient::SignIn(const std::string& email, const std::string& password) {
@@ -285,7 +295,8 @@ void CloudClient::Run() {
         // of margin cover connect/handshake. The cost is a few more idle requests.
         auto r = Api("GET", "/pcs/" + s.serverId + "/events?wait=5", json(), 7000);
         if (r.status == 200) {
-            for (const auto& ev : r.Json().value("events", json::array())) HandleEvent(ev);
+            const json& body = r.Json();
+            for (const auto& ev : ArrayField(body, "events")) HandleEvent(ev);
         } else if (r.status == 404) {
             std::lock_guard lock(m_mutex);
             m_registered = false;  // PC was removed from the account: re-register
@@ -298,8 +309,10 @@ void CloudClient::Run() {
 }
 
 void CloudClient::HandleEvent(const json& ev) {
-    const std::string type = ev.value("type", "");
-    const json data = ev.value("data", json::object());
+    // A91: this runs on the long-poll thread. One `"type": 123` from the server
+    // used to throw type_error out of HandleEvent and terminate the streamer.
+    const std::string type = StrField(ev, "type");
+    const json data = ObjectField(ev, "data");
     if (type == "unlinked") {
         RC_LOGI("PC was unlinked from the account");
         // Same race as SignOut: a refresh that is already in flight must not
@@ -312,21 +325,25 @@ void CloudClient::HandleEvent(const json& ev) {
         return;
     }
     if (type != "connect") return;
-    const std::string sessionId = data.value("sessionId", "");
+    const std::string sessionId = StrField(data, "sessionId");
     ExpectedCloudSession expected;
-    expected.connectSecret = data.value("connectSecret", "");
-    expected.headsetId = data.value("headsetId", "");
-    expected.headsetName = data.value("headsetName", "");
+    expected.connectSecret = StrField(data, "connectSecret");
+    expected.headsetId = StrField(data, "headsetId");
+    expected.headsetName = StrField(data, "headsetName");
     expected.expiresNs = rc::NowNs() + 120'000'000'000LL;
     if (sessionId.empty() || expected.connectSecret.empty()) return;
     RC_LOGI("Remote connection request from %s", expected.headsetName.c_str());
     m_server->ExpectCloudSession(sessionId, expected);
-    const json rv = data.value("rendezvous", json::object());
+    const json rv = ObjectField(data, "rendezvous");
+    // A91: the old value() calls here sat inside try{} but the catch rethrew,
+    // so a malformed field still killed EventLoop. No-throw reads remove the
+    // exception source entirely.
+    const std::string relayToken = StrField(data, "relayToken");
+    const std::string rvHost = StrField(rv, "host");
+    const int rvPort = IntField(rv, "port", 0);
     ++m_rvActive;
     try {
-        std::thread(&CloudClient::RendezvousLoop, this, sessionId, data.value("relayToken", ""), rv.value("host", ""),
-                    rv.value("port", 0))
-            .detach();
+        std::thread(&CloudClient::RendezvousLoop, this, sessionId, relayToken, rvHost, rvPort).detach();
     } catch (...) {
         --m_rvActive;
         m_rvDoneCv.notify_all();
@@ -415,6 +432,10 @@ void CloudClient::RendezvousLoop(std::string sessionId, std::string token, std::
 }
 
 void CloudClient::HandleRendezvous(const uint8_t* data, size_t size, const rc::NetAddress& from) {
+    // A91: the first four bytes are a framing header. The old code built
+    // `data + 4` without checking the length, so a 1-4 byte packet walked the
+    // pointer past the end of the buffer before json::parse ever saw it.
+    if (!data || size <= 4) return;
     json j;
     try {
         j = json::parse(reinterpret_cast<const char*>(data) + 4, reinterpret_cast<const char*>(data) + size);
@@ -424,14 +445,18 @@ void CloudClient::HandleRendezvous(const uint8_t* data, size_t size, const rc::N
     std::lock_guard lock(m_rvMutex);
     bool fromServer = false;
     for (const auto& sv : m_rvServers) fromServer |= sv == from;
-    if (!fromServer || j.value("session", "") != m_rvSession) return;
-    if (j.value("op", "") != "registered") return;
-    if (!m_rvRegistered) RC_LOGI("Rendezvous: registered, the server sees us as %s", j.value("self", "?").c_str());
+    if (!fromServer) return;
+    // A91: detached thread, so any throwing field read here is std::terminate.
+    if (StrField(j, "session") != m_rvSession) return;
+    if (StrField(j, "op") != "registered") return;
+    const std::string self = StrFieldOr(j, "self", "?");
+    if (!m_rvRegistered) RC_LOGI("Rendezvous: registered, the server sees us as %s", self.c_str());
     m_rvRegistered = true;
     std::vector<std::string> list;
-    for (const auto& p : j.value("peers", json::array()))
+    for (const auto& p : ArrayField(j, "peers"))
         if (p.is_string()) list.push_back(p.get<std::string>());
-    if (j.contains("peer") && j["peer"].is_string()) list.push_back(j["peer"].get<std::string>());
+    const std::string peer = StrField(j, "peer");
+    if (!peer.empty()) list.push_back(peer);
     for (const auto& s : list) {
         rc::NetAddress a;
         if (!rc::NetAddress::ParseEndpoint(s, a) || (a.v6 && !m_server->Socket().DualStack())) continue;
