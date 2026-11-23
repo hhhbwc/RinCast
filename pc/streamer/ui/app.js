@@ -331,6 +331,21 @@ function streamTrouble(s) {
   // A slow picture with a busy encoder is the PC's doing; the rest is the network's.
   const { encodeMs } = liveNumbers(s);
   if (poorRuns.fps >= 5 && encodeMs >= 14) return { level: "warn", title: t("trouble.pc.title"), text: t("trouble.pc.text") };
+  // A96: "the rest is the network's" was a guess, and on the machine we measured it was wrong:
+  // 34 fps of a requested 72 with loss 0 %, no drops and a 3 ms round trip. The headset times
+  // Game and SteamVR separately from the wire, so a game that needs clearly more than a whole
+  // frame period is a resolution problem on this PC, and a cable tip sends the user to the
+  // wrong end of the room. The margin is for the healthy case, where the game stage
+  // equals the frame period by definition.
+  const stages = s.client?.latencyStages || {};
+  const period = s.vr?.refreshRate ? 1000 / s.vr.refreshRate : 0;
+  if (poorRuns.fps >= 5 && stages.game > period * 1.1 && !(s.vr.droppedFps > 1)) {
+    return {
+      level: "warn",
+      title: t("trouble.game.title"),
+      text: t("trouble.game.text", { ms: stages.game.toFixed(0), period: period.toFixed(0), w: s.vr.eyeWidth, h: s.vr.eyeHeight }),
+    };
+  }
   if (s.vpn) return { level: "warn", title: t("trouble.vpn.title"), text: t("trouble.vpn.text") };
   if (s.remote) return { level: "warn", title: t("trouble.remote.title"), text: t("trouble.remote.text") };
   return { level: "warn", title: t("trouble.remote.title"), text: t("trouble.network.text") };

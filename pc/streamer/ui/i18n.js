@@ -290,6 +290,8 @@ const STRINGS = {
 
     "trouble.pc.title": "This PC is at its limit",
     "trouble.pc.text": "Lower the VR graphics quality on the headset, or close other programs.",
+    "trouble.game.title": "The game is the limit here, not the network",
+    "trouble.game.text": "Game and SteamVR take {ms} ms for a frame that has to fit in {period} ms at {w}×{h} per eye. Lower the VR resolution on the headset.",
     "trouble.vpn.title": "The VPN is limiting the stream",
     "trouble.vpn.text": "A VPN that relays its traffic is slow. A direct path between the two devices helps.",
     "trouble.remote.title": "The connection is limiting the stream",
@@ -648,6 +650,8 @@ const STRINGS = {
 
     "trouble.pc.title": "这台电脑已达极限",
     "trouble.pc.text": "在头显上调低 VR 画质，或关闭其他程序。",
+    "trouble.game.title": "这里的瓶颈是游戏，不是网络",
+    "trouble.game.text": "单眼 {w}×{h} 时，游戏与 SteamVR 一帧需要 {ms} 毫秒，而每帧只有 {period} 毫秒。请在头显上调低 VR 分辨率。",
     "trouble.vpn.title": "VPN 正在限制串流",
     "trouble.vpn.text": "中转流量的 VPN 速度较慢。让两台设备直接连接会更好。",
     "trouble.remote.title": "网络连接正在限制串流",
@@ -978,6 +982,8 @@ const STRINGS = {
 
     "trouble.pc.title": "這台電腦已達極限",
     "trouble.pc.text": "在頭戴裝置上調低 VR 畫質，或關閉其他程式。",
+    "trouble.game.title": "這裡的限制來自遊戲，不是網路",
+    "trouble.game.text": "單眼 {w}×{h} 時，遊戲與 SteamVR 一幀需要 {ms} 毫秒，而每幀只有 {period} 毫秒。請在頭戴裝置上調低 VR 解析度。",
     "trouble.vpn.title": "VPN 正在限制串流",
     "trouble.vpn.text": "中轉流量的 VPN 速度較慢。讓兩台裝置直接連線會更好。",
     "trouble.remote.title": "網路連線正在限制串流",
@@ -1308,6 +1314,8 @@ const STRINGS = {
 
     "trouble.pc.title": "Dieser PC ist am Limit",
     "trouble.pc.text": "Verringere die VR-Grafikqualität am Headset oder schließe andere Programme.",
+    "trouble.game.title": "Hier begrenzt das Spiel den Stream, nicht das Netzwerk",
+    "trouble.game.text": "Spiel und SteamVR brauchen {ms} ms für ein Bild, das bei {w}×{h} pro Auge in {period} ms passen muss. Verringere am Headset die VR-Auflösung.",
     "trouble.vpn.title": "Das VPN begrenzt den Stream",
     "trouble.vpn.text": "Ein VPN, das seinen Datenverkehr weiterleitet, ist langsam. Ein direkter Weg zwischen den Geräten hilft.",
     "trouble.remote.title": "Die Verbindung begrenzt den Stream",
@@ -1638,6 +1646,8 @@ const STRINGS = {
 
     "trouble.pc.title": "Este PC está al límite",
     "trouble.pc.text": "Baja la calidad gráfica VR en el casco o cierra otros programas.",
+    "trouble.game.title": "Aquí limita el juego, no la red",
+    "trouble.game.text": "A {w}×{h} por ojo, el juego y SteamVR necesitan {ms} ms para una imagen que debe caber en {period} ms. Baja la resolución VR en el casco.",
     "trouble.vpn.title": "La VPN está limitando la transmisión",
     "trouble.vpn.text": "Una VPN que retransmite su tráfico es lenta. Ayuda una ruta directa entre los dos dispositivos.",
     "trouble.remote.title": "La conexión está limitando la transmisión",
@@ -1968,6 +1978,8 @@ const STRINGS = {
 
     "trouble.pc.title": "Ce PC est à sa limite",
     "trouble.pc.text": "Baissez la qualité graphique VR sur le casque ou fermez d'autres programmes.",
+    "trouble.game.title": "Ici la limite vient du jeu, pas du réseau",
+    "trouble.game.text": "À {w}×{h} par œil, le jeu et SteamVR mettent {ms} ms pour une image qui doit tenir dans {period} ms. Baissez la résolution VR sur le casque.",
     "trouble.vpn.title": "Le VPN limite la diffusion",
     "trouble.vpn.text": "Un VPN qui relaie son trafic est lent. Un chemin direct entre les deux appareils aide.",
     "trouble.remote.title": "La connexion limite la diffusion",
@@ -2298,6 +2310,8 @@ const STRINGS = {
 
     "trouble.pc.title": "この PC が限界です",
     "trouble.pc.text": "ヘッドセットの VR 画質を下げるか、他のプログラムを閉じてください。",
+    "trouble.game.title": "ここはネットワークではなくゲームが限界です",
+    "trouble.game.text": "片目 {w}×{h} ではゲームと SteamVR が 1 枚に {ms} ミリ秒かかり、許されるのは {period} ミリ秒です。ヘッドセットの VR 解像度を下げてください。",
     "trouble.vpn.title": "VPN がストリーミングを制限しています",
     "trouble.vpn.text": "通信を中継する VPN は遅くなります。2 台のデバイス間を直接つなぐと改善します。",
     "trouble.remote.title": "接続がストリーミングを制限しています",

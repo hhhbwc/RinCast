@@ -412,6 +412,41 @@ try {
                issuesBefore.filter(i => i.level === 'warn').length + 1, 'the new issue is not a warning');
   check('hw_fallback_issue_visible', { before: issuesBefore.length, after: issuesAfter.map(i => i.level) });
 
+  // A96 (field case, 2026-11-24): 34 fps of a requested 72, loss 0 %, nothing dropped, a 3 ms
+  // round trip, and the home page told the user to run a cable to the router. The encoder was
+  // idle (4 ms) - the game needed 26 ms for a 14 ms frame. The headset already reports that
+  // stage separately, so the fix is UI-only. Six stats ticks because a number only counts as
+  // poor after five in a row. Both controls are required: without the under-threshold feed the
+  // assertion also passes when the card fires for *any* slow stream, and without the dropped
+  // feed the network gate is untested. The discriminator is the per-eye size, which no other
+  // issue text contains in any locale, so this holds when the browser language changes.
+  // A fresh page first: the hwFallback fixture above leaves its card on the base state, and
+  // reloading also zeroes the poor-runs, so the six ticks below are what makes the card appear.
+  await fresh(false, 1100, 1000, null);
+  const feedRate = (game, droppedFps, ticks = 6) => js(`(async () => {
+    for (let i = 0; i < ${ticks}; i++) {
+      __bridge.emit({ type: 'stats', session: { ...__bridge.base.session, vrState: 'running',
+        vr: { fps: 34, refreshRate: 72, encodeMs: 4.2, mbps: 22, eyeWidth: 2688, eyeHeight: 2688,
+              droppedFps: ${droppedFps}, latencyMs: 118, codec: 'HEVC' },
+        client: { latencyStages: { uplink: 1.4, game: ${game}, encoderWait: 0.6, encode: 4.4,
+                                 downlink: 1.9, decode: 9.1, nextFrame: 2, compositor: 30 } } } });
+      await new Promise(r => setTimeout(r, 25));
+    }
+    return [...document.querySelectorAll('#issues li')].map(e => ({ level: e.className, text: e.innerText }));
+  })()`);
+  const twoTicks = await feedRate(26, 0, 2);
+  const overBudget = await feedRate(26, 0, 4);
+  const underBudget = await feedRate(12, 0);
+  const losingPackets = await feedRate(26, 6);
+  assert.equal(twoTicks.length, 0, 'a trouble card appeared before the five ticks that make a number poor: ' + JSON.stringify(twoTicks));
+  assert.equal(overBudget.length, 1, 'the trouble list is not exactly one card: ' + JSON.stringify(overBudget));
+  assert(overBudget[0].level === 'warn', 'the game-bound card is not a warning: ' + overBudget[0].level);
+  assert(overBudget[0].text.includes('2688'), 'the game-bound card never names the per-eye size: ' + overBudget[0].text);
+  assert(!underBudget[0].text.includes('2688'), 'the game-bound card fires under its own threshold: ' + underBudget[0].text);
+  assert(!losingPackets[0].text.includes('2688'), 'the card ignores that frames are being dropped: ' + losingPackets[0].text);
+  assert.notEqual(overBudget[0].text, underBudget[0].text, 'both fixtures give the same advice, so nothing discriminates');
+  check('game_bound_card_replaces_network_advice', { ticks2: twoTicks.length, over: overBudget, under: underBudget, dropped: losingPackets });
+
   await fresh(); await js('__bridge.auto=false');
   await click(selector('tenBit'));
   await js('window.earlyReply=__bridge.apply(0)');
