@@ -1242,8 +1242,21 @@ void ClientSession::RunAutoTune() {
                     rc::BottleneckName(r.cls));
             // m_mutex is held by RunAutoTune, so m_vr is safe to touch here. The
             // QP floor is handed to the encoder thread; only the brake is set now.
-            if (m_vr) m_vr->ApplyProfileRung(m_autoProfileEff);
-            RC_LOGI("AUTO: tier applied in place - no stream rebuild, no black frame");
+            const bool hasVr = bool(m_vr);
+            if (hasVr) m_vr->ApplyProfileRung(m_autoProfileEff);
+            // A93: the sentence above used to stand on its own, which made it a claim
+            // nothing could falsify. It is now a claim with three values attached:
+            // vr= says whether a live VR stream received the handoff AT ALL (with the
+            // old line, vr=0 printed "applied" having applied the tier to nothing but
+            // the session's own copy), and qpFloor/brake name the two physical knobs
+            // the rung is made of, straight from the table the stream will use. The
+            // encoder's own thread confirms the first one took it (NVENC's
+            // "QP floor retuned" / the refused line) and the sender's confirms the
+            // second. Phrase and prefix stay byte-identical: log readers anchor on them.
+            const rc::StreamProfileParams np = rc::ProfileParams(rc::ProfileFromId(m_autoProfileEff));
+            RC_LOGI("AUTO: tier applied in place - no stream rebuild, no black frame "
+                    "(vr=%d, qpFloor %u, brake %.0f ms)",
+                    int(hasVr), np.minQp, np.targetQueueMs);
             needRebuild = false;
             break;
         }

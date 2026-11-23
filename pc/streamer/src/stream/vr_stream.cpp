@@ -889,7 +889,16 @@ void VrStream::RunSender() {
         // installed here on the sender's own thread. The QP floor goes to the encoder
         // thread separately; neither path stops the transport.
         const int pendingProfile = m_pendingProfile.exchange(-1, std::memory_order_relaxed);
-        if (pendingProfile >= 0) m_sender.SetProfile(rc::ProfileFromId(pendingProfile));
+        if (pendingProfile >= 0) {
+            m_sender.SetProfile(rc::ProfileFromId(pendingProfile));
+            // A93: the QP half of a tier move already reports itself (NVENC logs the
+            // retune, or vr_stream logs the refusal). The brake half had no line at all,
+            // so a tier whose second handoff never reached the sender thread - because
+            // no frame arrived, or because the rung was stored somewhere else - was
+            // indistinguishable from one that worked. This is that line.
+            RC_LOGI("VR: queue brake retargeted in place to rung %d (target %.0f ms, no stream rebuild)",
+                    pendingProfile, rc::ProfileParams(rc::ProfileFromId(pendingProfile)).targetQueueMs);
+        }
         SendJob send;
         {
             std::unique_lock lock(m_sendMutex);
