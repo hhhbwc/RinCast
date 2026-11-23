@@ -26,7 +26,12 @@ json Settings::ToJson(bool forUi) const {
         {"vrBitrateMbps", vrBitrateMbps},
         {"desktopBitrateMbps", desktopBitrateMbps},
         {"adaptiveBitrate", adaptiveBitrate},
-        {"streamProfile", streamProfile},
+        // A86 (user, 2026-11-23): the picture tier is no longer a user choice - the
+        // automatic tuner owns it end to end. StreamProfile is not persisted at all
+        // now: FromJson ignores the key, so a file written by an older build is read
+        // with the fixed start rung and the stale value is simply dropped on the next
+        // save. The field itself stays (Settings::streamProfile) because EffectiveSettings
+        // overwrites it with the live rung for the stream builders; see client_session.cpp.
         {"profileControlsVideo", profileControlsVideo},
         {"videoPacingMode", videoPacingMode},
         {"qualityProfileCbr", qualityProfileCbr},
@@ -83,7 +88,8 @@ void Settings::FromJson(const json& j) {
     get("vrBitrateMbps", vrBitrateMbps);
     get("desktopBitrateMbps", desktopBitrateMbps);
     get("adaptiveBitrate", adaptiveBitrate);
-    get("streamProfile", streamProfile);
+    // A86: "streamProfile" is deliberately NOT read - see the note in ToJson. An old
+    // settings file keeps its key, but it can no longer pin the tuner's start rung.
     get("profileControlsVideo", profileControlsVideo);
     get("videoPacingMode", videoPacingMode);
     get("qualityProfileCbr", qualityProfileCbr);

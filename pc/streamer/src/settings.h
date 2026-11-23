@@ -62,10 +62,14 @@ struct Settings {
     // What the automatic-bitrate switch now selects: 0 = latency, 1 = balanced,
     // 2 = picture quality. Stored as an int so the settings file stays readable.
     // See rc/stream_profile.h for what each value actually changes.
-    // A84 changed the MEANING, not the key or the values: this is the profile the
-    // user will accept as the WORST the stream gets (a floor), not the one they
-    // asked to run. With autoTune on, the effective profile is auto's and only
-    // ever sits at or above this while the link is calm (rc/auto_tune.h).
+    // A86 (user, 2026-11-23): "the tier slider should not exist at all - the tuner
+    // handles it". The user-facing choice is GONE from both UIs and this key is no
+    // longer read from or written to the settings file (see settings.cpp). The field
+    // survives only as the carrier `EffectiveSettings` overwrites with the live rung
+    // before the stream builders read it, so `pc.streamProfile` inside
+    // stream_config.h means "the rung this stream is built at" and nothing else.
+    // Its initial value is the tuner's START rung, not a floor it must respect - the
+    // tuner may run below it under pressure and above it when the link has room.
     int streamProfile = 1;
     // How a LAN stream paces its datagrams (PLAN-pacing-fix): 0 = auto (burst on the
     // LAN, the legacy follow on a remote path), 1 = off, 2 = follow the guard cap

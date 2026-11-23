@@ -77,20 +77,13 @@
         <div>
           <section class="card">
             <h2 data-i18n="video.vrStream">VR streaming</h2>
+            <!-- A86 (user, 2026-11-23): the "Priority" slider and the tuner's on/off
+                 switch are both GONE. The automatic tuner owns the picture end to end,
+                 so what is left here is a sentence saying so - no control. The note is
+                 static text: there is nothing for the user to set, and nothing to grey
+                 out. -->
             <div class="row">
-              <h3 id="l-profile" data-i18n="video.profile">Priority</h3>
-              <label class="bar" id="profileBar"><input type="range" min="0" max="2" step="1" data-setting="streamProfile" data-unit="profile" aria-labelledby="l-profile" aria-describedby="profileNote"><output></output></label>
-              <div class="ends"><span data-i18n="video.profileLatency">Low latency</span><span data-i18n="video.profileQuality">Best picture</span></div>
-              <p class="note" id="profileNote"></p>
-            </div>
-            <!-- 自动调参在后端已经落地（rc::AutoTune：链路有余量时它会把降下去的档位升回去，
-                 滑杆只是它要退回的地板），A74 把它从底层区提到滑杆正下方，让用户真的能打开它。 -->
-            <div class="row auto-tune" id="autoTuneBox">
-              <label class="check" id="autoTuneRow">
-                <input type="checkbox" data-setting="autoTune">
-                <span data-i18n="video.autoTune">Automatic tuning</span>
-                <small data-i18n="video.autoTuneHint">The system tunes the stream itself: under pressure it may step picture size, profile, CBR or foveation down, and it climbs them back when the link has room. The slider sets the floor it returns to - moving it does not switch the tuning off.</small>
-              </label>
+              <p class="note" id="autoTuneNote" data-i18n="video.autoTuneAlways">Picture follows the link on its own: smoother when it gets busy, sharper when it does not.</p>
             </div>
             <div class="row">
               <h3 data-i18n="video.bitrateGames">Games</h3>

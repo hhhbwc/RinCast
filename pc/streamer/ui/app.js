@@ -184,12 +184,9 @@ function bindSettings() {
 // slider has no unit at all - it names the stop you are on ("Balanced"), because "1 Mbps"
 // was never what the three-tier choice was about. Dispatch by data-unit, so a control
 // never has to know its own setting key.
-const PROFILE_STOPS = ["video.profileLatency", "video.profileBalanced", "video.profileQuality"];
+// A86: the picture-priority slider (data-unit="profile") is gone, so no control on the
+// page names a tier any more and this is the bitrate formatter only.
 function rangeText(el) {
-  if (el.dataset.unit === "profile") {
-    const stop = Math.max(0, Math.min(PROFILE_STOPS.length - 1, Math.round(Number(el.value) || 0)));
-    return t(PROFILE_STOPS[stop]);
-  }
   return `${el.value} Mbps`;
 }
 function updateRangeLabel(el) {
@@ -743,10 +740,10 @@ function renderDependents() {
     $("#overrideNote").textContent += ` ${t("video.frameGenState", { state: session.headsetFrameGeneration ? t("video.frameGenOn") : t("video.frameGenOff") })}`;
   // A19 audit #3: the switch that flips bitrate ownership back lives on the headset.
   $("#overrideNote").textContent += ` ${t("video.overrideChangeHint")}`;
-  // The three-way preference explains itself in words the user picked, not in
-  // queue milliseconds. Only the neutral note is ours; save errors get their own node.
-  const profile = Math.max(0, Math.min(2, Number(state.settings.streamProfile ?? 1)));
-  $("#profileNote").textContent = t(`video.profileNote${profile}`);
+  // A86 (user, 2026-11-23): the tier slider is gone, so there is no per-tier note to
+  // write and no `state.settings.streamProfile` to read - the tuner picks the rung and
+  // the page shows nothing about it on purpose (the headset's stats overlay is where a
+  // running picture tier can be seen).
   const h264 = state.settings.codec === "h264";
   setOff($("#tenBitRow"), h264);
   $("#tenBitHint").hidden = !h264;
@@ -778,8 +775,13 @@ function renderDependents() {
   setOff($("#twoPassRow"), !tunable);
   // CBR only takes effect when the profile drives video settings, the headset isn't
   // following SteamVR's resolution, and the link isn't remote/slow (server-side gates).
+  // A86: this row used to grey out unless the stream ran at the sharpest tier, because
+  // CBR was the sharp tier's own rate-control mode. The tier is the tuner's now (and is
+  // not even on this page), so gating the checkbox on a number the user cannot see would
+  // be a lock with no visible reason. It is live whenever the user asked the tier to
+  // drive video settings and the link allows it; the build decides the rest.
   const cbrBlockedByLink = !!session && (!!session.matchSteamVr || !!session.slowPath);
-  setOff($("#cbrRow"), profile !== 2 || !state.settings.profileControlsVideo || cbrBlockedByLink);
+  setOff($("#cbrRow"), !state.settings.profileControlsVideo || cbrBlockedByLink);
   setOff($("#playOnPcRow"), !state.settings.streamAudio);
   setOff($("#micRow"), state.settings.audioDevices === "system");
 }

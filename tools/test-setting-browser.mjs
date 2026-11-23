@@ -12,7 +12,16 @@ const ui = join(repo, 'pc/streamer/ui');
 const out = resolve(process.argv[2] || join(repo, 'build'));
 assert(existsSync(out), 'Output directory must already exist');
 const browserExe = process.env.RINCAST_TEST_BROWSER || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-const baseline = execFileSync('git', ['-C', repo, 'show', '636f9a4:pc/streamer/ui/app.js']);
+// A86 (user, 2026-11-23): the frozen baseline app.js still writes to #profileNote on every
+// render, and index.html no longer has that node (the tier slider was deleted on purpose).
+// The baseline is here to prove the 20-clicks-into-1 batching win against old JS, not to
+// prove old JS can render a page whose control was removed - so the one line that touches
+// the deleted node is blanked in the served copy. Resurrecting the node instead would put
+// a control the product just deleted back into the page for every future reader.
+const baseline = execFileSync('git', ['-C', repo, 'show', '636f9a4:pc/streamer/ui/app.js'])
+  .toString('utf8')
+  .replace('$("#profileNote").textContent = t(`video.profileNote${profile}`);',
+           '/* A86: #profileNote is gone with the tier slider */');
 let useBaseline = false;
 const allowed = new Map([['/', ['index.html', 'text/html']], ['/index.html', ['index.html', 'text/html']], ['/app.js', ['app.js', 'text/javascript']], ['/i18n.js', ['i18n.js', 'text/javascript']], ['/app.css', ['app.css', 'text/css']]]);
 const server = createServer((req, res) => {
@@ -32,15 +41,17 @@ function bridgeFixture() {
   Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN'] });
   const base = {
     type: 'state', version: 'ROUND8 browser fixture', downloadUrl: '', downloadSite: '',
-    settings: { _revision: 1, pcName: 'Browser fixture', codec: 'auto', tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, streamProfile: 2, profileControlsVideo: true, qualityProfileCbr: false, pcBitrateWins: true, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: 'auto', autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: false, preventSleep: true, cloudUrl: '', trustedDevices: [] },
+    settings: { _revision: 1, pcName: 'Browser fixture', codec: 'auto', tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, profileControlsVideo: true, qualityProfileCbr: false, pcBitrateWins: true, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: 'auto', autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: false, preventSleep: true, cloudUrl: '', trustedDevices: [] },
     cloud: { signedIn: false },
     system: { gpu: 'NVIDIA test fixture', port: 38711, addresses: [], vpnAddresses: [], firewall: { otherNetworksOpen: true }, encoder: { backend: 'nvenc', h264: true, hevc: true, av1: true, hevc10: true }, steamvr: { installed: true, running: false, driverRegistered: true }, openxr: { rincastAvailable: false, rincastActive: false, steamvrActive: true }, audioDriver: { speaker: false, microphone: false, steam: { speaker: true, microphone: true }, active: { speaker: 'steam', microphone: 'steam' } } },
     session: { deviceName: 'Fixture headset', model: 'Fixture', address: '127.0.0.1', connectedSeconds: 60, rttMs: 3, vrState: 'idle', headsetBitrateMbps: 0, headsetCodec: 'auto', desktop: [], client: {} },
     pendingApproval: null,
   };
   const listeners = [], sent = [], pageErrors = [];
-  addEventListener('error', e => pageErrors.push(String(e.error || e.message)));
-  addEventListener('unhandledrejection', e => pageErrors.push(String(e.reason)));
+  // A86: keep the stack, not just the message. "Cannot set properties of null" names no
+  // file and no line, and this gate is the only place a page-side typo shows up at all.
+  addEventListener('error', e => pageErrors.push(String((e.error && e.error.stack) || e.error || e.message)));
+  addEventListener('unhandledrejection', e => pageErrors.push(String((e.reason && e.reason.stack) || e.reason)));
   const b = window.__bridge = {
     base, sent, pageErrors, auto: true, frames: 0, early: false,
     changes: () => sent.filter(m => m.type === 'setSettings'),
@@ -269,23 +280,23 @@ try {
   assert.equal(shut.visible, 3);
   assert.equal(shut.danglingTitles, 0);
   assert.equal(shut.emptyCards, 0);
-  assert.equal(shut.keys, 18);  // hidden, not removed: the form state survives a toggle
+  assert.equal(shut.keys, 16);  // A86: 18 - the tier slider and its switch; hidden, not removed
   const valuesShut = await snapshot();
 
-  // U5: automatic tuning was buried in the tuning block; it now lives under the slider, so it
-  // has to be visible and focusable while 高级 is shut (and outside the fold in the DOM).
-  const autoTune = await js(`(() => {
-    const el = document.querySelector('[data-setting="autoTune"]');
+  // A86 (user, 2026-11-23): the tuner's on/off switch is gone from this page. The
+  // sentence that says the tuner exists takes its place, and it has to sit outside the
+  // 高级 fold exactly like the switch did: a user reading the streaming page must learn
+  // that the picture moves on its own without opening anything.
+  const autoNote = await js(`(() => {
+    const el = document.querySelector('#autoTuneNote');
     const r = el.getBoundingClientRect();
     return { insideFold: !!el.closest('#advanced'), h: +r.height.toFixed(2), rendered: el.offsetParent !== null,
       aboveFold: r.top < document.querySelector('#advanced').getBoundingClientRect().top };
   })()`);
-  assert.equal(autoTune.insideFold, false);
-  assert.equal(autoTune.rendered, true);
-  assert(autoTune.h > 2 && autoTune.aboveFold, JSON.stringify(autoTune));
-  await js(`document.querySelector('.rail-foot [data-page="account"]').focus()`);
-  const toAutoTune = await tabUntil(['autoTune'], 4);  // one Tab past the slider: the two are neighbours
-  check('u5_auto_tune_always_visible', { ...autoTune, tabPressesFromRail: toAutoTune.presses });
+  assert.equal(autoNote.insideFold, false);
+  assert.equal(autoNote.rendered, true);
+  assert(autoNote.h > 2 && autoNote.aboveFold, JSON.stringify(autoNote));
+  check('u5_auto_tune_note_visible', autoNote);
 
   // U6: shut means really shut - nothing inside the body can take focus, by script or by
   // keyboard. offsetParent is null only for a display:none subtree, which is what [hidden]
@@ -306,7 +317,7 @@ try {
     const page = document.querySelector('#videoPage');
     const main = document.querySelector('#main');
     const at = sel => { const el = page.querySelector(sel); return el ? +(el.getBoundingClientRect().top + main.scrollTop).toFixed(2) : null; };
-    return { slider: at('[data-setting="streamProfile"]'), autoTune: at('[data-setting="autoTune"]'),
+    return { autoNote: at('#autoTuneNote'),
       bitrate: at('[data-setting="vrBitrateMbps"]'), adaptive: at('[data-setting="adaptiveBitrate"]'),
       codec: at('#codecOptions'), desktop: at('[data-setting="desktopMaxHeight"]'),
       desktopBitrate: at('[data-setting="desktopBitrateMbps"]'),
@@ -329,7 +340,7 @@ try {
   const open = await cardReport();
   assert.equal(open.foldRows, 11, 'expanding showed a different number of rows than the block owns');
   assert.equal(open.foldHeight > shut.foldHeight, true);
-  assert.equal(open.keys, 18);
+  assert.equal(open.keys, 16);  // A86: same 16, nothing appears when the fold opens
   assert.equal(open.danglingTitles, 0);
   assert.equal(open.emptyCards, 0);
   const afterOpen = await anchorTops();
@@ -361,62 +372,31 @@ try {
   });
   check('u6_collapsed_controls_unfocusable', shutFocus);
 
-  // U2: the three-tier radio row is one slider now. Drive it with the keyboard only and check
-  // the number that reaches the wire is a number, and that its label names the stop.
+  // A86 (user, 2026-11-23): the "Priority" slider is GONE from this page - the user's
+  // call was that the automatic tuner owns the picture and there is nothing to pick. The
+  // guarded facts are therefore the negative ones: no slider, no switch, no leftover stop
+  // labels, and the sentence that replaced them is plain text rather than a control that
+  // could steal a Tab stop. The bitrate sliders must not have noticed any of this.
   await fresh(false, 1100, 1000, false);
-  const sliderShape = await js(`(() => {
-    const a = document.querySelectorAll('input[data-setting="streamProfile"]');
-    const el = a[0];
-    return { count: a.length, type: el.type, min: el.min, max: el.max, step: el.step,
-      radioLeft: document.querySelectorAll('input[name="streamProfile"]').length,
-      insideFold: !!el.closest('#advanced'), unit: el.dataset.unit,
-      describedBy: document.getElementById(el.getAttribute('aria-describedby'))?.id,
-      labelledBy: document.getElementById(el.getAttribute('aria-labelledby'))?.innerText.trim().length > 0,
-      ends: [...document.querySelectorAll('#videoPage .ends span')].map(s => s.innerText.trim()) };
-  })()`);
-  assert.equal(sliderShape.count, 1, 'the profile control must exist exactly once');
-  assert.deepEqual({ type: sliderShape.type, min: sliderShape.min, max: sliderShape.max, step: sliderShape.step }, { type: 'range', min: '0', max: '2', step: '1' });
-  assert.equal(sliderShape.radioLeft, 0, 'the old three-way radio row is still in the DOM (must be gone)');
-  assert.equal(sliderShape.insideFold, false);
-  assert.equal(sliderShape.unit, 'profile');
-  assert.equal(sliderShape.describedBy, 'profileNote');
-  assert.equal(sliderShape.labelledBy, true, 'the slider has no accessible name from the heading');
-  assert.equal(sliderShape.ends.length, 2);
-  assert(sliderShape.ends.every(s => s.length > 0));
-  await js(`__bridge.state({ streamProfile: 0 })`);
-  await js(`document.querySelector('.rail-foot [data-page="account"]').focus()`);
-  const toSlider = await tabUntil(['streamProfile'], 2);  // the streaming page's first control
-  const stopText = () => js(`(() => { const el = document.querySelector('[data-setting="streamProfile"]');
-    return { value: el.value, text: el.parentElement.querySelector('output').textContent, aria: el.getAttribute('aria-valuetext'),
-      fill: el.style.getPropertyValue('--fill') }; })()`);
-  const at0 = await stopText();
-  await pressKey('ArrowRight', 39);
-  await wait(60);
-  const at1 = await stopText();
-  await pressKey('ArrowRight', 39);
-  await wait(60);
-  const at2 = await stopText();
-  // Both presses, counted after they have all landed: what goes over the wire must still be
-  // the plain number 0/1/2, with one request per stop.
-  const sliderWrites = await js(`(() => { const m = __bridge.changes().filter(x => 'streamProfile' in x.settings);
-    return { requests: m.length, values: m.map(x => x.settings.streamProfile), types: m.map(x => typeof x.settings.streamProfile) }; })()`);
-  assert.equal(at0.value, '0');
-  assert.equal(at1.value, '1');
-  assert.equal(at2.value, '2');
-  assert.deepEqual(sliderWrites, { requests: 2, values: [1, 2], types: ['number', 'number'] });
-  assert(!at0.text.includes('Mbps') && !at1.text.includes('Mbps') && !at2.text.includes('Mbps'), `the slider label still says Mbps: ${at1.text}`);
-  assert.equal(at1.text, at1.aria, 'aria-valuetext and the visible stop name disagree');
-  assert.equal(at0.text, sliderShape.ends[0], 'stop 0 does not read as the left end of the scale');
-  assert.equal(at2.text, sliderShape.ends[1], 'stop 2 does not read as the right end of the scale');
-  assert(at1.text !== at0.text && at1.text !== at2.text, 'the three stops are not three distinct names');
-  assert.equal(at0.fill, '0%');
-  assert.equal(at1.fill, '50%');
-  assert.equal(at2.fill, '100%');
-  // The bitrate sliders must not have noticed any of this.
+  const tierGone = await js(`(() => ({
+    sliders: document.querySelectorAll('[data-setting="streamProfile"]').length,
+    switches: document.querySelectorAll('[data-setting="autoTune"]').length,
+    radios: document.querySelectorAll('input[name="streamProfile"]').length,
+    stops: [...document.querySelectorAll('#videoPage .ends span')].length,
+    note: (() => { const el = document.querySelector('#autoTuneNote');
+      return el ? { text: el.innerText.trim(), h: +el.getBoundingClientRect().height.toFixed(2),
+                    tabIndex: el.tabIndex } : null; })(),
+  }))()`);
+  assert.equal(tierGone.sliders, 0, 'the tier slider is still in the DOM');
+  assert.equal(tierGone.switches, 0, 'the tuner switch is still in the DOM');
+  assert.equal(tierGone.radios, 0, 'the old three-way radio row survived');
+  assert.equal(tierGone.stops, 0, 'the tier end labels are still in the DOM');
+  assert(tierGone.note && tierGone.note.h > 2 && tierGone.note.text.length > 10, JSON.stringify(tierGone.note));
+  assert(tierGone.note.tabIndex < 0, 'the replacement sentence became focusable');
   const bitrateLabels = await js(`(() => { const one = k => { const el = document.querySelector('[data-setting="' + k + '"]'); return el.parentElement.querySelector('output').textContent; };
     return { vr: one('vrBitrateMbps'), desktop: one('desktopBitrateMbps') }; })()`);
   assert(/ Mbps$/.test(bitrateLabels.vr) && / Mbps$/.test(bitrateLabels.desktop), JSON.stringify(bitrateLabels));
-  check('u2_profile_slider_keyboard', { tabPresses: toSlider.presses, stops: [at0, at1, at2], ...sliderWrites, bitrateLabels, ends: sliderShape.ends });
+  check('u2_tier_controls_gone', { ...tierGone, bitrateLabels });
 
   // A52: a machine whose vendor encoder failed still streams on Media Foundation. The home
   // page has to say so, otherwise "it got slower after a driver update" has no visible cause.
@@ -469,7 +449,11 @@ try {
     assert.equal(await js(`document.querySelector('#vrBitrateBar input').disabled`), disabled);
     assert.equal(await js(`document.querySelector('#vrBitrateBar output').textContent`), `${disabled ? headset : 100} Mbps`);
   }
-  for (const [profileValue, controls, match, slow, disabled] of [[2,true,false,false,false],[2,true,true,false,true],[2,true,false,true,true],[1,true,false,false,true],[2,false,false,false,true]]) {
+  // A86: the CBR row used to be gated on the tier (it only made sense at the sharpest one).
+  // The tier is the tuner's and is not on this page any more, so the row is live whenever
+  // the user asked the tier to drive video settings and the link allows it - the profile
+  // number no longer decides anything here, which is what the 0/1/2 case below pins down.
+  for (const [profileValue, controls, match, slow, disabled] of [[2,true,false,false,false],[2,true,true,false,true],[2,true,false,true,true],[0,true,false,false,false],[2,false,false,false,true]]) {
     await js(`__bridge.state({streamProfile:${profileValue},profileControlsVideo:${controls}},{matchSteamVr:${match},slowPath:${slow}})`);
     assert.equal(await js(`document.querySelector('#cbrRow input').disabled`), disabled);
   }
@@ -487,19 +471,19 @@ try {
   await fresh();
   const keys = await js(`[...new Set([...document.querySelectorAll('.page[data-page="video"] [data-setting]')].map(e=>e.dataset.setting))]`);
   // Full expected set, not a bare count: a dropped or renamed setting must fail loudly.
-  // (This page's controls were 14 when the gate was written; the count had drifted since.
-  //  Verified against HEAD before A48: HEAD also has these 18 keys, so this is drift in
-  //  the gate, not something A48 changed.)
+  // A86 (user, 2026-11-23) removed two of them with their controls: 'streamProfile' (the
+  // tier slider) and 'autoTune' (its on/off switch). 18 -> 16, and the sentence that
+  // replaced them carries no data-setting on purpose.
   assert.deepEqual(keys.slice().sort(), [
-    'adaptiveBitrate', 'adaptiveQuantization', 'autoTune', 'codec', 'desktopBitrateMbps',
+    'adaptiveBitrate', 'adaptiveQuantization', 'codec', 'desktopBitrateMbps',
     'desktopMaxHeight', 'encodeScalePct', 'fecPercent', 'fillMode', 'foveatedEncoding',
-    'l7Autoscale', 'pcBitrateWins', 'profileControlsVideo', 'qualityProfileCbr', 'streamProfile',
+    'l7Autoscale', 'pcBitrateWins', 'profileControlsVideo', 'qualityProfileCbr',
     'tenBit', 'twoPassEncoding', 'vrBitrateMbps',
   ]);
   const stressStart = performance.now();
   const framesBefore = await js('__bridge.frames');
   for (const key of keys) {
-    await js(`__bridge.state({codec:'auto',streamProfile:2,profileControlsVideo:true,pcBitrateWins:true},{headsetBitrateMbps:0,headsetGazeFoveation:false,matchSteamVr:false,slowPath:false})`);
+    await js(`__bridge.state({codec:'auto',profileControlsVideo:true,pcBitrateWins:true},{headsetBitrateMbps:0,headsetGazeFoveation:false,matchSteamVr:false,slowPath:false})`);
     const startCount = await js('__bridge.changes().length');
     for (let i = 0; i < 10; i++) {
       const type = await js(`document.querySelector(${JSON.stringify(selector(key))}).type`);

@@ -251,7 +251,9 @@ void App::ApplyPcSettings(const json& info) {
     if (s.contains("tenBit")) m_settings.tenBit = s.value("tenBit", m_settings.tenBit);
     if (s.contains("adaptiveBitrate")) m_settings.adaptiveBitrate = s.value("adaptiveBitrate", m_settings.adaptiveBitrate);
     if (s.contains("desktopFps")) m_settings.desktopFps = s.value("desktopFps", m_settings.desktopFps);
-    if (s.contains("streamProfile")) m_settings.streamProfile = std::clamp(s.value("streamProfile", m_settings.streamProfile), 0, 2);
+    // A86 (user, 2026-11-23): "streamProfile" is deliberately NOT adopted any more. The
+    // PC no longer sends it and this headset no longer shows it; a PC that still does
+    // (older build) is ignored rather than writing a value no UI can change back.
     SaveSettings();
 }
 

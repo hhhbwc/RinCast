@@ -265,15 +265,15 @@ bool ClientSession::AdoptHeadsetOwnedSettings() {
     // Ownership and persistence share the PC edit's lock, so no newer PC write is overwritten.
     std::lock_guard lock(m_mutex);
     const Settings pc = SettingsStore::Get().Snapshot();
-    const bool profileDiff = !m_ownedSettings.count(rc::synced::kStreamProfile) &&
-                             pc.streamProfile != m_settings.streamProfile;
+    // A86 (user, 2026-11-23): the picture tier is no longer a synced choice. The PC
+    // used to adopt a headset-owned streamProfile into its settings so the headset's
+    // slider became the tuner's floor; both sliders are gone now, so a value a
+    // headset still sends is IGNORED - never adopted. Adaptive bitrate keeps the
+    // pre-A86 rule untouched.
     const bool adaptiveDiff = !m_ownedSettings.count(rc::synced::kAdaptiveBitrate) &&
                               pc.adaptiveBitrate != m_settings.adaptiveBitrate;
-    if (!profileDiff && !adaptiveDiff) return false;
-    SettingsStore::Get().Update([&](Settings& s) {
-        if (profileDiff) s.streamProfile = m_settings.streamProfile;
-        if (adaptiveDiff) s.adaptiveBitrate = m_settings.adaptiveBitrate;
-    });
+    if (!adaptiveDiff) return false;
+    SettingsStore::Get().Update([&](Settings& s) { s.adaptiveBitrate = m_settings.adaptiveBitrate; });
     return true;
 }
 
@@ -575,36 +575,7 @@ void ClientSession::HandleMessage(const json& m) {
     if (type == "_serverInfo") return SendServerInfo();
     if (type == rc::msg::kClientInfo) {
         ApplyClientInfo(m);
-        // A84 §2 (was PLAN-AUTO-TUNE's MarkManual here): a streamProfile the
-        // headset picked at connect is the USER'S FLOOR, not a lock. Auto keeps
-        // working above it; EffectiveProfile lifts the live streams to it at once
-        // if auto had been running lower. Same condition AdoptHeadsetOwnedSettings
-        // below uses for the profile.
-        //
-        // A84b §3: the line used to print m_settings.streamProfile BEFORE the adopt,
-        // which is the number the headset sent, not the number the tuner is then fed
-        // (that is Settings::streamProfile, and the adopt can decline). It now only
-        // records THAT the floor arrived here and what it replaced; the value is read
-        // back off the settings after AdoptHeadsetOwnedSettings, so what is logged is
-        // what AutoTuneInput::profileFloorId gets.
-        bool floorFromHeadset = false;
-        int floorBefore = 0;
-        {
-            const Settings adopted = SettingsStore::Get().Snapshot();
-            std::lock_guard lock(m_mutex);
-            if (!m_ownedSettings.count(rc::synced::kStreamProfile) &&
-                adopted.streamProfile != m_settings.streamProfile) {
-                floorFromHeadset = true;
-                floorBefore = adopted.streamProfile;
-            }
-        }
-        // First connect: adopt the headset's profile/bitrate picks before StartVr
-        // builds cfg from the PC copy, so the page and the encoder agree from frame 1.
         AdoptHeadsetOwnedSettings();
-        if (floorFromHeadset)
-            RC_LOGI("AUTO: profile floor %d -> %d taken from the headset (auto works above it, never below "
-                    "unless the link forces it)",
-                    rc::ClampProfileId(floorBefore), rc::ClampProfileId(SettingsStore::Get().Snapshot().streamProfile));
         LogAutoCapability();
         SendServerInfo();
         SendMonitors();
@@ -980,7 +951,10 @@ void ClientSession::OwnSyncedSettings(const json& changed, const std::function<v
     if (changed.contains(rc::synced::kTenBit)) m_settings.tenBit = s.tenBit;
     if (changed.contains(rc::synced::kAdaptiveBitrate)) m_settings.adaptiveBitrate = s.adaptiveBitrate;
     if (changed.contains(rc::synced::kDesktopFps)) m_settings.desktopFps = s.desktopFps;
-    if (changed.contains(rc::synced::kStreamProfile)) m_settings.streamProfile = s.streamProfile;
+    // A86: kStreamProfile is deliberately NOT copied into m_settings. The key still
+    // exists on the wire and a headset that has the old slider will still send it,
+    // but the tier belongs to the tuner now - reading it here is what used to hand
+    // the slider a way back in (AdoptHeadsetOwnedSettings then persisted it).
 }
 
 void ClientSession::SendMonitors() {
@@ -1009,33 +983,28 @@ void ClientSession::OnSettingsChanged(const json& changed) {
     // PLAN-AUTO-TUNE: a manual write of a dimension auto owns locks that
     // dimension until autoTune is turned off and back on (DECISION-TABLE §3.1).
     // Enabling autoTune itself is the hand-over, so it clears last.
-    // A84 §2 REVERSES this for streamProfile: the slider is a floor, so writing it
-    // re-floors and clears the lock (the value reaches the tuner as
-    // AutoTuneInput::profileFloorId; EffectiveProfile lifts the live stream to a
-    // raised floor on the rebuild this write triggers - see app.cpp's rebuild list).
-    // Cbr and Fovea keep the old rule untouched.
-    bool handBackToFloor = false;
+    // A86 (user, 2026-11-23): streamProfile is no longer a settings key at all - the
+    // tier is the tuner's, so there is no floor write to announce and no lock to clear
+    // on that dimension. Cbr and Fovea keep the pre-A86 rule untouched.
+    bool rebuild = false;
     {
         std::lock_guard lock(m_mutex);
-        if (changed.contains("streamProfile"))
-            RC_LOGI("AUTO: profile floor set to %d by the PC (the worst picture the user accepts; auto runs "
-                    "above it while the link has room)",
-                    rc::ClampProfileId(SettingsStore::Get().Snapshot().streamProfile));
         if (changed.contains("qualityProfileCbr")) m_autoTune.MarkManual(rc::AutoDim::Cbr);
         if (changed.contains("foveatedEncoding")) m_autoTune.MarkManual(rc::AutoDim::Fovea);
         if (changed.contains("autoTune")) {
             const bool on = changed.value("autoTune", false);
             if (on) m_autoTune.ClearLocks();  // the hand-over: every dimension is auto's again
-            // Either way auto's own rung is gone: enabling starts at the user's
-            // floor and climbs on evidence, disabling hands the stream back to the
-            // rung the slider names (A84 §5 case 5 - off is the pre-A84 branch).
+            // A86: neither UI has this switch any more, so this branch is the
+            // settings-file escape hatch (remote support). Off pins the stream at
+            // the start rung - EffectiveProfileRung's !autoTuneOn branch - and on
+            // makes the tuner choose again from scratch.
             m_autoProfileEff = -1;
-            handBackToFloor = !on;
+            rebuild = !on;
         }
     }
     // app.cpp's rebuild list has no autoTune in it, so the switch that stops auto
     // moving the picture has to rebuild the picture itself.
-    if (handBackToFloor) OnStreamProfileChanged();
+    if (rebuild) OnStreamProfileChanged();
     if (changed.contains("desktopInput")) ApplyInputSetting(true);
     if (changed.contains("streamAudio") || changed.contains("micPassthrough") ||
         changed.contains("audioDevices") || changed.contains("playOnPcToo") || changed.contains("switchDefaultAudio"))

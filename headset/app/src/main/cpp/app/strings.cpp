@@ -141,12 +141,6 @@ const Entry kEn[] = {
 
     // A85: one slider, not three tiers. The ends say what it means; what happens in between is
     // the automatic tuning's job (A84), which is why no stop is named any more.
-    {"vr.profileSection", "Responsiveness"},
-    {"vr.profileLabel", "How responsive"},
-    {"vr.profileEndLeft", "Responsive"},
-    {"vr.profileEndRight", "Sharp"},
-    {"vr.profileMid", "In the middle"},
-    {"vr.profileHint", "Set how responsive you want it. The picture is tuned up on its own and steps back when it can't keep up."},
     {"vr.imageSection", "Image"},
     {"vr.resolution", "Resolution per eye"},
     {"vr.resolutionHint", "Changing it restarts the stream for a moment."},
@@ -476,12 +470,6 @@ const Entry kZhCN[] = {
     // A85：三档收成一根滑杆。两端写清语义就行，中间怎么走是自动调优（A84）的事。
     // 「系统」「来」不在 assets/ui/charset.txt 的字库图集里（图集外只显示成「?」），
     // 所以措辞只用已烘焙进来的字；要换字得先补 charset 再重烤 text.png。
-    {"vr.profileSection", "画质与跟手"},
-    {"vr.profileLabel", "要多跟手"},
-    {"vr.profileEndLeft", "跟手"},
-    {"vr.profileEndRight", "清晰"},
-    {"vr.profileMid", "居中"},
-    {"vr.profileHint", "定你要多跟手；画质会自动往清晰方向试，跟不上就退回。"},
     {"vr.imageSection", "画质"},
     {"vr.resolution", "单眼分辨率"},
     {"vr.resolutionHint", "改动会短暂重启串流。"},
@@ -808,12 +796,6 @@ const Entry kZhTW[] = {
     {"games.running", "執行中"},
 
     // A85：與簡體同義。字庫圖集（assets/ui/charset.txt）內無「系統」「來」等字，措辭迴避。
-    {"vr.profileSection", "畫質與跟手"},
-    {"vr.profileLabel", "要多跟手"},
-    {"vr.profileEndLeft", "跟手"},
-    {"vr.profileEndRight", "清晰"},
-    {"vr.profileMid", "居中"},
-    {"vr.profileHint", "定你要多跟手；畫質會自動往清晰方向試，跟不上就退回。"},
     {"vr.resolutionHint", "改動會短暫重啟串流。"},
     {"vr.imageSection", "畫質"},
     {"vr.resolution", "單眼解析度"},
@@ -1119,12 +1101,6 @@ const Entry kDe[] = {
     {"games.noneHint", "In Steam installierte VR-Spiele erscheinen hier. Sie brauchen SteamVR."},
     {"games.running", "Läuft"},
 
-    {"vr.profileSection", "Tempo und Bild"},
-    {"vr.profileLabel", "Wie schnell"},
-    {"vr.profileEndLeft", "Schnell"},
-    {"vr.profileEndRight", "Scharf"},
-    {"vr.profileMid", "In der Mitte"},
-    {"vr.profileHint", "Bestimme, wie schnell du es willst. Das Bild wird von selbst schärfer und geht zurück, wenn es nicht mitkommt."},
     {"vr.resolutionHint", "Eine Änderung startet den Stream kurz neu."},
     {"vr.imageSection", "Bild"},
     {"vr.resolution", "Auflösung pro Auge"},
@@ -1428,12 +1404,6 @@ const Entry kEs[] = {
     {"games.noneHint", "Los juegos VR instalados en Steam aparecen aquí. Necesitan SteamVR."},
     {"games.running", "En ejecución"},
 
-    {"vr.profileSection", "Respuesta y nitidez"},
-    {"vr.profileLabel", "Qué tan rápido"},
-    {"vr.profileEndLeft", "Rápido"},
-    {"vr.profileEndRight", "Nítido"},
-    {"vr.profileMid", "En medio"},
-    {"vr.profileHint", "Define lo rápido que lo quieres. La imagen gana nitidez sola y retrocede si no la sigue."},
     {"vr.resolutionHint", "El cambio reinicia la transmisión un momento."},
     {"vr.imageSection", "Imagen"},
     {"vr.resolution", "Resolución por ojo"},
@@ -1737,12 +1707,6 @@ const Entry kFr[] = {
     {"games.noneHint", "Les jeux VR installés dans Steam apparaissent ici. Ils nécessitent SteamVR."},
     {"games.running", "En cours"},
 
-    {"vr.profileSection", "Réactivité et netteté"},
-    {"vr.profileLabel", "Quelle réactivité"},
-    {"vr.profileEndLeft", "Réactif"},
-    {"vr.profileEndRight", "Net"},
-    {"vr.profileMid", "Au milieu"},
-    {"vr.profileHint", "Définissez la réactivité voulue. L’image gagne en netteté toute seule et recule quand elle ne suit plus."},
     {"vr.resolutionHint", "Le changement redémarre brièvement le flux."},
     {"vr.imageSection", "Image"},
     {"vr.resolution", "Résolution par œil"},
@@ -2048,12 +2012,6 @@ const Entry kJa[] = {
 
     // A85：三段スライダーを一本のバーに。語彙は焼き済みフォント（assets/ui/charset.txt）に
     // ある字だけを使っている（無い字は「?」で出る）。
-    {"vr.profileSection", "応答と画質"},
-    {"vr.profileLabel", "どこまで応答重視"},
-    {"vr.profileEndLeft", "レスポンス"},
-    {"vr.profileEndRight", "くっきり"},
-    {"vr.profileMid", "中間"},
-    {"vr.profileHint", "どこまで応答を重視するかを指定してください。画質は自動でくっきり方向に上がり、追いつけない時は戻ります。"},
     {"vr.resolutionHint", "変更するとストリームが一時的に再起動します。"},
     {"vr.imageSection", "画質"},
     {"vr.resolution", "片目あたりの解像度"},
