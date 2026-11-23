@@ -564,15 +564,45 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
     static float contentBottom = 0;
     const float scroll = ui.BeginScroll("vr-quality", body, std::max(0.f, contentBottom - body.y), false);
     Column l{body.x, body.y - scroll, w};
-    // 画质档位放在最上面：VR 用户最常改的就是它，改完电脑端也同步（最后一次改动生效）。
+    // 这根「跟手 ↔ 清晰」滑杆放在最上面：VR 用户最常改的就是它，改完电脑端也同步（最后一次改动生效）。
+    // A85 (user, 2026-11-22): the three named tiers are gone, one slider takes their place. It
+    // still lands on streamProfile 0/1/2 - the wire and the JSON key are frozen - and it now means
+    // the floor A84's automatic tuning aims back at. It is a floor for where tuning settles, not a
+    // promise under pressure: sustained pressure may dip below it for a moment to save the stream
+    // (auto_tune.h), and the picture then climbs back on its own and past the floor toward "sharp"
+    // whenever the link has room. So the only thing left to ask the user for is how responsive they
+    // want it, which is what the two ends say.
     Section(ui, l, Tr("vr.profileSection"));
-    const std::vector<std::string> profiles = {Tr("profile.latency"), Tr("profile.balanced"), Tr("profile.quality")};
-    int pi = std::clamp(s.streamProfile, 0, 2);
-    if (RadioLine(ui, l, "profile", Tr("vr.profileLabel"), profiles, pi)) {
-        s.streamProfile = pi;
-        changed = true;
+    // The PC rebuilds the whole stream when streamProfile changes (pc/streamer/src/app.cpp
+    // OnStreamProfileChanged), so this is applied when the handle is let go, never once per pixel -
+    // the same rule the resolution row below follows.
+    static float dragProfile = -1;
+    float profile = dragProfile >= 0 ? dragProfile : float(std::clamp(s.streamProfile, 0, 2));
+    const int shownProfile = std::clamp(int(std::lround(profile)), 0, 2);
+    const std::string profileText = shownProfile <= 0   ? Tr("vr.profileEndLeft")
+                                    : shownProfile >= 2 ? Tr("vr.profileEndRight")
+                                                        : Tr("vr.profileMid");
+    if (BarRow(ui, l, "profile", Tr("vr.profileLabel"), profile, 0.f, 2.f, 1.f, profileText))
+        dragProfile = profile;
+    // What each end of the track stands for, written under it.
+    l.y += 2;
+    ui.R().Text(Tr("vr.profileEndLeft"), l.x, l.y, 20, kMuted, Face::Medium);
+    ui.R().Text(Tr("vr.profileEndRight"), l.x + l.w, l.y, 20, kMuted, Face::Medium, Align::Right);
+    l.y += 28;
+    if (dragProfile >= 0 && !ui.IsHeld("profile")) {
+        const int committed = std::clamp(int(std::lround(dragProfile)), 0, 2);
+        dragProfile = -1;
+        if (committed != s.streamProfile) {
+            s.streamProfile = committed;
+            changed = true;
+        }
     }
-    Label(ui, l, Tr("vr.profileHint"));
+    // Wrapped, unlike the neighbouring Label hints: this sentence is wider than the column in
+    // every Latin locale (and this page's columns are half the panel).
+    const std::string profileHint = Tr("vr.profileHint");
+    const float profileHintH = WrapHeight(ui, profileHint, l.w, 20, 26) + 4;
+    ui.R().WrapText(profileHint, {l.x, l.y, l.w, profileHintH}, 20, kMuted, Face::Medium, 26);
+    l.y += profileHintH;
     Section(ui, l, Tr("vr.imageSection"));
     // Pixels per eye, against the headset's panel. Each change restarts the stream (and may ask
     // for a SteamVR restart), so it's applied when the handle is let go.
