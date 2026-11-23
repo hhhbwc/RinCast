@@ -101,6 +101,15 @@ static std::string A82RateList(const std::vector<float>& rates) {
     return out;
 }
 
+// A94: the same rule StartVr applies when it builds the stream (see the Refresh clamp
+// WARN there). A rate the device does not enumerate never reaches the encoder, so two
+// requests that map to one effective rate describe one stream - comparing the raw
+// numbers instead made the headset's panel-rate chase rebuild for nothing.
+static float EffectiveRefreshRate(float requested, const std::vector<float>& rates) {
+    if (rates.empty() || std::find(rates.begin(), rates.end(), requested) != rates.end()) return requested;
+    return rates.back();
+}
+
 // The 1 s reading of all three aspects, from the session's existing 1 s tick. The WARN
 // the card asks for is rate limited to 10 s because on the affected device the condition
 // holds for the whole session (the driver cannot hot-change the resolution) - the aspects
@@ -616,9 +625,20 @@ void ClientSession::HandleMessage(const json& m) {
         // (headset/app/src/main/cpp/app/app.cpp:292-309) pushes the panel's ACTUAL rate
         // through settings.refreshRate after 6 s of divergence; KeepRefreshRate's 2 s retry
         // loop (xr_context.cpp:762-780) never reaches the wire. Readings only.
-        if (before.refreshRate != after.refreshRate)
+        // A94: the decision rides the EFFECTIVE rate. On a device that enumerates only
+        // [72] while its panel idles at 90, the chase alternated 72 <-> 90 and every flip
+        // rebuilt a stream that was already going to run at 72 Hz - 4 rebuilds in 11 min
+        // in the 2026-11-24 01:05 PICO 4 log, two of them 7 s apart. Storing the raw
+        // request is untouched: a device that lists both rates still rebuilds on a real move.
+        const float hzBefore = EffectiveRefreshRate(before.refreshRate, m_caps.refreshRates);
+        const float hzAfter = EffectiveRefreshRate(after.refreshRate, m_caps.refreshRates);
+        if (hzBefore != hzAfter)
             RC_LOGI("Headset moved refreshRate %.0f -> %.0f Hz (its panel's actual rate) - the stream rebuilds at it",
                     before.refreshRate, after.refreshRate);
+        else if (before.refreshRate != after.refreshRate)
+            RC_LOGI("Headset moved refreshRate %.0f -> %.0f Hz but both map to the %.0f Hz the stream already "
+                    "runs at (device list [%s]) - no rebuild",
+                    before.refreshRate, after.refreshRate, hzAfter, A82RateList(m_caps.refreshRates).c_str());
         AdoptHeadsetOwnedSettings();
         // A84 §2 (was PLAN-AUTO-TUNE's MarkManual here): a streamProfile the
         // headset sends with a value the PC never pushed is the user moving their
@@ -632,7 +652,8 @@ void ClientSession::HandleMessage(const json& m) {
                                   before.vrQuality != after.vrQuality || before.vrScale != after.vrScale ||
                                   before.matchSteamVr != after.matchSteamVr || before.gazeFoveation != after.gazeFoveation ||
                                   before.eyesTracked != after.eyesTracked ||
-                                  before.frameGeneration != after.frameGeneration || before.refreshRate != after.refreshRate ||
+                                  before.frameGeneration != after.frameGeneration ||
+                                  hzBefore != hzAfter /* A94: effective, not the raw chase value */ ||
                                   before.debugEncodeScalePct != after.debugEncodeScalePct ||
                                   before.vrBitrateMbps != after.vrBitrateMbps ||
                                   before.adaptiveBitrate != after.adaptiveBitrate;
