@@ -391,7 +391,12 @@ void VrStream::Run() {
 
         const rcvr::ProducerKind producer = m_bridge->ActiveProducer();
         const std::string app = m_bridge->ApplicationName();
-        const bool fresh = now - lastFrameNs < 1'000'000'000LL;
+        // A88: one second was too eager. A tier rebuild (A87 no longer does one),
+        // a SteamVR resolution settle or a single slow game frame (the 10:17 log
+        // has 801 ms gaps) used to trip "waiting" and send the headset to the
+        // desktop view; coming back meant another visible hitch. Three seconds
+        // still reports a real dead producer, and the 10 s WARN below is unchanged.
+        const bool fresh = now - lastFrameNs < 3'000'000'000LL;
         if (streaming && !fresh) {
             streaming = false;
             m_streaming = false;

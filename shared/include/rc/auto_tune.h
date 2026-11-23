@@ -76,6 +76,18 @@ constexpr double kClassifyQpMaxAv1 = 255.0;
 
 // Pure, ordered (DECISION-TABLE §2). The qp [16, 20) band with low fill is a
 // deliberate dead zone: no real-device evidence for it yet, so no action.
+// A88: the classifier has no Unknown member on purpose - Ok is its silent "nothing
+// fired" state (see the note below). But "nothing fired" is not the same as "the
+// link is clean": when the VR stream is paused or has no frames, every field sits
+// at its unknown sentinel (the 2026-11-23 10:17 log: fps=0 game=0 qp=-1 wire=0
+// queue=-1) and the periodic line still read `signals ok`. Feeding that to Update
+// resets the climb streak and makes a black screen look like headroom. The caller
+// skips the whole tick when this says false. One field reporting is enough - the
+// test is deliberately an AND, not a vote.
+inline bool HasUsableSignals(const BottleneckSignal& s) {
+    return !(s.qp < 0 && s.mbps <= 0 && s.queueMs < 0 && s.gameFps <= 0);
+}
+
 inline Bottleneck ClassifyBottleneck(const BottleneckSignal& s) {
     // A8b: non-finite decodeMs/droppedFps/queueMs/loss/qp (+inf / NaN / -inf)
     // is garbage telemetry -> Unknown (the enum has no Unknown member; Ok is

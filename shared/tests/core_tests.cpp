@@ -4806,6 +4806,28 @@ static void TestAutoTuneProfileFloor() {
 // because client_session.cpp is not linked into rincast-core and a rule only
 // reachable from there has no test that could go red - which is exactly how A84
 // ended up with an effProfile nobody had ever checked.
+// A88: "no data" must never read as "the link is clean". The 2026-11-23 10:17
+// log had 30 s of `signals ok fps=0 game=0 qp=-1 wire=0 queue=-1` while the
+// headset showed nothing. The caller now skips those ticks; this is the rule.
+static void TestHasUsableSignals() {
+    rc::BottleneckSignal s{};
+    CHECK(!rc::HasUsableSignals(s), "all-unknown is no evidence, not a clean link");
+    s.gameFps = 33;
+    CHECK(rc::HasUsableSignals(s), "a game fps reading alone is enough to judge the tick");
+    s.gameFps = 0;
+    s.qp = 24;
+    CHECK(rc::HasUsableSignals(s), "a QP reading alone is enough");
+    s.qp = -1;
+    s.mbps = 5;
+    CHECK(rc::HasUsableSignals(s), "a wire reading alone is enough");
+    s.mbps = 0;
+    s.queueMs = 0;
+    CHECK(rc::HasUsableSignals(s), "a measured zero queue IS evidence");
+    s.queueMs = -1;
+    s.decodeMs = 8;
+    CHECK(!rc::HasUsableSignals(s), "a decode reading does not stand in for a stream");
+}
+
 static void TestEffectiveProfileRung() {
     std::printf("effective profile rung: ");
     // autoTune OFF is the pre-A84 branch, byte for byte: the slider is an absolute
@@ -6956,6 +6978,7 @@ int main() {
     TestAutoTuneClassifyEdgeCases();  // TASK-ROBUST-EDGES-2026-11-20 §2
     TestAutoTuneDecide();
     TestAutoTuneProfileFloor();  // A84 (TASK-A84-PROFILE-FLOOR-TWO-WAY-AUTOTUNE-2026-11-23 §5)
+    TestHasUsableSignals();  // A88: no stream is not a clean link
     TestEffectiveProfileRung();  // A84b §4 (TASK-A84b): the rule behind the periodic effProfile
     TestSettingsSchemaMigration();  // A84b §2: the autoTune default migration, out of settings.cpp
     TestLinkPolicy();

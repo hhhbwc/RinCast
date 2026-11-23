@@ -1162,6 +1162,12 @@ void ClientSession::RunAutoTune() {
     in.profileFloorId = pc.streamProfile;
     in.dipAtMs = ProfileDipAtMs(eff.streamProfile);
 
+    // A88: a paused/absent stream reports qp=-1, wire=0, queue=-1, gameFps=0. That
+    // is no evidence, not a clean link. Skipping here - rather than adding an
+    // Unknown member to Bottleneck - keeps BottleneckName(), the log anchors and
+    // every switch untouched, and stops Update() from resetting the climb streak
+    // while the headset is showing nothing.
+    if (!rc::HasUsableSignals(sig)) return;
     const int64_t now = rc::NowNs();
     const auto r = m_autoTune.Update(sig, in, now);
 
