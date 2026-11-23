@@ -69,64 +69,72 @@
       <h1 id="h-video" tabindex="-1" data-i18n="nav.video">Streaming</h1>
 
       <!-- A74: 常显区只有用户真正要碰的四样 —— 一根「跟手 ↔ 清晰」滑杆、自动调参、
-           VR 码率、编码方式。整卡常驻，卡内不做条件隐藏，标题与控件同生共死。 -->
-      <section class="card">
-        <h2 data-i18n="video.vrStream">VR streaming</h2>
-        <div class="row">
-          <h3 id="l-profile" data-i18n="video.profile">Priority</h3>
-          <label class="bar" id="profileBar"><input type="range" min="0" max="2" step="1" data-setting="streamProfile" data-unit="profile" aria-labelledby="l-profile" aria-describedby="profileNote"><output></output></label>
-          <div class="ends"><span data-i18n="video.profileLatency">Low latency</span><span data-i18n="video.profileQuality">Best picture</span></div>
-          <p class="note" id="profileNote"></p>
+           VR 码率、编码方式。整卡常驻，卡内不做条件隐藏，标题与控件同生共死。
+           A86: 两张常显卡搬进 .cols 的两个独立列，与音频页/通用页同一机制（见 app.css:72-77）——
+           高的一边不再把矮的一边顶下去。卡里一个控件都没动，只多了两层容器。
+           「高级」折叠卡留在 .cols 之外，仍是本页最后一个兄弟节点：展开只向下生长。 -->
+      <div class="cols">
+        <div>
+          <section class="card">
+            <h2 data-i18n="video.vrStream">VR streaming</h2>
+            <div class="row">
+              <h3 id="l-profile" data-i18n="video.profile">Priority</h3>
+              <label class="bar" id="profileBar"><input type="range" min="0" max="2" step="1" data-setting="streamProfile" data-unit="profile" aria-labelledby="l-profile" aria-describedby="profileNote"><output></output></label>
+              <div class="ends"><span data-i18n="video.profileLatency">Low latency</span><span data-i18n="video.profileQuality">Best picture</span></div>
+              <p class="note" id="profileNote"></p>
+            </div>
+            <!-- 自动调参在后端已经落地（rc::AutoTune，只降不升，手动改回某项即接管），
+                 A74 把它从底层区提到滑杆正下方，让用户真的能打开它。 -->
+            <div class="row auto-tune" id="autoTuneBox">
+              <label class="check" id="autoTuneRow">
+                <input type="checkbox" data-setting="autoTune">
+                <span data-i18n="video.autoTune">Automatic tuning</span>
+                <small data-i18n="video.autoTuneHint">The system keeps the stream smooth: it may lower picture size, profile, CBR or foveation on its own. It only steps down; changing one yourself takes that setting back.</small>
+              </label>
+            </div>
+            <div class="row">
+              <h3 data-i18n="video.bitrateGames">Games</h3>
+              <label class="bar" id="vrBitrateBar"><input type="range" min="20" max="500" step="10" data-setting="vrBitrateMbps" aria-label="Bitrate limit for games" data-i18n-aria="video.bitrateGamesAria"><output></output></label>
+              <p class="note" id="streamNote" hidden></p>
+              <label class="check" id="adaptiveBitrateRow"><input type="checkbox" data-setting="adaptiveBitrate"><span data-i18n="video.adaptive">Automatic bitrate</span></label>
+            </div>
+            <div class="row">
+              <h3 id="l-codec" data-i18n="video.codec">Codec</h3>
+              <div class="options grid" id="codecOptions" role="radiogroup" aria-labelledby="l-codec" aria-describedby="codecHint">
+                <label><input type="radio" name="codec" data-setting="codec" value="auto"><span data-i18n="video.codecAuto">Automatic</span></label>
+                <label><input type="radio" name="codec" data-setting="codec" value="hevc"><span>HEVC</span></label>
+                <label><input type="radio" name="codec" data-setting="codec" value="av1"><span>AV1</span></label>
+                <label><input type="radio" name="codec" data-setting="codec" value="h264"><span>H.264</span></label>
+                <small id="codecHint" hidden data-i18n="video.codecHint">At this picture size H.264 is not available; the stream falls back to HEVC.</small>
+              </div>
+            </div>
+            <p class="note" id="overrideNote"></p>
+          </section>
         </div>
-        <!-- 自动调参在后端已经落地（rc::AutoTune，只降不升，手动改回某项即接管），
-             A74 把它从底层区提到滑杆正下方，让用户真的能打开它。 -->
-        <div class="row auto-tune" id="autoTuneBox">
-          <label class="check" id="autoTuneRow">
-            <input type="checkbox" data-setting="autoTune">
-            <span data-i18n="video.autoTune">Automatic tuning</span>
-            <small data-i18n="video.autoTuneHint">The system keeps the stream smooth: it may lower picture size, profile, CBR or foveation on its own. It only steps down; changing one yourself takes that setting back.</small>
-          </label>
+        <div>
+          <!-- 桌面串流：常显。A86 起坐在右列，卡内的东西一件没动。 -->
+          <section class="card">
+            <h2 data-i18n="video.desktop">Desktop</h2>
+            <div class="row">
+              <h3 id="l-desktop-res" data-i18n="video.resolution">Resolution</h3>
+              <div class="options" role="radiogroup" aria-labelledby="l-desktop-res">
+                <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="0"><span data-i18n="video.resNative">Same as monitor</span></label>
+                <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="2160"><span data-i18n="video.res2160">Up to 2160p</span></label>
+                <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="1440"><span data-i18n="video.res1440">Up to 1440p</span></label>
+                <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="1080"><span data-i18n="video.res1080">Up to 1080p</span></label>
+              </div>
+            </div>
+            <div class="row">
+              <h3 data-i18n="video.bitrate">Bitrate limit</h3>
+              <label class="bar"><input type="range" min="10" max="150" step="5" data-setting="desktopBitrateMbps" aria-label="Bitrate limit for the desktop" data-i18n-aria="video.bitrateDesktopAria"><output></output></label>
+            </div>
+            <div id="elevateRow" hidden>
+              <button class="btn" id="elevateBtn" data-i18n="video.elevate">Restart as administrator</button>
+              <p class="note" id="elevateNote" data-i18n="video.elevateHint">Needed to click elevated windows.</p>
+            </div>
+          </section>
         </div>
-        <div class="row">
-          <h3 data-i18n="video.bitrateGames">Games</h3>
-          <label class="bar" id="vrBitrateBar"><input type="range" min="20" max="500" step="10" data-setting="vrBitrateMbps" aria-label="Bitrate limit for games" data-i18n-aria="video.bitrateGamesAria"><output></output></label>
-          <p class="note" id="streamNote" hidden></p>
-          <label class="check" id="adaptiveBitrateRow"><input type="checkbox" data-setting="adaptiveBitrate"><span data-i18n="video.adaptive">Automatic bitrate</span></label>
-        </div>
-        <div class="row">
-          <h3 id="l-codec" data-i18n="video.codec">Codec</h3>
-          <div class="options grid" id="codecOptions" role="radiogroup" aria-labelledby="l-codec" aria-describedby="codecHint">
-            <label><input type="radio" name="codec" data-setting="codec" value="auto"><span data-i18n="video.codecAuto">Automatic</span></label>
-            <label><input type="radio" name="codec" data-setting="codec" value="hevc"><span>HEVC</span></label>
-            <label><input type="radio" name="codec" data-setting="codec" value="av1"><span>AV1</span></label>
-            <label><input type="radio" name="codec" data-setting="codec" value="h264"><span>H.264</span></label>
-            <small id="codecHint" hidden data-i18n="video.codecHint">At this picture size H.264 is not available; the stream falls back to HEVC.</small>
-          </div>
-        </div>
-        <p class="note" id="overrideNote"></p>
-      </section>
-
-      <!-- 桌面串流：常显，位置不变。 -->
-      <section class="card">
-        <h2 data-i18n="video.desktop">Desktop</h2>
-        <div class="row">
-          <h3 id="l-desktop-res" data-i18n="video.resolution">Resolution</h3>
-          <div class="options" role="radiogroup" aria-labelledby="l-desktop-res">
-            <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="0"><span data-i18n="video.resNative">Same as monitor</span></label>
-            <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="2160"><span data-i18n="video.res2160">Up to 2160p</span></label>
-            <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="1440"><span data-i18n="video.res1440">Up to 1440p</span></label>
-            <label><input type="radio" name="desktopMaxHeight" data-setting="desktopMaxHeight" value="1080"><span data-i18n="video.res1080">Up to 1080p</span></label>
-          </div>
-        </div>
-        <div class="row">
-          <h3 data-i18n="video.bitrate">Bitrate limit</h3>
-          <label class="bar"><input type="range" min="10" max="150" step="5" data-setting="desktopBitrateMbps" aria-label="Bitrate limit for the desktop" data-i18n-aria="video.bitrateDesktopAria"><output></output></label>
-        </div>
-        <div id="elevateRow" hidden>
-          <button class="btn" id="elevateBtn" data-i18n="video.elevate">Restart as administrator</button>
-          <p class="note" id="elevateNote" data-i18n="video.elevateHint">Needed to click elevated windows.</p>
-        </div>
-      </section>
+      </div>
 
       <!-- A74: 编码器底层项全部收进「高级」。它是本页最后一个兄弟节点，默认收起，展开只
            向下生长，不会把上面任何常显控件顶走。收起用的是 hidden（不是 visibility、不是

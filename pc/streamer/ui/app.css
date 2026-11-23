@@ -80,6 +80,16 @@ main { overflow-y: auto; padding: 24px 32px 32px; min-height: 0; }
 #videoPage .card { margin-top: 18px; }
 #videoPage .card > h2:first-child { margin-top: 0; }
 #videoPage .card + .card { border-top: 1px solid var(--line); padding-top: 18px; }
+/* A86: the two always-on cards now sit in the independent columns (the `.cols` mechanism above,
+   the same one the audio and general pages use), so the two rules just above - written for one
+   vertical stack - no longer reach them: a column holds a single card, so there is no
+   `.card + .card` left, and 高级 follows the pair rather than a card. Restate only the shapes that
+   remain; nothing here touches `.cols` itself or the 800px breakpoint, which belong to A74.
+   Why margin-top: a flex item is its own formatting context, so a card's 18px would NOT collapse
+   away inside a column - both columns would start 18px lower than the title's gap intends.
+   `.card + .card` above is kept as-is (additions only) even though it no longer matches here. */
+#videoPage .cols > div > .card:first-child { margin-top: 0; }
+#videoPage .cols + .card { border-top: 1px solid var(--line); padding-top: 18px; }
 #videoPage .row { margin-top: 14px; }
 #videoPage .row > h3:first-child { margin-top: 0; }
 /* The one slider the user drives: its two ends say what turning it means. */
@@ -281,6 +291,10 @@ dialog p { color: var(--muted); }
   .cols { flex-direction: column; align-items: stretch; }
   .cols > div { flex: 0 0 auto; }
   .cols:first-of-type > div + div > h2:first-child { margin-top: 34px; }
+  /* A86: once stacked, the right-hand column's card sits under the left one again and needs back
+     the divider `.card + .card` used to hand it. It must carry `:first-child` to out-rank the
+     margin-top:0 above (same specificity, later in the sheet): without it the two cards touch. */
+  #videoPage .cols > div + div > .card:first-child { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 18px; }
   main { padding: 20px; }
   .top { flex-wrap: wrap; }
   .numbers b { font-size: 26px; }
