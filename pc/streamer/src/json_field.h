@@ -47,6 +47,15 @@ inline int IntField(const nlohmann::json& j, const char* key, int fallback) {
     return static_cast<int>(v);
 }
 
+// A92: a 64-bit number for the control channel's nanosecond offsets. double keeps
+// only 53 bits of mantissa, but the values here are ~1e9 ns, far below that
+// limit; the range check still rejects anything that would wrap on cast.
+inline int64_t Int64Field(const nlohmann::json& j, const char* key, int64_t fallback) {
+    const double v = NumberField(j, key, double(fallback));
+    if (!(v >= -9223372036854775808.0 && v < 9223372036854775808.0)) return fallback;
+    return static_cast<int64_t>(v);
+}
+
 inline uint32_t UIntField(const nlohmann::json& j, const char* key, uint32_t fallback) {
     const double v = NumberField(j, key, double(fallback));
     if (!(v >= 0.0 && v <= 4294967295.0)) return fallback;

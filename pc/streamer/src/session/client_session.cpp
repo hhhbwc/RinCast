@@ -352,10 +352,14 @@ void ClientSession::Enqueue(json message) {
         return type == rc::msg::kUpdateSettings || type == "_profile" || type == "_serverInfo" ||
                type == "_audio" || type == "_tick" || type == "_monitors";
     };
-    const std::string type = message.value("type", "");
+    // A92: Enqueue is also reached from the receive thread. Every message in
+    // this queue has its type validated before it gets here, but reading it
+    // through the throwing accessor would still be one malformed control
+    // message away from std::terminate if that ever changed.
+    const std::string type = StrField(message, "type");
     if (coalesces(type)) {
         for (auto it = m_queue.rbegin(); it != m_queue.rend(); ++it) {
-            const std::string queuedType = it->value("type", "");
+            const std::string queuedType = StrField(*it, "type");
             if (!coalesces(queuedType)) break;
             if (queuedType != type) continue;
             if (type == rc::msg::kUpdateSettings) {
@@ -540,13 +544,13 @@ void ClientSession::WorkerLoop() {
         try {
             HandleMessage(m);
         } catch (const std::exception& e) {
-            RC_LOGW("Error handling %s: %s", m.value("type", "?").c_str(), e.what());
+            RC_LOGW("Error handling %s: %s", StrFieldOr(m, "type", "?").c_str(), e.what());
         }
     }
 }
 
 void ClientSession::HandleMessage(const json& m) {
-    const std::string type = m.value("type", "");
+    const std::string type = StrField(m, "type");  // A92: queued messages crossed the receive thread
     if (type == "_tick") {
         // Steam VR launch timeout.
         if (m_steamVrLaunchNs && rc::NowNs() - m_steamVrLaunchNs > 90'000'000'000LL) {
@@ -649,7 +653,7 @@ void ClientSession::HandleMessage(const json& m) {
     if (type == rc::msg::kStartDesktop) return StartDesktop(m);
     if (type == rc::msg::kStopDesktop) return StopDesktop();
     if (type == "desktop.active") {
-        const std::string active = m.value("monitorId", "");
+        const std::string active = StrField(m, "monitorId");
         std::lock_guard lock(m_mutex);
         for (auto& [id, d] : m_desktop) d->SetActive(active.empty() || d->Monitor().id == active);
         return;
@@ -678,8 +682,10 @@ void ClientSession::HandleMessage(const json& m) {
         return;
     }
     if (type == rc::msg::kVrPhase) {
-        if (const int64_t slip = m.value("slipNs", int64_t(0)); slip > 0) App::Get().Bridge().SlipVsync(slip);
-        else App::Get().Bridge().ShiftVsync(m.value("shiftNs", int64_t(0)));
+        // A92: these come from the headset's control channel. A wrong-typed
+        // "slipNs" used to throw on the worker thread and terminate the process.
+        if (const int64_t slip = Int64Field(m, "slipNs", 0); slip > 0) App::Get().Bridge().SlipVsync(slip);
+        else App::Get().Bridge().ShiftVsync(Int64Field(m, "shiftNs", 0));
         return;
     }
     if (type == rc::msg::kListGames) {
@@ -692,14 +698,14 @@ void ClientSession::HandleMessage(const json& m) {
         return;
     }
     if (type == "games.image") {
-        const std::string id = m.value("id", "");
+        const std::string id = StrField(m, "id");  // A92: headset control message
         auto bytes = App::Get().Games().Image(id);
         if (bytes.size() > 400 * 1024) bytes.clear();  // keep the control channel snappy
         SendControl({{"type", "games.image"}, {"id", id}, {"data", Base64Encode(bytes.data(), bytes.size())}});
         return;
     }
     if (type == rc::msg::kLaunchGame) {
-        const std::string id = m.value("id", "");
+        const std::string id = StrField(m, "id");  // A92: headset control message
         const bool ok = App::Get().Games().Launch(id);
         SendControl({{"type", rc::msg::kNotice}, {"level", ok ? "info" : "error"},
                      {"text", ok ? "Launching game…" : "Could not launch the game"}});

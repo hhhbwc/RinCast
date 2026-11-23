@@ -124,6 +124,13 @@ int main() {
     Expect(rcs::StrFieldOr(cloud, "missing", "fallback") == "fallback", "A91 string-or: missing uses the fallback");
     Expect(rcs::StrFieldOr(cloud, "num", "fallback") == "fallback", "A91 string-or: a number uses the fallback");
 
+    // A92: the headset's kvPhase control message carries 64-bit nanosecond
+    // offsets. A wrong type or an out-of-range number used to throw on the
+    // worker thread; the fallback keeps the phase untouched instead.
+    Expect(rcs::Int64Field(cloud, "num", -1) == 123, "A92 int64: a real number passes through");
+    Expect(rcs::Int64Field(cloud, "text", -1) == -1, "A92 int64: a string uses the fallback");
+    Expect(rcs::Int64Field(j, "huge", -1) == -1, "A92 int64: 1e300 is out of range, not a wrap");
+
     if (failures) {
         std::printf("\n%d check(s) FAILED\n", failures);
         return 1;
