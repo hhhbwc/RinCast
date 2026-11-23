@@ -195,17 +195,30 @@ struct FormatReader {
     bool isFloat = true;
     WORD bits = 32;
     void Init(const WAVEFORMATEX* f) {
+        if (!f) { channels = 0; bits = 0; isFloat = false; return; }
         channels = f->nChannels;
         bits = f->wBitsPerSample;
-        isFloat = f->wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
+        isFloat = f->wFormatTag == WAVE_FORMAT_IEEE_FLOAT && bits == 32;
         if (f->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-            auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(f);
-            isFloat = ext->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+            // A90: the second call site copies only sizeof(WAVEFORMATEX)+cbSize
+            // bytes into a vector. Without this check a malformed or old driver
+            // format that claims EXTENSIBLE with cbSize < 22 makes reading
+            // SubFormat a heap out-of-bounds read. Unknown/unsafe -> treat as
+            // integer PCM, which ToS16 can clamp; treating unknown bits as
+            // float would decode integer bit patterns into ear-splitting noise.
+            if (f->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+                const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(f);
+                isFloat = ext->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT && bits == 32;
+            } else {
+                isFloat = false;
+            }
         }
     }
     float Sample(const uint8_t* frame, int ch) const {
         if (ch >= channels) return 0;
-        if (isFloat) return reinterpret_cast<const float*>(frame)[ch];
+        // A90: only a 32-bit float format may be read as a float. A format that
+        // declares float with any other bit width would index by the wrong size.
+        if (isFloat && bits == 32) return reinterpret_cast<const float*>(frame)[ch];
         if (bits == 16) return reinterpret_cast<const int16_t*>(frame)[ch] / 32768.f;
         if (bits == 32) return float(reinterpret_cast<const int32_t*>(frame)[ch] / 2147483648.0);
         if (bits == 24) {
@@ -247,7 +260,11 @@ void MatchMicFormats(const std::wstring& feedName, const std::wstring& micName) 
     auto mixOf = [](IMMDevice* d, UINT& rate, UINT& ch) {
         ComPtr<IAudioClient> c;
         WAVEFORMATEX* f = nullptr;
-        if (FAILED(d->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &c)) || FAILED(c->GetMixFormat(&f))) return false;
+        // A90: the other two GetMixFormat call sites in this file both pair the
+        // HRESULT check with a null check; keep that rule here too (a driver shim
+        // returning S_OK + nullptr would otherwise crash on the next line).
+        if (FAILED(d->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &c)) || FAILED(c->GetMixFormat(&f)) || !f)
+            return false;
         rate = f->nSamplesPerSec;
         ch = f->nChannels;
         CoTaskMemFree(f);
