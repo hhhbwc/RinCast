@@ -166,7 +166,7 @@ $null = Invoke-Guarded 'Reading the Public-network choice' {
 }
 $programProfiles = if ($AllowPublic -or $hadPublic) { 'Private', 'Domain', 'Public' } else { 'Private', 'Domain' }
 $profiles = 'Private', 'Domain'
-$null = Invoke-Guarded 'Replacing the old firewall rules' {
+$null = Invoke-Guarded 'Removing the old firewall rules' {
     # A95: read the names first, then delete one at a time. Get-NetFirewallRule piped into
     # Remove-NetFirewallRule deletes out of the enumerator it is still walking, and once the
     # store shifts under it the next MoveNext is the "file not specified" failure. Two identical
@@ -182,12 +182,31 @@ $null = Invoke-Guarded 'Replacing the old firewall rules' {
         try { Remove-NetFirewallRule -Name $name -ErrorAction Stop } catch { $left += "$name ($($_.Exception.Message))" }
     }
     if ($left) { Warn "Old firewall rules could not be removed and stay in place: $($left -join '; ')" }
-    New-NetFirewallRule -DisplayName 'RinCast Streamer' -Group 'RinCast' -Direction Inbound -Action Allow `
-        -Program $exe -Protocol UDP -Profile $programProfiles -ErrorAction Stop | Out-Null
-    New-NetFirewallRule -DisplayName 'RinCast discovery (UDP 38710)' -Group 'RinCast' -Direction Inbound -Action Allow `
-        -Protocol UDP -LocalPort 38710 -Profile $profiles -ErrorAction Stop | Out-Null
-    New-NetFirewallRule -DisplayName 'RinCast streaming (UDP 38711)' -Group 'RinCast' -Direction Inbound -Action Allow `
-        -Protocol UDP -LocalPort 38711 -Profile $profiles -ErrorAction Stop | Out-Null
+}
+$specs = @(
+    @{ DisplayName = 'RinCast Streamer'; Group = 'RinCast'; Direction = 'Inbound'; Action = 'Allow'; Program = $exe; Protocol = 'UDP'; Profile = $programProfiles },
+    @{ DisplayName = 'RinCast discovery (UDP 38710)'; Group = 'RinCast'; Direction = 'Inbound'; Action = 'Allow'; LocalPort = 38710; Protocol = 'UDP'; Profile = $profiles },
+    @{ DisplayName = 'RinCast streaming (UDP 38711)'; Group = 'RinCast'; Direction = 'Inbound'; Action = 'Allow'; LocalPort = 38711; Protocol = 'UDP'; Profile = $profiles }
+)
+foreach ($spec in $specs) {
+    $what = "Adding the firewall rule '$($spec.DisplayName)'"
+    # Each rule gets its own guard: on 11-24 01:26 the second add died and took the third with it.
+    $null = Invoke-Guarded $what {
+        # Adding a rule is two writes (the rule, then its filter), and the 01:26 failure was the
+        # second write of one rule colliding with the first write of the next. A retry is the
+        # answer to that race; the read-back below, not this loop, is what decides whether it worked.
+        # Already-present means the delete above did not take: skipping is what leaves the old
+        # rule's settings, whereas a duplicate of the same name is the residue we are cleaning up.
+        for ($try = 1; $try -le 2; $try++) {
+            if (@(Get-NetFirewallRule -Group 'RinCast' -DisplayName $spec.DisplayName -ErrorAction SilentlyContinue).Count) { break }
+            if ($try -gt 1) { Start-Sleep -Milliseconds 500 }
+            try { New-NetFirewallRule @spec -ErrorAction Stop | Out-Null; break }
+            catch {
+                if ($try -eq 2) { throw }
+                Warn "$what failed, trying once more [$(Get-ErrorAt $_), $(Get-ErrorDetail $_.Exception)]: $($_.Exception.Message)"
+            }
+        }
+    }
 }
 # A95: say it out loud rather than leave a hole. A rule that reported success but never landed,
 # or one an old Block rule still covers, looks exactly like a working install from here.
