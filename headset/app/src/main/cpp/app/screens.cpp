@@ -608,6 +608,20 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
         ui.R().Text(rates[0] + " fps", l.x, l.y + 6, 21, kText);
         l.y += 46;
     }
+    // A97: the app already reports this device's decode wall to the PC (media/video_decoder.cpp:100),
+    // the PC turns it into a WARN at stream start, and none of it ever came back to the page that
+    // picks the pixels - so "it stutters, why" had no answer on screen. Same figure, same condition as
+    // the PC's (client_session.cpp:1458 checks the rate against the hint and nothing else), shown
+    // where the choice is made. It is a known value for one model, not a live measurement, so the
+    // wording says "known" and the line is advice, never a lock: the slider still goes where it wants.
+    // `ask` is the rate the stream really gets: with one entry in the list the PC clamps to it.
+    static const int wallFps = VideoDecoder::Capabilities().maxFpsAtMaxRes;
+    const float ask = rates.empty() ? s.refreshRate : available[size_t(ri)];
+    if (wallFps > 0 && ask > float(wallFps)) {
+        const std::string wall = Trf("vr.decodeWall", {{"fps", std::to_string(wallFps)}});
+        ui.R().WrapText(wall, {l.x, l.y + 2, l.w, 64}, 20, kWarn, Face::Medium, 26);
+        l.y += WrapHeight(ui, wall, l.w, 20, 26) + 12;
+    }
     l.y += 14;
     Label(ui, l, Tr("vr.codecLabel"));
     // Not static: a static initializer would freeze the translated label in whatever

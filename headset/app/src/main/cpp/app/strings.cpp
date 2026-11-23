@@ -144,6 +144,7 @@ const Entry kEn[] = {
     {"vr.imageSection", "Image"},
     {"vr.resolution", "Resolution per eye"},
     {"vr.resolutionHint", "Changing it restarts the stream for a moment."},
+    {"vr.decodeWall", "This device is known to stop near {fps} fps at large sizes. Fewer pixels if the picture lags."},
     {"vr.sameAsSteamVr", "Same as SteamVR"},
     {"vr.matchSteamVr", "Match SteamVR's resolution"},
     {"vr.matchSteamVrHint", "Set in SteamVR, under Video"},
@@ -473,6 +474,7 @@ const Entry kZhCN[] = {
     {"vr.imageSection", "画质"},
     {"vr.resolution", "单眼分辨率"},
     {"vr.resolutionHint", "改动会短暂重启串流。"},
+    {"vr.decodeWall", "本机在大画面下最高只能到 {fps} 帧。要更高帧率，请调低单眼分辨率。"},
     {"vr.sameAsSteamVr", "与 SteamVR 相同"},
     {"vr.matchSteamVr", "匹配 SteamVR 的分辨率"},
     {"vr.matchSteamVrHint", "在 SteamVR 设置的\"视频\"中调整"},
@@ -797,6 +799,7 @@ const Entry kZhTW[] = {
 
     // A85：與簡體同義。字庫圖集（assets/ui/charset.txt）內無「系統」「來」等字，措辭迴避。
     {"vr.resolutionHint", "改動會短暫重啟串流。"},
+    {"vr.decodeWall", "本機在大畫面下最高只能到 {fps} 幀。要更高幀率，請調低單眼解析度。"},
     {"vr.imageSection", "畫質"},
     {"vr.resolution", "單眼解析度"},
     {"vr.sameAsSteamVr", "與 SteamVR 相同"},
@@ -1102,6 +1105,7 @@ const Entry kDe[] = {
     {"games.running", "Läuft"},
 
     {"vr.resolutionHint", "Eine Änderung startet den Stream kurz neu."},
+    {"vr.decodeWall", "Bei großen Bildern ist das Modell bekanntlich bei etwa {fps} fps am Ende. Bei Rucklern weniger Pixel wählen."},
     {"vr.imageSection", "Bild"},
     {"vr.resolution", "Auflösung pro Auge"},
     {"vr.sameAsSteamVr", "Wie SteamVR"},
@@ -1405,6 +1409,7 @@ const Entry kEs[] = {
     {"games.running", "En ejecución"},
 
     {"vr.resolutionHint", "El cambio reinicia la transmisión un momento."},
+    {"vr.decodeWall", "Con imágenes grandes, este modelo se detiene sobre los {fps} fps. Si va a tirones, reduce los píxeles."},
     {"vr.imageSection", "Imagen"},
     {"vr.resolution", "Resolución por ojo"},
     {"vr.sameAsSteamVr", "Igual que SteamVR"},
@@ -1708,6 +1713,7 @@ const Entry kFr[] = {
     {"games.running", "En cours"},
 
     {"vr.resolutionHint", "Le changement redémarre brièvement le flux."},
+    {"vr.decodeWall", "Avec une image grande, ce modèle s'arrête vers {fps} fps. En cas de saccades, réduisez les pixels."},
     {"vr.imageSection", "Image"},
     {"vr.resolution", "Résolution par œil"},
     {"vr.sameAsSteamVr", "Comme SteamVR"},
@@ -2013,6 +2019,7 @@ const Entry kJa[] = {
     // A85：三段スライダーを一本のバーに。語彙は焼き済みフォント（assets/ui/charset.txt）に
     // ある字だけを使っている（無い字は「?」で出る）。
     {"vr.resolutionHint", "変更するとストリームが一時的に再起動します。"},
+    {"vr.decodeWall", "大きい画面では本機は約 {fps} fps が上限です。カクつく場合は画素数を減らしてください。"},
     {"vr.imageSection", "画質"},
     {"vr.resolution", "片目あたりの解像度"},
     {"vr.sameAsSteamVr", "SteamVR と同じ"},
