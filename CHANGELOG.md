@@ -2,6 +2,56 @@
 
 Notable changes to RinCast. Versions follow [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+### Added
+
+- The streamer's one-second VR diagnostics now separate encoder hold, texture lock,
+  conversion, motion-field readback and sender-handoff waits, and report frame-slot
+  replacements and per-second pacing overruns alongside the existing totals.
+- The headset can run a guarded no-waiting-picture timing experiment with
+  `debug.rincast.nowait=1` alongside `debug.rincast.slip=1`, and logs the queue
+  policy's inputs. Both switches remain off by default.
+- NVENC can run a default-off cadence-budget experiment with
+  `RINCAST_CADENCE_FILL=1`. In Quality VR capped-VBR streams it uses the slow
+  encoder cadence to raise the hardware average/max budget without changing the
+  nominal frame-rate denominator, sender ceiling or VBV bucket. It replaces the
+  older rung-follow branch while active and still needs a real-device A/B.
+- Frame-generation motion readback can run as a default-off non-blocking experiment with
+  `RINCAST_ASYNC_MOTION=1`. Two staging textures keep GPU copies away from the frame's
+  critical path; a field that is not ready sends explicit zero motion instead of stalling.
+  Delayed fields carry their own previous-frame timestamp, and only true discontinuities
+  reset the estimate; deliberate half-rate gaps keep their real interval. The one-second
+  diagnostics append `motionPending`. The synchronous path and wire format are unchanged;
+  a real-device A/B is still required.
+
+### Changed
+
+- Setup now installs for the current user under `%LOCALAPPDATA%\Programs\RinCast` without requesting
+  administrator rights. System-wide firewall, OpenXR and audio-driver steps are skipped in
+  per-user mode and remain available when the installer is explicitly run as administrator.
+- Expanding the Streaming page's Advanced section no longer changes the main content width
+  or wraps adjacent option labels when the scrollbar appears.
+
+### Fixed
+
+- Firewall rule lookup no longer combines mutually exclusive `Get-NetFirewallRule` parameter
+  sets, and the read-back check no longer loses the expected rule name to nested `$_` scope.
+- Static and near-static scenes no longer use symmetric block-matching noise as generated
+  motion. Frame generation now requires a nonzero whole-grid median with majority support,
+  so noisy local vectors repeat the last frame instead of shearing it; coherent whole-picture
+  pans keep generating. The headset's diagnostics append `coherent` and `global` counts.
+- Automatic picture adjustments use only recent frames and headset feedback. Waiting,
+  paused or disconnected streams no longer mistake frozen statistics for a healthy link,
+  and an evidence gap starts a fresh adjustment episode.
+- Picture-tier changes update the sender's queue brake and the encoder's quality floor
+  and buffer together without restarting VR. Encoder restarts keep the live tier, and
+  old headsets' retired picture-tier setting no longer changes it or rebuilds video.
+
+- A rendered VR frame keeps its own predicted display time even after newer headset
+  tracking arrives. Predictions made without a measured headset/PC clock offset are no
+  longer labelled exact, avoiding stale-frame decisions based on a time estimate.
+
 ## 1.2.1 - 2026-11-14
 
 ### Added

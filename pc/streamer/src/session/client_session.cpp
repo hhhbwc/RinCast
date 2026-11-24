@@ -281,12 +281,12 @@ json ClientSession::SyncedSettingsForUi() {
     out[rc::synced::kDesktopFps] = s.desktopFps;
     out[rc::synced::kStreamProfile] = s.streamProfile;
     for (const char* key : rc::synced::kAll) {
+        if (std::string(key) == rc::synced::kStreamProfile) continue;  // A86: tuner-only, not a headset pick
         if (m_ownedSettings.count(key)) continue;  // PC still owns it
         if (std::string(key) == rc::synced::kCodec) out[key] = m_settings.codec;
         else if (std::string(key) == rc::synced::kTenBit) out[key] = m_settings.tenBit;
         else if (std::string(key) == rc::synced::kAdaptiveBitrate) out[key] = m_settings.adaptiveBitrate;
         else if (std::string(key) == rc::synced::kDesktopFps) out[key] = m_settings.desktopFps;
-        else if (std::string(key) == rc::synced::kStreamProfile) out[key] = m_settings.streamProfile;
     }
     return out;
 }
@@ -410,7 +410,8 @@ void ClientSession::OnPacket(rc::PacketType type, const uint8_t* payload, size_t
             s.sequence = ++seq;
             s.receivedPcNs = rc::NowNs();
             s.headsetTargetNs = t.targetDisplayTimeNs;
-            s.targetDisplayPcNs = m_connection->HasClockOffset()
+            const bool clockValid = m_connection->HasClockOffset();
+            s.targetDisplayPcNs = clockValid
                                       ? m_connection->RemoteToLocalNs(int64_t(t.targetDisplayTimeNs))
                                       : s.receivedPcNs + 40'000'000;
             s.flags = t.flags;
@@ -432,7 +433,7 @@ void ClientSession::OnPacket(rc::PacketType type, const uint8_t* payload, size_t
                 std::memcpy(d.pose.linearVelocity, c.linearVelocity, sizeof(float) * 3);
                 std::memcpy(d.pose.angularVelocity, c.angularVelocity, sizeof(float) * 3);
             }
-            App::Get().Bridge().PublishTracking(s);
+            App::Get().Bridge().PublishTracking(s, clockValid);
             MeasurePoseWait(s.receivedPcNs);
             // Where the eyes look comes after the poses, from headsets doing foveated encoding.
             if (size >= sizeof(t) + sizeof(rc::GazePayload)) {
@@ -640,14 +641,8 @@ void ClientSession::HandleMessage(const json& m) {
                     "runs at (device list [%s]) - no rebuild",
                     before.refreshRate, after.refreshRate, hzAfter, A82RateList(m_caps.refreshRates).c_str());
         AdoptHeadsetOwnedSettings();
-        // A84 §2 (was PLAN-AUTO-TUNE's MarkManual here): a streamProfile the
-        // headset sends with a value the PC never pushed is the user moving their
-        // slider, which now STATES A FLOOR and hands the dimension back - it does
-        // not lock auto out of it. The floor reaches the tuner as
-        // AutoTuneInput::profileFloorId, where the change itself clears the lock.
-        // (The synced key is still never written by auto: it moves only the
-        // session's effective profile, so there is nothing left to fight over.)
-        const bool profileChanged = before.streamProfile != after.streamProfile;
+        // A86: the headset slider and its floor are gone. Legacy clients still send
+        // streamProfile, but it is not adopted and cannot restart a stream.
         const bool videoChanged = before.codec != after.codec || before.tenBit != after.tenBit ||
                                   before.vrQuality != after.vrQuality || before.vrScale != after.vrScale ||
                                   before.matchSteamVr != after.matchSteamVr || before.gazeFoveation != after.gazeFoveation ||
@@ -661,13 +656,12 @@ void ClientSession::HandleMessage(const json& m) {
                                     before.desktopFps != after.desktopFps ||
                                     before.desktopBitrateMbps != after.desktopBitrateMbps ||
                                     before.adaptiveBitrate != after.adaptiveBitrate;
-        // A profile change and its video changes share one restart per stream.
-        ScheduleVideoRestart(videoChanged || profileChanged, desktopChanged || profileChanged);
+        ScheduleVideoRestart(videoChanged, desktopChanged);
         if (before.streamAudio != after.streamAudio || before.micPassthrough != after.micPassthrough)
             Enqueue(json{{"type", "_audio"}});
         const bool syncedChanged = before.codec != after.codec || before.tenBit != after.tenBit ||
                                    before.adaptiveBitrate != after.adaptiveBitrate ||
-                                   before.desktopFps != after.desktopFps || profileChanged;
+                                   before.desktopFps != after.desktopFps;
         if (syncedChanged) App::Get().PushUi(App::Get().StateJson());
         return;
     }
@@ -857,16 +851,13 @@ void ClientSession::ApplyClientInfo(const json& m) {
         m_settings.desktopBitrateMbps = desktopMbps ? std::clamp(desktopMbps, 5, 200) : 0;
         m_settings.desktopFps = IntField(s, "desktopFps", m_settings.desktopFps);
         m_settings.adaptiveBitrate = BoolField(s, "adaptiveBitrate", m_settings.adaptiveBitrate);
-        m_settings.streamProfile = std::clamp(IntField(s, "streamProfile", m_settings.streamProfile), 0, 2);
         m_settings.debugEncodeScalePct =
             std::clamp(IntField(s, "debugEncodeScalePct", m_settings.debugEncodeScalePct), 0, 100);  // ROUND20 L17
-        // The preference is a PC-side setting for now (rcs::Settings::streamProfile).
-        // The headset will send its own choice once its three-way UI exists.
         m_settings.streamAudio = BoolField(s, "streamAudio", m_settings.streamAudio);
         m_settings.micPassthrough = BoolField(s, "micPassthrough", m_settings.micPassthrough);
         // 头显改了某个可同步项（值与 PC 推过去的不一样）→ 这一项的所有权归它，PC 不再推。
         for (const char* key : rc::synced::kAll) {
-            if (!s.contains(key)) continue;
+            if (std::string(key) == rc::synced::kStreamProfile || !s.contains(key)) continue;
             auto it = m_ownedSettings.find(key);
             if (it == m_ownedSettings.end()) continue;
             if (it->second != s[key]) {
@@ -983,7 +974,8 @@ void ClientSession::SendServerInfo() {
 json ClientSession::OwnedSettingsJson() {
     std::lock_guard lock(m_mutex);
     json out = json::object();
-    for (const auto& [k, v] : m_ownedSettings) out[k] = v;
+    for (const auto& [k, v] : m_ownedSettings)
+        if (k != rc::synced::kStreamProfile) out[k] = v;
     return out;
 }
 
@@ -994,7 +986,7 @@ void ClientSession::OwnSyncedSettings(const json& changed, const std::function<v
     const json values = s.ToJson(true);
     ++m_pcRevision;
     for (const char* key : rc::synced::kAll) {
-        if (!changed.contains(key)) continue;
+        if (std::string(key) == rc::synced::kStreamProfile || !changed.contains(key)) continue;
         m_ownedSettings[key] = values[key];
         m_pcKeyRevisions[key] = m_pcRevision;
     }
@@ -1002,10 +994,6 @@ void ClientSession::OwnSyncedSettings(const json& changed, const std::function<v
     if (changed.contains(rc::synced::kTenBit)) m_settings.tenBit = s.tenBit;
     if (changed.contains(rc::synced::kAdaptiveBitrate)) m_settings.adaptiveBitrate = s.adaptiveBitrate;
     if (changed.contains(rc::synced::kDesktopFps)) m_settings.desktopFps = s.desktopFps;
-    // A86: kStreamProfile is deliberately NOT copied into m_settings. The key still
-    // exists on the wire and a headset that has the old slider will still send it,
-    // but the tier belongs to the tuner now - reading it here is what used to hand
-    // the slider a way back in (AdoptHeadsetOwnedSettings then persisted it).
 }
 
 void ClientSession::SendMonitors() {
@@ -1161,7 +1149,7 @@ void ClientSession::RunAutoTune() {
     const bool nominalClamped = nominal != st.refreshRate;
 
     rc::BottleneckSignal sig;
-    sig.decodeMs = NumberField(m_clientStats, "decodeMs", -1.0);
+    sig.decodeMs = vs.clientDecodeMs;
     const double hintMs = m_caps.maxFpsAtMaxRes > 0 ? 1000.0 / m_caps.maxFpsAtMaxRes : 0.0;
     sig.decodeBudgetMs = hintMs > 0 ? hintMs * 0.8 : 20.0;  // the ladder's own budget formula
     sig.droppedFps = m_vr ? double(vs.droppedFps) : -1.0;
@@ -1172,24 +1160,18 @@ void ClientSession::RunAutoTune() {
     sig.ceilingKbps = vs.bitrateKbps;
     sig.queueMs = vs.queueMs;
     sig.loss = vs.lossAvg;
+    sig.lastFrameNs = vs.lastFrameNs;
+    sig.lastFeedbackNs = vs.lastFeedbackNs;
+    sig.streamActive = m_vr && m_vr->Running() && !m_vr->Paused();
 
-    // A84 §2: the tuner is fed the RUNG the live stream is built at (the only thing
-    // it may move), the slider as the FLOOR, and the brake line that rung pays.
-    // A84b §3: BuildAutoTuneInput no longer takes the key-ownership flag - the
-    // floor above carries the intent it guarded, see stream_config.h.
     Settings eff = pc;
     eff.streamProfile = EffectiveProfileLocked();
     rc::AutoTuneInput in = BuildAutoTuneInput(eff, st, m_slowPath);
     in.dipAtMs = ProfileDipAtMs(eff.streamProfile);
-
-    // A88: a paused/absent stream reports qp=-1, wire=0, queue=-1, gameFps=0. That
-    // is no evidence, not a clean link. Skipping here - rather than adding an
-    // Unknown member to Bottleneck - keeps BottleneckName(), the log anchors and
-    // every switch untouched, and stops Update() from resetting the climb streak
-    // while the headset is showing nothing.
-    if (!rc::HasUsableSignals(sig)) return;
     const int64_t now = rc::NowNs();
-    const auto r = m_autoTune.Update(sig, in, now);
+
+    const auto r = m_autoTune.UpdateWithEvidence(sig, in, now);
+    if (!sig.streamActive || !rc::HasFreshSignals(sig, now)) return;
 
     // P1: the 30 s signals line (DECISION-TABLE §4) - autoTune only, so an
     // opted-out install sees nothing new beyond the one capability line.
@@ -1241,11 +1223,10 @@ void ClientSession::RunAutoTune() {
         // A84: the picture rung is NOT a settings write any more. Moving the synced
         // key would move the user's floor with it - which is how the slider became a
         // ceiling nobody could climb back over. It is session state.
-        // A87 (user, 2026-11-23): it used to fall through to the rebuild below. That
-        // rebuilt StopVr()+StartVr(), and the 10:17 log shows the cost: 46 s with no
-        // VR frame because SteamVR had to reopen the shared textures the game waits
-        // on. A tier move only changes the QP floor and the queue-brake line, both
-        // of which the live stream can take in place (see VrStream::ApplyProfileRung).
+        // A87/A99: it used to fall through to the rebuild below, costing 46 s with
+        // no VR frame while SteamVR reopened shared textures. A tier move now updates
+        // the sender brake and encoder QP/VBV in place; the persistent live rung also
+        // survives internal encoder rebuilds (see VrStream::ApplyProfileRung).
         case rc::AutoAction::ProfileDown:
         case rc::AutoAction::ProfileUp: {
             const int from = eff.streamProfile;
@@ -1262,22 +1243,17 @@ void ClientSession::RunAutoTune() {
                     double(r.evidenceNs) / 1e9, in.dipAtMs, sig.queueMs, sig.decodeMs,
                     rc::BottleneckName(r.cls));
             // m_mutex is held by RunAutoTune, so m_vr is safe to touch here. The
-            // QP floor is handed to the encoder thread; only the brake is set now.
+            // persistent live rung feeds the sender brake, encoder QP/VBV and any
+            // later internal encoder rebuild.
             const bool hasVr = bool(m_vr);
             if (hasVr) m_vr->ApplyProfileRung(m_autoProfileEff);
-            // A93: the sentence above used to stand on its own, which made it a claim
-            // nothing could falsify. It is now a claim with three values attached:
-            // vr= says whether a live VR stream received the handoff AT ALL (with the
-            // old line, vr=0 printed "applied" having applied the tier to nothing but
-            // the session's own copy), and qpFloor/brake name the two physical knobs
-            // the rung is made of, straight from the table the stream will use. The
-            // encoder's own thread confirms the first one took it (NVENC's
-            // "QP floor retuned" / the refused line) and the sender's confirms the
-            // second. Phrase and prefix stay byte-identical: log readers anchor on them.
+            // The handoff is synchronous, the encoder ACK is not: NVENC (or the
+            // refusal warning) reports on its own thread. Keep the anchored prefix
+            // and append the requested profile's full rate-control shape.
             const rc::StreamProfileParams np = rc::ProfileParams(rc::ProfileFromId(m_autoProfileEff));
             RC_LOGI("AUTO: tier applied in place - no stream rebuild, no black frame "
-                    "(vr=%d, qpFloor %u, brake %.0f ms)",
-                    int(hasVr), np.minQp, np.targetQueueMs);
+                    "(vr=%d, qpFloor %u, brake %.0f ms) vbvPct %u, encoderAck async, visual unverified",
+                    int(hasVr), np.minQp, np.targetQueueMs, np.vbvFramesPercent);
             needRebuild = false;
             break;
         }

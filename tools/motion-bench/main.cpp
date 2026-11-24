@@ -16,6 +16,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
+#include "rc/motion_field.h"
 #include "../../pc/streamer/src/stream/motion_estimator.h"
 
 #pragma comment(lib, "d3d11.lib")
@@ -188,7 +189,7 @@ int main(int argc, char** argv) {
         {"head turning 1 degree a frame", 0, 0, 0, false, 1.f},
         {"head turning 3 degrees a frame", 0, 0, 0, false, 3.f},
     };
-    std::printf("%-32s %10s %10s %8s  %s\n", "scene", "repeat dB", "warp dB", "GPU ms", "blocks moved");
+    std::printf("%-32s %10s %10s %10s %8s %8s  %s\n", "scene", "repeat dB", "warp dB", "gated dB", "GPU ms", "gate", "blocks moved");
     for (const Scene& s : scenes) {
         std::mt19937 rng(7);
         // A direction from this frame's head, as the last frame's head saw it: one step less turned.
@@ -205,6 +206,13 @@ int main(int argc, char** argv) {
         ctx->End(disjoint.Get());
         std::vector<float> field;
         me.Read(ctx.Get(), field);
+        std::vector<int8_t> grid;
+        rc::ApplyMotionHysteresis(field, grid);
+        const auto gate = rc::JudgeMotionField(grid, int(me.GridWidth()), int(me.GridHeight()));
+        std::vector<float> gated(field.size(), 0.0f);
+        if (gate.worth) {
+            for (size_t i = 0; i < field.size(); i++) gated[i] = float(grid[i]) * rc::kMotionUnitPixels;
+        }
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
         while (ctx->GetData(disjoint.Get(), &dj, sizeof(dj), 0) != S_OK) {}
         UINT64 a = 0, b = 0;
@@ -214,8 +222,9 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i + 1 < field.size(); i += 2)
             if (field[i] != 0 || field[i + 1] != 0) moved++;
         const Image warped = Warp(cur, field, int(me.GridWidth()), int(me.GridHeight()));
-        std::printf("%-32s %10.2f %10.2f %8.2f  %d of %zu\n", s.name, Psnr(cur, next), Psnr(warped, next),
-                    double(b - a) * 1000.0 / double(dj.Frequency), moved, field.size() / 2);
+        const Image gatedWarp = Warp(cur, gated, int(me.GridWidth()), int(me.GridHeight()));
+        std::printf("%-32s %10.2f %10.2f %10.2f %8.2f %8s  %d of %zu\n", s.name, Psnr(cur, next), Psnr(warped, next),
+                    Psnr(gatedWarp, next), double(b - a) * 1000.0 / double(dj.Frequency), gate.worth ? "accept" : "reject", moved, field.size() / 2);
     }
     return 0;
 }

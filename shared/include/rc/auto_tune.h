@@ -60,6 +60,9 @@ struct BottleneckSignal {
     uint32_t ceilingKbps = 0;    // the user's ceiling (pre-guard), 0 unknown
     double queueMs = -1;         // queue the headset reports, <0 unknown
     double loss = 0;             // measured loss fraction 0..1
+    int64_t lastFrameNs = 0;     // last encoded frame sent, 0 = none
+    int64_t lastFeedbackNs = 0;  // last headset report carrying a queue, 0 = none
+    bool streamActive = true;    // false while paused, waiting or disconnected
 };
 
 // A8 validity domains (TASK-AUTOTUNE-ROBUST-2026-11-20 §1c). loss is a
@@ -77,15 +80,43 @@ constexpr double kClassifyQpMaxAv1 = 255.0;
 // Pure, ordered (DECISION-TABLE §2). The qp [16, 20) band with low fill is a
 // deliberate dead zone: no real-device evidence for it yet, so no action.
 // A88: the classifier has no Unknown member on purpose - Ok is its silent "nothing
-// fired" state (see the note below). But "nothing fired" is not the same as "the
-// link is clean": when the VR stream is paused or has no frames, every field sits
-// at its unknown sentinel (the 2026-11-23 10:17 log: fps=0 game=0 qp=-1 wire=0
-// queue=-1) and the periodic line still read `signals ok`. Feeding that to Update
-// resets the climb streak and makes a black screen look like headroom. The caller
-// skips the whole tick when this says false. One field reporting is enough - the
-// test is deliberately an AND, not a vote.
+// fired" state. A stats snapshot also has no age: after a pause its last QP, wire rate
+// and queue can still look healthy. These bounds reject that stale evidence before it
+// reaches Update, while keeping the classifier and its hysteresis laws unchanged.
+constexpr int64_t kAutoSignalFrameMaxAgeNs = 2'000'000'000LL;
+constexpr int64_t kAutoSignalFeedbackMaxAgeNs = 5'000'000'000LL;
+
+inline bool SignalFresh(int64_t sampleNs, int64_t nowNs, int64_t maxAgeNs) {
+    return sampleNs > 0 && nowNs >= sampleNs && nowNs - sampleNs <= maxAgeNs;
+}
+
+inline BottleneckSignal WithFreshSignals(BottleneckSignal s, int64_t nowNs) {
+    if (!s.streamActive || !SignalFresh(s.lastFrameNs, nowNs, kAutoSignalFrameMaxAgeNs)) {
+        s.qp = -1;
+        s.mbps = 0;
+        s.ceilingKbps = 0;
+        s.gameFps = 0;
+        s.droppedFps = -1;
+    }
+    if (!s.streamActive || !SignalFresh(s.lastFeedbackNs, nowNs, kAutoSignalFeedbackMaxAgeNs)) {
+        s.decodeMs = -1;
+        s.queueMs = -1;
+        s.loss = 0;
+    }
+    return s;
+}
+
 inline bool HasUsableSignals(const BottleneckSignal& s) {
     return !(s.qp < 0 && s.mbps <= 0 && s.queueMs < 0 && s.gameFps <= 0);
+}
+
+inline bool HasFreshSignals(const BottleneckSignal& s, int64_t nowNs) {
+    // Quality moves need both a live frame and a current headset queue; one domain
+    // alone cannot justify carrying an evidence episode across a gap in the other.
+    return s.streamActive &&
+           SignalFresh(s.lastFrameNs, nowNs, kAutoSignalFrameMaxAgeNs) &&
+           SignalFresh(s.lastFeedbackNs, nowNs, kAutoSignalFeedbackMaxAgeNs) &&
+           HasUsableSignals(WithFreshSignals(s, nowNs));
 }
 
 inline Bottleneck ClassifyBottleneck(const BottleneckSignal& s) {
@@ -276,14 +307,25 @@ class AutoTune {
 
     Result Update(const BottleneckSignal& s, const AutoTuneInput& in, int64_t nowNs) {
         std::lock_guard lock(m_mutex);
+        if (!m_cfg.enabled) return {};
+        return UpdateLocked(s, in, nowNs);
+    }
+
+    // Production entry: a telemetry gap breaks both evidence streaks, rather than
+    // letting the last healthy or pressured snapshot continue across the gap.
+    Result UpdateWithEvidence(const BottleneckSignal& s, const AutoTuneInput& in, int64_t nowNs) {
+        std::lock_guard lock(m_mutex);
+        if (!m_cfg.enabled) return {};
+        if (!HasFreshSignals(s, nowNs)) {
+            ResetEpisodesLocked();
+            return {};
+        }
+        return UpdateLocked(WithFreshSignals(s, nowNs), in, nowNs);
+    }
+
+   private:
+    Result UpdateLocked(const BottleneckSignal& s, const AutoTuneInput& in, int64_t nowNs) {
         Result r;
-        // A84b §1: the enable decision, enforced HERE. Disabled is INERT, not merely
-        // silent - the return is above everything that reads or writes state, so the
-        // off branch classifies nothing, accumulates no Ok streak, no pressure
-        // streak, no floor, no cooldown anchor and no wire peak. The first tick after
-        // a re-enable therefore behaves exactly like a session that never ran auto,
-        // which is the half the old call-site gate could not be made to prove.
-        if (!m_cfg.enabled) return r;
         r.cls = ClassifyBottleneck(s);
         // A86b: the floor-write branch is gone with the slider. There is no user
         // write on the Profile dimension any more - auto owns it for the session;
@@ -384,7 +426,6 @@ class AutoTune {
         return r;
     }
 
-   private:
     // A84 §2: the only way back up. Stricter than the brake on purpose (climbing
     // spends the latency the user asked for), and it never stops at the floor:
     // passing it on the way to 2 IS the point of this card. The caller holds the

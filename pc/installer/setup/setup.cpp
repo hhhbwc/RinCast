@@ -58,20 +58,10 @@ std::wstring SelfPath() {
     return p;
 }
 
-bool IsElevated() {
-    HANDLE token = nullptr;
-    TOKEN_ELEVATION e{};
-    DWORD size = 0;
-    const bool ok = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
-                    GetTokenInformation(token, TokenElevation, &e, sizeof(e), &size);
-    if (token) CloseHandle(token);
-    return ok && e.TokenIsElevated;
-}
-
 std::wstring RegString(const wchar_t* name) {
     wchar_t buf[1024];
     DWORD size = sizeof(buf);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, kUninstallKey, name, RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS) return {};
+    if (RegGetValueW(HKEY_CURRENT_USER, kUninstallKey, name, RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS) return {};
     return buf;
 }
 
@@ -86,7 +76,7 @@ bool ProcessRunning(const wchar_t* exe) {
     return found;
 }
 
-// Through Explorer: runs as the person at the desktop, not elevated like this program.
+// Open links and the streamer through the shell.
 void OpenAsUser(const std::wstring& target) {
     ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"\"" + target + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
 }
@@ -708,7 +698,7 @@ int RunWindow(HINSTANCE inst) {
 bool Render(const std::wstring& page, const fs::path& out) {
     g.dpi = 144;
     MakeFonts();
-    g.options.dir = L"C:\\Program Files\\RinCast";
+    g.options.dir = L"C:\\Users\\Example\\AppData\\Local\\Programs\\RinCast";
     g.mode = page == L"remove" || page == L"removed" ? Mode::Uninstall : Mode::Install;
     g.updating = page == L"update";
     g.installedVersion = L"0.9.0";
@@ -717,7 +707,7 @@ bool Render(const std::wstring& page, const fs::path& out) {
                                                 : Page::Choose;
     g.step = L"Adding firewall rules";
     g.steps = 3;
-    g.error = L"C:\\Program Files\\RinCast already contains other files. Choose an empty folder.";
+    g.error = L"C:\\Users\\Example\\AppData\\Local\\Programs\\RinCast already contains other files. Choose an empty folder.";
     g.log = L"log";
     const int w = g.S(600), h = g.S(460);
     HDC screen = GetDC(nullptr);
@@ -740,23 +730,6 @@ bool Render(const std::wstring& page, const fs::path& out) {
     DeleteDC(dc);
     ReleaseDC(nullptr, screen);
     return bool(f);
-}
-
-// Runs this program again, elevated, with the same arguments.
-int Elevate(const std::wstring& args) {
-    SHELLEXECUTEINFOW sei{sizeof(sei)};
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.lpVerb = L"runas";
-    const std::wstring self = SelfPath();
-    sei.lpFile = self.c_str();
-    sei.lpParameters = args.c_str();
-    sei.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&sei)) return 1;  // declined
-    WaitForSingleObject(sei.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(sei.hProcess, &code);
-    CloseHandle(sei.hProcess);
-    return int(code);
 }
 
 }  // namespace
@@ -785,18 +758,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                     L"RinCast Setup", MB_ICONERROR);
         return 1;
     }
-    if (!IsElevated()) {
-        std::wstring joined;
-        for (const auto& a : args) joined += L"\"" + a + L"\" ";
-        return Elevate(joined);
-    }
-
     g.installedVersion = RegString(L"DisplayVersion");
     const std::wstring installedAt = RegString(L"InstallLocation");
     g.updating = g.mode == Mode::Install && !installedAt.empty();
-    wchar_t pf[MAX_PATH];
-    SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, 0, pf);
-    g.options.dir = !installedAt.empty() ? installedAt : (fs::path(pf) / L"RinCast").wstring();
+    wchar_t local[MAX_PATH];
+    SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, local);
+    g.options.dir = !installedAt.empty() ? installedAt : (fs::path(local) / L"Programs" / L"RinCast").wstring();
     if (!value(L"--dir").empty()) g.options.dir = value(L"--dir");
     g.options.allowPublic = has(L"--allow-public");
     g.options.keepSettings = has(L"--keep-settings");

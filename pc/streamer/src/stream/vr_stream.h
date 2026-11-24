@@ -13,6 +13,7 @@
 
 #include "../encode/color_convert.h"
 #include "../encode/encoder.h"
+#include "rc/auto_tune.h"
 #include "rc/platform.h"
 #include "rc/protocol.h"
 #include "rc/stale_flush.h"  // A72: the flush's chain state lives in the members below
@@ -66,17 +67,13 @@ class VrStream {
     bool Start();
     void Stop();
     void RequestKeyframe() { m_sender.RequestKeyframe(); }
-    // A87: a picture-tier move is the QP floor plus the queue-brake line - neither
-    // needs a new stream. The brake is set here (on the session's message thread,
-    // where the old rebuild path ran) and the QP floor travels to the encoder's own
-    // thread through an atomic. Nothing here touches sockets, textures or SteamVR's
-    // shared surface, so the picture does not go black while it applies.
+    // A87/A99: a picture-tier move updates the queue brake, encoder QP floor and
+    // profile VBV without rebuilding the stream. The live profile is persistent so an
+    // internal encoder rebuild cannot fall back to the profile the session started at.
     void ApplyProfileRung(int rung) {
-        const rc::StreamProfile profile = rc::ProfileFromId(rung);
-        // VideoSender::m_guard has no lock and belongs to the sender thread, so the
-        // brake line is queued there too - never written from this (session) thread.
+        rung = rc::ClampProfileId(rung);
+        m_liveProfile.store(rung, std::memory_order_relaxed);
         m_pendingProfile.store(rung, std::memory_order_relaxed);
-        m_pendingMinQp.store(rc::ProfileParams(profile).minQp, std::memory_order_relaxed);
     }
     // The headset left the VR view: nothing is encoded or sent, but the game's frames still
     // count for Running(). Resuming starts with a keyframe.
@@ -107,6 +104,17 @@ class VrStream {
     bool Running() const { return m_streaming; }
 
    private:
+    struct DiagTiming {
+        uint32_t samples = 0;
+        int64_t sumNs = 0;
+        int64_t maxNs = 0;
+        void Add(int64_t ns) {
+            samples++;
+            sumNs += ns;
+            if (ns > maxNs) maxNs = ns;
+        }
+    };
+
     // A converted frame waiting for the encoder. Conversion and encoding run on threads of
     // their own: one frame converts while the one before it encodes. Run in sequence, a
     // frame took both times, and every frame the game finished meanwhile was replaced.
@@ -128,6 +136,9 @@ class VrStream {
         // acquire. -1 = n/a (submitPcNs was 0 / no keyed mutex); signed, never abs()'d.
         int64_t submitToJobNs = -1;
         int64_t lockWaitNs = -1;
+        int64_t holdNs = -1;
+        int64_t convertBlockNs = -1;
+        int64_t motionReadNs = -1;
         // A26 (stale-frame flush): this frame's predicted display moment in the PC
         // clock, recovered in Run() from the tracking sample the frame was rendered
         // with (0 = unknown: never expires - see rc/stale_flush.h).
@@ -140,6 +151,8 @@ class VrStream {
         // (rc::kFlushGraceNs), and this says in the log which prediction the next
         // "0-8 ms late" burst came from.
         bool predictedDisplayExact = false;
+        bool predictedDisplayClockValid = false;
+        bool predictedDisplayTrackHit = false;
         float renderOrientation[4] = {}, renderPosition[3] = {};
         float fovTan[2][4] = {};
         std::vector<uint8_t> motion;  // the motion field, already in its wire form
@@ -156,15 +169,21 @@ class VrStream {
         uint32_t frameIndex = 0;  // ROUND19 T1: the producer's frame counter, for the diag seq field
         int64_t predictedDisplayPcNs = 0;  // A26: carried from the EncodeJob for the flush gate
         bool predictedDisplayExact = false;  // A75 §2.2: carried too - names the source in the flush log line
+        bool predictedDisplayClockValid = false;
+        bool predictedDisplayTrackHit = false;
         int64_t submitToJobNs = -1;  // A83 phase M: carried for the flush line's per-frame upstream age
         int64_t lockWaitNs = -1;     // A83 phase M: carried for the flush line's per-frame lock wait
+        int64_t holdNs = -1;
+        int64_t convertBlockNs = -1;
+        int64_t motionReadNs = -1;
+        int64_t sendWaitNs = -1;
     };
 
     void Run();
     void RunEncoder();
     void RunSender();
     // Waits until the encoder is about to want the next frame (see Run).
-    void WaitForEncoder(int64_t convertAvgNs);
+    int64_t WaitForEncoder(int64_t convertAvgNs);
     // Where frames went, every 10 s while streaming (see Run).
     void LogFrameFlow(int64_t now);
     // Where each eye's full-density square starts for this frame, from the gaze.
@@ -239,6 +258,14 @@ class VrStream {
     uint32_t m_diagGapMin = 0, m_diagGapMax = 0;  // arrival gaps (ms) in this window
     uint32_t m_diagLockSamples = 0;
     int64_t m_diagLockSumNs = 0, m_diagLockMaxNs = 0;  // keyed-mutex acquire wait
+    DiagTiming m_diagHold, m_diagLock1s, m_diagConvertBlock, m_diagMotionRead;
+    uint32_t m_diagJobRepl = 0;
+    uint32_t m_diagMotionPending = 0;
+    std::atomic<uint32_t> m_diagSendWaitIdx{0};
+    std::atomic<uint32_t> m_diagSendWaitCount{0};
+    std::array<std::atomic<uint32_t>, kDiagRing> m_diagSendWaitUs{};
+    uint32_t m_diagOverrunsPrev = 0;
+    bool m_diagOverrunsPrimed = false;
     // A83 phase M (reading only): the 1 s window behind the fields appended to `rc diag
     // 1s`. submitGap = deltas of consecutive driver-written submitPcNs (driver.cpp:846),
     // the producer's cadence - measured without our pull loop, so it alone separates "the
@@ -253,9 +280,9 @@ class VrStream {
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_streaming{false};
     std::atomic<bool> m_paused{false};
-    // A87: 0 = no pending change; otherwise the QP floor RunEncoder must apply on
-    // the encoder session. Written on the session thread, consumed on the encode thread.
-    std::atomic<uint32_t> m_pendingMinQp{0};
+    // A87/A99: the current session rung is the single source for sender, NVENC and
+    // every encoder rebuild. Written on the session thread, read by both stream threads.
+    std::atomic<int> m_liveProfile{1};
     // -1 = no pending change; otherwise the rung for RunSender to set on its own
     // VideoSender (m_guard is not thread-safe). Same writer, different consumer.
     std::atomic<int> m_pendingProfile{-1};

@@ -564,6 +564,20 @@ def run_selftest():
         return pc_ev, hmd_ev
 
     results = []
+    a98_msg = ("rc diag 1s: game 60/s enc 60/s drop 0/s, halfRate OFF, target 100000 kbps, "
+               "wire 80.0 Mbps, queue 2 ms, qp 20.0, render 2000x2000 enc 1800x1800, "
+               "seq 1-60, enc p50/p95 5.0/7.0 ms, sendBacklog 3.0 ms, overruns 2, "
+               "jobAge -1.0 ms, sendAge -1.0 ms, arrival1s 16.0-17.0 ms, submitGap 16.0-17.0 ms, "
+               "submitToJob avg 4.0/max 5.0 ms, hold avg/max 0.2/0.4 ms, lock avg/max 0.1/0.2 ms, "
+               "convertBlock avg/max 1.0/1.5 ms, motionRead n/a, jobRepl 0, "
+               "sendWait avg/max 0.0/0.1 ms, overruns1s 1, motionPending 7")
+    a98_match = PC_DIAG.search(a98_msg)
+    a98_suffix = a98_msg[a98_match.end():] if a98_match else ""
+    results.append(("A98/A102 appended diag fields preserve PC_DIAG parsing",
+                    a98_match is not None and a98_match.group(1) == "60" and a98_match.group(9) == "2000"
+                    and a98_match.group(11) == "1800" and a98_match.group(13) == "1"
+                    and a98_match.group(14) == "60" and ", overruns1s 1" in a98_suffix
+                    and ", motionPending 7" in a98_suffix))
     for label, off in (("positive +2.7 s", 2.7), ("negative -2.7 s", -2.7)):
         pc_ev, hmd_ev = synth(off)
         est, detail = estimate_offset_entry(pc_ev, hmd_ev)

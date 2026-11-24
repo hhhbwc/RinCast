@@ -232,14 +232,14 @@ Both take `--quiet` for unattended use; setup also takes `--dir <folder>` and
 `--allow-public`, the uninstaller `--keep-settings`. For working on it, `--render <page>
 <file.bmp>` draws a page without running anything, and `--extract <folder>` unpacks the files.
 
-Without the setup program, run `dist\RinCast\install.ps1`. It asks for administrator rights if it needs them, then:
-1. Copies the files to `%ProgramFiles%\RinCast`, or to an empty folder given with `-InstallDir`.
-2. Adds firewall rules for UDP 38710 and 38711 and for the streamer executable, on Private and Domain networks. Public networks open only when allowed in the streamer (General, Networks) or with `-AllowPublic`; a reinstall keeps that choice.
-3. Registers the SteamVR driver.
-4. Installs the audio driver, if the package has one.
-5. Adds a Start menu entry and an entry in Apps & features.
+Without the setup program, run `dist\RinCast\install.ps1`. It installs for the current user without requesting administrator rights:
+1. Copies the files to `%LOCALAPPDATA%\Programs\RinCast`, or to an empty folder given with `-InstallDir`.
+2. Registers the SteamVR driver for the current user.
+3. Adds a per-user Start menu entry and an entry in Apps & features.
 
-`uninstall.ps1` reverses all of it. It only deletes a custom install folder if
+Firewall rules, the system-wide OpenXR runtime and the optional audio driver are skipped in per-user mode. They remain available when the installer is explicitly run as administrator.
+
+`uninstall.ps1` reverses the per-user install. It only deletes a custom install folder if
 the folder contains the `.rincast-install` marker the installer leaves there.
 
 ## Making a release

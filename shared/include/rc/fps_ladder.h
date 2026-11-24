@@ -49,6 +49,8 @@ inline uint32_t ScaleRateToRealFps(uint32_t kbps, double rcFps, double realFps) 
 constexpr int64_t kRateStartupNs = 3'000'000'000LL;
 constexpr int64_t kRateRetryNs = 1'000'000'000LL;
 constexpr int64_t kRateGrowNs = 3'000'000'000LL;
+constexpr double kCadenceMaxScale = 1.5;
+constexpr double kCadenceVbvHeadroom = 0.95;
 
 // L17 fill mode floor: the smallest ladder rung whose per-frame budget still fits the
 // VBV bucket. ratio = (vbvPct/100) * rung / nominal >= 1  <=>  rung >= nominal*100/vbvPct.
@@ -156,19 +158,18 @@ inline bool SameRatePlan(const EncoderRatePlan& a, const EncoderRatePlan& b) {
 inline EncoderRatePlan PlanEncoderRate(uint32_t kbps, double nominal, bool desktop, bool startup,
                                       const EncoderRateTracker& tracker, uint32_t currentRateNum,
                                       uint32_t averagePercent, uint32_t vbvFramesPercent,
-                                      bool fillMode = false) {
+                                      bool fillMode = false, bool cadenceFill = false) {
     // 帧率补偿已冻结（D-034）：不再让 frameRateNum 跟随实时 fps 降档。降档会把每帧预算放大
     // real/rung 倍（真机 38fps@30档 = 390KB/帧、124Mbps、190-215ms 的根因），再和标称 VBV 互相
     // 打架造成 QP「呼吸」。冻结在标称后：每帧预算 = kbps/nominal（恒定小帧），VBV = 标称线上
     // 时间上限，预算恒小于桶 → 既不爆队列也不泵。低帧率时码率自然降低，这是延迟优先的物理取舍。
-    (void)startup;
     nominal = std::isfinite(nominal) && nominal >= 1.0 ? std::min(nominal, 1000.0) : 72.0;  // ROUND18 L4 fallback
     uint32_t rateNum = uint32_t(nominal * 1000.0);
     // L17 opt-in fill branch (default off = byte-identical to the frozen path): only
     // the frame-rate rung follows the slow fps EMA, floored at FillFloorRung(nominal, vbvPct) and never
     // above nominal. `scaled` and the VBV formula below stay on the frozen D-034
     // deep bucket - that is what keeps per-frame budget <= VBV at this rung.
-    if (fillMode && !desktop) {
+    if (fillMode && !cadenceFill && !desktop && !startup) {
         const double slow = tracker.slowIntervalNs > 0 ? 1e9 / tracker.slowIntervalNs : nominal;
         int rung = QuantizeFps(slow, int(currentRateNum / 1000));
         const int lo = std::min(FillFloorRung(int(nominal + 0.5), int(vbvFramesPercent)), int(nominal));
@@ -180,8 +181,23 @@ inline EncoderRatePlan PlanEncoderRate(uint32_t kbps, double nominal, bool deskt
     // 桶按标称帧率算，与档位无关：固定的线上时间上限（1.5 帧 = 16.7ms，2 帧 = 22ms），
     // 且恒 ≥ 每帧预算（kbps/nominal），驱动不会被桶夹住而振荡。
     const uint32_t vbvPct = std::clamp(vbvFramesPercent, 25u, 400u);
-    const double vbv = double(kbps) * 1000.0 * vbvPct / 100.0 / nominal;
-    budget.vbvBufferSize = uint32_t(std::min(vbv, double(UINT32_MAX)));
+    const uint32_t vbv = uint32_t(std::min(double(kbps) * 1000.0 * vbvPct / 100.0 / nominal, double(UINT32_MAX)));
+    budget.vbvBufferSize = vbv;
+    if (cadenceFill && !desktop && !startup && tracker.slowIntervalNs > 0 && vbv > 0) {
+        const double slowFps = 1e9 / tracker.slowIntervalNs;
+        if (std::isfinite(slowFps) && slowFps > 0 && slowFps < nominal * 0.85) {
+            // Preserve 5% bucket headroom; the nominal denominator is never lowered.
+            const double scale = std::min({kCadenceMaxScale, nominal / slowFps,
+                                           double(vbvPct) / 100.0 * kCadenceVbvHeadroom});
+            if (scale > 1.0) {
+                const auto scaledRate = [scale](uint32_t value) {
+                    return uint32_t(std::min(double(value) * scale, double(UINT32_MAX)));
+                };
+                budget.maxBitrate = scaledRate(budget.maxBitrate);
+                budget.averageBitrate = std::min(budget.maxBitrate, scaledRate(budget.averageBitrate));
+            }
+        }
+    }
     return {kbps, rateNum, budget};
 }
 

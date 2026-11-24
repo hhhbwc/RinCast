@@ -1,43 +1,32 @@
 <#
   RinCast PC installer: the steps RinCast-<version>-Setup.exe runs, and what a manual install
-  from the unpacked release zip or a staged package (dist\RinCast) runs. It asks for
-  administrator rights if it needs them.
+  from the unpacked release zip or a staged package (dist\RinCast) runs. It installs for the
+  current user without requesting administrator rights.
 
       powershell -ExecutionPolicy Bypass -File install.ps1 [-InstallDir <path>] [-SkipAudio] [-NoStart] [-AllowPublic]
 
   What it does:
-    1. Copies RinCast Streamer and the SteamVR driver to %ProgramFiles%\RinCast.
-    2. Adds Windows Firewall rules so headsets can reach the streamer on Private and
-       Domain networks. Public networks stay closed until someone allows them in RinCast
-       Streamer (General, Networks), which a reinstall keeps. -AllowPublic allows them now.
-    3. Registers the RinCast XR OpenXR runtime, if this is a local build that has it.
-    4. Registers the SteamVR driver with vrpathreg (if SteamVR is installed).
-    5. Installs the RinCast Speaker / RinCast Microphone audio driver, if this
-       package has one. Release packages normally don't.
-    6. Creates a Start menu shortcut and an uninstaller entry.
+    1. Copies RinCast Streamer and the SteamVR driver to %LOCALAPPDATA%\Programs\RinCast.
+    2. Registers the SteamVR driver with vrpathreg (if SteamVR is installed).
+    3. Creates a per-user Start menu shortcut and uninstaller entry.
 
-  Only step 1 can stop the install: without its files there is nothing to register. Every step
-  after it that the streamer can still do by itself (firewall rules, the two registrations,
-  audio, shortcuts) reports what failed and carries on with the rest, so a partial install is
-  reported as one instead of as "not installed".
+  Firewall rules, the system-wide OpenXR runtime and the optional audio driver need
+  administrator rights. They are skipped in per-user mode and left for a later setup path.
+  If Run as Administrator is chosen explicitly, those system-wide steps are still available.
 #>
 [CmdletBinding()]
 param(
-    [string]$InstallDir = (Join-Path $env:ProgramFiles 'RinCast'),
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\RinCast'),
     [switch]$SkipAudio,
     [switch]$NoStart,
-    [switch]$AllowPublic,
-    [switch]$Elevated  # internal: this is the window that self-elevation opened
+    [switch]$AllowPublic
 )
 
 $ErrorActionPreference = 'Stop'
 $source = $PSScriptRoot
 $sentinelName = '.rincast-install'
-
-function Close-Window {
-    # The elevated window closes when the script ends; keep the result readable.
-    if ($Elevated) { Read-Host 'Press Enter to close this window' | Out-Null }
-}
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
 
 function Step($text) { Write-Host "-> $text" -ForegroundColor Cyan }
 # Not Write-Warning: its prefix is translated, and RinCast's setup looks for these.
@@ -86,33 +75,10 @@ function Invoke-Guarded {
 
 trap {
     Write-Host "`nRinCast was not installed: $($_.Exception.Message) [at $(Get-ErrorAt $_), $($_.Exception.GetType().Name), $(Get-ErrorDetail $_.Exception)]" -ForegroundColor Red
-    Close-Window
     exit 1
 }
 
-# An elevated PowerShell can run as a different account than the person at the
-# desktop, and then HKCU and %LOCALAPPDATA% belong to that admin account.
-function Get-DesktopUserSid {
-    $session = (Get-Process -Id $PID).SessionId
-    $shell = Get-CimInstance Win32_Process -Filter "Name='explorer.exe' AND SessionId=$session" | Select-Object -First 1
-    if ($shell) {
-        $sid = (Invoke-CimMethod -InputObject $shell -MethodName GetOwnerSid).Sid
-        if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) { return $sid }
-    }
-    return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-}
-
 $InstallDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InstallDir).TrimEnd('\')
-
-$id = [Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-InstallDir', "`"$InstallDir`"", '-Elevated')
-    foreach ($flag in 'SkipAudio', 'NoStart', 'AllowPublic') {
-        if ((Get-Variable $flag -ValueOnly).IsPresent) { $argv += "-$flag" }
-    }
-    $child = Start-Process powershell.exe -Verb RunAs -ArgumentList $argv -Wait -PassThru
-    exit $child.ExitCode
-}
 
 if (-not (Test-Path (Join-Path $source 'RinCast Streamer.exe'))) {
     throw "RinCast Streamer.exe isn't next to install.ps1. Unpack the whole release zip first."
@@ -123,7 +89,7 @@ $sentinel = Join-Path $InstallDir $sentinelName
 if ($InstallDir -eq [IO.Path]::GetPathRoot($InstallDir).TrimEnd('\')) {
     throw "Choose a folder for RinCast, not the root of a drive ($InstallDir)."
 }
-if ((Test-Path $InstallDir) -and -not (Test-Path $sentinel) -and $InstallDir -ine (Join-Path $env:ProgramFiles 'RinCast') -and
+if ((Test-Path $InstallDir) -and -not (Test-Path $sentinel) -and $InstallDir -ine (Join-Path $env:LOCALAPPDATA 'Programs\RinCast') -and
     (Get-ChildItem $InstallDir -Force | Select-Object -First 1)) {
     throw "$InstallDir already contains other files. Choose an empty folder."
 }
@@ -157,6 +123,7 @@ Get-ChildItem $InstallDir -Recurse -File | Unblock-File
 $exe = Join-Path $InstallDir 'RinCast Streamer.exe'
 
 # 2. Firewall ----------------------------------------------------------------
+if ($isAdmin) {
 Step 'Adding firewall rules'
 # Someone who allowed Public networks in RinCast Streamer keeps that choice.
 $hadPublic = $false
@@ -198,7 +165,9 @@ foreach ($spec in $specs) {
         # Already-present means the delete above did not take: skipping is what leaves the old
         # rule's settings, whereas a duplicate of the same name is the residue we are cleaning up.
         for ($try = 1; $try -le 2; $try++) {
-            if (@(Get-NetFirewallRule -Group 'RinCast' -DisplayName $spec.DisplayName -ErrorAction SilentlyContinue).Count) { break }
+            # -Group and -DisplayName are different parameter sets; query the group, then filter.
+            if (@(Get-NetFirewallRule -Group 'RinCast' -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -eq $spec.DisplayName }).Count) { break }
             if ($try -gt 1) { Start-Sleep -Milliseconds 500 }
             try { New-NetFirewallRule @spec -ErrorAction Stop | Out-Null; break }
             catch {
@@ -211,16 +180,21 @@ foreach ($spec in $specs) {
 # A95: say it out loud rather than leave a hole. A rule that reported success but never landed,
 # or one an old Block rule still covers, looks exactly like a working install from here.
 $null = Invoke-Guarded 'Checking the firewall rules took effect' {
+    $rules = @(Get-NetFirewallRule -Group 'RinCast' -ErrorAction SilentlyContinue)
+    $present = @($rules | Select-Object -ExpandProperty DisplayName)
     $absent = @('RinCast Streamer', 'RinCast discovery (UDP 38710)', 'RinCast streaming (UDP 38711)') |
-        Where-Object { -not @(Get-NetFirewallRule -Group 'RinCast' -DisplayName $_ -ErrorAction SilentlyContinue) }
+        Where-Object { $present -notcontains $_ }
     if ($absent) { throw "still missing: $($absent -join ', ')" }
     $blocked = @(Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue |
         Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' })
     if ($blocked) { throw "$($blocked.Count) inbound Block rule(s) still cover $exe, and those win over the Allow rules" }
 }
+} else {
+    Write-Host '   Firewall setup needs administrator rights and is skipped. Windows may ask for network access when RinCast first connects.' -ForegroundColor DarkGray
+}
 
 # 3. OpenXR runtime (local builds only) ---------------------------------------
-if (Test-Path (Join-Path $source 'openxr\rincast-openxr.json')) {
+if ($isAdmin -and (Test-Path (Join-Path $source 'openxr\rincast-openxr.json'))) {
     Step 'Registering the RinCast XR OpenXR runtime'
     $null = Invoke-Guarded 'Registering the RinCast XR OpenXR runtime' {
         $manifest = Join-Path $InstallDir 'openxr\rincast-openxr.json'
@@ -233,13 +207,9 @@ if (Test-Path (Join-Path $source 'openxr\rincast-openxr.json')) {
 # 4. SteamVR driver -----------------------------------------------------------
 $driverDir = Join-Path $InstallDir 'driver\rincast'
 $null = Invoke-Guarded 'Registering the SteamVR driver' {
-    $userSid = Get-DesktopUserSid
-    $steam = (Get-ItemProperty "Registry::HKEY_USERS\$userSid\Software\Valve\Steam" -ErrorAction SilentlyContinue).SteamPath
+    $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
     $vrpathreg = if ($steam) { Join-Path $steam 'steamapps\common\SteamVR\bin\win64\vrpathreg.exe' }
-    if ($userSid -ne $id.User.Value) {
-        # vrpathreg writes to the profile of the account it runs as, which is the wrong one here.
-        Write-Host '   RinCast Streamer registers the SteamVR driver the first time it starts.' -ForegroundColor DarkGray
-    } elseif ($vrpathreg -and (Test-Path $vrpathreg)) {
+    if ($vrpathreg -and (Test-Path $vrpathreg)) {
         Step 'Registering the SteamVR driver'
         & $vrpathreg adddriver $driverDir | Out-Null
     } else {
@@ -250,6 +220,9 @@ $null = Invoke-Guarded 'Registering the SteamVR driver' {
 # 5. Audio driver -------------------------------------------------------------
 if (-not $SkipAudio) {
     if (Test-Path (Join-Path $source 'audio\RinCastAudio.inf')) {
+        if (-not $isAdmin) {
+            Write-Host '   Audio driver setup needs administrator rights and is skipped. Audio uses Steam streaming devices for now.' -ForegroundColor DarkGray
+        } else {
         $inf = Join-Path $InstallDir 'audio\RinCastAudio.inf'
         Step 'Installing RinCast Speaker and RinCast Microphone'
         $null = Invoke-Guarded 'Installing RinCast Speaker and RinCast Microphone' {
@@ -271,6 +244,7 @@ if (-not $SkipAudio) {
                 default { Warn "Audio driver setup failed (exit code $LASTEXITCODE). Audio uses Steam's streaming devices instead, if Steam has installed them." }
             }
         }
+        }
     } else {
         Write-Host "   This package has no RinCast audio driver. Audio uses Steam's streaming devices (Steam Streaming Speakers and Steam Streaming Microphone)." -ForegroundColor DarkGray
     }
@@ -280,14 +254,15 @@ if (-not $SkipAudio) {
 Step 'Creating shortcuts'
 $null = Invoke-Guarded 'Creating the Start menu shortcut' {
     $shell = New-Object -ComObject WScript.Shell
-    $lnk = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'RinCast Streamer.lnk'))
+    $programs = if ($isAdmin) { [Environment]::GetFolderPath('CommonPrograms') } else { [Environment]::GetFolderPath('Programs') }
+    $lnk = $shell.CreateShortcut((Join-Path $programs 'RinCast Streamer.lnk'))
     $lnk.TargetPath = $exe
     $lnk.WorkingDirectory = $InstallDir
     $lnk.Save()
 }
 
 $null = Invoke-Guarded 'Registering the uninstall entry' {
-    $un = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RinCast'
+    $un = if ($isAdmin) { 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RinCast' } else { 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RinCast' }
     New-Item -Force $un -ErrorAction Stop | Out-Null
     # Apps > Installed apps runs the uninstaller program where there is one (setup packages).
     $uninstaller = Join-Path $InstallDir 'Uninstall RinCast.exe'
@@ -317,6 +292,7 @@ if ($issues) {
 } else {
     Write-Host "`nRinCast $version is installed." -ForegroundColor Green
 }
-# Through Explorer, so the streamer runs as the desktop user and not elevated.
-if (-not $NoStart) { Start-Process explorer.exe -ArgumentList "`"$exe`"" }
-Close-Window
+if (-not $NoStart) {
+    if ($isAdmin) { Start-Process explorer.exe -ArgumentList "`"$exe`"" }
+    else { Start-Process -FilePath $exe }
+}

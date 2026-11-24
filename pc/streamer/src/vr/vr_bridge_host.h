@@ -9,6 +9,7 @@
 
 #include "../gpu.h"
 #include "vr_bridge.h"
+#include "rc/tracking_cache.h"
 
 namespace rcs {
 
@@ -23,7 +24,8 @@ class VrBridgeHost {
     // resolution changes. Returns true if SteamVR needs a restart to apply.
     bool Configure(const rcvr::DisplayConfig& config);
     void SetHeadsetConnected(bool connected);
-    void PublishTracking(const rcvr::TrackingSnapshot& snapshot);
+    void PublishTracking(const rcvr::TrackingSnapshot& snapshot, bool clockValid);
+    bool LookupTracking(uint64_t sequence, int64_t& targetDisplayPcNs, bool& clockValid) const;
     void PublishBody(const rcvr::BodySnapshot& snapshot);
     void PublishHand(int hand, const rcvr::HandSnapshot& snapshot);
     void Recenter();
@@ -62,6 +64,7 @@ class VrBridgeHost {
     void HeartbeatLoop();
     bool CreateTextures(uint32_t width, uint32_t height);
     void RecoverFromDeadProducer();
+    void ClearTrackingCache();
 
     HANDLE m_mapping = nullptr;
     HANDLE m_frameEvent = nullptr;
@@ -84,6 +87,9 @@ class VrBridgeHost {
     std::atomic<double> m_pendingShiftNs{0};  // for the heartbeat loop, which owns the phase
     std::atomic<double> m_driftNsPerS{0};
     std::atomic<double> m_pendingSlipNs{0};  // what is left of a slip
+
+    mutable std::mutex m_trackingCacheMutex;
+    rc::TrackingTargetCache m_trackingCache;
 };
 
 }  // namespace rcs

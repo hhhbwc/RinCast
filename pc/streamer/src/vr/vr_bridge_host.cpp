@@ -12,6 +12,7 @@
 namespace rcs {
 
 bool VrBridgeHost::Start() {
+    ClearTrackingCache();
     m_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(rcvr::Shared),
                                    rcvr::kSharedMemoryName);
     if (!m_mapping) {
@@ -73,6 +74,7 @@ void VrBridgeHost::Stop() {
     if (m_trackingEvent) CloseHandle(m_trackingEvent);
     m_shared = nullptr;
     m_mapping = m_frameEvent = m_trackingEvent = nullptr;
+    ClearTrackingCache();
 }
 
 bool VrBridgeHost::CreateTextures(uint32_t width, uint32_t height) {
@@ -167,10 +169,24 @@ void VrBridgeHost::SetHeadsetConnected(bool connected) {
     if (m_shared) InterlockedExchange(&m_shared->headsetConnected, connected ? 1 : 0);
 }
 
-void VrBridgeHost::PublishTracking(const rcvr::TrackingSnapshot& snapshot) {
+void VrBridgeHost::PublishTracking(const rcvr::TrackingSnapshot& snapshot, bool clockValid) {
     if (!m_shared) return;
+    {
+        std::lock_guard lock(m_trackingCacheMutex);
+        m_trackingCache.Put(snapshot.sequence, snapshot.targetDisplayPcNs, clockValid);
+    }
     rcvr::WriteTracking(m_shared, snapshot);
     SetEvent(m_trackingEvent);
+}
+
+bool VrBridgeHost::LookupTracking(uint64_t sequence, int64_t& targetDisplayPcNs, bool& clockValid) const {
+    std::lock_guard lock(m_trackingCacheMutex);
+    return m_trackingCache.Get(sequence, targetDisplayPcNs, clockValid);
+}
+
+void VrBridgeHost::ClearTrackingCache() {
+    std::lock_guard lock(m_trackingCacheMutex);
+    m_trackingCache.Clear();
 }
 
 void VrBridgeHost::PublishBody(const rcvr::BodySnapshot& snapshot) {

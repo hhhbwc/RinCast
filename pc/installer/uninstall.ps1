@@ -1,6 +1,7 @@
 <#
-  Removes RinCast: streamer, SteamVR driver registration, OpenXR runtime
-  registration, audio driver and test certificate, firewall rules and shortcuts.
+  Removes the per-user RinCast install: streamer, SteamVR driver registration, shortcuts,
+  uninstaller entry and settings. System-wide firewall, OpenXR and audio-driver cleanup is
+  only attempted when this script is explicitly run as administrator.
 
       powershell -ExecutionPolicy Bypass -File uninstall.ps1 [-KeepSettings]
 #>
@@ -8,107 +9,78 @@
 param([switch]$KeepSettings)
 
 $ErrorActionPreference = 'Continue'
-$id = [Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Start-Process powershell.exe -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" $(if ($KeepSettings) { '-KeepSettings' })"
-    return
-}
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+$userUn = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RinCast'
+$machineUn = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RinCast'
 
-# An elevated PowerShell can run as a different account than the person at the
-# desktop, and then HKCU and %LOCALAPPDATA% belong to that admin account.
-function Get-DesktopUserSid {
-    $session = (Get-Process -Id $PID).SessionId
-    $shell = Get-CimInstance Win32_Process -Filter "Name='explorer.exe' AND SessionId=$session" | Select-Object -First 1
-    if ($shell) {
-        $sid = (Invoke-CimMethod -InputObject $shell -MethodName GetOwnerSid).Sid
-        if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) { return $sid }
-    }
-    return $id.User.Value
-}
-function Get-LocalAppData($sid) {
-    $path = (Get-ItemProperty "Registry::HKEY_USERS\$sid\Volatile Environment" -ErrorAction SilentlyContinue).LOCALAPPDATA
-    if ($path) { return $path }
-    $userProfile = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -ErrorAction SilentlyContinue).ProfileImagePath
-    if ($userProfile) { return Join-Path $userProfile 'AppData\Local' }
-    return $null
-}
-$userSid = Get-DesktopUserSid
-$userHive = "Registry::HKEY_USERS\$userSid"
-
-$installDir = $PSScriptRoot
-$un = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RinCast'
-$loc = (Get-ItemProperty $un -ErrorAction SilentlyContinue).InstallLocation
-if ($loc) { $installDir = $loc }
-$installDir = $installDir.TrimEnd('\')
+$installDir = $PSScriptRoot.TrimEnd('\')
+$loc = (Get-ItemProperty $userUn -ErrorAction SilentlyContinue).InstallLocation
+if (-not $loc -and $isAdmin) { $loc = (Get-ItemProperty $machineUn -ErrorAction SilentlyContinue).InstallLocation }
+if ($loc) { $installDir = $loc.TrimEnd('\') }
 
 $running = Get-Process 'RinCast Streamer' -ErrorAction SilentlyContinue
 if ($running) {
     $running | Stop-Process -Force
-    # Windows keeps the exe locked until the process has really gone.
     $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 }
-# Windows' default audio devices, if the streamer had switched them to the headset's when it
-# was closed. It keeps them in the desktop user's profile, so only when that's this account.
+
 $streamer = Join-Path $installDir 'RinCast Streamer.exe'
-if ($userSid -eq $id.User.Value -and (Test-Path $streamer)) {
+if (Test-Path $streamer) {
     Start-Process $streamer -ArgumentList '--restore-audio-defaults' -Wait -ErrorAction SilentlyContinue
 }
 
-# Audio driver
-$setup = Join-Path $installDir 'rincast-audio-setup.exe'
-if (Test-Path $setup) { & $setup remove | Out-Null }
+if ($isAdmin) {
+    $setup = Join-Path $installDir 'rincast-audio-setup.exe'
+    if (Test-Path $setup) { & $setup remove | Out-Null }
 
-# Test certificate from a development build (scripts\audio\test-sign.ps1)
-foreach ($store in 'Root', 'TrustedPublisher') {
-    Get-ChildItem "Cert:\LocalMachine\$store" | Where-Object Subject -eq 'CN=RinCast Test Signing' | Remove-Item
+    foreach ($store in 'Root', 'TrustedPublisher') {
+        Get-ChildItem "Cert:\LocalMachine\$store" | Where-Object Subject -eq 'CN=RinCast Test Signing' | Remove-Item -ErrorAction SilentlyContinue
+    }
+
+    $manifest = Join-Path $installDir 'openxr\rincast-openxr.json'
+    $xr = 'HKLM:\SOFTWARE\Khronos\OpenXR\1'
+    Remove-ItemProperty -Path "$xr\AvailableRuntimes" -Name $manifest -ErrorAction SilentlyContinue
+    $active = (Get-ItemProperty $xr -ErrorAction SilentlyContinue).ActiveRuntime
+    if ($active -and ($active -ieq $manifest)) {
+        $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
+        $steamXr = if ($steam) { Join-Path $steam 'steamapps\common\SteamVR\steamxr_win64.json' }
+        if ($steamXr -and (Test-Path $steamXr)) { Set-ItemProperty $xr -Name ActiveRuntime -Value $steamXr }
+        else { Remove-ItemProperty $xr -Name ActiveRuntime -ErrorAction SilentlyContinue }
+    }
+
+    $names = @(Get-NetFirewallRule -Group 'RinCast' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+    foreach ($display in 'RinCast Streamer', 'RinCast Streamer (USB cable)', 'rincast streamer.exe') {
+        $names += @(Get-NetFirewallRule -DisplayName $display -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+    }
+    foreach ($name in ($names | Where-Object { $_ } | Select-Object -Unique)) {
+        Remove-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
+    }
 }
 
-# SteamVR driver. vrpathreg writes to the profile of the account it runs as, so when the
-# desktop user is another account their SteamVR keeps an entry for a folder that is gone,
-# which SteamVR ignores.
-$steam = (Get-ItemProperty "$userHive\Software\Valve\Steam" -ErrorAction SilentlyContinue).SteamPath
+$steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
 $vrpathreg = if ($steam) { Join-Path $steam 'steamapps\common\SteamVR\bin\win64\vrpathreg.exe' }
-if ($userSid -eq $id.User.Value -and $vrpathreg -and (Test-Path $vrpathreg)) { & $vrpathreg removedriver (Join-Path $installDir 'driver\rincast') | Out-Null }
-
-# OpenXR runtime: unregister, and hand the active runtime back to SteamVR if it was ours.
-$manifest = Join-Path $installDir 'openxr\rincast-openxr.json'
-$xr = 'HKLM:\SOFTWARE\Khronos\OpenXR\1'
-Remove-ItemProperty -Path "$xr\AvailableRuntimes" -Name $manifest -ErrorAction SilentlyContinue
-$active = (Get-ItemProperty $xr -ErrorAction SilentlyContinue).ActiveRuntime
-if ($active -and ($active -ieq $manifest)) {
-    $steamXr = if ($steam) { Join-Path $steam 'steamapps\common\SteamVR\steamxr_win64.json' }
-    if ($steamXr -and (Test-Path $steamXr)) { Set-ItemProperty $xr -Name ActiveRuntime -Value $steamXr }
-    else { Remove-ItemProperty $xr -Name ActiveRuntime -ErrorAction SilentlyContinue }
+if ($vrpathreg -and (Test-Path $vrpathreg)) {
+    & $vrpathreg removedriver (Join-Path $installDir 'driver\rincast') | Out-Null
 }
 
-# Firewall, autostart, shortcuts, uninstall entry
-# A95: read the names first, then delete one at a time. Deleting straight out of the
-# Get-NetFirewallRule enumerator fails with "the system cannot find the file specified" once the
-# store shifts under it, and here that failure was quiet: rules survived the uninstall. The
-# 'rincast streamer.exe' name is what dismissing Windows' own firewall prompt leaves behind.
-$names = @(Get-NetFirewallRule -Group 'RinCast' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
-foreach ($display in 'RinCast Streamer', 'RinCast Streamer (USB cable)', 'rincast streamer.exe') {
-    $names += @(Get-NetFirewallRule -DisplayName $display -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'RinCast Streamer' -ErrorAction SilentlyContinue
+$programs = if ($isAdmin) { [Environment]::GetFolderPath('CommonPrograms') } else { [Environment]::GetFolderPath('Programs') }
+Remove-Item (Join-Path $programs 'RinCast Streamer.lnk') -ErrorAction SilentlyContinue
+$userInstall = (Get-ItemProperty $userUn -ErrorAction SilentlyContinue).InstallLocation
+if (-not $userInstall -or $userInstall.TrimEnd('\') -ieq $installDir) { Remove-Item $userUn -Recurse -ErrorAction SilentlyContinue }
+if ($isAdmin) {
+    $machineInstall = (Get-ItemProperty $machineUn -ErrorAction SilentlyContinue).InstallLocation
+    if (-not $machineInstall -or $machineInstall.TrimEnd('\') -ieq $installDir) { Remove-Item $machineUn -Recurse -ErrorAction SilentlyContinue }
 }
-foreach ($name in ($names | Where-Object { $_ } | Select-Object -Unique)) { Remove-NetFirewallRule -Name $name -ErrorAction SilentlyContinue }
-$still = @(Get-NetFirewallRule -Group 'RinCast' -ErrorAction SilentlyContinue) +
-    @(Get-NetFirewallRule -DisplayName 'RinCast Streamer' -ErrorAction SilentlyContinue)
-if ($still) {
-    Write-Host ("!  Firewall rules were left behind: " + (($still | Select-Object -ExpandProperty DisplayName | Select-Object -Unique) -join ', ') +
-        ' - remove them in Windows Defender Firewall with Advanced Security.') -ForegroundColor Yellow
-}
-Remove-ItemProperty "$userHive\Software\Microsoft\Windows\CurrentVersion\Run" -Name 'RinCast Streamer' -ErrorAction SilentlyContinue
-Remove-Item (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'RinCast Streamer.lnk') -ErrorAction SilentlyContinue
-Remove-Item $un -Recurse -ErrorAction SilentlyContinue
+
 if (-not $KeepSettings) {
-    $localAppData = Get-LocalAppData $userSid
-    if ($localAppData) { Remove-Item (Join-Path $localAppData 'RinCast') -Recurse -Force -ErrorAction SilentlyContinue }
+    Remove-Item (Join-Path $env:LOCALAPPDATA 'RinCast') -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Files (the script itself lives here, so delete from a detached shell). The installer leaves a
-# sentinel file; a custom folder without it may hold someone else's files, so leave it alone.
 $isDriveRoot = $installDir -eq [IO.Path]::GetPathRoot($installDir).TrimEnd('\')
-$isDefault = $installDir -ieq (Join-Path $env:ProgramFiles 'RinCast')
+$isDefault = $installDir -ieq (Join-Path $env:LOCALAPPDATA 'Programs\RinCast') -or
+    ($isAdmin -and $installDir -ieq (Join-Path $env:ProgramFiles 'RinCast'))
 if (-not $isDriveRoot -and ($isDefault -or (Test-Path (Join-Path $installDir '.rincast-install')))) {
     Start-Process cmd.exe -WindowStyle Hidden -ArgumentList "/c timeout /t 2 >nul & rmdir /s /q `"$installDir`""
     Write-Host 'RinCast was removed.' -ForegroundColor Green

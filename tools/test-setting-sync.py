@@ -31,6 +31,9 @@ def block(source, signature):
 
 PRELUDE = r'''
 #include <nlohmann/json.hpp>
+#include "json_field.h"
+#include "rc/auto_tune.h"
+#include "rc/stream_profile.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -47,12 +50,13 @@ PRELUDE = r'''
 #include <thread>
 #include <vector>
 using json = nlohmann::json;
+using namespace rcs;
 using namespace std::chrono_literals;
 #define RC_LOGI(...) ((void)0)
 #define RC_LOGW(...) (++errors)
 namespace rc {
 int64_t NowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
-namespace msg { constexpr auto kUpdateSettings = "settings.update"; }
+namespace msg { constexpr auto kUpdateSettings = "settings.update"; constexpr auto kNotice = "notice"; }
 namespace synced {
 constexpr auto kCodec="codec", kTenBit="tenBit", kAdaptiveBitrate="adaptiveBitrate", kDesktopFps="desktopFps", kStreamProfile="streamProfile";
 constexpr const char* kAll[]={kCodec,kTenBit,kAdaptiveBitrate,kDesktopFps,kStreamProfile};
@@ -77,6 +81,15 @@ struct App {
     void PushUi(const json&) {}
     json StateJson() { return {}; }
 };
+std::string SyncedKeyTitle(const std::string& key) { return key; }
+std::string A82RateList(const std::vector<float>& rates) {
+    std::string out;
+    for (float rate : rates) { if (!out.empty()) out += '/'; out += std::to_string(int(rate + 0.5f)); }
+    return out;
+}
+float EffectiveRefreshRate(float requested, const std::vector<float>& rates) {
+    return rates.empty() || std::find(rates.begin(), rates.end(), requested) != rates.end() ? requested : rates.back();
+}
 struct FakeDesktop {
     struct Info { std::string id="monitor"; };
     Info Monitor() { return {}; }
@@ -95,6 +108,8 @@ struct ClientSession {
     uint64_t m_pcRevision=0;
     std::map<std::string,uint64_t> m_pcKeyRevisions;
     std::map<std::string,json> m_ownedSettings;
+    std::map<std::string,int64_t> m_ownershipNoticeNs;
+    rc::AutoTune m_autoTune;
     ClientCaps m_caps;
     ClientStreamSettings m_settings;
     bool m_vr=true;
@@ -106,6 +121,7 @@ struct ClientSession {
     void StartDesktop(const json&) { ++desktopRestarts; }
     void ApplyInputSetting(bool) {}
     void SendServerInfo() {}
+    void SendControl(const json&) {}
     void SendMonitors() {}
     void Enqueue(json);
     void ScheduleVideoRestart(bool,bool);
@@ -114,6 +130,7 @@ struct ClientSession {
     bool AdoptHeadsetOwnedSettings();
     void OwnSyncedSettings(const json&,const std::function<void()>&);
     json SyncedSettingsForUi();
+    json OwnedSettingsJson();
     void OnSettingsChanged(const json&);
     void OnStreamProfileChanged();
     void RestartVideoForProfile(bool,bool);
@@ -176,9 +193,19 @@ try {
         partial.ApplyClientInfo(fresh);
         partial.AdoptHeadsetOwnedSettings();
         check(SettingsStore::Get().Snapshot().adaptiveBitrate,"headset true did not persist");
-        check(SettingsStore::Get().Snapshot().streamProfile==2,"headset profile did not persist");
+        check(SettingsStore::Get().Snapshot().streamProfile==0,"legacy headset profile regained PC ownership");
         check(partial.SyncedSettingsForUi()["adaptiveBitrate"]==true,"UI differs from latest headset setting");
+        check(partial.SyncedSettingsForUi()["streamProfile"]==0,"legacy profile leaked into UI");
+        check(partial.StreamSettings().streamProfile==1,"legacy profile changed session state");
+        check(!partial.m_ownedSettings.contains("streamProfile"),"legacy profile retained ownership");
+        check(partial.m_pcKeyRevisions["streamProfile"]==0,"legacy profile created a PC revision");
+        check(!partial.OwnedSettingsJson().contains("streamProfile"),"legacy profile was pushed back");
     }
+    ClientSession legacyOnly;
+    legacyOnly.m_desktop[1]=std::make_unique<FakeDesktop>();
+    legacyOnly.HandleMessage(report(legacyOnly,{{"streamProfile",2}}));
+    check(!legacyOnly.m_restartVr && !legacyOnly.m_restartDesktop,"legacy profile rebuilt video");
+    check(legacyOnly.m_queue.empty(),"legacy profile pushed UI");
     ClientSession concurrent;
     auto waitingReport=report(concurrent,{{"adaptiveBitrate",true}});
     std::promise<void> saving, reporting;
@@ -211,7 +238,7 @@ try {
     check(audio.m_queue.size()==1 && audio.m_queue.front()["type"]=="_serverInfo","unrelated edit rebuilt audio");
     ClientSession batch;
     batch.m_desktop[1]=std::make_unique<FakeDesktop>();
-    batch.HandleMessage(report(batch,{{"codec","hevc"},{"streamProfile",2}}));
+    batch.HandleMessage(report(batch,{{"codec","hevc"}}));
     check(batch.m_restartVr && batch.m_restartDesktop,"combined change lost a stream restart");
     check(batch.vrRestarts==0,"headset handler restarted immediately");
     ClientSession burst;
@@ -260,13 +287,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
+    args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
     baseline = subprocess.check_output(["git", "-C", str(REPO), "show", "636f9a4:pc/streamer/src/session/client_session.cpp"], encoding="utf-8")
     assert 'if (type == "_profile") return RestartVideoForProfile();' in baseline
     methods = ["void ClientSession::Enqueue(", "void ClientSession::ScheduleVideoRestart(",
                "void ClientSession::WorkerLoop(", "void ClientSession::ApplyClientInfo(",
                "bool ClientSession::AdoptHeadsetOwnedSettings(", "void ClientSession::OwnSyncedSettings(",
-               "json ClientSession::SyncedSettingsForUi(", "void ClientSession::OnSettingsChanged(",
+               "json ClientSession::SyncedSettingsForUi(", "json ClientSession::OwnedSettingsJson(",
+               "void ClientSession::OnSettingsChanged(",
                "void ClientSession::OnStreamProfileChanged(", "void ClientSession::RestartVideoForProfile("]
     app = (REPO / "pc/streamer/src/app.cpp").read_text(encoding="utf-8")
     settings = (REPO / "pc/streamer/src/settings.h").read_text(encoding="utf-8")
@@ -281,11 +310,123 @@ def main():
     assert '"settings", SettingsForUi()' in block(app, 'if (type == "setSettings")')
     connect = block(block(CPP, "void ClientSession::HandleMessage("), "if (type == rc::msg::kClientInfo)")
     assert connect.index("AdoptHeadsetOwnedSettings();") < connect.index("StartVr();")
-    for method, stream in (("void ClientSession::StartVr()", "Vr"), ("void ClientSession::StartDesktop(", "Desktop")):
+    config_header = (REPO / "pc/streamer/src/stream/stream_config.h").read_text(encoding="utf-8")
+    assert config_header.count("cfg.profile = rc::ProfileFromId(pc.streamProfile);") == 2
+    for method, builder in (("void ClientSession::StartVr()", "BuildVrStreamConfigGuarded(eff,"),
+                            ("void ClientSession::StartDesktop(", "BuildDesktopStreamConfig(eff,")):
         body = block(CPP, method)
-        assert "cfg.adaptive = m_slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate)" in body
-        assert "cfg.profile = rc::ProfileFromId(pc.streamProfile)" in body
-        assert f"m_restart{stream} = false;" in body
+        assert "const Settings eff = EffectiveSettings(pc);" in body
+        assert builder in body
+        assert "cfg.adaptive = slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate)" in config_header
+        assert f"m_restart{'Vr' if 'StartVr' in method else 'Desktop'} = false;" in body
+    auto_tune = block(CPP, "void ClientSession::RunAutoTune()")
+    assert "sig.decodeMs = vs.clientDecodeMs;" in auto_tune
+    assert "sig.lastFrameNs = vs.lastFrameNs;" in auto_tune
+    assert "sig.lastFeedbackNs = vs.lastFeedbackNs;" in auto_tune
+    assert "sig.streamActive = m_vr && m_vr->Running() && !m_vr->Paused();" in auto_tune
+    assert "m_autoTune.UpdateWithEvidence(sig, in, now)" in auto_tune
+    assert "if (!sig.streamActive || !rc::HasFreshSignals(sig, now)) return;" in auto_tune
+    apply_info = block(CPP, "void ClientSession::ApplyClientInfo(")
+    assert 'IntField(s, "streamProfile"' not in apply_info
+    assert 'std::string(key) == rc::synced::kStreamProfile || !s.contains(key)' in apply_info
+    own = block(CPP, "void ClientSession::OwnSyncedSettings(")
+    assert 'std::string(key) == rc::synced::kStreamProfile || !changed.contains(key)' in own
+    assert 'm_pcKeyRevisions.erase(rc::synced::kStreamProfile);' not in own
+    update = block(CPP, "void ClientSession::HandleMessage(")
+    assert "profileChanged" not in update
+    sender = (REPO / "pc/streamer/src/stream/video_sender.cpp").read_text(encoding="utf-8")
+    send = block(sender, "void VideoSender::Send(")
+    assert send.index("m_packetizer.SendFrame(") < send.index("m_lastFrameNs.store(")
+    assert "m_lastFrameNs.store(now, std::memory_order_release)" in send
+    feedback = block(sender, "void VideoSender::OnFeedback(")
+    assert feedback.index("const bool measured = fb.queueDelayMs >= 0;") < feedback.index("m_lastFeedbackNs.store(")
+    assert feedback.index("m_lossAvg.store(") < feedback.index("m_lastFeedbackNs.store(")
+    assert "m_lastFeedbackNs.store(now, std::memory_order_release)" in feedback
+    stats = block(sender, "VideoSenderStats VideoSender::Stats(")
+    assert "m_lastFrameNs.load(std::memory_order_acquire)" in stats
+    assert "m_lastFeedbackNs.load(std::memory_order_acquire)" in stats
+    vr_header = (REPO / "pc/streamer/src/stream/vr_stream.h").read_text(encoding="utf-8")
+    apply_rung = block(vr_header, "void ApplyProfileRung(")
+    assert apply_rung.index("m_liveProfile.store(") < apply_rung.index("m_pendingProfile.store(")
+    assert "m_pendingMinQp" not in vr_header
+    vr = (REPO / "pc/streamer/src/stream/vr_stream.cpp").read_text(encoding="utf-8")
+    encoder_loop = block(vr, "void VrStream::RunEncoder(")
+    assert "m_liveProfile(int(config.profile))" in vr
+    assert "rc::ProfileFromId(m_liveProfile.load(std::memory_order_relaxed))" in encoder_loop
+    assert "ec.profile = liveProfile;" in encoder_loop
+    assert "ec.profile = m_config.profile" not in encoder_loop
+    assert "encoder->SetProfile(liveProfile)" in encoder_loop
+    sender_loop = block(vr, "void VrStream::RunSender(")
+    assert "m_pendingProfile.exchange(-1" in sender_loop
+    assert "m_sender.SetProfile(rc::ProfileFromId(pendingProfile))" in sender_loop
+    encoder_header = (REPO / "pc/streamer/src/encode/encoder.h").read_text(encoding="utf-8")
+    assert "virtual bool SetProfile(rc::StreamProfile /*profile*/) { return false; }" in encoder_header
+    nvenc = (REPO / "pc/streamer/src/encode/nvenc_encoder.cpp").read_text(encoding="utf-8")
+    set_profile = block(nvenc, "bool SetProfile(rc::StreamProfile profile) override")
+    assert "const auto q = rc::ProfileParams(profile);" in set_profile
+    assert "const auto plan = RatePlan(profile, now);" in set_profile
+    assert "ApplyBudget(candidateConfig, plan);" in set_profile
+    assert "candidateConfig.rcParams.minQP.qpInterP = qp;" in set_profile
+    assert "nvEncReconfigureEncoder" in set_profile
+    assert set_profile.index("if (!ok)") < set_profile.index("m_config.profile = profile;")
+    assert set_profile.index("m_config.profile = profile;") < set_profile.index("m_encodeConfig = candidateConfig;")
+    assert 'GetEnvironmentVariableA("RINCAST_CADENCE_FILL", text, sizeof(text)) == 1' in nvenc
+    assert "text[0] == '1'" in nvenc
+    rate_plan = block(nvenc, "rc::EncoderRatePlan RatePlan(rc::StreamProfile profile, int64_t now) const")
+    assert "CadenceFillExperiment() && m_cappedVbr" in rate_plan
+    assert "profile == rc::StreamProfile::Quality" in rate_plan
+    assert "!m_config.desktop &&\n                                 !startup && m_config.fps > 0" in rate_plan
+    assert "const bool pressure = !cadenceFill &&" in rate_plan
+    assert "fillOn && !cadenceFill, cadenceFill);" in rate_plan
+    reconfigure = block(nvenc, "void ReconfigureRate(int64_t now)")
+    assert "ApplyBudget(candidateConfig, plan);" in reconfigure
+    assert "rc::ClampVbvInitialDelay(candidateConfig.rcParams.vbvInitialDelay, plan.budget.vbvBufferSize)" in reconfigure
+    assert "candidateInit.frameRateNum = plan.rateNum;" in reconfigure
+    assert "const bool ok = rc::ApplyEncoderRateTransaction(" in reconfigure
+    assert reconfigure.index("const bool ok = rc::ApplyEncoderRateTransaction(") < reconfigure.index("m_encodeConfig = candidateConfig;")
+    assert "// resetEncoder/forceIDR 为零" in reconfigure
+    assert "RINCAST_CADENCE_FILL" not in settings
+    assert "RINCAST_CADENCE_FILL" not in config_header
+    motion_header = (REPO / "pc/streamer/src/stream/motion_estimator.h").read_text(encoding="utf-8")
+    motion_cpp = (REPO / "pc/streamer/src/stream/motion_estimator.cpp").read_text(encoding="utf-8")
+    assert "Microsoft::WRL::ComPtr<ID3D11Texture2D> m_staging[2];" in motion_header
+    assert "m_readPending[0] = m_readPending[1] = false;" in motion_header
+    assert "void QueueRead(ID3D11DeviceContext* ctx);" in motion_header
+    assert "bool TryRead(ID3D11DeviceContext* ctx, std::vector<float>& out);" in motion_header
+    queue_read = block(motion_cpp, "void MotionEstimator::QueueRead(")
+    assert "if (m_readPending[0] && m_readPending[1]) return;" in queue_read
+    assert "if (m_readPending[slot]) slot ^= 1;" in queue_read
+    assert "ctx->CopyResource(m_staging[slot].Get(), m_field.tex.Get());" in queue_read
+    assert "m_readPending[slot] = true;" in queue_read
+    assert "m_readWrite ^= 1;" in queue_read
+    try_read = block(motion_cpp, "bool MotionEstimator::TryRead(")
+    assert "if (!m_readPending[slot])" in try_read
+    assert "D3D11_MAP_READ | D3D11_MAP_FLAG_DO_NOT_WAIT" in try_read
+    assert "DXGI_ERROR_WAS_STILL_DRAWING" in try_read
+    assert try_read.index("DXGI_ERROR_WAS_STILL_DRAWING") < try_read.index("m_readPending[slot] = false;")
+    assert "m_readNext ^= 1;" in try_read
+    sync_read = block(motion_cpp, "bool MotionEstimator::Read(")
+    assert "D3D11_MAP_READ, 0, &map" in sync_read
+    assert "D3D11_MAP_FLAG_DO_NOT_WAIT" not in sync_read
+    assert 'GetEnvironmentVariableA("RINCAST_ASYNC_MOTION", text, sizeof(text)) == 1' in vr
+    assert "text[0] == '1'" in vr
+    run = block(vr, "void VrStream::Run(")
+    assert "const bool asyncMotion = AsyncMotionExperiment();" in run
+    assert "fs.frameIndex != lastMotionFrameIndex + 1" in run
+    assert "lastMotionFrameIndex = fs.frameIndex;" in run
+    assert "if (motionValid && asyncMotion) motion.QueueRead(ctx.Get());" in run
+    assert "motionRead = motion.TryRead(ctx.Get(), motionField);" in run
+    assert "motionRead = motion.Read(ctx.Get(), motionField);" in run
+    assert run.index("motion.TryRead(") < run.index("motion.Read(")
+    assert "++m_diagMotionPending;" in run
+    assert "motionField.assign(size_t(motion.GridWidth()) * motion.GridHeight() * 2, 0.0f);" in run
+    assert run.index("motionField.assign(size_t(motion.GridWidth()) * motion.GridHeight() * 2, 0.0f);") < run.index("AppendMotion(")
+    assert "if (motionRead || asyncMotion)" in run
+    flow = block(vr, "void VrStream::LogFrameFlow(")
+    assert flow.index("overruns1s %u") < flow.index("motionPending %u")
+    assert "m_diagMotionPending = 0;" in flow
+    assert "RINCAST_ASYNC_MOTION" not in settings
+    assert "RINCAST_ASYNC_MOTION" not in config_header
     assert 'Enqueue(json{{"type", "_profile"}});' in block(CPP, "void ClientSession::OnStreamProfileChanged()")
     handler = block(block(CPP, "void ClientSession::HandleMessage("), "if (type == rc::msg::kUpdateSettings)")
     dispatch = '''void ClientSession::HandleMessage(const json& m) {
@@ -307,7 +448,7 @@ def main():
     version = sorted(p.name for p in (sdk / "Include").iterdir() if (p / "um/Windows.h").exists())[-1]
     env = {k: os.environ[k] for k in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if k in os.environ}
     env["PATH"] = str(compiler_bin) + r";C:\Windows\System32"
-    env["INCLUDE"] = ";".join(map(str, [msvc / "include", sdk / "Include" / version / "ucrt", sdk / "Include" / version / "shared", sdk / "Include" / version / "um", REPO / "third_party"]))
+    env["INCLUDE"] = ";".join(map(str, [msvc / "include", sdk / "Include" / version / "ucrt", sdk / "Include" / version / "shared", sdk / "Include" / version / "um", REPO / "third_party", REPO / "shared/include", REPO / "pc/streamer/src"]))
     env["LIB"] = ";".join(map(str, [msvc / "lib/x64", sdk / "Lib" / version / "ucrt/x64", sdk / "Lib" / version / "um/x64"]))
     exe = args.out / "settings-harness.exe"
     built = subprocess.run([str(compiler_bin / "cl.exe"), "/nologo", "/utf-8", "/std:c++20", "/EHsc", "/O2", "/DNDEBUG", str(cpp), "/Fe:" + str(exe)], cwd=args.out, env=env, capture_output=True)

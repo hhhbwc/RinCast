@@ -140,11 +140,11 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
             m_wireCapKbps.store(snap.encoderTargetKbps, std::memory_order_relaxed);
     }
 
+    const int64_t now = rc::NowNs();
     std::lock_guard lock(m_statsMutex);
     m_windowFrames++;
     m_windowBytes += frame.data.size();
     m_windowEncodeMs += encodeMs;
-    const int64_t now = rc::NowNs();
     const double elapsed = double(now - m_windowStartNs) / 1e9;
     if (elapsed >= 1.0) {
         m_stats.fps = m_windowFrames / elapsed;
@@ -213,6 +213,7 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
         m_windowEncodeMs = 0;
         m_windowStartNs = now;
     }
+    m_lastFrameNs.store(now, std::memory_order_release);
 }
 
 bool VideoSender::WantsFrame() {
@@ -385,11 +386,14 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
         RC_LOGI("Stream %u: guard at the floor, queue %.0f ms, sending %u of %u kbps, arriving %.0f kbps",
                 m_streamId, q, res.capKbps, aim, m_receivedKbps);
     }
+    if (measured) m_lastFeedbackNs.store(now, std::memory_order_release);
 }
 
 VideoSenderStats VideoSender::Stats() {
     std::lock_guard lock(m_statsMutex);
     VideoSenderStats s = m_stats;
+    s.lastFrameNs = m_lastFrameNs.load(std::memory_order_acquire);
+    s.lastFeedbackNs = m_lastFeedbackNs.load(std::memory_order_acquire);
     s.lossAvg = m_lossAvg.load(std::memory_order_relaxed);  // PLAN-AUTO-TUNE: the same read the throughput log already makes
     m_stats.framesLost = 0;
     return s;

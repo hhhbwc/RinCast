@@ -54,8 +54,7 @@ struct ClientStreamSettings {
     int desktopBitrateMbps = 0;
     int desktopFps = 0;
     bool adaptiveBitrate = true;
-    int streamProfile = 1;             // 0 latency, 1 balanced, 2 best picture (the headset may pick it;
-                                       // A84: this is the floor - see EffectiveProfile)
+    int streamProfile = 1;             // Legacy wire field; A86: ignored, tuner owns the live rung.
     bool streamAudio = true;
     bool micPassthrough = true;
 };
@@ -91,8 +90,7 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
                        const std::string& error = {});
     void OnSettingsChanged(const json& changed);
     void OwnSyncedSettings(const json& changed, const std::function<void()>& save);
-    // The three-way preference is baked into the encoder and the queue guard when a
-    // stream starts, so switching it has to rebuild the live streams to take effect.
+    // Rebuild streams affected by build-time settings; live picture-tier moves do not call this.
     void OnStreamProfileChanged();
     void OnMonitorsChanged();
     // ROUND19 T3: the user's manual reset is the only way the autoscale ladder
@@ -145,10 +143,8 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     // saved settings except for streamProfile. Takes m_mutex, so it must not be
     // called from under it (RunAutoTune uses EffectiveProfileLocked for that).
     Settings EffectiveSettings(const Settings& pc);
-    // The headset's picks for these PC-backed synced keys (profile, adaptive bitrate)
-    // win: persist them so the encoder, which reads the PC copy, runs what the UI shows.
-    // Used on both first connect (kClientInfo) and later changes (kUpdateSettings).
-    // Returns true if either value was written back.
+    // The headset's adaptive-bitrate pick is PC-backed and wins unless a newer PC
+    // write exists. Used on both first connect and later changes. Returns true if written back.
     bool AdoptHeadsetOwnedSettings();
     void MeasurePoseWait(int64_t receivedNs);
     json OwnedSettingsJson();

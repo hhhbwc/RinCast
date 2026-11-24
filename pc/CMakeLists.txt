@@ -88,7 +88,7 @@ target_link_libraries(capture-test PRIVATE rincast-core)
 
 # Developer tool: frame generation quality and estimator speed on this GPU.
 add_executable(motion-bench ../tools/motion-bench/main.cpp streamer/src/stream/motion_estimator.cpp)
-target_include_directories(motion-bench PRIVATE ../third_party)
+target_include_directories(motion-bench PRIVATE ../third_party ../shared/include)
 target_compile_definitions(motion-bench PRIVATE UNICODE _UNICODE)
 target_link_libraries(motion-bench PRIVATE d3d11 dxgi d3dcompiler)
 
@@ -119,10 +119,12 @@ target_link_libraries(a14-matrix PRIVATE rincast-core)
 # (rc/frame_queue_bound.h) and A26 stale flush (rc/stale_flush.h) - against synthetic
 # timelines calibrated to the AB9/AB10 session aggregates. Measurement only - no
 # product behaviour in here.
-add_executable(a24-replay ../tools/a24-replay/main.cpp)
-target_include_directories(a24-replay PRIVATE ../third_party)
-target_compile_definitions(a24-replay PRIVATE UNICODE _UNICODE)
-target_link_libraries(a24-replay PRIVATE rincast-core)
+if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/../tools/a24-replay/main.cpp)
+  add_executable(a24-replay ../tools/a24-replay/main.cpp)
+  target_include_directories(a24-replay PRIVATE ../third_party)
+  target_compile_definitions(a24-replay PRIVATE UNICODE _UNICODE)
+  target_link_libraries(a24-replay PRIVATE rincast-core)
+endif()
 
 # Developer tool: lists the virtual audio devices and how each setting resolves.
 add_executable(audio-check ../tools/audio-check/main.cpp streamer/src/audio/audio.cpp streamer/src/util.cpp)

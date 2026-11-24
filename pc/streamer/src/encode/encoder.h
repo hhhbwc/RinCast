@@ -99,13 +99,10 @@ class VideoEncoder {
     // once the bitstream is available.
     virtual bool Encode(ID3D11Texture2D* input, bool forceKeyframe, EncodedFrame& out) = 0;
     virtual void SetBitrate(uint32_t kbps) = 0;
-    // A87: retune the QP floor on the live encoder session. This is the one thing a
-    // picture-tier change actually needs (the ceiling does not change with the tier -
-    // see the 10:17 log: both rungs say "ceiling 100000 kbps", only QP floor 16->24).
-    // False = this backend cannot reconfigure RC params in place; the caller keeps the
-    // old floor and must NOT rebuild the stream over it (that costs ~46 s of black
-    // screen because SteamVR has to reopen the shared textures).
-    virtual bool SetMinQp(uint32_t /*qp*/) { return false; }
+    // Retune both the QP floor and the profile's VBV on the live session. False means
+    // this backend cannot apply the profile in place; the caller keeps streaming and
+    // reports the refusal. A later internal rebuild still uses the caller's live profile.
+    virtual bool SetProfile(rc::StreamProfile /*profile*/) { return false; }
     virtual const char* Name() const = 0;
     // The QP the last finished 5 s window actually ran at, -1 when unknown. Lets the
     // UI show "was the ceiling spent, and at what quality" without opening logs.

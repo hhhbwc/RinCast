@@ -17,7 +17,11 @@ class MotionEstimator {
 
     bool Init(ID3D11Device* device, uint32_t width, uint32_t height);
     // The next frame has nothing to be compared with.
-    void Reset() { m_hasPrevious = false; }
+    void Reset() {
+        m_hasPrevious = false;
+        m_readPending[0] = m_readPending[1] = false;
+        m_readWrite = m_readNext = 0;
+    }
 
     uint32_t GridWidth() const { return m_gridWidth; }
     uint32_t GridHeight() const { return m_gridHeight; }
@@ -31,6 +35,10 @@ class MotionEstimator {
     // The newest field: x, y in pixels per frame, row by row. Waits for the GPU.
     bool Read(ID3D11DeviceContext* ctx, std::vector<float>& out);
 
+    // Copies the newest field without waiting; TryRead consumes the older slot later.
+    bool QueueRead(ID3D11DeviceContext* ctx);
+    bool TryRead(ID3D11DeviceContext* ctx, std::vector<float>& out, bool& slotConsumed);
+
    private:
     struct Level {
         Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
@@ -40,12 +48,16 @@ class MotionEstimator {
     bool MakeLevel(DXGI_FORMAT format, uint32_t w, uint32_t h, Level& level);
     void Dispatch(ID3D11DeviceContext* ctx, ID3D11ComputeShader* cs, ID3D11ShaderResourceView* const* srvs, UINT srvCount,
                   ID3D11UnorderedAccessView* uav, UINT x, UINT y);
+    void Decode(const D3D11_MAPPED_SUBRESOURCE& map, std::vector<float>& out);
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> m_lumaCs, m_downCs, m_coarseCs, m_refineCs, m_medianCs;
     Level m_quarter[2], m_sixteenth[2];  // this frame's and the last, swapping
     Level m_coarse, m_refined, m_field;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_staging;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_staging[2];
+    bool m_readPending[2]{};
+    int m_readWrite = 0;
+    int m_readNext = 0;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_constants;
     uint32_t m_width = 0, m_height = 0;
     uint32_t m_gridWidth = 0, m_gridHeight = 0, m_quarterW = 0, m_quarterH = 0, m_sixteenthW = 0, m_sixteenthH = 0;

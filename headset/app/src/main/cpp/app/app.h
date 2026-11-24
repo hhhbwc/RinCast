@@ -146,7 +146,7 @@ class App {
     bool VrRunning() const { return m_vrState == "running"; }
     const std::deque<Notice>& Notices() const { return m_notices; }
     struct Stats {
-        double fps = 0, latencyMs = 0, decodeMs = 0, mbps = 0, rttMs = 0;
+        double fps = 0, generatedFps = 0, latencyMs = 0, decodeMs = 0, mbps = 0, rttMs = 0;
         std::string codec;
         int width = 0, height = 0;
         double stageMs[kStageCount] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};  // -1: not measured
@@ -312,6 +312,7 @@ class App {
     bool m_motionMoves = false;    // something moves: generating a frame would change the picture
     bool m_motionConsistent = true;  // ...and as one motion, not rotation or deformation
     int m_motionGateMoving = 0, m_motionGateMean = 0, m_motionGateSpread = 0, m_motionGateFar = 0;
+    int m_motionGateCoherent = 0, m_motionGateGlobal = 0;
     bool m_vrLatched = false;      // this display got a new VR frame
     // TASK-QUOTA-GEN-2026-11-20 §1: a freshly decoded frame earns exactly one generated
     // frame (the credit), spent by the first empty display slot that asks for one - the
@@ -408,6 +409,7 @@ class App {
     int64_t m_slipRetryNs = 0;      // asking didn't help: not again before
     std::deque<int64_t> m_slips;    // when it was asked with no picture meant to wait, lately
     int64_t m_queueKeptUntilNs = 0;  // pictures waited again right after running out: one stays until then
+    int64_t m_queuePolicyLogNs = 0;
     // For the log: how long before the late latch each frame was decoded, how many newer
     // pictures waited when each was taken (0, 1, 2 or more), and how often the PC was asked.
     std::vector<float> m_flowSlackMs;
@@ -469,10 +471,11 @@ class App {
     std::string m_debugUi, m_debugTab, m_debugPc;
     float m_debugPreLatchMs = 0;    // debug.rincast.prelatch_ms
     bool m_debugSlip = false;       // debug.rincast.slip
+    bool m_debugNoWait = false;     // debug.rincast.nowait
     bool m_debugPoseHold = true;    // debug.rincast.pose_hold
     std::set<std::string> m_placed;  // windows that have been positioned at least once
     int64_t m_statsWindowStart = 0;
-    uint32_t m_statsFrames = 0;
+    uint32_t m_statsFrames = 0, m_statsGenerated = 0;
     double m_latencySum = 0;
     uint32_t m_latencyCount = 0;
     // A22 (TASK-LATENCY-EMA): the panels' latency display, an EMA over at most one latency

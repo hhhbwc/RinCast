@@ -225,7 +225,7 @@ bool MotionEstimator::Init(ID3D11Device* device, uint32_t width, uint32_t height
     m_sixteenthH = m_quarterH / 4;
     m_gridWidth = width / kBlockSize;
     m_gridHeight = height / kBlockSize;
-    m_hasPrevious = false;
+    Reset();
     m_lumaCs = Compile(device, kLumaCs);
     m_downCs = Compile(device, kDownCs);
     m_coarseCs = Compile(device, (std::string(kExpected) + kCoarseCs).c_str());
@@ -252,7 +252,9 @@ bool MotionEstimator::Init(ID3D11Device* device, uint32_t width, uint32_t height
     d.BindFlags = 0;
     d.Usage = D3D11_USAGE_STAGING;
     d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    return SUCCEEDED(device->CreateTexture2D(&d, nullptr, &m_staging));
+    for (auto& staging : m_staging)
+        if (FAILED(device->CreateTexture2D(&d, nullptr, &staging))) return false;
+    return true;
 }
 
 void MotionEstimator::Dispatch(ID3D11DeviceContext* ctx, ID3D11ComputeShader* cs, ID3D11ShaderResourceView* const* srvs, UINT srvCount,
@@ -300,10 +302,7 @@ bool MotionEstimator::Process(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView
     return compared;
 }
 
-bool MotionEstimator::Read(ID3D11DeviceContext* ctx, std::vector<float>& out) {
-    ctx->CopyResource(m_staging.Get(), m_field.tex.Get());
-    D3D11_MAPPED_SUBRESOURCE map;
-    if (FAILED(ctx->Map(m_staging.Get(), 0, D3D11_MAP_READ, 0, &map))) return false;
+void MotionEstimator::Decode(const D3D11_MAPPED_SUBRESOURCE& map, std::vector<float>& out) {
     out.resize(size_t(m_gridWidth) * m_gridHeight * 2);
     for (uint32_t y = 0; y < m_gridHeight; y++) {
         const auto* row = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(map.pData) + y * map.RowPitch);
@@ -315,7 +314,49 @@ bool MotionEstimator::Read(ID3D11DeviceContext* ctx, std::vector<float>& out) {
             out[size_t(y) * m_gridWidth * 2 + x] = (h & 0x8000) ? -magnitude : magnitude;
         }
     }
-    ctx->Unmap(m_staging.Get(), 0);
+}
+
+bool MotionEstimator::Read(ID3D11DeviceContext* ctx, std::vector<float>& out) {
+    ctx->CopyResource(m_staging[0].Get(), m_field.tex.Get());
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (FAILED(ctx->Map(m_staging[0].Get(), 0, D3D11_MAP_READ, 0, &map))) return false;
+    Decode(map, out);
+    ctx->Unmap(m_staging[0].Get(), 0);
+    return true;
+}
+
+bool MotionEstimator::QueueRead(ID3D11DeviceContext* ctx) {
+    if (m_readPending[0] && m_readPending[1]) return false;
+    int slot = m_readWrite;
+    if (m_readPending[slot]) slot ^= 1;
+    ctx->CopyResource(m_staging[slot].Get(), m_field.tex.Get());
+    m_readPending[slot] = true;
+    m_readWrite ^= 1;
+    return true;
+}
+
+bool MotionEstimator::TryRead(ID3D11DeviceContext* ctx, std::vector<float>& out, bool& slotConsumed) {
+    slotConsumed = false;
+    const int slot = m_readNext;
+    if (!m_readPending[slot]) {
+        m_readNext ^= 1;
+        return false;
+    }
+    D3D11_MAPPED_SUBRESOURCE map;
+    const HRESULT hr = ctx->Map(m_staging[slot].Get(), 0,
+                                static_cast<D3D11_MAP>(D3D11_MAP_READ | D3D11_MAP_FLAG_DO_NOT_WAIT), 0, &map);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return false;
+    if (FAILED(hr)) {
+        m_readPending[slot] = false;
+        m_readNext ^= 1;
+        slotConsumed = true;
+        return false;
+    }
+    Decode(map, out);
+    ctx->Unmap(m_staging[slot].Get(), 0);
+    m_readPending[slot] = false;
+    m_readNext ^= 1;
+    slotConsumed = true;
     return true;
 }
 

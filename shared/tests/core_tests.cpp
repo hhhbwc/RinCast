@@ -54,6 +54,8 @@
 // A26 (TASK-BACKLOG-FLUSH-2026-11-22): the sender-side stale-frame flush's pure
 // decision logic (expiry, debt wipe, keyframe/log throttles), tested below.
 #include "rc/stale_flush.h"
+#include "rc/tracking_cache.h"
+#include "rc/vr_queue_policy.h"
 #include "rc/fovea_placement.h"
 #include "rc/fovea_qp.h"
 #include "rc/stream_profile.h"
@@ -1374,6 +1376,72 @@ static void TestMotionHysteresis() {
     }
 }
 
+static void TestMotionGate() {
+    constexpr int w = 84, h = 84, blocks = w * h;
+    const auto make = [blocks](int x, int y, int count) {
+        std::vector<int8_t> grid(2 * blocks, 0);
+        for (int i = 0; i < count; i++) {
+            grid[2 * i] = int8_t(x);
+            grid[2 * i + 1] = int8_t(y);
+        }
+        return grid;
+    };
+    const auto liveShaped = [make](int moving) {
+        auto grid = make(0, 0, 0);
+        for (int i = 0; i < moving; i++) {
+            int x = 1, y = 0;
+            if (moving == 644) y = i < 71 ? 3 : 0;
+            if (moving == 3788) y = i < 224 ? 3 : i < 448 ? -3 : i == 448 ? 4 : 0;
+            if (moving == 5687) y = i < 1564 ? 7 : i < 3129 ? -7 : 0;
+            if (moving == 53) { x = 1; y = i < 20 ? 5 : i < 40 ? -2 : i < 47 ? -1 : 0; }
+            grid[2 * i] = int8_t(i % 2 ? -x : x);
+            grid[2 * i + 1] = int8_t(y);
+        }
+        return grid;
+    };
+    for (int moving : {644, 3788, 5687, 53}) {
+        auto grid = liveShaped(moving);
+        const rc::MotionGate gate = rc::JudgeMotionField(grid, w, h);
+        CHECK(!gate.worth);
+        CHECK(gate.global == 0);
+        CHECK(gate.moving == moving);
+    }
+    {
+        auto grid = make(3, -1, blocks * 3 / 5);
+        const auto gate = rc::JudgeMotionField(grid, w, h);
+        CHECK(gate.worth);
+        CHECK(gate.global == 4);
+        CHECK(gate.coherent == blocks * 3 / 5);
+        CHECK(gate.spread == 0);
+    }
+    {
+        auto grid = make(3, -1, blocks * 2 / 5);
+        CHECK(!rc::JudgeMotionField(grid, w, h).worth);
+    }
+    {
+        auto grid = make(0, 0, 0);
+        for (int i = 0; i < blocks; i++) {
+            grid[2 * i] = int8_t(i % 2 ? -5 : 5);
+            grid[2 * i + 1] = int8_t(i % 3 ? -2 : 2);
+        }
+        CHECK(!rc::JudgeMotionField(grid, w, h).worth);
+    }
+    {
+        auto grid = make(3, -1, blocks * 7 / 10);
+        for (int i = blocks * 7 / 10; i < blocks * 4 / 5; i++) grid[2 * i] = 13;
+        const auto gate = rc::JudgeMotionField(grid, w, h);
+        CHECK(gate.worth);
+        CHECK(gate.farRejected == blocks / 10);
+        for (int i = blocks * 7 / 10; i < blocks * 4 / 5; i++) CHECK(grid[2 * i] == 0);
+    }
+    {
+        auto grid = make(1, 0, 0);
+        CHECK(!rc::JudgeMotionField(grid, 0, h).worth);
+        CHECK(!rc::JudgeMotionField(grid, w, h).worth);
+    }
+    std::printf("motion gate: live-shaped false fields rejected, coherent pan accepted\n");
+}
+
 // An Ogg Opus file of a stereo sine, built the way an encoder lays it out (no CRCs: the
 // reader doesn't check them).
 static rc::TrackData MakeOggOpus(double hz, int packets, int trimEnd, bool badTail = false) {
@@ -1845,6 +1913,9 @@ static void TestStreamProfile() {
     // swung QP 3-25 / 9-29 and the user read it as strong "breathing"; 12 cuts
     // the near-lossless spikes while keeping the sharpness edge over Balanced 16.
     CHECK(rc::ProfileParams(rc::StreamProfile::Quality).minQp == 12);
+    CHECK(rc::ProfileParams(rc::StreamProfile::Quality).vbvFramesPercent == 200);
+    CHECK(rc::ComputeCappedVbr(cap, fps, rc::StreamProfile::Quality).vbvBufferSize ==
+          rc::ComputeCappedVbr(cap, fps, rc::StreamProfile::Balanced).vbvBufferSize * 4 / 3);
     // The floors are the point: with Balanced's at 20 the real device pinned the QP
     // at exactly 20.0 and 35 of a 100 Mbps ceiling; off, the same content swung
     // 4.7-25 and read as "breathing" (2026-11-17 real device). 16 is a middle guess
@@ -3216,6 +3287,79 @@ static void TestStaleFlushGraceReplay() {
                 sent, dropped, (long long)(rc::kFlushGraceNs / kMs));
 }
 
+static void TestVrQueuePolicy() {
+    constexpr int64_t period = 13'888'889;  // 72 Hz
+    constexpr int64_t now = 100'000'000'000LL;
+    constexpr double needed = 10.6e6;  // 72 Hz log shape: margin 5.6 ms, latest slack -5.5 ms
+    std::printf("VR queue policy: ");
+    CHECK(rc::SelectVrQueueWanted(true, true, false, period, needed, 1, now, 0) == 1);
+    CHECK(rc::SelectVrQueueWanted(true, true, true, period, needed, 1, now, 0) == 0);
+    CHECK(rc::SelectVrQueueWanted(false, true, true, period, needed, 1, now, 0) == 1);
+    CHECK(rc::SelectVrQueueWanted(true, false, true, period, needed, 1, now, 0) == 1);
+    CHECK(rc::SelectVrQueueWanted(true, true, true, period, needed, 1, now, now + 1) == 1);
+    CHECK(rc::SelectVrQueueWanted(true, true, false, 0, needed, 1, now, 0) == 1);
+    CHECK(rc::SelectVrQueueWanted(true, true, false, period, rc::VrQueueLimitNs(period, 1), 1, now, 0) == 0);
+    CHECK(rc::SelectVrQueueWanted(true, true, false, period, rc::VrQueueLimitNs(period, 0) + 1, 0, now, 0) == 1);
+    std::printf("default hysteresis and guarded nowait experiment checked\n");
+}
+
+static void TestTrackingTargetCache() {
+    static_assert(rc::TrackingTargetCache::kCapacity == 64);
+    constexpr int64_t submitNs = 1'000'000'000;
+    constexpr int64_t guardNs = 5'000'000;
+    constexpr int64_t aheadNs = 40'000'000;
+    rc::TrackingTargetCache cache;
+    int64_t targetNs = -1;
+    bool clockValid = false;
+
+    cache.Put(42, submitNs + aheadNs, true);
+    CHECK((cache.Get(42, targetNs, clockValid)));
+    CHECK(targetNs == submitNs + aheadNs);
+    CHECK(clockValid);
+    auto p = rc::SelectPredictedDisplay(true, targetNs, clockValid, submitNs, guardNs, aheadNs);
+    CHECK(p.exact && p.trackHit && p.clockValid);
+    CHECK(p.pcNs == targetNs);
+
+    cache.Put(43, submitNs + aheadNs, false);
+    CHECK((cache.Get(43, targetNs, clockValid)));
+    p = rc::SelectPredictedDisplay(true, targetNs, clockValid, submitNs, guardNs, aheadNs);
+    CHECK(!p.exact && p.trackHit && !p.clockValid);
+    CHECK(p.pcNs == submitNs + aheadNs);
+
+    cache.Put(44, submitNs - guardNs, true);
+    CHECK((cache.Get(44, targetNs, clockValid)));
+    p = rc::SelectPredictedDisplay(true, targetNs, clockValid, submitNs, guardNs, aheadNs);
+    CHECK(!p.exact && p.trackHit && p.clockValid);
+    CHECK(p.pcNs == submitNs + aheadNs);
+
+    p = rc::SelectPredictedDisplay(false, 0, false, submitNs, guardNs, aheadNs);
+    CHECK(!p.exact && !p.trackHit && !p.clockValid);
+    CHECK(p.pcNs == submitNs + aheadNs);
+
+    cache.Put(7, submitNs + 1, true);
+    cache.Put(7, submitNs + 2, false);
+    CHECK((cache.Get(7, targetNs, clockValid)));
+    CHECK(targetNs == submitNs + 2 && !clockValid);
+    cache.Put(0, submitNs + aheadNs, true);
+    CHECK((!cache.Get(0, targetNs, clockValid)));
+
+    rc::TrackingTargetCache bounded;
+    for (uint64_t sequence = 1; sequence <= rc::TrackingTargetCache::kCapacity; sequence++)
+        bounded.Put(sequence, submitNs + int64_t(sequence), true);
+    CHECK((bounded.Get(rc::TrackingTargetCache::kCapacity, targetNs, clockValid)));
+    CHECK(targetNs == submitNs + int64_t(rc::TrackingTargetCache::kCapacity));
+    bounded.Put(rc::TrackingTargetCache::kCapacity + 1, submitNs + 100, true);
+    CHECK((!bounded.Get(1, targetNs, clockValid)));
+    CHECK((bounded.Get(rc::TrackingTargetCache::kCapacity, targetNs, clockValid)));
+    CHECK(targetNs == submitNs + int64_t(rc::TrackingTargetCache::kCapacity));
+    CHECK((bounded.Get(rc::TrackingTargetCache::kCapacity + 1, targetNs, clockValid)));
+    CHECK(targetNs == submitNs + 100 && clockValid);
+    bounded.Clear();
+    CHECK((!bounded.Get(rc::TrackingTargetCache::kCapacity + 1, targetNs, clockValid)));
+    std::printf("A98 tracking cache: hit/invalid-clock/guard/miss/update/overflow/clear passed\n");
+}
+
+
 // TASK-LATENCY-METER-FIX-2026-11-22 §2: the stage accumulator must not drop samples.
 // The user saw the panel's stages sum fall far short of the total latency: the old
 // AddStages filtered each stage on its own, so a clock-offset error pushing the game
@@ -3743,6 +3887,76 @@ static void TestFillModePlan() {
     CHECK(!gate.InCooldown(t0 + 10 * second + 30 * second));
     CHECK(gate.Update(false, t0 + 11 * second));     // armed keeps: pressure drops leave it on; the rung tracks the EMA
     std::printf("fill mode: off frozen, on floor-45 rung, vbv untouched; gate 5s hold / 30s re-arm cooldown / armed sticky, rung follows EMA\n");
+}
+
+static void TestCadenceBudgetPlan() {
+    constexpr int64_t second = 1'000'000'000LL;
+    rc::EncoderRateTracker tracker;
+    auto settle = [&](double fps) {
+        tracker = {};
+        for (int i = 0; i < 400; ++i) tracker.Observe(1e9 / fps);
+    };
+    auto plan = [&](bool enabled, bool desktop, bool startup, double nominal, uint32_t vbvPct,
+                    uint32_t avgPct = 100, bool fill = false) {
+        return rc::PlanEncoderRate(100000, nominal, desktop, startup, tracker, 90000,
+                                   avgPct, vbvPct, fill, enabled);
+    };
+
+    settle(45);
+    const auto off = plan(false, false, false, 90.0, 200);
+    const auto on = plan(true, false, false, 90.0, 200);
+    CHECK(rc::SameRatePlan(plan(true, true, false, 90.0, 200), off));
+    CHECK(rc::SameRatePlan(plan(true, false, true, 90.0, 200), off));
+    CHECK(on.rateNum == 90000);
+    CHECK(on.requestedKbps == 100000);
+    CHECK(on.budget.maxBitrate == 150'000'000);
+    CHECK(on.budget.averageBitrate == 150'000'000);
+    CHECK(on.budget.vbvBufferSize == off.budget.vbvBufferSize);
+    CHECK(double(on.budget.maxBitrate) / 90.0 <= double(on.budget.vbvBufferSize));
+
+    // 150% VBV leaves less room: the same cadence must stop at 95% of the bucket.
+    const auto balanced = plan(true, false, false, 90.0, 150);
+    CHECK(std::abs(int64_t(balanced.budget.maxBitrate) - int64_t(142'500'000)) <= 2);
+    CHECK(double(balanced.budget.maxBitrate) / 90.0 <= double(balanced.budget.vbvBufferSize));
+
+    for (double nominal : {72.0, 90.0, 120.0}) {
+        for (uint32_t vbvPct : {150u, 200u}) {
+            const auto baseline = plan(false, false, false, nominal, vbvPct);
+            const auto candidate = plan(true, false, false, nominal, vbvPct);
+            CHECK(candidate.rateNum == uint32_t(nominal * 1000.0));
+            CHECK(candidate.requestedKbps == baseline.requestedKbps);
+            CHECK(candidate.budget.maxBitrate >= baseline.budget.maxBitrate);
+            CHECK(candidate.budget.vbvBufferSize == baseline.budget.vbvBufferSize);
+            CHECK(double(candidate.budget.maxBitrate) / nominal <= double(candidate.budget.vbvBufferSize));
+        }
+    }
+    CHECK(rc::SameRatePlan(plan(true, false, false, 90.0, 100), plan(false, false, false, 90.0, 100)));
+    tracker.slowIntervalNs = std::numeric_limits<double>::infinity();
+    CHECK(rc::SameRatePlan(plan(true, false, false, 90.0, 200), off));
+
+    settle(1);
+    CHECK(plan(true, false, false, 90.0, 200).budget.maxBitrate == on.budget.maxBitrate);
+    settle(80);
+    CHECK(rc::SameRatePlan(plan(true, false, false, 90.0, 200), off));
+    tracker = {};
+    CHECK(rc::SameRatePlan(plan(true, false, false, 90.0, 200), off));
+
+    // The candidate replaces the rung-follow branch; the two never stack.
+    settle(45);
+    CHECK(plan(true, false, false, 90.0, 200, 100, true).rateNum == 90000);
+    const auto avg60 = plan(true, false, false, 90.0, 200, 60);
+    CHECK(avg60.budget.maxBitrate == on.budget.maxBitrate);
+    CHECK(std::abs(int64_t(avg60.budget.averageBitrate) - int64_t(90'000'000)) <= 2);
+
+    rc::EncoderRateState state;
+    state.applied = off;
+    CHECK(!state.ShouldAttempt(on, 10 * second));
+    CHECK(state.ShouldAttempt(on, 13 * second));
+    CHECK(rc::ApplyEncoderRateTransaction(state, on, 13 * second, [] { return true; }));
+    settle(80);
+    CHECK(!state.ShouldAttempt(off, 13 * second + 1));
+    CHECK(state.ShouldAttempt(off, 14 * second));
+    std::printf("cadence budget: opt-in, nominal denominator, bounded avg/max, fixed VBV, 3s growth hold\n");
 }
 
 // TASK-ROBUST-EDGES-2026-11-20 §1.2: the FillModeGate edge matrix
@@ -4794,21 +5008,158 @@ static void TestAutoTuneProfileFloor() {
 // headset showed nothing. The caller now skips those ticks; this is the rule.
 static void TestHasUsableSignals() {
     rc::BottleneckSignal s{};
-    CHECK(!rc::HasUsableSignals(s), "all-unknown is no evidence, not a clean link");
+    CHECK(!rc::HasUsableSignals(s));
     s.gameFps = 33;
-    CHECK(rc::HasUsableSignals(s), "a game fps reading alone is enough to judge the tick");
+    CHECK(rc::HasUsableSignals(s));
     s.gameFps = 0;
     s.qp = 24;
-    CHECK(rc::HasUsableSignals(s), "a QP reading alone is enough");
+    CHECK(rc::HasUsableSignals(s));
     s.qp = -1;
     s.mbps = 5;
-    CHECK(rc::HasUsableSignals(s), "a wire reading alone is enough");
+    CHECK(rc::HasUsableSignals(s));
     s.mbps = 0;
     s.queueMs = 0;
-    CHECK(rc::HasUsableSignals(s), "a measured zero queue IS evidence");
+    CHECK(rc::HasUsableSignals(s));
     s.queueMs = -1;
     s.decodeMs = 8;
-    CHECK(!rc::HasUsableSignals(s), "a decode reading does not stand in for a stream");
+    CHECK(!rc::HasUsableSignals(s));
+}
+
+static void TestAutoTuneFreshEvidence() {
+    const int64_t S = 1000000000LL;
+    const int64_t now = 100 * S;
+    std::printf("auto-tune fresh evidence: ");
+    auto sample = [](int64_t atNs, bool calm) {
+        rc::BottleneckSignal s;
+        s.lastFrameNs = atNs;
+        s.lastFeedbackNs = atNs;
+        s.queueMs = calm ? 5.0 : 500.0;
+        s.decodeMs = 8.0;
+        s.decodeBudgetMs = 16.0;
+        return s;
+    };
+
+    rc::BottleneckSignal legacy = sample(0, true);
+    legacy.qp = 24;
+    legacy.mbps = 20;
+    legacy.gameFps = 60;
+    legacy.droppedFps = 0;
+    legacy.ceilingKbps = 50000;
+    CHECK(!rc::HasFreshSignals(legacy, now));
+    auto cleared = rc::WithFreshSignals(legacy, now);
+    CHECK(cleared.qp == -1 && cleared.mbps == 0 && cleared.ceilingKbps == 0);
+    CHECK(cleared.gameFps == 0 && cleared.droppedFps == -1);
+    CHECK(cleared.queueMs == -1 && cleared.decodeMs == -1 && cleared.loss == 0);
+
+    rc::BottleneckSignal edge = sample(now - 5 * S, true);
+    edge.lastFrameNs = now - 2 * S;
+    CHECK(rc::SignalFresh(edge.lastFrameNs, now, rc::kAutoSignalFrameMaxAgeNs));
+    CHECK(rc::SignalFresh(edge.lastFeedbackNs, now, rc::kAutoSignalFeedbackMaxAgeNs));
+    CHECK(rc::HasFreshSignals(edge, now));
+    edge.lastFrameNs = now - 2 * S - 1;
+    CHECK(!rc::SignalFresh(edge.lastFrameNs, now, rc::kAutoSignalFrameMaxAgeNs));
+    auto staleFrame = rc::WithFreshSignals(edge, now);
+    CHECK(staleFrame.queueMs == 5.0 && staleFrame.decodeMs == 8.0);
+    CHECK(!rc::HasFreshSignals(edge, now));
+    edge.lastFrameNs = now;
+    edge.qp = 24;
+    edge.mbps = 20;
+    edge.gameFps = 60;
+    edge.lastFeedbackNs = now + 1;
+    CHECK(!rc::SignalFresh(edge.lastFeedbackNs, now, rc::kAutoSignalFeedbackMaxAgeNs));
+    edge.lastFeedbackNs = now - 5 * S - 1;
+    auto staleFeedback = rc::WithFreshSignals(edge, now);
+    CHECK(staleFeedback.queueMs == -1 && staleFeedback.decodeMs == -1 && staleFeedback.loss == 0);
+    CHECK(staleFeedback.qp == 24 && staleFeedback.mbps == 20 && staleFeedback.gameFps == 60);
+    CHECK(!rc::HasFreshSignals(edge, now));
+    edge.lastFeedbackNs = now - 5 * S;
+    CHECK(rc::SignalFresh(edge.lastFeedbackNs, now, rc::kAutoSignalFeedbackMaxAgeNs));
+
+    rc::BottleneckSignal paused = sample(now, true);
+    paused.streamActive = false;
+    paused.qp = 24;
+    paused.mbps = 20;
+    paused.gameFps = 60;
+    paused.loss = 0.5;
+    auto pausedCleared = rc::WithFreshSignals(paused, now);
+    CHECK(!rc::HasFreshSignals(paused, now));
+    CHECK(pausedCleared.qp == -1 && pausedCleared.mbps == 0 && pausedCleared.gameFps == 0);
+    CHECK(pausedCleared.queueMs == -1 && pausedCleared.decodeMs == -1 && pausedCleared.loss == 0);
+
+    rc::AutoTune::Config cfg{};
+    rc::AutoTuneInput in;
+    in.profileId = 0;
+    in.dipAtMs = 21;
+    auto configure = [&](rc::AutoTune& g) {
+        g.Configure(cfg);
+        g.SetEnabled(true);
+    };
+
+    {
+        rc::AutoTune g;
+        configure(g);
+        for (int64_t t = S; t <= 30 * S; t += S)
+            CHECK(g.UpdateWithEvidence(sample(t, true), in, t).action == rc::AutoAction::None);
+        const auto r = g.UpdateWithEvidence(sample(31 * S, true), in, 31 * S);
+        CHECK(r.action == rc::AutoAction::ProfileUp && r.profileId == 1);
+        CHECK(r.evidenceNs == 30 * S);
+    }
+    {
+        rc::AutoTune g;
+        configure(g);
+        for (int64_t t = S; t <= 29 * S; t += S)
+            CHECK(g.UpdateWithEvidence(sample(t, true), in, t).action == rc::AutoAction::None);
+        CHECK(g.UpdateWithEvidence(sample(29 * S, true), in, 33 * S).action == rc::AutoAction::None);
+        for (int64_t t = 34 * S; t <= 63 * S; t += S)
+            CHECK(g.UpdateWithEvidence(sample(t, true), in, t).action == rc::AutoAction::None);
+        const auto r = g.UpdateWithEvidence(sample(64 * S, true), in, 64 * S);
+        CHECK(r.action == rc::AutoAction::ProfileUp && r.evidenceNs == 30 * S);
+    }
+    {
+        rc::AutoTune g;
+        configure(g);
+        in.profileId = 2;
+        in.dipAtMs = 72;
+        for (int64_t t = S; t <= 4 * S; t += S)
+            CHECK(g.UpdateWithEvidence(sample(t, false), in, t).action == rc::AutoAction::None);
+        CHECK(g.UpdateWithEvidence(sample(4 * S, false), in, 7 * S).action == rc::AutoAction::None);
+        for (int64_t t = 8 * S; t <= 12 * S; t += S)
+            CHECK(g.UpdateWithEvidence(sample(t, false), in, t).action == rc::AutoAction::None);
+        const auto r = g.UpdateWithEvidence(sample(13 * S, false), in, 13 * S);
+        CHECK(r.action == rc::AutoAction::ProfileDown && r.profileId == 1);
+        CHECK(r.evidenceNs == 5 * S);
+    }
+    {
+        rc::AutoTune g;
+        configure(g);
+        in.profileId = 0;
+        in.dipAtMs = 21;
+        for (int64_t t = S; t <= 29 * S; t += S)
+            CHECK(g.UpdateWithEvidence(sample(t, true), in, t).action == rc::AutoAction::None);
+        auto inactive = sample(30 * S, true);
+        inactive.streamActive = false;
+        CHECK(g.UpdateWithEvidence(inactive, in, 30 * S).action == rc::AutoAction::None);
+        for (int64_t t = 31 * S; t <= 60 * S; t += S)
+            CHECK(g.UpdateWithEvidence(sample(t, true), in, t).action == rc::AutoAction::None);
+        const auto r = g.UpdateWithEvidence(sample(61 * S, true), in, 61 * S);
+        CHECK(r.action == rc::AutoAction::ProfileUp && r.evidenceNs == 30 * S);
+    }
+    {
+        rc::AutoTune g;
+        configure(g);
+        in.profileId = 0;
+        in.dipAtMs = 21;
+        for (int64_t t = S; t <= 29 * S; t += S)
+            CHECK(g.UpdateWithEvidence(sample(t, true), in, t).action == rc::AutoAction::None);
+        auto staleQueue = sample(30 * S, true);
+        staleQueue.lastFeedbackNs = 24 * S;
+        CHECK(g.UpdateWithEvidence(staleQueue, in, 30 * S).action == rc::AutoAction::None);
+        for (int64_t t = 31 * S; t <= 60 * S; t += S)
+            CHECK(g.UpdateWithEvidence(sample(t, true), in, t).action == rc::AutoAction::None);
+        const auto r = g.UpdateWithEvidence(sample(61 * S, true), in, 61 * S);
+        CHECK(r.action == rc::AutoAction::ProfileUp && r.evidenceNs == 30 * S);
+    }
+    std::printf("ok\n");
 }
 
 static void TestEffectiveProfileRung() {
@@ -6837,6 +7188,7 @@ int main() {
     TestMusic();
     TestMotionRuns();
     TestMotionHysteresis();  // A18 (TASK-MOTION-HYSTERESIS-2026-11-22)
+    TestMotionGate();
     TestHandSkeleton();
     NetInit();
     TestAddresses();
@@ -6900,6 +7252,7 @@ int main() {
     TestQpStatisticsValidity();
     TestEncoderRateTransaction();
     TestFillModePlan();
+    TestCadenceBudgetPlan();
     TestFillModeGateEdges();  // TASK-ROBUST-EDGES-2026-11-20 §1.2
     TestStreamProfile();
     TestProfileFoveaGradient();
@@ -6923,6 +7276,8 @@ int main() {
     TestStaleFlush();  // A26 (TASK-BACKLOG-FLUSH-2026-11-22)
     TestStaleFlushChainGate();  // A72 (TASK-A72-STALE-FLUSH-2026-11-22): rules C1-C8
     TestStaleFlushGraceReplay();  // A75 (TASK-A75-FLUSH-GRACE-2026-11-22): the grace period replayed
+    TestVrQueuePolicy();
+    TestTrackingTargetCache();  // A98: sequence hit, clock validity, guard and bounded eviction
     TestLossBrake();
     TestQueueGuard();
     TestGuardRecoveryCost();  // A73b (TASK-A73b-RECOVERY-COST): the recovery-cost table
@@ -6932,6 +7287,7 @@ int main() {
     TestAutoTuneDecide();
     TestAutoTuneProfileFloor();  // A84 (TASK-A84-PROFILE-FLOOR-TWO-WAY-AUTOTUNE-2026-11-23 §5)
     TestHasUsableSignals();  // A88: no stream is not a clean link
+    TestAutoTuneFreshEvidence();  // A99: stale snapshots and paused streams break evidence streaks
     TestEffectiveProfileRung();  // A84b §4 (TASK-A84b): the rule behind the periodic effProfile
     TestSettingsSchemaMigration();  // A84b §2: the autoTune default migration, out of settings.cpp
     TestLinkPolicy();

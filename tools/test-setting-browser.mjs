@@ -324,7 +324,17 @@ try {
       scrollTop: +main.scrollTop.toFixed(2),
       mainScroll: main.scrollHeight, bodyScroll: document.body.scrollHeight };
   })()`);
+  const anchorWidths = () => js(`(() => {
+    const main = document.querySelector('#main');
+    const labels = [...document.querySelectorAll('#videoPage .cols .options label')].map(label => {
+      const span = label.querySelector('span');
+      const r = label.getBoundingClientRect();
+      return { text: label.textContent.trim(), width: +r.width.toFixed(2), lines: span.getClientRects().length };
+    });
+    return { mainClientWidth: main.clientWidth, labels };
+  })()`);
   const beforeOpen = await anchorTops();
+  const beforeWidths = await anchorWidths();
   // Reach the fold with the keyboard only, and open it with a real Enter - a disclosure that
   // only answers to a mouse is not one. The walk starts from a known element, so the number of
   // presses it reports is a fact about the tab order rather than about the previous test.
@@ -344,8 +354,12 @@ try {
   assert.equal(open.danglingTitles, 0);
   assert.equal(open.emptyCards, 0);
   const afterOpen = await anchorTops();
+  const afterWidths = await anchorWidths();
   const moved = Object.keys(beforeOpen).filter(k => !['mainScroll', 'bodyScroll', 'scrollTop'].includes(k) && beforeOpen[k] !== afterOpen[k]);
   assert.deepEqual(moved, [], `expanding 高级 moved: ${moved.map(k => `${k} ${beforeOpen[k]}->${afterOpen[k]}`).join(', ')}`);
+  assert.equal(afterWidths.mainClientWidth, beforeWidths.mainClientWidth,
+    `expanding 高级 changed content width: ${beforeWidths.mainClientWidth}->${afterWidths.mainClientWidth}`);
+  assert.deepEqual(afterWidths.labels, beforeWidths.labels, 'expanding 高级 squeezed an adjacent option or changed its wrapping');
   assert(afterOpen.mainScroll > beforeOpen.mainScroll, 'the page did not grow at all: nothing was expanded');
   assert.deepEqual(await snapshot(), valuesShut, 'the disclosure toggle changed a control value');
   const openHead = await js(`document.querySelector('#advancedHead').getAttribute('aria-expanded')`);

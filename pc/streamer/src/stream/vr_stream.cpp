@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -14,6 +15,7 @@
 #include "rc/fovea_placement.h"
 #include "rc/motion_field.h"
 #include "rc/stale_flush.h"
+#include "rc/tracking_cache.h"
 
 #include <avrt.h>
 
@@ -85,6 +87,14 @@ constexpr int64_t kStalePredictAheadNs = 40'000'000;
 // such a value is not trusted and the predict-ahead estimate is used instead.
 constexpr int64_t kStaleClockGuardNs = 5'000'000;
 
+bool AsyncMotionExperiment() {
+    static const bool enabled = [] {
+        char text[2]{};
+        return GetEnvironmentVariableA("RINCAST_ASYNC_MOTION", text, sizeof(text)) == 1 && text[0] == '1';
+    }();
+    return enabled;
+}
+
 }  // namespace
 
 // The full-density square follows the eyes, but only moves once they look clearly elsewhere:
@@ -115,6 +125,7 @@ VrStream::VrStream(rc::Connection* connection, VrBridgeHost* bridge, const VrStr
     : m_connection(connection),
       m_bridge(bridge),
       m_config(config),
+      m_liveProfile(int(config.profile)),
       m_sender(connection, rc::kVrStreamId, config.codec, config.bitrateKbps, config.fecPercent, config.adaptive,
                config.profile),
       m_onState(std::move(onState)) {
@@ -216,12 +227,43 @@ void VrStream::LogFrameFlow(int64_t now) {
                      double(m_cadSubmitToJobSumNs) / m_cadSubmitToJobSamples / 1e6,
                      double(m_cadSubmitToJobMaxNs) / 1e6);
         else snprintf(s2jPart, sizeof(s2jPart), ", submitToJob n/a");
+        const auto fmtAvgMax = [](char* b, size_t n, const char* name, const DiagTiming& t) {
+            if (t.samples)
+                snprintf(b, n, ", %s avg/max %.1f/%.1f ms", name,
+                         double(t.sumNs) / t.samples / 1e6, double(t.maxNs) / 1e6);
+            else snprintf(b, n, ", %s n/a", name);
+        };
+        DiagTiming sendWait;
+        const uint32_t sendWaitEnd = m_diagSendWaitIdx.load(std::memory_order_relaxed);
+        const uint32_t sendWaitCount =
+            std::min<uint32_t>(m_diagSendWaitCount.exchange(0, std::memory_order_relaxed), uint32_t(kDiagRing));
+        for (uint32_t i = sendWaitEnd - sendWaitCount; i < sendWaitEnd; i++)
+            sendWait.Add(int64_t(m_diagSendWaitUs[i % kDiagRing].load(std::memory_order_relaxed)) * 1000);
+        char holdPart[96], lockPart[96], convertPart[96], motionPart[96], sendWaitPart[96], jobReplPart[40];
+        fmtAvgMax(holdPart, sizeof(holdPart), "hold", m_diagHold);
+        fmtAvgMax(lockPart, sizeof(lockPart), "lock", m_diagLock1s);
+        fmtAvgMax(convertPart, sizeof(convertPart), "convertBlock", m_diagConvertBlock);
+        fmtAvgMax(motionPart, sizeof(motionPart), "motionRead", m_diagMotionRead);
+        fmtAvgMax(sendWaitPart, sizeof(sendWaitPart), "sendWait", sendWait);
+        snprintf(jobReplPart, sizeof(jobReplPart), ", jobRepl %u", m_diagJobRepl);
+        const uint32_t overruns1s = m_diagOverrunsPrimed ? (overruns >= m_diagOverrunsPrev ? overruns - m_diagOverrunsPrev
+                                                                                         : overruns)
+                                                        : 0;
+        m_diagOverrunsPrev = overruns;
         RC_LOGI("rc diag 1s: game %.0f/s enc %.0f/s drop %.0f/s, halfRate %s, target %u kbps, wire %.1f Mbps, "
                 "queue %.0f ms, qp %.1f, render %ux%u enc %ux%u%s, enc p50/p95 %.1f/%.1f ms"
-                ", sendBacklog %.1f ms, overruns %u, jobAge %.1f ms, sendAge %.1f ms%s%s%s",
+                ", sendBacklog %.1f ms, overruns %u, jobAge %.1f ms, sendAge %.1f ms%s%s%s"
+                "%s%s%s%s%s%s, overruns1s %u, motionPending %u",
                 s.gameFps, s.encFps, s.droppedFps, m_halfRateActive.load(std::memory_order_relaxed) ? "ON" : "OFF",
                 m_sender.TargetBitrateKbps(), s.mbps, s.queueMs, s.qp, s.srcWidth, s.srcHeight, s.encWidth, s.encHeight,
-                seqPart, p50, p95, backlogMs, overruns, jobAgeMs, sendAgeMs, arrPart, subPart, s2jPart);
+                seqPart, p50, p95, backlogMs, overruns, jobAgeMs, sendAgeMs, arrPart, subPart, s2jPart,
+                holdPart, lockPart, convertPart, motionPart, jobReplPart, sendWaitPart, overruns1s, m_diagMotionPending);
+        m_diagHold = {};
+        m_diagLock1s = {};
+        m_diagConvertBlock = {};
+        m_diagMotionRead = {};
+        m_diagMotionPending = 0;
+        m_diagJobRepl = 0;
         m_cadArrivalSamples = 0; m_cadArrivalMinNs = m_cadArrivalMaxNs = 0;
         m_cadSubmitSamples = 0; m_cadSubmitMinNs = m_cadSubmitMaxNs = 0;
         m_cadSubmitToJobSamples = 0; m_cadSubmitToJobSumNs = m_cadSubmitToJobMaxNs = 0;
@@ -281,16 +323,19 @@ void VrStream::LogFrameFlow(int64_t now) {
         RC_LOGI("VR stale flush: %u frame(s) dropped past their display moment in this 10 s window", staleDrops);
 }
 
-void VrStream::WaitForEncoder(int64_t convertAvgNs) {
+int64_t VrStream::WaitForEncoder(int64_t convertAvgNs) {
     const int64_t start = rc::NowNs();
+    const auto finish = [&] {
+        const int64_t heldNs = rc::NowNs() - start;
+        m_flowHeldNs += heldNs;
+        m_diagHold.Add(heldNs);
+        return heldNs;
+    };
     {
         std::unique_lock lock(m_jobMutex);
         // The frame before still waits for the encoder: one converted now would only replace it.
         if (m_job) m_jobTaken.wait_for(lock, std::chrono::milliseconds(100), [this] { return !m_running || !m_job; });
-        if (!m_encoding || m_job) {
-            m_flowHeldNs += rc::NowNs() - start;
-            return;
-        }
+        if (!m_encoding || m_job) return finish();
     }
     // The encoder is busy: take the game's next frame so its conversion ends about when the
     // encoder is free. Taken sooner, it would wait for the encoder and arrive older. Meanwhile the
@@ -299,7 +344,7 @@ void VrStream::WaitForEncoder(int64_t convertAvgNs) {
     const int64_t readyAt = m_encodeStartNs + m_encodeAvgNs - convertAvgNs - 1'000'000;
     const int64_t wait = std::min<int64_t>(readyAt - rc::NowNs(), 20'000'000);
     if (wait >= 1'000'000) rc::SleepMs(int(wait / 1'000'000));
-    m_flowHeldNs += rc::NowNs() - start;
+    return finish();
 }
 
 void VrStream::Run() {
@@ -330,18 +375,24 @@ void VrStream::Run() {
     bool convertersReady = false;
     constexpr double kHalfRateBelowBpp = 0.03, kFullRateAboveBpp = 0.05;
     bool halfRate = false, skipNext = false;
+    bool motionSkipPending = false;
     m_sender.SetPacingMode(m_config.pacingMode, 0);
+    m_diagOverrunsPrev = m_sender.BudgetOverruns();
+    m_diagOverrunsPrimed = true;
     uint64_t lastFrameIndex = 0;
     int64_t lastFrameNs = 0;
     bool streaming = false;
     rcvr::ProducerKind lastProducer = rcvr::ProducerKind::None;
     std::string lastApp;
     MotionEstimator motion;
+    const bool asyncMotion = AsyncMotionExperiment();
     bool motionReady = false;
+    uint64_t lastMotionFrameIndex = 0;
     std::map<ID3D11Texture2D*, ComPtr<ID3D11ShaderResourceView>> motionViews;
     rcvr::BridgePose motionPose{};
     uint64_t motionPreviousTimestamp = 0;
     std::vector<float> motionField;
+    std::deque<uint64_t> motionReadPrevious;
     // A18: the quantized grid lives on in m_motionGridPrev (the hysteresis state) instead of
     // a local, per the card: the cross-frame state belongs to VrStream.
     uint32_t lastTextureGeneration = m_bridge->TextureGeneration();
@@ -355,6 +406,9 @@ void VrStream::Run() {
         m_cadPrevSubmitNs = 0;  // A83: the next frame becomes the cadence baseline again
         motionViews.clear();  // the SRVs pin the previous generation's textures
         motion.Reset();
+        lastMotionFrameIndex = 0;
+        motionSkipPending = false;
+        motionReadPrevious.clear();
         m_motionGridPrev.clear();
         motionPose = rcvr::BridgePose{};
         motionPreviousTimestamp = 0;
@@ -367,7 +421,8 @@ void VrStream::Run() {
     while (m_running) {
         WaitForSingleObject(m_bridge->FrameEvent(), 50);
         // Not before the encoder is about to want it; the frame waits in the bridge, the game with it.
-        if (streaming && !m_paused) WaitForEncoder(convertAvgNs);
+        int64_t frameHoldNs = -1;
+        if (streaming && !m_paused) frameHoldNs = WaitForEncoder(convertAvgNs);
         const int64_t now = rc::NowNs();
         // A61: dead-producer recovery and a resolution change both hand out new textures.
         if (const uint32_t generation = m_bridge->TextureGeneration(); generation != lastTextureGeneration) {
@@ -462,6 +517,9 @@ void VrStream::Run() {
             lastFrameNs = now;
             InterlockedExchange(&fs.state, rcvr::kSlotFree);
             motion.Reset();
+            lastMotionFrameIndex = 0;
+            motionSkipPending = false;
+            motionReadPrevious.clear();
             // A18: the hysteresis state follows the estimator's - the next frame compares
             // against nothing, so every block starts over from still.
             m_motionGridPrev.clear();
@@ -520,6 +578,11 @@ void VrStream::Run() {
             convertersReady = true;
             motionViews.clear();
             motionReady = m_config.motionField && motion.Init(device, srcWidth, srcHeight);
+            lastMotionFrameIndex = 0;
+            motionSkipPending = false;
+            motionReadPrevious.clear();
+            motionPose = rcvr::BridgePose{};
+            motionPreviousTimestamp = 0;
             if (m_config.motionField && !motionReady) RC_LOGW("Frame generation: the motion estimator didn't start");
             // A18: a new estimator geometry invalidates the old grid's blocks - the hysteresis
             // state restarts from all-still with it (the next AppendMotion resizes it fresh).
@@ -542,6 +605,7 @@ void VrStream::Run() {
             ++m_diagLockSamples;
             m_diagLockSumNs += waited;
             if (waited > m_diagLockMaxNs) m_diagLockMaxNs = waited;
+            m_diagLock1s.Add(waited);
         }
         if (!lockOk) {
             WarnEvery5s("VR frame dropped: the driver kept the frame locked for over 100 ms");
@@ -562,11 +626,26 @@ void VrStream::Run() {
         m_halfRateActive.store(halfRate, std::memory_order_relaxed);
         skipNext = halfRate && !skipNext;
         if (skipNext) {
+            if (asyncMotion) motionSkipPending = true;
             if (mutex) mutex->ReleaseSync(0);
             lastFrameIndex = fs.frameIndex;
             InterlockedExchange(&fs.state, rcvr::kSlotFree);
             continue;
         }
+
+        // A delayed field must stay per-frame; only the deliberate half-rate skip may span two.
+        if (asyncMotion && motionReady && lastMotionFrameIndex) {
+            const bool intentionalGap = motionSkipPending && fs.frameIndex > lastMotionFrameIndex &&
+                                        fs.frameIndex - lastMotionFrameIndex == 2;
+            if (!intentionalGap && fs.frameIndex != lastMotionFrameIndex + 1) {
+                motion.Reset();
+                lastMotionFrameIndex = 0;
+                motionPreviousTimestamp = 0;
+                motionReadPrevious.clear();
+                m_motionGridPrev.clear();
+            }
+        }
+        motionSkipPending = false;
 
         // A target neither the encoder nor the frame waiting for it uses.
         ColorConverter* converter = nullptr;
@@ -601,14 +680,20 @@ void VrStream::Run() {
             if (view) {
                 float turn[9];
                 HeadTurn(motionPose, fs.renderPose, turn);
+                const uint64_t fieldPreviousTimestamp = motionPreviousTimestamp;
                 motionValid = motion.Process(ctx.Get(), view.Get(), turn, fs.fovTan);
+                if (motionValid && asyncMotion && motion.QueueRead(ctx.Get()))
+                    motionReadPrevious.push_back(fieldPreviousTimestamp);
                 motionPose = fs.renderPose;
                 motionConsumed = true;
+                lastMotionFrameIndex = fs.frameIndex;
             }
         }
         if (mutex) mutex->ReleaseSync(0);
         // The encoder is on another thread: hand the GPU the conversion now.
         ctx->Flush();
+        const int64_t convertBlockNs = rc::NowNs() - convertStart;
+        m_diagConvertBlock.Add(convertBlockNs);
 
         const rcvr::FrameSlot slotCopy = fs;
         InterlockedExchange(&fs.state, rcvr::kSlotFree);
@@ -619,20 +704,15 @@ void VrStream::Run() {
             continue;
         }
 
-        // A26 (stale-frame flush): recover this frame's predicted display moment in the
-        // PC clock. The frame slot only carries the headset-clock echo
-        // (FrameSlot::headsetTargetNs), so the moment comes from the tracking sample the
-        // frame was rendered with - the streamer translated the headset's target into the
-        // PC clock when it published it (client_session: RemoteToLocalNs, or its +40 ms
-        // fallback). When the latest sample is still this frame's, the prediction is
-        // exact; a newer one means the frame is at most one vsync old (the error stays
-        // far below what the staleness gate judges), and the submit-time + predict-ahead
-        // estimate covers the rest (seqlock hiccup, no tracking yet, a mapping that
-        // failed the sanity guard above).
-        rcvr::TrackingSnapshot flushTracking{};
-        const bool flushTrackingRead = rcvr::ReadTracking(shared, flushTracking);
-        const bool flushExact = flushTrackingRead && flushTracking.sequence == slotCopy.trackingSequence &&
-                                flushTracking.targetDisplayPcNs > slotCopy.submitPcNs - kStaleClockGuardNs;
+        // The shared bridge keeps only the newest tracking sample. A rendered frame can
+        // carry an older sequence, so recover its target from the bridge's bounded cache.
+        int64_t trackedDisplayPcNs = 0;
+        bool trackingClockValid = false;
+        const bool trackingHit =
+            m_bridge->LookupTracking(slotCopy.trackingSequence, trackedDisplayPcNs, trackingClockValid);
+        const rc::PredictedDisplay prediction = rc::SelectPredictedDisplay(
+            trackingHit, trackedDisplayPcNs, trackingClockValid, slotCopy.submitPcNs,
+            kStaleClockGuardNs, kStalePredictAheadNs);
 
         EncodeJob job;
         job.yuv = converter->Output();
@@ -647,21 +727,40 @@ void VrStream::Run() {
         job.frameIndex = slotCopy.frameIndex;
         job.headsetTargetNs = slotCopy.headsetTargetNs;
         job.submitPcNs = slotCopy.submitPcNs;
-        job.predictedDisplayPcNs = flushExact ? flushTracking.targetDisplayPcNs
-                                              : slotCopy.submitPcNs + kStalePredictAheadNs;
-        // A75 (TASK-A75-FLUSH-GRACE-2026-11-22): carry the source along with the moment it
-        // produced, for the flush log line. The drop decision does not read it - the
-        // grace is one rule for both paths (rc::kFlushGraceNs, stale_flush.h); this only
-        // makes the next "0-8 ms late" burst answerable as exact or estimated. No extra
-        // seqlock read, no extra synchronisation: `flushExact` is already computed above.
-        job.predictedDisplayExact = flushExact;
+        job.predictedDisplayPcNs = prediction.pcNs;
+        // A75: the flush judges both prediction sources with the same grace; the source
+        // and cache/clock state travel with the frame only to explain a later drop line.
+        job.predictedDisplayExact = prediction.exact;
+        job.predictedDisplayClockValid = prediction.clockValid;
+        job.predictedDisplayTrackHit = prediction.trackHit;
         std::memcpy(job.renderOrientation, slotCopy.renderPose.orientation, sizeof(job.renderOrientation));
         std::memcpy(job.renderPosition, slotCopy.renderPose.position, sizeof(job.renderPosition));
         std::memcpy(job.fovTan, slotCopy.fovTan, sizeof(job.fovTan));
-        // Read now, before the next frame's estimate replaces it. This waits for the GPU, but
-        // only with frame generation on.
-        if (motionValid && motion.Read(ctx.Get(), motionField))
-            AppendMotion(motion, motionField, motionPreviousTimestamp, m_motionGridPrev, job.motion);
+        // The async path never waits for a field: a miss sends explicit zero motion.
+        int64_t frameMotionReadNs = -1;
+        if (motionValid) {
+            const int64_t motionReadStart = rc::NowNs();
+            bool motionRead = false;
+            uint64_t motionHeaderPrevious = motionPreviousTimestamp;
+            if (asyncMotion) {
+                bool slotConsumed = false;
+                motionRead = motion.TryRead(ctx.Get(), motionField, slotConsumed);
+                if (slotConsumed) {
+                    motionHeaderPrevious = motionReadPrevious.front();
+                    motionReadPrevious.pop_front();
+                }
+                if (!motionRead) {
+                    ++m_diagMotionPending;
+                    motionField.assign(size_t(motion.GridWidth()) * motion.GridHeight() * 2, 0.0f);
+                }
+            } else {
+                motionRead = motion.Read(ctx.Get(), motionField);
+            }
+            frameMotionReadNs = rc::NowNs() - motionReadStart;
+            m_diagMotionRead.Add(frameMotionReadNs);
+            if (motionRead || asyncMotion)
+                AppendMotion(motion, motionField, motionHeaderPrevious, m_motionGridPrev, job.motion);
+        }
         if (motionConsumed) motionPreviousTimestamp = slotCopy.headsetTargetNs;
         const int64_t convertNs = rc::NowNs() - convertStart;
         m_flowConvertNs += convertNs;
@@ -675,6 +774,9 @@ void VrStream::Run() {
         const int64_t submitToJobNs = slotCopy.submitPcNs ? jobEnterNs - slotCopy.submitPcNs : -1;
         job.submitToJobNs = submitToJobNs;
         job.lockWaitNs = frameLockWaitNs;
+        job.holdNs = frameHoldNs;
+        job.convertBlockNs = convertBlockNs;
+        job.motionReadNs = frameMotionReadNs;
         if (submitToJobNs >= 0) {
             m_cadSubmitToJobSumNs += submitToJobNs;
             if (!m_cadSubmitToJobSamples || submitToJobNs > m_cadSubmitToJobMaxNs)
@@ -684,7 +786,10 @@ void VrStream::Run() {
         {
             std::lock_guard lock(m_jobMutex);
             // The encoder hasn't taken the one before: this newer frame replaces it.
-            if (m_job) m_flowReplacedQueue++;
+            if (m_job) {
+                m_flowReplacedQueue++;
+                m_diagJobRepl++;
+            }
             m_job = std::move(job);
             // A79 phase M: stamp the slot-entry moment at the slot's only write point
             // (the lock is the existing one; the diag reader never takes it). A83: taken
@@ -724,6 +829,8 @@ void VrStream::RunEncoder() {
     uint32_t srcW = 0, srcH = 0;
     DXGI_FORMAT encFormat = DXGI_FORMAT_UNKNOWN;
     uint32_t appliedKbps = 0;
+    rc::StreamProfile appliedProfile = rc::StreamProfile::Balanced;
+    int64_t profileAttemptNs = 0;
     EncodedFrame out;
     std::vector<uint8_t> frameMeta;
     while (m_running) {
@@ -747,6 +854,7 @@ void VrStream::RunEncoder() {
         // (foveated sizes are derived from the config and round to 16 px). Without this,
         // a rebuilt texture that lands on a freed address is handed to NVENC as its dead
         // predecessor's registration.
+        const rc::StreamProfile liveProfile = rc::ProfileFromId(m_liveProfile.load(std::memory_order_relaxed));
         if (!encoder || encWidth != job.width || encHeight != job.height || encFormat != job.format ||
             srcW != job.srcWidth || srcH != job.srcHeight) {
             encWidth = job.width;
@@ -760,7 +868,7 @@ void VrStream::RunEncoder() {
             ec.height = encHeight;
             ec.fps = m_config.fps;
             ec.bitrateKbps = m_sender.TargetBitrateKbps();
-            ec.profile = m_config.profile;
+            ec.profile = liveProfile;
             ec.tenBit = m_config.tenBit;
             ec.inputFormat = encFormat;
             // The lens-based bit budget assumes a picture that isn't squeezed.
@@ -775,6 +883,7 @@ void VrStream::RunEncoder() {
             m_statEncW.store(ec.width, std::memory_order_relaxed);
             m_statEncH.store(ec.height, std::memory_order_relaxed);
             appliedKbps = ec.bitrateKbps;
+            appliedProfile = liveProfile;
             m_sender.RequestKeyframe();
             if (!encoder) {
                 WarnEvery5s("VR frame dropped: the encoder didn't start");
@@ -783,18 +892,19 @@ void VrStream::RunEncoder() {
             }
         }
 
-        // A87: apply a tier change to the LIVE encoder instead of rebuilding the stream.
-        // The queue-brake half was already set by ApplyProfileRung on the session thread;
-        // this is the QP-floor half, which must touch the encoder on its own thread. If the
-        // driver refuses it, we keep the old floor and carry on streaming - trading a
-        // slightly wrong picture for the ~46 s black screen a rebuild used to cost.
-        if (const uint32_t q = m_pendingMinQp.exchange(0, std::memory_order_relaxed)) {
-            if (!encoder->SetMinQp(q))
-                // The congestion guard is already capping the bitrate on this very
-                // signal (the 10:17 log walked 90800 -> 37968 kbps), which forces
-                // rate control to raise QP anyway. A second, independent cap here
-                // would fight the guard for the same budget - so just say so.
-                RC_LOGW("VR: encoder refused QP floor %u; keeping the old one, the congestion guard still caps the bitrate (no rebuild)", q);
+        // A87/A99: the live rung owns both encoder RC parameters. Apply them together so
+        // Quality's deeper VBV cannot lag behind its QP floor. Refusals are retried at
+        // most once a second, and an internal rebuild above starts at the same live rung.
+        const int64_t profileNow = rc::NowNs();
+        if (liveProfile != appliedProfile && (!profileAttemptNs || profileNow - profileAttemptNs >= 1'000'000'000LL)) {
+            profileAttemptNs = profileNow;
+            if (encoder->SetProfile(liveProfile)) {
+                appliedProfile = liveProfile;
+            } else {
+                const auto q = rc::ProfileParams(liveProfile);
+                RC_LOGW("VR: encoder refused profile rung %d (QP floor %u, VBV %u%%); keeping the old profile, no rebuild",
+                        m_liveProfile.load(std::memory_order_relaxed), q.minQp, q.vbvFramesPercent);
+            }
         }
 
         // Half rate pays nothing extra here. The encoder tracks the interval between the
@@ -856,14 +966,24 @@ void VrStream::RunEncoder() {
         send.recovery = recovery;
         send.predictedDisplayPcNs = job.predictedDisplayPcNs;  // A26: the flush gate judges this
         send.predictedDisplayExact = job.predictedDisplayExact;  // A75: the flush log line names it
+        send.predictedDisplayClockValid = job.predictedDisplayClockValid;
+        send.predictedDisplayTrackHit = job.predictedDisplayTrackHit;
         send.submitToJobNs = job.submitToJobNs;  // A83 phase M: the flush line reports this frame's own upstream ages
         send.lockWaitNs = job.lockWaitNs;
+        send.holdNs = job.holdNs;
+        send.convertBlockNs = job.convertBlockNs;
+        send.motionReadNs = job.motionReadNs;
         {
             // The one before still going out (a paced send): wait, a dropped frame would break
             // the ones referencing it.
+            const int64_t sendWaitStart = rc::NowNs();
             std::unique_lock lock(m_sendMutex);
             m_sendCv.wait(lock, [this] { return !m_running || !m_send; });
             if (!m_running) break;
+            send.sendWaitNs = rc::NowNs() - sendWaitStart;
+            const uint32_t idx = uint32_t(m_diagSendWaitIdx.fetch_add(1, std::memory_order_relaxed) % kDiagRing);
+            m_diagSendWaitUs[idx].store(uint32_t(send.sendWaitNs / 1000), std::memory_order_relaxed);
+            m_diagSendWaitCount.fetch_add(1, std::memory_order_relaxed);
             m_send = std::move(send);
             // A79 phase M: stamp the send-slot entry moment at the slot's only fill point.
             m_sendSinceNs.store(rc::NowNs(), std::memory_order_relaxed);
@@ -885,17 +1005,14 @@ void VrStream::RunSender() {
     if (mmcss) AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_HIGH);
     bool firstSent = false;
     while (m_running) {
-        // A87: VideoSender::m_guard is not locked, so the tier's new queue-brake line is
-        // installed here on the sender's own thread. The QP floor goes to the encoder
-        // thread separately; neither path stops the transport.
+        // A87/A99: VideoSender::m_guard is not locked, so the tier's new queue-brake
+        // line is installed here on the sender's own thread. The encoder thread reads
+        // the same persistent live rung for QP/VBV; neither path stops the transport.
         const int pendingProfile = m_pendingProfile.exchange(-1, std::memory_order_relaxed);
         if (pendingProfile >= 0) {
             m_sender.SetProfile(rc::ProfileFromId(pendingProfile));
-            // A93: the QP half of a tier move already reports itself (NVENC logs the
-            // retune, or vr_stream logs the refusal). The brake half had no line at all,
-            // so a tier whose second handoff never reached the sender thread - because
-            // no frame arrived, or because the rung was stored somewhere else - was
-            // indistinguishable from one that worked. This is that line.
+            // A93/A99: the encoder reports the QP/VBV half on its own thread. This
+            // line confirms the sender actually consumed the queued brake change.
             RC_LOGI("VR: queue brake retargeted in place to rung %d (target %.0f ms, no stream rebuild)",
                     pendingProfile, rc::ProfileParams(rc::ProfileFromId(pendingProfile)).targetQueueMs);
         }
@@ -956,13 +1073,18 @@ void VrStream::RunSender() {
                     if (v >= 0) snprintf(b, n, "%.1f ms", double(v) / 1e6);
                     else snprintf(b, n, "n/a");
                 };
-                char s2jPart[32], lwPart[32];
+                char s2jPart[32], lwPart[32], holdPart[32], convertPart[32], motionPart[32], sendWaitPart[32];
                 fmtMs(s2jPart, sizeof(s2jPart), send.submitToJobNs);
                 fmtMs(lwPart, sizeof(lwPart), send.lockWaitNs);
+                fmtMs(holdPart, sizeof(holdPart), send.holdNs);
+                fmtMs(convertPart, sizeof(convertPart), send.convertBlockNs);
+                fmtMs(motionPart, sizeof(motionPart), send.motionReadNs);
+                fmtMs(sendWaitPart, sizeof(sendWaitPart), send.sendWaitNs);
                 RC_LOGI("VR stale flush: dropped %u frame(s) since the last line; last one %s "
                         "(%lld ms from its display moment, %s); pacer debt wiped, repair %s"
                         "; sendBacklog %.1f ms, overruns %u, jobAge %.1f ms, sendAge %.1f ms"
-                        ", submitToJob %s, lockWait %s",
+                        ", submitToJob %s, lockWait %s, hold %s, convertBlock %s, motionRead %s, sendWait %s"
+                        ", clockValid %s, trackHit %s",
                         m_staleLogCount, late ? "expired" : "held, chain broken",
                         (long long)((nowNs - send.predictedDisplayPcNs) / 1'000'000),
                         send.predictedDisplayExact ? "exact" : "estimated",
@@ -970,7 +1092,9 @@ void VrStream::RunSender() {
                         double(m_sender.SendBacklogNs()) / 1e6, m_sender.BudgetOverruns(),
                         flushJobSince ? double(nowNs - flushJobSince) / 1e6 : -1.0,
                         flushSendSince ? double(nowNs - flushSendSince) / 1e6 : -1.0,
-                        s2jPart, lwPart);
+                        s2jPart, lwPart, holdPart, convertPart, motionPart, sendWaitPart,
+                        send.predictedDisplayClockValid ? "yes" : "no",
+                        send.predictedDisplayTrackHit ? "yes" : "no");
                 m_staleLogCount = 0;
             }
             if (gate.breaker)

@@ -33,6 +33,8 @@ struct VideoSenderStats {
     uint32_t encWidth = 0, encHeight = 0;  // what is actually being encoded, 0 = unknown
     uint32_t srcWidth = 0, srcHeight = 0;  // what the game renders (before encodeScale), 0 = unknown
     double gameFps = 0, encFps = 0, droppedFps = 0;  // 10 s averages from the frame-flow log
+    int64_t lastFrameNs = 0;     // last encoded frame handed to the sender, 0 = none
+    int64_t lastFeedbackNs = 0;  // last usable headset feedback, 0 = none
 };
 
 // R4.2 (TASK-COMBO-SWEEP-2026-11-21): the wire bytes one frame costs on the path -
@@ -206,6 +208,8 @@ class VideoSender {
     // A81 M2: the queueFloor exactly as the guard's Update() receives it, published for
     // the send thread's latency readout (m_queueBaselineMs is network-thread only).
     std::atomic<double> m_queueFloorMs{-1};  // -1 = no feedback report yet
+    std::atomic<int64_t> m_lastFrameNs{0};
+    std::atomic<int64_t> m_lastFeedbackNs{0};
     double m_receivedKbps = 0;        // smoothed rate that actually arrives
 };
 

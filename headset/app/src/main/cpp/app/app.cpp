@@ -25,6 +25,7 @@
 #include "rc/hand_skeleton.h"
 #include "rc/platform.h"
 #include "rc/protocol.h"
+#include "rc/vr_queue_policy.h"
 #include "stb/stb_image.h"
 #include "strings.h"
 
@@ -731,10 +732,12 @@ void App::EnterMode(Mode m) {
 //   adb shell setprop debug.rincast.slip 1                 ask the PC to let waiting pictures run
 //                                                          out (SteamVR games); off by default, as
 //                                                          a picture waiting measured faster
+//   adb shell setprop debug.rincast.nowait 1                with slip, try no waiting picture even
+//                                                          when the arrival margin exceeds 0.75 frame
 //   adb shell setprop debug.rincast.pose_hold 0            send poses as soon as they are located,
 //                                                          not held back for SteamVR's pickup
 // On Linux the same come from the environment: DEBUG_RINCAST_PC, DEBUG_RINCAST_TAB, DEBUG_RINCAST_UI,
-// DEBUG_RINCAST_PRELATCH_MS, DEBUG_RINCAST_SLIP, DEBUG_RINCAST_POSE_HOLD.
+// DEBUG_RINCAST_PRELATCH_MS, DEBUG_RINCAST_SLIP, DEBUG_RINCAST_NOWAIT, DEBUG_RINCAST_POSE_HOLD.
 static void DebugProperty(const char* name, char (&value)[92]) {
 #ifdef __ANDROID__
     __system_property_get(name, value);
@@ -783,6 +786,14 @@ void App::PollDebugProperties() {
         m_debugSlip = slip;
         RC_LOGI("debug.rincast.slip = %d: the PC is %s to let waiting pictures run out", int(slip),
                 slip ? "asked" : "never asked");
+    }
+    value[0] = 0;
+    DebugProperty("debug.rincast.nowait", value);
+    if (const bool nowait = value[0] == '1'; nowait != m_debugNoWait) {
+        m_debugNoWait = nowait;
+        RC_LOGI("debug.rincast.nowait = %d: %s", int(nowait),
+                nowait ? "the no-waiting-picture experiment is armed; slip and SteamVR are still required"
+                       : "the no-waiting-picture experiment is off");
     }
     value[0] = 0;
     DebugProperty("debug.rincast.pose_hold", value);
@@ -1186,7 +1197,7 @@ void App::ConfigureVrStream(const json& s) {
     m_vrHasFrame = false;
     m_motionMoves = false;
     // A new stream starts with nothing waiting and nothing known about its timing.
-    m_behindSinceNs = m_slipUntilNs = m_slipRetryNs = m_queueKeptUntilNs = 0;
+    m_behindSinceNs = m_slipUntilNs = m_slipRetryNs = m_queueKeptUntilNs = m_queuePolicyLogNs = 0;
     m_slips.clear();
     m_arrivalSpread.clear();
     m_queueWanted = 1;
@@ -1961,50 +1972,6 @@ void App::UpdateFace(const FrameState& frame) {
     if (m_headset->ReadFace(m_xr, frame.predictedDisplayTime, f)) m_client.SendFace(f);
 }
 
-// Whether the motion field is worth warping a picture by. A block's motion is one
-// translation, so warping only looks right when the picture mostly moves as one: a pan or a
-// translate. Judging that:
-//   - matches that jumped further than a fast pan (repeating text, fences, flat areas) are not
-//     motion: they are dropped before anything is counted.
-//   - rotation and zoom spread the vectors in every direction, so few of them stay close to
-//     the field's own mean; a pan keeps them together.
-// The counts go to the log, so a gate that skips too much can be seen for what it is.
-struct MotionGate {
-    bool worth = false;
-    int moving = 0;  // blocks with any motion left
-    int mean = 0;    // the field's mean vector, in units
-    int spread = 0;  // blocks far from that mean
-    int far = 0;     // matches dropped as too far to be motion
-};
-static MotionGate JudgeMotionField(std::vector<int8_t>& grid, int w, int h) {
-    MotionGate g;
-    if (w < 1 || h < 1 || grid.size() < size_t(w) * size_t(h) * 2) return g;
-    const auto mag = [](int v) { return v < 0 ? -v : v; };
-    constexpr int kFarUnits = 12;  // 48 px in one frame: a wrong match, not motion
-    for (size_t i = 0; i < grid.size(); i += 2) {
-        if (mag(grid[i]) > kFarUnits || mag(grid[i + 1]) > kFarUnits) {
-            g.far++;
-            grid[i] = grid[i + 1] = 0;
-        }
-    }
-    long sx = 0, sy = 0;
-    for (size_t i = 0; i < grid.size(); i += 2) {
-        if (!grid[i] && !grid[i + 1]) continue;
-        g.moving++;
-        sx += grid[i];
-        sy += grid[i + 1];
-    }
-    if (g.moving < 2) return g;
-    const int mx = int(sx / g.moving), my = int(sy / g.moving);
-    g.mean = mag(mx) + mag(my);
-    for (size_t i = 0; i < grid.size(); i += 2) {
-        if (!grid[i] && !grid[i + 1]) continue;
-        if (mag(grid[i] - mx) + mag(grid[i + 1] - my) > 2 + g.mean / 2) g.spread++;
-    }
-    g.worth = g.spread <= g.moving * 3 / 4;
-    return g;
-}
-
 void App::ReadMotion(const std::vector<uint8_t>& metadata) {
     m_motionMoves = false;
     // After the frame's metadata, and its foveation's.
@@ -2025,12 +1992,14 @@ void App::ReadMotion(const std::vector<uint8_t>& metadata) {
                                                            : double(m_motionFrameNs);
     // Before anything is counted or uploaded: far matches dropped, so the picture is warped by
     // motion only.
-    const MotionGate gate = JudgeMotionField(m_motionGrid, m_motionWidth, m_motionHeight);
+    const rc::MotionGate gate = rc::JudgeMotionField(m_motionGrid, m_motionWidth, m_motionHeight);
     m_motionConsistent = gate.worth;
     m_motionGateMoving = gate.moving;
     m_motionGateMean = gate.mean;
     m_motionGateSpread = gate.spread;
-    m_motionGateFar = gate.far;
+    m_motionGateFar = gate.farRejected;
+    m_motionGateCoherent = gate.coherent;
+    m_motionGateGlobal = gate.global;
     m_motionMoves = std::any_of(m_motionGrid.begin(), m_motionGrid.end(), [](int8_t v) { return v != 0; });
     if (m_motionMoves) m_scene.UploadMotion(m_motionGrid.data(), m_motionWidth, m_motionHeight);
 }
@@ -2068,16 +2037,18 @@ void App::GenerateFrame(const FrameState& frame) {
     m_xr.ReleaseImage(m_vrSwapchain);
     glFlush();  // as for a new frame: the GPU starts now
     m_generatedFrames++;
+    m_statsGenerated++;
     const int64_t now = rc::NowNs();
     if (now - m_generatedLogNs > 5'000'000'000LL) {
         const double secs = double(now - m_generatedLogNs) / 1e9;
         double streamFps = 0;
         if (m_serverStats.contains("vr")) streamFps = m_serverStats["vr"].value("fps", 0.0);
         RC_LOGI("Frame generation: %.0f/s generated, %.0f/s shown of %.0f Hz, stream %.0f fps, %.0f%% skipped "
-                "(cap %.1f, field: %d moving, mean %d, spread %d, far %d)",
+                "(cap %.1f, field: %d moving, mean %d, spread %d, far %d, coherent %d, global %d)",
                 m_generatedFrames / secs, m_stats.fps, m_xr.RefreshRate(), streamFps,
                 m_generatedFrames + m_generatedSkipped ? 100.0 * m_generatedSkipped / double(m_generatedFrames + m_generatedSkipped) : 0.0,
-                m_lastGenCap, m_motionGateMoving, m_motionGateMean, m_motionGateSpread, m_motionGateFar);
+                m_lastGenCap, m_motionGateMoving, m_motionGateMean, m_motionGateSpread, m_motionGateFar,
+                m_motionGateCoherent, m_motionGateGlobal);
         m_generatedFrames = 0;
         m_generatedSkipped = 0;
         m_generatedLogNs = now;
@@ -2350,6 +2321,7 @@ void App::LatchVideo(const FrameState& frame, bool late) {
         }
         const bool vr = m_mode == Mode::Vr || m_mode == Mode::LaunchingVr;
         m_stats.fps = m_statsFrames / secs / std::max<size_t>(1, vr ? 1 : m_desktopStreams.size());
+        m_stats.generatedFps = m_statsGenerated / secs;
         // VD-OBSERVE (TASK 2026-11-20 §2.1): the pace policy, ticked at 1 Hz here rather than in
         // GenerateFrame(): that one only runs with frame generation on, which is off by default,
         // so its log would never be seen - exactly the state we want to judge first.
@@ -2386,6 +2358,7 @@ void App::LatchVideo(const FrameState& frame, bool late) {
         }
         m_stats.latencyMs = m_latencyCount ? m_latencySum / m_latencyCount : 0;
         m_statsFrames = 0;
+        m_statsGenerated = 0;
         m_latencySum = 0;
         m_latencyCount = 0;
         json stages = json::object();
@@ -2576,8 +2549,18 @@ void App::SteerVrTiming(const FrameState& frame) {
     const double needed = double(second) + 0.5e6;
     const double widest = 0.8 * period;
     // Once it fits it may grow to the widest; to start fitting it has to be clearly narrower.
-    const bool fits = known && PcSlips() && needed <= (m_queueWanted == 0 ? widest : 0.75 * period);
-    m_queueWanted = fits && now >= m_queueKeptUntilNs ? 0 : 1;
+    const bool pcSlips = PcSlips();
+    const int wanted = rc::SelectVrQueueWanted(known, pcSlips, m_debugNoWait, frame.period, needed,
+                                               m_queueWanted, now, m_queueKeptUntilNs);
+    if (wanted != m_queueWanted || now - m_queuePolicyLogNs >= 5'000'000'000LL) {
+        RC_LOGI("VR queue policy: wanted %d, known %d, pcSlips %d, nowait %d, needed %.1f ms, limit %.1f ms, "
+                "kept %.0f ms",
+                wanted, int(known), int(pcSlips), int(m_debugNoWait), needed / 1e6,
+                rc::VrQueueLimitNs(frame.period, m_queueWanted) / 1e6,
+                double(std::max<int64_t>(0, m_queueKeptUntilNs - now)) / 1e6);
+        m_queuePolicyLogNs = now;
+    }
+    m_queueWanted = wanted;
     if (m_queueWanted == 0) {
         // Wider at once, narrower slowly: a margin too narrow costs a repeated picture, one
         // too wide a millisecond.

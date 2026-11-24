@@ -1251,8 +1251,11 @@ void BuildStats(Ui& ui, const Rect& r) {
         const char* label;
         std::string value;
     };
+    std::string fps = s.fps > 0 ? FormatMs(s.fps) + " fps" : "–";
+    if (s.fps > 0 && app.CurrentMode() == Mode::Vr && app.Settings().frameGeneration)
+        fps += " (" + FormatMs(s.fps + s.generatedFps) + " fps)";
     const Item items[] = {{Tr("stat.latency.total"), latencyEma >= 0 ? FormatMs(latencyEma) + " ms" : "–"},
-                          {Tr("stat.fps"), s.fps > 0 ? FormatMs(s.fps) + " fps" : "–"},
+                          {Tr("stat.fps"), fps},
                           {Tr("stat.frameGen"), FrameGenStatus(app)},
                           {Tr("stat.bitrate"), s.mbps > 0 ? FormatMs(s.mbps) + " Mbps" : "–"},
                           {Tr("stat.decoding"), s.decodeMs > 0 ? FormatMs(s.decodeMs) + " ms" : "–"},

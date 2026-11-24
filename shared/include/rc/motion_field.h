@@ -60,6 +60,69 @@ inline void ApplyMotionHysteresis(const std::vector<float>& field, std::vector<i
     }
 }
 
+struct MotionGate {
+    bool worth = false;
+    int moving = 0;
+    int mean = 0;
+    int spread = 0;
+    int farRejected = 0;
+    int coherent = 0;
+    int global = 0;
+};
+
+// Whole-picture translation needs majority support; moving-only means hide symmetric noise.
+inline MotionGate JudgeMotionField(std::vector<int8_t>& grid, int w, int h) {
+    MotionGate g;
+    if (w < 1 || h < 1 || grid.size() < size_t(w) * size_t(h) * 2) return g;
+    const auto mag = [](int v) { return v < 0 ? -v : v; };
+    constexpr int kFarUnits = 12;
+    for (size_t i = 0; i < grid.size(); i += 2) {
+        if (mag(grid[i]) > kFarUnits || mag(grid[i + 1]) > kFarUnits) {
+            g.farRejected++;
+            grid[i] = grid[i + 1] = 0;
+        }
+    }
+    const size_t blocks = size_t(w) * size_t(h);
+    long sx = 0, sy = 0;
+    for (size_t i = 0; i < grid.size(); i += 2) {
+        if (!grid[i] && !grid[i + 1]) continue;
+        g.moving++;
+        sx += grid[i];
+        sy += grid[i + 1];
+    }
+    if (g.moving < 2) return g;
+    const int mx = int(sx / g.moving), my = int(sy / g.moving);
+    g.mean = mag(mx) + mag(my);
+
+    int histX[2 * kFarUnits + 1]{};
+    int histY[2 * kFarUnits + 1]{};
+    for (size_t i = 0; i < grid.size(); i += 2) {
+        histX[int(grid[i]) + kFarUnits]++;
+        histY[int(grid[i + 1]) + kFarUnits]++;
+    }
+    const auto median = [blocks](const int* hist) {
+        size_t count = 0;
+        for (int i = 0; i <= 2 * kFarUnits; i++) {
+            count += size_t(hist[i]);
+            if (count * 2 >= blocks) return i - kFarUnits;
+        }
+        return 0;
+    };
+    const int gx = median(histX), gy = median(histY);
+    g.global = mag(gx) + mag(gy);
+    const int tolerance = 2 + g.global / 2;
+    for (size_t i = 0; i < grid.size(); i += 2) {
+        if (!grid[i] && !grid[i + 1]) continue;
+        if (mag(int(grid[i]) - gx) + mag(int(grid[i + 1]) - gy) > tolerance)
+            g.spread++;
+        else
+            g.coherent++;
+    }
+    const size_t required = std::max<size_t>(2, blocks * 2 / 5);
+    g.worth = g.global > 0 && g.coherent >= required && g.spread <= g.moving / 4;
+    return g;
+}
+
 #pragma pack(push, 1)
 struct MotionHeader {
     uint16_t gridWidth;

@@ -19,6 +19,14 @@ namespace {
 using CreateInstanceFn = NVENCSTATUS(NVENCAPI*)(NV_ENCODE_API_FUNCTION_LIST*);
 using MaxVersionFn = NVENCSTATUS(NVENCAPI*)(uint32_t*);
 
+bool CadenceFillExperiment() {
+    static const bool enabled = [] {
+        char text[2]{};
+        return GetEnvironmentVariableA("RINCAST_CADENCE_FILL", text, sizeof(text)) == 1 && text[0] == '1';
+    }();
+    return enabled;
+}
+
 struct NvencLib {
     HMODULE module = nullptr;
     NV_ENCODE_API_FUNCTION_LIST api{};
@@ -398,38 +406,41 @@ class NvencEncoder final : public VideoEncoder {
         m_requestedKbps = kbps;
     }
 
-    bool SetMinQp(uint32_t qp) override {
-        // A87: the picture-tier change only moves the QP floor (the ceiling stays the
-        // same - see the 2026-11-23 10:17 log, 100000 kbps on both sides of 1 -> 0).
-        // Reconfiguring the session is enough: no encoder destroy, no new D3D textures,
-        // so SteamVR never has to reopen the shared surface and the game never stalls.
-        if (!m_encoder || !m_cappedVbr || !m_encodeConfig.rcParams.enableMinQP) {
-            // A driver that fell back to CBR at init explicitly turned MinQP off
-            // (line ~270). Enabling it through reconfigure is rejected by some
-            // drivers; report the refusal and keep the floor we already have.
-            return false;
-        }
-        auto candidateConfig = m_encodeConfig;  // full copy: a partial config is rejected
-        const uint32_t q = std::clamp(qp, 1u, 51u);
-        candidateConfig.rcParams.minQP.qpInterP = q;
-        candidateConfig.rcParams.minQP.qpInterB = q;
-        candidateConfig.rcParams.minQP.qpIntra = q;
+    bool SetProfile(rc::StreamProfile profile) override {
+        if (!m_encoder || !m_cappedVbr || !m_encodeConfig.rcParams.enableMinQP) return false;
+        const auto q = rc::ProfileParams(profile);
+        const int64_t now = rc::NowNs();
+        const auto plan = RatePlan(profile, now);
+        auto candidateConfig = m_encodeConfig;
+        const uint32_t qp = std::clamp(q.minQp, 1u, 51u);
+        candidateConfig.rcParams.minQP.qpInterP = qp;
+        candidateConfig.rcParams.minQP.qpInterB = qp;
+        candidateConfig.rcParams.minQP.qpIntra = qp;
+        ApplyBudget(candidateConfig, plan);
+        candidateConfig.rcParams.vbvInitialDelay =
+            rc::ClampVbvInitialDelay(candidateConfig.rcParams.vbvInitialDelay, plan.budget.vbvBufferSize);
         auto candidateInit = m_init;
+        candidateInit.frameRateNum = plan.rateNum;
+        candidateInit.frameRateDen = 1000;
         candidateInit.encodeConfig = &candidateConfig;
-        NV_ENC_RECONFIGURE_PARAMS re{};
-        re.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-        re.reInitEncodeParams = candidateInit;
-        // resetEncoder/forceIDR stay zero: only RC params changed, no resolution or GOP
-        // change, so the decoder keeps its reference frames and there is no black frame.
-        if (NvencLib::Get().api.nvEncReconfigureEncoder(m_encoder, &re) != NV_ENC_SUCCESS) {
-            RC_LOGW("NVENC: QP-floor reconfigure to %u refused (%s); keeping the old floor",
-                    q, NvencLib::Get().api.nvEncGetLastErrorString(m_encoder));
+        const bool ok = rc::ApplyEncoderRateTransaction(m_rateState, plan, now, [&] {
+            NV_ENC_RECONFIGURE_PARAMS re{};
+            re.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+            re.reInitEncodeParams = candidateInit;
+            return NvencLib::Get().api.nvEncReconfigureEncoder(m_encoder, &re) == NV_ENC_SUCCESS;
+        });
+        if (!ok) {
+            RC_LOGW("NVENC: QP-floor reconfigure to %u refused (%s); keeping profile %d and its old VBV",
+                    qp, NvencLib::Get().api.nvEncGetLastErrorString(m_encoder), int(m_config.profile));
             return false;
         }
+        m_config.profile = profile;
+        m_config.bitrateKbps = plan.requestedKbps;
         m_encodeConfig = candidateConfig;
         m_init = candidateInit;
         m_init.encodeConfig = &m_encodeConfig;
-        RC_LOGI("NVENC: QP floor retuned to %u in place (no session reset)", q);
+        RC_LOGI("NVENC: QP floor retuned to %u in place (no session reset), profile %d, VBV %.2f Mbit",
+                qp, int(profile), double(plan.budget.vbvBufferSize) / 1e6);
         return true;
     }
 
@@ -477,20 +488,26 @@ class NvencEncoder final : public VideoEncoder {
     // The old CBR behaviour, kept for --cbr A/B runs and as a driver fallback:
     // average == maximum, and 1.5 frames of VBV.
     static constexpr uint32_t kLegacyVbvFramesPercent = 150;
-    rc::EncoderRatePlan RatePlan(int64_t now) const {
-        const auto q = rc::ProfileParams(m_config.profile);
+    rc::EncoderRatePlan RatePlan(int64_t now) const { return RatePlan(m_config.profile, now); }
+
+    rc::EncoderRatePlan RatePlan(rc::StreamProfile profile, int64_t now) const {
+        const auto q = rc::ProfileParams(profile);
         const uint32_t avgPct = m_config.vbrAveragePercent ? m_config.vbrAveragePercent : q.vbrAveragePercent;
         const bool startup = !m_streamStartNs || now - m_streamStartNs < rc::kRateStartupNs;
+        const bool cadenceFill = CadenceFillExperiment() && m_cappedVbr &&
+                                 profile == rc::StreamProfile::Quality && !m_config.desktop &&
+                                 !startup && m_config.fps > 0;
         // L17 fill branch gate: pressure only (fast EMA below 85% of nominal, VR, not
         // startup); the gate owns the 5 s hold, 30 s cooldown and the only-down latch.
         // The pure planner still does the rung math; VBV and scaled stay frozen D-034.
         const double realFps = m_rateTracker.RealFps(m_config.fps);
-        const bool pressure = m_config.fillMode && !m_config.desktop && !startup && m_config.fps > 0 &&
-                              realFps < double(m_config.fps) * 0.85;
+        const bool pressure = !cadenceFill && m_config.fillMode && !m_config.desktop && !startup &&
+                              m_config.fps > 0 && realFps < double(m_config.fps) * 0.85;
         const bool fillOn = m_fillGate.Update(pressure, now);
         return rc::PlanEncoderRate(m_requestedKbps, m_config.fps, m_config.desktop, startup, m_rateTracker,
                                    m_rateState.applied.rateNum, m_cappedVbr ? avgPct : 100,
-                                   m_cappedVbr ? q.vbvFramesPercent : kLegacyVbvFramesPercent, fillOn);
+                                   m_cappedVbr ? q.vbvFramesPercent : kLegacyVbvFramesPercent,
+                                   fillOn && !cadenceFill, cadenceFill);
     }
 
     static void ApplyBudget(NV_ENC_CONFIG& config, const rc::EncoderRatePlan& plan) {
