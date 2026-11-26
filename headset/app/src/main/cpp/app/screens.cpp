@@ -640,6 +640,12 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
     changed |= CheckRow(ui, l, "10bit", Tr("vr.tenBit"), s.tenBit, ci == 3 ? Tr("vr.needsHevcAv1") : "", ci != 3);
     Section(ui, l, Tr("vr.enhancements"));
     changed |= CheckRow(ui, l, "upscaling", Tr("vr.upscaling"), s.upscaling, Tr("vr.upscalingHint"));
+    float sharpenPct = s.sharpening * 100.0f;
+    const std::string sharpenText = s.sharpening <= 0.001f ? Tr("stat.frameGen.off") : std::to_string(int(sharpenPct)) + "%";
+    if (BarRow(ui, l, "sharpening", Tr("vr.sharpening"), sharpenPct, 0, 100, 10, sharpenText, !s.upscaling)) {
+        s.sharpening = sharpenPct / 100.0f;
+        changed = true;
+    }
     changed |= CheckRow(ui, l, "framegen", Tr("vr.frameGen"), s.frameGeneration, Tr("vr.frameGenHint"));
 
     Column c{body.x + w + gap, body.y - scroll, w};

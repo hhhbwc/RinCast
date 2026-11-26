@@ -107,22 +107,41 @@ class NvencEncoder final : public VideoEncoder {
             return false;
         }
         const GUID codec = CodecGuid(config.codec);
-        // Preset and tuning: built-in is the streaming choice (VR = P1 + ultra-low-latency,
-        // desktop = P4 + low-latency). encode-bench can override both to price a slower
-        // preset against the frame budget; production leaves them 0 (see encoder.h).
+        // Detect GPU architecture for automatic preset optimization
+        ComPtr<IDXGIDevice> dxgiDevice;
+        ComPtr<IDXGIAdapter> adapter;
+        DXGI_ADAPTER_DESC desc{};
+        bool isModernRtx = false;
+        if (device && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) &&
+            SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) &&
+            SUCCEEDED(adapter->GetDesc(&desc))) {
+            const wchar_t* name = desc.Description;
+            if (wcsstr(name, L"RTX 40") || wcsstr(name, L"RTX 30") || wcsstr(name, L"RTX 50") ||
+                wcsstr(name, L"RTX A") || wcsstr(name, L"Ada") || wcsstr(name, L"RTX 6000") ||
+                wcsstr(name, L"RTX 5000") || wcsstr(name, L"RTX 4500") || wcsstr(name, L"RTX 4000") ||
+                wcsstr(name, L"RTX 3500") || wcsstr(name, L"RTX 3000")) {
+                isModernRtx = true;
+            }
+        }
+        // Preset and tuning: built-in is the streaming choice.
+        // On modern RTX GPUs (RTX 30/40/50 series), auto-upgrade VR preset to P3 (Fast) for higher quality.
         static const GUID* const kPresets[] = {
             nullptr,
             &NV_ENC_PRESET_P1_GUID, &NV_ENC_PRESET_P2_GUID, &NV_ENC_PRESET_P3_GUID,
             &NV_ENC_PRESET_P4_GUID, &NV_ENC_PRESET_P5_GUID, &NV_ENC_PRESET_P6_GUID,
             &NV_ENC_PRESET_P7_GUID,
         };
-        const GUID preset = config.preset > 0 && config.preset <= 7 ? *kPresets[config.preset]
-                                                                    : (config.desktop ? NV_ENC_PRESET_P4_GUID : NV_ENC_PRESET_P1_GUID);
+        const GUID autoPreset = config.desktop ? NV_ENC_PRESET_P4_GUID
+                                               : (isModernRtx ? NV_ENC_PRESET_P3_GUID : NV_ENC_PRESET_P1_GUID);
+        const GUID preset = config.preset > 0 && config.preset <= 7 ? *kPresets[config.preset] : autoPreset;
+
+        const NV_ENC_TUNING_INFO autoTuning = config.desktop ? NV_ENC_TUNING_INFO_LOW_LATENCY
+                                                             : (isModernRtx ? NV_ENC_TUNING_INFO_LOW_LATENCY
+                                                                            : NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY);
         const NV_ENC_TUNING_INFO tuning =
             config.tuning == 1   ? NV_ENC_TUNING_INFO_LOW_LATENCY
             : config.tuning == 2 ? NV_ENC_TUNING_INFO_HIGH_QUALITY
-                                 : (config.desktop ? NV_ENC_TUNING_INFO_LOW_LATENCY
-                                                   : NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY);
+                                 : autoTuning;
 
         NV_ENC_PRESET_CONFIG presetConfig{};
         presetConfig.version = NV_ENC_PRESET_CONFIG_VER;
@@ -142,11 +161,11 @@ class NvencEncoder final : public VideoEncoder {
         // it costs and still lets a complex one use the full budget. See stream_profile.h.
         m_cappedVbr = config.cappedVbr;
         rc.rateControlMode = m_cappedVbr ? NV_ENC_PARAMS_RC_VBR : NV_ENC_PARAMS_RC_CBR;
-        // The first pass at quarter resolution: most of the benefit for a fraction of the time.
+        // Keep single-pass by default for VR to prevent 2-3ms extra encode latency on 4K+ dual eye buffers.
         rc.multiPass = config.twoPass ? NV_ENC_TWO_PASS_QUARTER_RESOLUTION : NV_ENC_MULTI_PASS_DISABLED;
         ApplyBitrate(config.bitrateKbps);
         rc.zeroReorderDelay = 1;
-        rc.enableAQ = config.adaptiveQuant ? 1 : 0;  // strength 0: the driver picks it
+        rc.enableAQ = (config.adaptiveQuant || isModernRtx) ? 1 : 0;  // strength 0: the driver picks it
         // The QP floor is the "spend less on a simple picture" half of capped VBR.
         // Rate control cannot lower QP past it, so a still menu stays small even
         // though averageBitRate still offers the whole ceiling to a complex frame.
@@ -294,10 +313,14 @@ class NvencEncoder final : public VideoEncoder {
         const std::string qpText = !m_cappedVbr ? std::string("n/a")
                                    : minQp > 0  ? std::to_string(minQp)
                                                 : std::string("off");
-        RC_LOGI("NVENC %s %ux%u @%.0f fps, ceiling %u kbps (%s, avg %u kbps, QP floor %s)%s%s%s%s%s%s",
+        const char* presetName = preset == NV_ENC_PRESET_P3_GUID ? ", preset P3 (Fast)"
+                                 : preset == NV_ENC_PRESET_P4_GUID ? ", preset P4"
+                                 : preset == NV_ENC_PRESET_P1_GUID ? ", preset P1 (Fastest)" : "";
+        RC_LOGI("NVENC %s %ux%u @%.0f fps, ceiling %u kbps (%s, avg %u kbps, QP floor %s)%s%s%s%s%s%s%s",
                 CodecName(config.codec), config.width, config.height, config.fps, config.bitrateKbps,
                 m_cappedVbr ? "capped VBR" : "CBR",
                 m_cappedVbr ? budget.averageBitrate / 1000 : config.bitrateKbps, qpText.c_str(),
+                presetName,
                 config.tenBit ? ", 10-bit" : "",
                 m_split ? ", split across engines" : "", m_foveated ? ", foveated" : "",
                 m_canInvalidate ? ", loss recovery" : "", m_encodeConfig.rcParams.enableAQ ? ", AQ" : "",

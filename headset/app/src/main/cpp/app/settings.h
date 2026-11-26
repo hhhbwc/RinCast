@@ -37,6 +37,7 @@ struct HeadsetSettings {
     // tuner's own state now - this headset neither shows it nor sends it. An old
     // settings.json keeps the key; Load simply ignores it.
     bool upscaling = false;             // Snapdragon GSR on the VR picture
+    float sharpening = 0.5f;            // 0..1 CAS / layer sharpening (0 = off)
     bool frameGeneration = false;       // make a frame from motion when the next is late
     bool bodyTracking = false;          // send the body to SteamVR as trackers
     bool faceTracking = false;          // send the face (and eyes) to the PC, for VRCFaceTracking

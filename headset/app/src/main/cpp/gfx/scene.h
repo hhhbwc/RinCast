@@ -50,7 +50,8 @@ class SceneRenderer {
     // Copies an external (video) texture into dstFbo.
     // crop: VideoDecoder::Crop() (null = whole texture).
     void BlitExternal(GLuint dstFbo, GLuint texture, int width, int height, const float* crop = nullptr, float u0 = 0,
-                      float v0 = 0, float u1 = 1, float v1 = 1, const VideoFoveation* foveation = nullptr);
+                      float v0 = 0, float u1 = 1, float v1 = 1, const VideoFoveation* foveation = nullptr,
+                      float sharpen = 0.0f, float vibrance = 0.0f, int srcWidth = 0, int srcHeight = 0);
     bool UpscalerReady() const { return m_upscalerReady; }
     // Keeps a width x height video frame as a normal texture, gamma-encoded, then draws it to dstFbo:
     void KeepVideo(GLuint texture, const float* crop, int width, int height, const VideoFoveation* foveation = nullptr);

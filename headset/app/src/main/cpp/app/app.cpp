@@ -2445,8 +2445,18 @@ void App::LatchVideo(const FrameState& frame, bool late) {
                 m_scene.KeepVideo(texture.texture, texture.crop, m_vrEyeWidth * 2, m_vrEyeHeight, foveation);
                 m_scene.DrawKeptUpscaled(fbo, m_vrSwapchain.width, m_vrSwapchain.height);
             } else {
+                float vrSharpen = 0.0f;
+                float vrVibrance = 0.0f;
+                const bool isPico = m_headset && !std::strcmp(m_headset->Family(), "PICO");
+                const bool allowSharpen = (m_stats.mbps == 0 || m_stats.mbps >= 35);
+                if (!m_xr.LayerSettings() && allowSharpen && m_settings.sharpening > 0.001f) {
+                    vrSharpen = std::clamp(m_settings.sharpening, 0.0f, 1.0f);
+                }
+                if (isPico && m_settings.sharpening > 0.001f) {
+                    vrVibrance = 0.15f;
+                }
                 m_scene.BlitExternal(fbo, texture.texture, m_vrSwapchain.width, m_vrSwapchain.height, texture.crop, 0, 0,
-                                     1, 1, foveation);
+                                     1, 1, foveation, vrSharpen, vrVibrance, texture.width, texture.height);
             }
             TimeVrDraw(false);
             if (!m_xr.ReleaseImage(m_vrSwapchain)) {
@@ -3222,7 +3232,7 @@ void App::BuildLayers(const FrameState& frame) {
         m_vrLayer.viewCount = 2;
         m_vrLayer.views = m_vrViews;
         // Sharpening shows up compression artifacts, so only with bits to spare.
-        if (m_xr.LayerSettings() && m_stats.mbps >= 40) {
+        if (m_xr.LayerSettings() && m_stats.mbps >= 40 && m_settings.sharpening > 0.001f) {
             XrCompositionLayerSettingsFB s{XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB};
             s.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB;
             m_layerSettings.push_back(s);

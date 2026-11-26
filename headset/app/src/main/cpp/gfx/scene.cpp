@@ -169,13 +169,46 @@ vec2 Foveate(vec2 uv, float eye) {
 static const char* kBlitExtFs = R"(
 uniform samplerExternalOES uTex;
 uniform vec4 uCrop;  // visible part of the decoder buffer: offset.xy, scale.zw
+uniform vec2 uTexel;
+uniform float uSharpen;
+uniform float uVibrance;
 in vec2 vUv;
 out vec4 oColor;
+
+vec3 CasFilter(vec2 uv) {
+    vec2 tc = uCrop.xy + uv * uCrop.zw;
+    vec3 c = texture(uTex, tc).rgb;
+    if (uSharpen <= 0.001) return c;
+    vec2 step = uTexel * uCrop.zw;
+    vec3 a = texture(uTex, tc + vec2(0.0, -step.y)).rgb;
+    vec3 b = texture(uTex, tc + vec2(-step.x, 0.0)).rgb;
+    vec3 d = texture(uTex, tc + vec2(step.x, 0.0)).rgb;
+    vec3 e = texture(uTex, tc + vec2(0.0, step.y)).rgb;
+    vec3 minRgb = min(min(min(a, b), min(d, e)), c);
+    vec3 maxRgb = max(max(max(a, b), max(d, e)), c);
+    vec3 amp = clamp(min(minRgb, 2.0 - maxRgb) / max(maxRgb, vec3(1e-5)), 0.0, 1.0);
+    vec3 w = -sqrt(amp) * (uSharpen * 0.22);
+    vec3 result = (w * (a + b + d + e) + c) / (4.0 * w + vec3(1.0));
+    return clamp(result, minRgb, maxRgb);
+}
+
+vec3 EnhanceColor(vec3 col) {
+    if (uVibrance > 0.001) {
+        float luma = dot(col, vec3(0.299, 0.587, 0.114));
+        float sat = max(col.r, max(col.g, col.b)) - min(col.r, min(col.g, col.b));
+        float boost = (1.0 - sat) * uVibrance;
+        col = clamp(mix(vec3(luma), col, 1.0 + boost), 0.0, 1.0);
+        col = pow(col, vec3(1.0 + 0.06 * uVibrance));
+    }
+    return col;
+}
+
 // Layer swapchains are sRGB: ToLayer() linearizes the gamma-encoded video, or with sRGB writes
 // off leaves it as it is.
 void main() {
     vec2 uv = Foveate(vec2(vUv.x, 1.0 - vUv.y), step(0.5, vUv.x));
-    vec3 g = texture(uTex, uCrop.xy + uv * uCrop.zw).rgb;
+    vec3 g = CasFilter(uv);
+    g = EnhanceColor(g);
     oColor = vec4(ToLayer(g), 1.0);
 }
 )";
@@ -532,7 +565,8 @@ static void SetFoveation(const Program& p, const VideoFoveation* f) {
 }
 
 void SceneRenderer::BlitExternal(GLuint dstFbo, GLuint texture, int width, int height, const float* crop, float u0, float v0,
-                                 float u1, float v1, const VideoFoveation* foveation) {
+                                 float u1, float v1, const VideoFoveation* foveation,
+                                 float sharpen, float vibrance, int srcWidth, int srcHeight) {
     static const float kFull[4] = {0, 0, 1, 1};
     glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
     glViewport(0, 0, width, height);
@@ -544,6 +578,11 @@ void SceneRenderer::BlitExternal(GLuint dstFbo, GLuint texture, int width, int h
     glUniform4f(m_blitExt.Uniform("uRect"), u0, v0, u1, v1);
     glUniform4fv(m_blitExt.Uniform("uCrop"), 1, crop ? crop : kFull);
     SetFoveation(m_blitExt, foveation);
+    const float tw = srcWidth > 0 ? float(srcWidth) : float(width);
+    const float th = srcHeight > 0 ? float(srcHeight) : float(height);
+    glUniform2f(m_blitExt.Uniform("uTexel"), 1.0f / tw, 1.0f / th);
+    glUniform1f(m_blitExt.Uniform("uSharpen"), sharpen);
+    glUniform1f(m_blitExt.Uniform("uVibrance"), vibrance);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
     glUniform1i(m_blitExt.Uniform("uTex"), 0);
