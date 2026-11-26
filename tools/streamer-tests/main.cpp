@@ -297,6 +297,13 @@ void TestVrBridgeHostAndClient() {
     CHECK(host.TextureGeneration() == 2);
     CHECK(client.shared()->configGeneration > genBefore);
 
+    // Toggle 10-bit without changing resolution/refresh/FOV -> textures regenerate & configGeneration increments.
+    const LONG genBefore10 = client.shared()->configGeneration;
+    host.Configure(cfg, true);
+    CHECK(host.TextureGeneration() == 3);
+    CHECK(client.shared()->textureFormat == DXGI_FORMAT_R10G10B10A2_TYPELESS);
+    CHECK(client.shared()->configGeneration > genBefore10);
+
     // Concurrent seqlock stress: writer bumps monotonically coherent sequence/position while reader checks zero tears.
     std::atomic<bool> stopSeqlock{false};
     std::atomic<uint64_t> reads{0};

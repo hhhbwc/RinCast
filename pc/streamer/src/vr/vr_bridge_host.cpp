@@ -165,7 +165,7 @@ bool VrBridgeHost::Configure(const rcvr::DisplayConfig& config, bool tenBit) {
     if ((resolutionChanged || formatChanged) && !CreateTextures(c.eyeWidth * 2, c.eyeHeight, tenBit)) return false;
     m_shared->config = c;
     MemoryBarrier();
-    if (displayChanged) InterlockedIncrement(&m_shared->configGeneration);
+    if (displayChanged || formatChanged) InterlockedIncrement(&m_shared->configGeneration);
     m_hasConfig = true;
 
     json fov = json::array();

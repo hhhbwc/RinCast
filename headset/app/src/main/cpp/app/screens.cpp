@@ -642,23 +642,38 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
     changed |= CheckRow(ui, l, "10bit", Tr("vr.tenBit"), s.tenBit, ci == 3 ? Tr("vr.needsHevcAv1") : "", ci != 3);
     Section(ui, l, Tr("vr.enhancements"));
     changed |= CheckRow(ui, l, "upscaling", Tr("vr.upscaling"), s.upscaling, Tr("vr.upscalingHint"));
+    static bool sharpenDirty = false;
     float sharpenPct = std::round(s.vrSharpen * 100.0f);
     const std::string sharpenText = s.vrSharpen <= 0.001f ? Tr("stat.frameGen.off") : std::to_string(int(sharpenPct)) + "%";
-    if (BarRow(ui, l, "vr-sharpen", Tr("vr.sharpen"), sharpenPct, 0, 100, 5, sharpenText, !s.upscaling)) {
+    if (BarRow(ui, l, "vr-sharpen", Tr("vr.sharpen"), sharpenPct, 0, 100, 5, sharpenText)) {
         s.vrSharpen = std::clamp(sharpenPct / 100.0f, 0.0f, 1.0f);
-        changed = true;
+        sharpenDirty = true;
     }
+    if (sharpenDirty && !ui.IsHeld("vr-sharpen")) {
+        sharpenDirty = false;
+        app.SaveSettings();
+    }
+    static bool vibranceDirty = false;
     float vibrancePct = std::round((s.vrVibrance / 0.45f) * 100.0f);
     const std::string vibranceText = vibrancePct <= 0.5f ? Tr("stat.frameGen.off") : std::to_string(int(vibrancePct)) + "%";
     if (BarRow(ui, l, "vr-vibrance", Tr("vr.vibrance"), vibrancePct, 0, 100, 5, vibranceText)) {
         s.vrVibrance = std::clamp((vibrancePct / 100.0f) * 0.45f, 0.0f, 0.5f);
-        changed = true;
+        vibranceDirty = true;
     }
+    if (vibranceDirty && !ui.IsHeld("vr-vibrance")) {
+        vibranceDirty = false;
+        app.SaveSettings();
+    }
+    static bool darkDirty = false;
     float darkPct = std::round((s.vrDarkGamma / 0.30f) * 100.0f);
     const std::string darkText = darkPct <= 0.5f ? Tr("stat.frameGen.off") : std::to_string(int(darkPct)) + "%";
     if (BarRow(ui, l, "vr-dark-gamma", Tr("vr.darkGamma"), darkPct, 0, 100, 5, darkText)) {
         s.vrDarkGamma = std::clamp((darkPct / 100.0f) * 0.30f, 0.0f, 0.35f);
-        changed = true;
+        darkDirty = true;
+    }
+    if (darkDirty && !ui.IsHeld("vr-dark-gamma")) {
+        darkDirty = false;
+        app.SaveSettings();
     }
     changed |= CheckRow(ui, l, "framegen", Tr("vr.frameGen"), s.frameGeneration, Tr("vr.frameGenHint"));
 
@@ -995,7 +1010,7 @@ bool PageGeneral(Ui& ui, const Rect& body) {
     if (CheckRow(ui, c, "compat-plain-xr", Tr("general.compatPlainXr"), s.compatPlainOpenXr,
                  Tr("general.compatPlainXrHint"))) {
         changed = true;
-        if (app.VrRunning()) app.PostNotice(Tr("notice.restartSteamVrForRes"));
+        app.PostNotice(Tr("general.compatPlainXrHint"));
     }
     c.y += 4;
     // The language, named in its own words so it's findable in any UI. What's selected is
