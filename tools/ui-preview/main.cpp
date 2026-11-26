@@ -88,6 +88,7 @@ struct Scene {
     std::function<void(App&)> setup;
     float hoverX = -1, hoverY = -1;
     bool click = false;  // press there and let go, then keep rendering
+    std::function<bool(App&)> verify;
 };
 
 void Lan(App& a) {
@@ -160,6 +161,17 @@ const std::vector<Scene>& Scenes() {
         {"streaming-connected", "home", 2, [](App& a) { Live(a); a.settings.frameGeneration = true; a.settings.vrBitrateMbps = 0; }},
         {"streaming-match", "home", 2, [](App& a) { Live(a); a.settings.matchSteamVr = true; }},
         {"streaming-pico", "home", 2, [](App& a) { a.device.pico = true; a.input.simultaneous = false; }},
+        {"streaming-settings-apply", "home", 2, [](App&) {}, 300, 760, true, [](App& a) {
+             const bool snapshotsMatch = a.savedSettings.frameGeneration && a.appliedStreamSettings.frameGeneration;
+             if (!a.settings.frameGeneration || !snapshotsMatch || a.savedSettingsCount != 1 ||
+                 a.appliedStreamSettingsCount != 1 || a.settings.upscaling) {
+                 fprintf(stderr, "settings Apply click: enabled=%d saved=%d applied=%d savedSnapshot=%d appliedSnapshot=%d upscaling=%d\n",
+                         int(a.settings.frameGeneration), a.savedSettingsCount, a.appliedStreamSettingsCount,
+                         int(a.savedSettings.frameGeneration), int(a.appliedStreamSettings.frameGeneration), int(a.settings.upscaling));
+                 return false;
+             }
+             return true;
+         }},
         {"desktop", "home", 3, [](App&) {}},
         {"environment", "home", 4, [](App&) {}},
         {"settings", "home", 5, [](App&) {}},
@@ -195,8 +207,24 @@ const std::vector<Scene>& Scenes() {
         {"keyboard-fmt", "keyboard", 0, [](App& a) { a.kb.PreviewState().page = "fmt"; }},
         {"keyboard-tip", "keyboard", 0, [](App&) {}, 1040, 255},
         {"stats", "stats", 0, Live},
+        {"stats-frame-gen", "stats", 0, [](App& a) {
+             Live(a); a.mode = Mode::Vr; a.settings.frameGeneration = true;
+             a.stats.fps = 42; a.stats.generatedFps = 30;
+         }},
+        {"stats-frame-gen-standby", "stats", 0, [](App& a) {
+             Live(a); a.mode = Mode::Vr; a.settings.frameGeneration = true;
+             a.stats.fps = 72; a.stats.generatedFps = 0;
+         }},
+        {"stats-frame-gen-rejected", "stats", 0, [](App& a) {
+             Live(a); a.mode = Mode::Vr; a.settings.frameGeneration = true;
+             a.stats.fps = 42; a.stats.generatedFps = 12; a.stats.generatedRejectedFps = 18;
+         }},
+        {"stats-frame-gen-all-rejected", "stats", 0, [](App& a) {
+             Live(a); a.mode = Mode::Vr; a.settings.frameGeneration = true;
+             a.stats.fps = 42; a.stats.generatedRejectedFps = 18;
+         }},
         {"notice-error", "notices", 0, [](App& a) { a.notices.push_back({"Couldn't start Half-Life: Alyx. Check that Steam is running on your PC.", "error", "", 0, 3600}); }},
-        {"notice-action", "notices", 0, [](App& a) { a.notices.push_back({"SteamVR needs a restart to use the new resolution. The running game closes.", "warning", "vr.restartSteamVR", 0, 15}); }},
+        {"notice-action", "notices", 0, [](App& a) { a.notices.push_back({Tr("notice.restartSteamVR"), "warning", "vr.restartSteamVR", 0, 15}); }},
         {"vr-overlay", "vr-overlay", 0, [](App& a) { Live(a); a.mode = Mode::Vr; a.vrRunning = true; }},
         {"vr-overlay-desktop", "vr-overlay", 0, [](App& a) { Live(a); a.vrRunning = true; }},
         {"vr-launching", "launch", 0, [](App& a) { Live(a); a.vrState = "Starting SteamVR…"; }},
@@ -307,6 +335,14 @@ int main(int argc, char** argv) {
             }
         stbi_write_png((out + "/" + s.name + ".png").c_str(), ow, oh, 3, img.data(), ow * 3);
         printf("%s\n", s.name);
+        if (s.verify) {
+            if (!s.verify(app)) {
+                fprintf(stderr, "FAIL: UI behavior contract: %s\n", s.name);
+                rt.Destroy();
+                return 5;
+            }
+            printf("PASS: UI behavior %s\n", s.name);
+        }
         rt.Destroy();
     }
     return 0;

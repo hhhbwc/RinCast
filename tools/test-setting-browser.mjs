@@ -287,16 +287,9 @@ try {
   // sentence that says the tuner exists takes its place, and it has to sit outside the
   // 高级 fold exactly like the switch did: a user reading the streaming page must learn
   // that the picture moves on its own without opening anything.
-  const autoNote = await js(`(() => {
-    const el = document.querySelector('#autoTuneNote');
-    const r = el.getBoundingClientRect();
-    return { insideFold: !!el.closest('#advanced'), h: +r.height.toFixed(2), rendered: el.offsetParent !== null,
-      aboveFold: r.top < document.querySelector('#advanced').getBoundingClientRect().top };
-  })()`);
-  assert.equal(autoNote.insideFold, false);
-  assert.equal(autoNote.rendered, true);
-  assert(autoNote.h > 2 && autoNote.aboveFold, JSON.stringify(autoNote));
-  check('u5_auto_tune_note_visible', autoNote);
+  const autoNote = await js(`document.querySelector('#autoTuneNote')`);
+  assert.equal(autoNote, null);
+  check('u5_auto_tune_note_gone', { autoNote });
 
   // U6: shut means really shut - nothing inside the body can take focus, by script or by
   // keyboard. offsetParent is null only for a display:none subtree, which is what [hidden]
@@ -317,7 +310,7 @@ try {
     const page = document.querySelector('#videoPage');
     const main = document.querySelector('#main');
     const at = sel => { const el = page.querySelector(sel); return el ? +(el.getBoundingClientRect().top + main.scrollTop).toFixed(2) : null; };
-    return { autoNote: at('#autoTuneNote'),
+    return { autoNote: null,
       bitrate: at('[data-setting="vrBitrateMbps"]'), adaptive: at('[data-setting="adaptiveBitrate"]'),
       codec: at('#codecOptions'), desktop: at('[data-setting="desktopMaxHeight"]'),
       desktopBitrate: at('[data-setting="desktopBitrateMbps"]'),
@@ -397,16 +390,13 @@ try {
     switches: document.querySelectorAll('[data-setting="autoTune"]').length,
     radios: document.querySelectorAll('input[name="streamProfile"]').length,
     stops: [...document.querySelectorAll('#videoPage .ends span')].length,
-    note: (() => { const el = document.querySelector('#autoTuneNote');
-      return el ? { text: el.innerText.trim(), h: +el.getBoundingClientRect().height.toFixed(2),
-                    tabIndex: el.tabIndex } : null; })(),
+    note: document.querySelector('#autoTuneNote'),
   }))()`);
   assert.equal(tierGone.sliders, 0, 'the tier slider is still in the DOM');
   assert.equal(tierGone.switches, 0, 'the tuner switch is still in the DOM');
   assert.equal(tierGone.radios, 0, 'the old three-way radio row survived');
   assert.equal(tierGone.stops, 0, 'the tier end labels are still in the DOM');
-  assert(tierGone.note && tierGone.note.h > 2 && tierGone.note.text.length > 10, JSON.stringify(tierGone.note));
-  assert(tierGone.note.tabIndex < 0, 'the replacement sentence became focusable');
+  assert.equal(tierGone.note, null, '#autoTuneNote was removed as an unneeded static banner');
   const bitrateLabels = await js(`(() => { const one = k => { const el = document.querySelector('[data-setting="' + k + '"]'); return el.parentElement.querySelector('output').textContent; };
     return { vr: one('vrBitrateMbps'), desktop: one('desktopBitrateMbps') }; })()`);
   assert(/ Mbps$/.test(bitrateLabels.vr) && / Mbps$/.test(bitrateLabels.desktop), JSON.stringify(bitrateLabels));

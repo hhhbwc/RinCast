@@ -147,6 +147,12 @@ class Connection {
     std::atomic<int64_t> m_clockOffsetNs{0};
     std::atomic<bool> m_hasClockOffset{false};
     std::atomic<bool> m_peerDisconnected{false};
+    // Disconnect rides the unreliable path: a single burst can land behind a large control
+    // message and be dropped by a full receive queue (seen in tests, one run in five).
+    // Tick re-sends it for a short window so the peer's clean-shutdown state is not a
+    // coin flip; the window closes on its own and nothing is retried forever.
+    std::atomic<int64_t> m_disconnectUntilNs{0};
+    std::atomic<int64_t> m_disconnectLastNs{0};
 
     mutable std::mutex m_statsMutex;
     ConnectionStats m_stats;

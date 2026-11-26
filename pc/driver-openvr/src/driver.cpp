@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "hand_poses.h"
+#include "layer_reproj.h"
 #include "openvr/openvr_driver.h"
 #include "vr_bridge.h"
 
@@ -261,6 +262,7 @@ class Controller : public vr::ITrackedDeviceServerDriver {
         props->SetInt32Property(c, vr::Prop_ControllerRoleHint_Int32,
                                 left ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand);
         props->SetInt32Property(c, vr::Prop_DeviceClass_Int32, vr::TrackedDeviceClass_Controller);
+        props->SetUint64Property(c, vr::Prop_CurrentUniverseId_Uint64, kUniverseId);
         props->SetBoolProperty(c, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
         props->SetStringProperty(c, vr::Prop_NamedIconPathDeviceOff_String,
                                  left ? "{oculus}/icons/cb_left_controller_off.png" : "{oculus}/icons/cb_right_controller_off.png");
@@ -457,6 +459,7 @@ class HandDevice : public vr::ITrackedDeviceServerDriver {
         props->SetInt32Property(c, vr::Prop_ControllerRoleHint_Int32,
                                 left ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand);
         props->SetInt32Property(c, vr::Prop_DeviceClass_Int32, vr::TrackedDeviceClass_Controller);
+        props->SetUint64Property(c, vr::Prop_CurrentUniverseId_Uint64, kUniverseId);
         props->SetBoolProperty(c, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
         // Below the controller, for when both happen to be connected at once.
         props->SetInt32Property(c, vr::Prop_ControllerHandSelectionPriority_Int32, -1);
@@ -519,32 +522,7 @@ class HandDevice : public vr::ITrackedDeviceServerDriver {
 // ---------------------------------------------------------------------------
 // HMD (direct mode)
 // ---------------------------------------------------------------------------
-static const char* kBlitShader = R"(
-Texture2D tex : register(t0);
-SamplerState samp : register(s0);
-cbuffer Layer : register(b0) { float4 rect; };  // uMin, vMin, uMax, vMax of the source
-struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-V vs(uint id : SV_VertexID) {
-    float2 c = float2((id << 1) & 2, id & 2);
-    V o; o.pos = float4(c * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = lerp(rect.xy, rect.zw, c); return o;
-}
-// SteamVR usually renders larger than the stream (its resolution setting, 150% on a fast GPU).
-// One bilinear sample per pixel would then skip most of the game's pixels: fine detail shimmers
-// and edges crawl. Shrinking, each pixel averages the ones it covers instead, from a 4x4 grid
-// of bilinear samples spread over them.
-float4 ps(V i) : SV_Target {
-    float w, h;
-    tex.GetDimensions(w, h);
-    const float2 covered = float2(abs(ddx(i.uv.x)) * w, abs(ddy(i.uv.y)) * h);  // source pixels per pixel
-    if (covered.x <= 1.05 && covered.y <= 1.05) return tex.Sample(samp, i.uv);
-    const float2 step = max(covered, 1.0) / (4.0 * float2(w, h));
-    float4 sum = 0;
-    [unroll] for (int y = 0; y < 4; y++)
-        [unroll] for (int x = 0; x < 4; x++)
-            sum += tex.SampleLevel(samp, i.uv + (float2(x, y) - 1.5) * step, 0);
-    return sum / 16;
-}
-)";
+static const char* kBlitShader = rcvr::kBlitShader;
 
 class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponent,
             public vr::IVRDriverDirectModeComponent {
@@ -819,12 +797,55 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
             if (syncMutex) syncMutex->ReleaseSync(0);
             return;
         }
+        float fovTan[2][4];
+        {
+            std::lock_guard lock(m_cfgMutex);
+            std::memcpy(fovTan, m_cfg.fovTan, sizeof(fovTan));
+        }
+        std::vector<rcvr::ValidLayerEntry> validLayers;
+        for (size_t i = 0; i < layers.size(); i++) {
+            if (textures[i][0] || textures[i][1]) {
+                const vr::HmdMatrix34_t& pose = textures[i][0] ? layers[i][0].mHmdPose : layers[i][1].mHmdPose;
+                validLayers.push_back({i, pose});
+            }
+        }
+        std::deque<rcvr::TrackingSnapshot> historyCopy;
+        rcvr::TrackingSnapshot fallbackTracking;
+        {
+            std::lock_guard lock(g_shared->mutex);
+            historyCopy = g_shared->history;
+            fallbackTracking = g_shared->frameTracking;
+        }
+        const rcvr::LayerSelectionResult target =
+            rcvr::SelectCompositeTargetLayer(validLayers, historyCopy, fallbackTracking);
+
         D3D11_TEXTURE2D_DESC dd;
         dst->GetDesc(&dd);
+        int reprojCount = 0;
         for (int eye = 0; eye < 2; eye++) {
             const D3D11_VIEWPORT vp{float(eye * dd.Width / 2), 0, float(dd.Width / 2), float(dd.Height), 0, 1};
-            for (size_t i = 0; i < layers.size(); i++)
-                if (textures[i][eye]) DrawLayer(textures[i][eye].Get(), layers[i][eye].bounds, dst, vp, i > 0);
+            const vr::HmdMatrix34_t& targetPose =
+                (textures[target.targetIdx][eye] != nullptr) ? layers[target.targetIdx][eye].mHmdPose : target.targetPose;
+            for (size_t i = 0; i < layers.size(); i++) {
+                if (!textures[i][eye]) continue;
+                float reproj[9];
+                bool reprojEnabled = false;
+                if (layers.size() > 1 && i != target.targetIdx) {
+                    reprojEnabled = rcvr::ComputeLayerReproj(layers[i][eye].mHmdPose, targetPose, reproj);
+                    if (reprojEnabled) reprojCount++;
+                }
+                DrawLayer(textures[i][eye].Get(), layers[i][eye].bounds, dst, vp, i > 0,
+                          fovTan[eye], reproj, reprojEnabled);
+            }
+        }
+        if (layers.size() > 1 && reprojCount > 0) {
+            static int64_t lastReprojLogNs = 0;
+            const int64_t nowNs = rcvr::QpcNowNs();
+            if (nowNs - lastReprojLogNs > 5'000'000'000LL) {
+                lastReprojLogNs = nowNs;
+                Log("Multi-layer composite: %zu layers, target layer %zu (latest pose), %d eyes reprojected",
+                    layers.size(), target.targetIdx, reprojCount);
+            }
         }
         if (dstMutex) dstMutex->ReleaseSync(0);
         m_ctx->Flush();
@@ -838,17 +859,13 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
             s->renderedEyeWidth = LONG(sd.Width * std::fabs(b.uMax - b.uMin) + 0.5f);
             s->renderedEyeHeight = LONG(sd.Height * std::fabs(b.vMax - b.vMin) + 0.5f);
         }
-        const rcvr::TrackingSnapshot t = RenderedWith(layers[0][0].mHmdPose);
         rcvr::FrameSlot& fs = s->slots[slot];
         fs.frameIndex = ++m_frameIndex;
-        fs.trackingSequence = t.sequence;
-        fs.headsetTargetNs = t.headsetTargetNs;
+        fs.trackingSequence = target.targetTracking.sequence;
+        fs.headsetTargetNs = target.targetTracking.headsetTargetNs;
         fs.submitPcNs = rcvr::QpcNowNs();
-        fs.renderPose = t.hmd;
-        {
-            std::lock_guard lock(m_cfgMutex);
-            std::memcpy(fs.fovTan, m_cfg.fovTan, sizeof(fs.fovTan));
-        }
+        fs.renderPose = target.targetTracking.hmd;
+        std::memcpy(fs.fovTan, fovTan, sizeof(fs.fovTan));
         s->producerKind = LONG(rcvr::ProducerKind::SteamVR);
         s->producerPid = LONG(GetCurrentProcessId());
         InterlockedExchange64(&s->producerHeartbeatNs, rcvr::QpcNowNs());
@@ -878,9 +895,11 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
         const int64_t now = rcvr::QpcNowNs();
         const int64_t next = NextVsync(now, m_pacedVsync);
         m_pacedVsync = next;
-        if (WaitForStreamer() && rcvr::QpcNowNs() >= next) return;
+        const bool waited = WaitForStreamer();
+        const int64_t after = rcvr::QpcNowNs();
+        if (waited && after >= next) return;
         const int64_t coarse = next - 1'500'000;
-        if (coarse > now) Sleep(DWORD((coarse - now) / 1'000'000));
+        if (coarse > after) Sleep(DWORD((coarse - after) / 1'000'000));
         while (rcvr::QpcNowNs() < next) YieldProcessor();
     }
     // Until the streamer has taken the frame just presented; false if it didn't need waiting
@@ -976,7 +995,7 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
         sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
         m_device->CreateSamplerState(&sd, &m_sampler);
         D3D11_BUFFER_DESC bd{};
-        bd.ByteWidth = 16;
+        bd.ByteWidth = sizeof(rcvr::LayerConstants);
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         m_device->CreateBuffer(&bd, nullptr, &m_rectBuffer);
         D3D11_BLEND_DESC bl{};
@@ -1026,7 +1045,7 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
     // and encoded again on writing, plain 8/10-bit ones are copied as they are, and float
     // (linear) ones are encoded to sRGB.
     void DrawLayer(ID3D11Texture2D* src, const vr::VRTextureBounds_t& b, ID3D11Texture2D* dst, const D3D11_VIEWPORT& vp,
-                   bool blend) {
+                   bool blend, const float fovTan[4] = nullptr, const float reproj[9] = nullptr, bool reprojEnabled = false) {
         D3D11_TEXTURE2D_DESC sdesc;
         src->GetDesc(&sdesc);
         if (sdesc.SampleDesc.Count > 1) return;  // SteamVR resolves before handing layers over
@@ -1055,8 +1074,46 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
         rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
         ComPtr<ID3D11RenderTargetView> rtv;
         if (FAILED(m_device->CreateRenderTargetView(dst, &rtvd, &rtv))) return;
-        const float rect[4] = {b.uMin, b.vMin, b.uMax, b.vMax};
-        m_ctx->UpdateSubresource(m_rectBuffer.Get(), 0, nullptr, rect, 0, 0);
+        rcvr::LayerConstants lc{};
+        lc.rect[0] = b.uMin;
+        lc.rect[1] = b.vMin;
+        lc.rect[2] = b.uMax;
+        lc.rect[3] = b.vMax;
+        if (fovTan) {
+            std::memcpy(lc.fov, fovTan, sizeof(float) * 4);
+        }
+        if (reproj && reprojEnabled) {
+            lc.reproj0[0] = reproj[0];
+            lc.reproj0[1] = reproj[1];
+            lc.reproj0[2] = reproj[2];
+            lc.reproj0[3] = 1.0f;
+
+            lc.reproj1[0] = reproj[3];
+            lc.reproj1[1] = reproj[4];
+            lc.reproj1[2] = reproj[5];
+            lc.reproj1[3] = blend ? 1.0f : 0.0f;
+
+            lc.reproj2[0] = reproj[6];
+            lc.reproj2[1] = reproj[7];
+            lc.reproj2[2] = reproj[8];
+            lc.reproj2[3] = 0.0f;
+        } else {
+            lc.reproj0[0] = 1.0f;
+            lc.reproj0[1] = 0.0f;
+            lc.reproj0[2] = 0.0f;
+            lc.reproj0[3] = 0.0f;
+
+            lc.reproj1[0] = 0.0f;
+            lc.reproj1[1] = 1.0f;
+            lc.reproj1[2] = 0.0f;
+            lc.reproj1[3] = blend ? 1.0f : 0.0f;
+
+            lc.reproj2[0] = 0.0f;
+            lc.reproj2[1] = 0.0f;
+            lc.reproj2[2] = 1.0f;
+            lc.reproj2[3] = 0.0f;
+        }
+        m_ctx->UpdateSubresource(m_rectBuffer.Get(), 0, nullptr, &lc, 0, 0);
         m_ctx->RSSetViewports(1, &vp);
         m_ctx->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
         m_ctx->OMSetBlendState(blend ? m_blend.Get() : nullptr, nullptr, 0xFFFFFFFF);
@@ -1065,6 +1122,7 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
         m_ctx->VSSetShader(m_vs.Get(), nullptr, 0);
         m_ctx->VSSetConstantBuffers(0, 1, m_rectBuffer.GetAddressOf());
         m_ctx->PSSetShader(m_ps.Get(), nullptr, 0);
+        m_ctx->PSSetConstantBuffers(0, 1, m_rectBuffer.GetAddressOf());
         m_ctx->PSSetShaderResources(0, 1, srv.GetAddressOf());
         m_ctx->PSSetSamplers(0, 1, m_sampler.GetAddressOf());
         m_ctx->RSSetState(nullptr);
@@ -1082,38 +1140,6 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
         for (int i = 0; i < 3; i++)
             if (it->second->handles[i] == handle) return it->second->tex[i];
         return nullptr;
-    }
-
-    // The tracking sample whose head pose SteamVR rendered the frame with: the closest of
-    // the poses handed to it recently (they are identical up to float rounding).
-    rcvr::TrackingSnapshot RenderedWith(const vr::HmdMatrix34_t& m) {
-        std::lock_guard lock(g_shared->mutex);
-        if (g_shared->history.empty()) return g_shared->frameTracking;
-        const rcvr::TrackingSnapshot* best = nullptr;
-        double bestScore = 1e30;
-        for (const auto& t : g_shared->history) {
-            const vr::DriverPose_t p = MakePose(t.hmd, true, true, 0, false);
-            const auto& q = p.qRotation;
-            // Rotation matrix of q, as SteamVR builds the device-to-absolute matrix.
-            const double r[3][3] = {{1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y - q.z * q.w), 2 * (q.x * q.z + q.y * q.w)},
-                                    {2 * (q.x * q.y + q.z * q.w), 1 - 2 * (q.x * q.x + q.z * q.z), 2 * (q.y * q.z - q.x * q.w)},
-                                    {2 * (q.x * q.z - q.y * q.w), 2 * (q.y * q.z + q.x * q.w), 1 - 2 * (q.x * q.x + q.y * q.y)}};
-            double score = 0;
-            for (int i = 0; i < 3; i++) {
-                score += std::fabs(m.m[i][3] - p.vecPosition[i]);
-                for (int j = 0; j < 3; j++) score += std::fabs(m.m[i][j] - r[i][j]);
-            }
-            // Equal poses carry no age information; prefer the newest matching sample.
-            if (score <= bestScore) {
-                bestScore = score;
-                best = &t;
-            }
-        }
-        if (bestScore > 0.01 && m_poseMismatchLogs < 5) {
-            m_poseMismatchLogs++;
-            Log("Frame pose matches no recent tracking sample closely (difference %.4f)", bestScore);
-        }
-        return *best;
     }
 
     rcvr::DisplayConfig m_cfg;
@@ -1257,6 +1283,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         for (auto& t : m_trackers) t.reset();
         delete g_shared;
         g_shared = nullptr;
+        timeEndPeriod(1);
         VR_CLEANUP_SERVER_DRIVER_CONTEXT();
     }
 

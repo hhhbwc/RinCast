@@ -113,6 +113,7 @@ void Platform::PlaySound(Sound) {}
 void Platform::RequestPermissions(const std::vector<std::string>&) {}
 void Platform::SetUsbNetwork(bool) {}
 Platform::UsbNetwork Platform::GetUsbNetwork() { return {}; }
+Platform::VideoDecoderCapsResult Platform::VideoDecoderCaps() { return {}; }
 void Platform::Speak(const std::string&) {}
 
 HttpResult Platform::Http(const std::string& method, const std::string& url, const std::string& body,

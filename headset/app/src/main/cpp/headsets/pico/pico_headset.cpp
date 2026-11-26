@@ -23,11 +23,17 @@ class PicoHeadset : public Headset {
     bool PanelSize(uint32_t& width, uint32_t& height) const override {
         // The Neo3; the PICO 4 (Pro, Enterprise) and 4 Ultra share their panels.
         const std::string model = SystemProperty("ro.product.model");
-        if (model.find("Neo3") != std::string::npos || model.find("Neo 3") != std::string::npos)
+        if (model.find("Neo3") != std::string::npos || model.find("Neo 3") != std::string::npos) {
             width = 1832, height = 1920;
-        else
+            return true;
+        }
+        if (model.find("Phoenix") != std::string::npos || model.find("A8110") != std::string::npos ||
+            model.find("PICO 4") != std::string::npos || model.find("Pico 4") != std::string::npos ||
+            model.find("A9210") != std::string::npos) {
             width = 2160, height = 2160;
-        return true;
+            return true;
+        }
+        return false;
     }
 
     std::vector<ControllerProfile> Controllers() const override {

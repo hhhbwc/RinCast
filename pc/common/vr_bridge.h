@@ -12,6 +12,7 @@
 
 #include <windows.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -20,6 +21,12 @@ namespace rcvr {
 inline constexpr wchar_t kSharedMemoryName[] = L"Local\\RinCastVRBridge.v1";
 inline constexpr wchar_t kFrameReadyEventName[] = L"Local\\RinCastVRFrameReady.v1";
 inline constexpr wchar_t kTrackingEventName[] = L"Local\\RinCastVRTracking.v1";
+
+struct BridgeNames {
+    const wchar_t* sharedMemory = kSharedMemoryName;
+    const wchar_t* frameReady = kFrameReadyEventName;
+    const wchar_t* trackingEvent = kTrackingEventName;
+};
 inline constexpr uint32_t kMagic = 0x42564352;  // 'RCVB'
 inline constexpr uint32_t kVersion = 5;
 inline constexpr int kFrameSlots = 3;
@@ -147,6 +154,30 @@ struct Shared {
     volatile LONG renderedEyeHeight;       // resolution setting applied), 0 = no frame yet
 };
 
+static_assert(kVersion == 5);
+static_assert(kFrameSlots == 3);
+static_assert(sizeof(DisplayConfig) == 192);
+static_assert(sizeof(FrameSlot) == 128);
+static_assert(sizeof(TrackingSnapshot) == 248);
+static_assert(sizeof(BodySnapshot) == 536);
+static_assert(sizeof(HandSnapshot) == 1624);
+static_assert(sizeof(Shared) == 5888);
+static_assert(offsetof(Shared, config) == 24);
+static_assert(offsetof(Shared, textureNames) == 216);
+static_assert(offsetof(Shared, trackingSeqlock) == 632);
+static_assert(offsetof(Shared, tracking) == 640);
+static_assert(offsetof(Shared, latestReadySlot) == 904);
+static_assert(offsetof(Shared, slots) == 912);
+static_assert(offsetof(Shared, applicationName) == 1296);
+static_assert(offsetof(Shared, hapticsWrite) == 1424);
+static_assert(offsetof(Shared, haptics) == 1428);
+static_assert(offsetof(Shared, bodySeqlock) == 2072);
+static_assert(offsetof(Shared, body) == 2080);
+static_assert(offsetof(Shared, handSeqlock) == 2616);
+static_assert(offsetof(Shared, hands) == 2632);
+static_assert(offsetof(Shared, renderedEyeWidth) == 5880);
+static_assert(offsetof(Shared, renderedEyeHeight) == 5884);
+
 #pragma pack(pop)
 
 // ---------------------------------------------------------------------------
@@ -245,17 +276,17 @@ class BridgeClient {
    public:
     ~BridgeClient() { Close(); }
 
-    bool Open() {
+    bool Open(const BridgeNames& names = {}) {
         if (m_shared) return true;
-        m_mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, kSharedMemoryName);
+        m_mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, names.sharedMemory);
         if (!m_mapping) return false;
         m_shared = static_cast<Shared*>(MapViewOfFile(m_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
         if (!m_shared || m_shared->magic != kMagic || m_shared->version != kVersion) {
             Close();
             return false;
         }
-        m_frameReady = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, kFrameReadyEventName);
-        m_trackingEvent = OpenEventW(SYNCHRONIZE, FALSE, kTrackingEventName);
+        m_frameReady = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, names.frameReady);
+        m_trackingEvent = OpenEventW(SYNCHRONIZE, FALSE, names.trackingEvent);
         return true;
     }
 

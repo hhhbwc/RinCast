@@ -47,6 +47,12 @@ class Platform {
         int kbps = 0;            // USB 2: ~480000, USB 3: ~5000000
     };
     static UsbNetwork GetUsbNetwork();
+    struct VideoDecoderCapsResult {
+        bool valid = false;
+        bool h264 = true, hevc = true, hevc10 = false, av1 = false, av110 = false;
+        int maxWidth = 4096, maxHeight = 4096;
+    };
+    static VideoDecoderCapsResult VideoDecoderCaps();
     static void Speak(const std::string& text);  // needs a text-to-speech engine on the headset
     // Blocking; call from worker threads only.
     static HttpResult Http(const std::string& method, const std::string& url, const std::string& body,

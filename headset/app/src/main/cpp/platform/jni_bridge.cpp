@@ -26,23 +26,46 @@ std::string ToString(JNIEnv* env, jstring s) {
 std::string CallString(const char* method) {
     JniScope scope;
     JNIEnv* env = scope.env();
+    if (!env || !g_activity) return {};
+    if (env->ExceptionCheck()) env->ExceptionClear();
     jclass cls = env->GetObjectClass(g_activity);
+    if (!cls) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return {};
+    }
     jmethodID m = env->GetMethodID(cls, method, "()Ljava/lang/String;");
-    std::string out = ToString(env, static_cast<jstring>(env->CallObjectMethod(g_activity, m)));
+    if (!m) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+        return {};
+    }
+    jobject res = env->CallObjectMethod(g_activity, m);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+        return {};
+    }
+    std::string out = ToString(env, static_cast<jstring>(res));
     env->DeleteLocalRef(cls);
     return out;
 }
 }  // namespace
 
 JniScope::JniScope() {
-    if (g_vm->GetEnv(reinterpret_cast<void**>(&m_env), JNI_VERSION_1_6) == JNI_EDETACHED) {
+    if (g_vm && g_vm->GetEnv(reinterpret_cast<void**>(&m_env), JNI_VERSION_1_6) == JNI_EDETACHED) {
         g_vm->AttachCurrentThread(&m_env, nullptr);
         m_attached = true;
+    }
+    if (m_env && m_env->ExceptionCheck()) {
+        m_env->ExceptionClear();
     }
 }
 
 JniScope::~JniScope() {
-    if (m_attached) g_vm->DetachCurrentThread();
+    if (m_env && m_env->ExceptionCheck()) {
+        m_env->ExceptionClear();
+    }
+    if (m_attached && g_vm) g_vm->DetachCurrentThread();
 }
 
 void Platform::Init(android_app* app) {
@@ -63,9 +86,13 @@ std::string Platform::SystemLocale() { return CallString("getSystemLocale"); }
 bool Platform::HasMicPermission() {
     JniScope scope;
     JNIEnv* env = scope.env();
+    if (!env || !g_activity) return false;
+    if (env->ExceptionCheck()) env->ExceptionClear();
     jclass cls = env->GetObjectClass(g_activity);
+    if (!cls) return false;
     jmethodID m = env->GetMethodID(cls, "hasMicPermission", "()Z");
-    const bool ok = env->CallBooleanMethod(g_activity, m);
+    const bool ok = m ? env->CallBooleanMethod(g_activity, m) : false;
+    if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(cls);
     return ok;
 }
@@ -73,18 +100,26 @@ bool Platform::HasMicPermission() {
 void Platform::SetStreamingLocks(bool enable) {
     JniScope scope;
     JNIEnv* env = scope.env();
+    if (!env || !g_activity) return;
+    if (env->ExceptionCheck()) env->ExceptionClear();
     jclass cls = env->GetObjectClass(g_activity);
+    if (!cls) return;
     jmethodID m = env->GetMethodID(cls, "setStreamingLocks", "(Z)V");
-    env->CallVoidMethod(g_activity, m, jboolean(enable));
+    if (m) env->CallVoidMethod(g_activity, m, jboolean(enable));
+    if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(cls);
 }
 
 void Platform::PlaySound(Sound sound) {
     JniScope scope;
     JNIEnv* env = scope.env();
+    if (!env || !g_activity) return;
+    if (env->ExceptionCheck()) env->ExceptionClear();
     jclass cls = env->GetObjectClass(g_activity);
+    if (!cls) return;
     jmethodID m = env->GetMethodID(cls, "playUiSound", "(I)V");
-    env->CallVoidMethod(g_activity, m, jint(sound));
+    if (m) env->CallVoidMethod(g_activity, m, jint(sound));
+    if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(cls);
 }
 
@@ -94,20 +129,28 @@ void Platform::RequestPermissions(const std::vector<std::string>& permissions) {
     if (list.empty()) return;
     JniScope scope;
     JNIEnv* env = scope.env();
+    if (!env || !g_activity) return;
+    if (env->ExceptionCheck()) env->ExceptionClear();
     jclass cls = env->GetObjectClass(g_activity);
+    if (!cls) return;
     jmethodID m = env->GetMethodID(cls, "requestPermissionList", "(Ljava/lang/String;)V");
     jstring s = env->NewStringUTF(list.c_str());
-    env->CallVoidMethod(g_activity, m, s);
-    env->DeleteLocalRef(s);
+    if (m && s) env->CallVoidMethod(g_activity, m, s);
+    if (s) env->DeleteLocalRef(s);
+    if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(cls);
 }
 
 void Platform::SetUsbNetwork(bool on) {
     JniScope scope;
     JNIEnv* env = scope.env();
+    if (!env || !g_activity) return;
+    if (env->ExceptionCheck()) env->ExceptionClear();
     jclass cls = env->GetObjectClass(g_activity);
+    if (!cls) return;
     jmethodID m = env->GetMethodID(cls, "setUsbNetwork", "(Z)V");
-    env->CallVoidMethod(g_activity, m, jboolean(on));
+    if (m) env->CallVoidMethod(g_activity, m, jboolean(on));
+    if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(cls);
 }
 
@@ -125,14 +168,70 @@ Platform::UsbNetwork Platform::GetUsbNetwork() {
     return u;
 }
 
+Platform::VideoDecoderCapsResult Platform::VideoDecoderCaps() {
+    VideoDecoderCapsResult res;
+    JniScope scope;
+    JNIEnv* env = scope.env();
+    if (!env || !g_activity) return res;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jclass cls = env->GetObjectClass(g_activity);
+    if (!cls) return res;
+    jmethodID m = env->GetMethodID(cls, "queryVideoDecoderCaps", "()[I");
+    if (!m) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+        return res;
+    }
+    jintArray arr = static_cast<jintArray>(env->CallObjectMethod(g_activity, m));
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        if (arr) env->DeleteLocalRef(arr);
+        env->DeleteLocalRef(cls);
+        return res;
+    }
+    if (arr) {
+        jsize len = env->GetArrayLength(arr);
+        if (len >= 7) {
+            jint buf[7];
+            env->GetIntArrayRegion(arr, 0, 7, buf);
+            if (!env->ExceptionCheck()) {
+                res.valid = true;
+                res.h264 = buf[0] != 0;
+                res.hevc = buf[1] != 0;
+                res.hevc10 = buf[2] != 0;
+                res.av1 = buf[3] != 0;
+                res.av110 = buf[4] != 0;
+                if (buf[5] > 0) res.maxWidth = buf[5];
+                if (buf[6] > 0) res.maxHeight = buf[6];
+            } else {
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(arr);
+    }
+    env->DeleteLocalRef(cls);
+    return res;
+}
+
 void Platform::Speak(const std::string& text) {
     JniScope scope;
     JNIEnv* env = scope.env();
+    if (!env || !g_activity) return;
+    if (env->ExceptionCheck()) env->ExceptionClear();
     jclass cls = env->GetObjectClass(g_activity);
+    if (!cls) return;
     jmethodID m = env->GetMethodID(cls, "speak", "(Ljava/lang/String;)V");
+    if (!m) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+        return;
+    }
     jstring s = env->NewStringUTF(text.c_str());
-    env->CallVoidMethod(g_activity, m, s);
-    env->DeleteLocalRef(s);
+    if (s) {
+        env->CallVoidMethod(g_activity, m, s);
+        env->DeleteLocalRef(s);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(cls);
 }
 
@@ -140,23 +239,32 @@ HttpResult Platform::Http(const std::string& method, const std::string& url, con
                           const std::string& bearer, int timeoutMs) {
     JniScope scope;
     JNIEnv* env = scope.env();
+    if (!env || !g_activity) return {};
+    if (env->ExceptionCheck()) env->ExceptionClear();
     jclass cls = env->GetObjectClass(g_activity);
+    if (!cls) return {};
     jmethodID m = env->GetMethodID(
         cls, "httpRequest", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;");
+    if (!m) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+        return {};
+    }
     jstring jm = env->NewStringUTF(method.c_str());
     jstring ju = env->NewStringUTF(url.c_str());
     jstring jb = env->NewStringUTF(body.c_str());
     jstring jt = env->NewStringUTF(bearer.c_str());
-    const std::string raw = ToString(env, static_cast<jstring>(env->CallObjectMethod(g_activity, m, jm, ju, jb, jt, timeoutMs)));
-    env->DeleteLocalRef(jm);
-    env->DeleteLocalRef(ju);
-    env->DeleteLocalRef(jb);
-    env->DeleteLocalRef(jt);
+    jobject res = env->CallObjectMethod(g_activity, m, jm, ju, jb, jt, timeoutMs);
+    if (jm) env->DeleteLocalRef(jm);
+    if (ju) env->DeleteLocalRef(ju);
+    if (jb) env->DeleteLocalRef(jb);
+    if (jt) env->DeleteLocalRef(jt);
     env->DeleteLocalRef(cls);
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
         return {};
     }
+    const std::string raw = ToString(env, static_cast<jstring>(res));
     HttpResult r;
     const size_t nl = raw.find('\n');
     r.status = std::atoi(raw.substr(0, nl).c_str());

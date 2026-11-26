@@ -89,6 +89,8 @@ class XrInput {
     std::vector<XrPath> m_controllerProfiles;  // those the runtime took
     bool m_simultaneous = false;
     int m_simultaneousRetry = 0;
+    int64_t m_lastControllerActivityNs[2] = {0, 0};
+    Pose m_lastControllerPose[2] = {};
 };
 
 }  // namespace rv

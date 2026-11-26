@@ -79,40 +79,80 @@ bool XrInput::Init(XrContext& xr, const std::vector<ControllerProfile>& profiles
     XrInteractionProfileSuggestedBinding sb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
     for (const ControllerProfile& profile : profiles) {
         if (profile.extension && !xr.HasExtension(profile.extension)) continue;
-        std::vector<XrActionSuggestedBinding> b;
-        auto bind = [&](XrAction a, const char* path) { b.push_back({a, Path(inst, path)}); };
-        for (const char* side : {"left", "right"}) {
-            const std::string h = std::string("/user/hand/") + side;
-            bind(m_aimPose, (h + "/input/aim/pose").c_str());
-            bind(m_gripPose, (h + "/input/grip/pose").c_str());
-            bind(m_trigger, (h + "/input/trigger/value").c_str());
-            bind(m_squeeze, (h + "/input/squeeze/value").c_str());
-            bind(m_stick, (h + "/input/thumbstick").c_str());
-            bind(m_stickClick, (h + "/input/thumbstick/click").c_str());
-            if (profile.touchSensors) {
-                bind(m_touchStick, (h + "/input/thumbstick/touch").c_str());
-                bind(m_touchTrigger, (h + "/input/trigger/touch").c_str());
+        const bool isWmr = strstr(profile.path, "motion_controller") != nullptr;
+        const bool isIndex = strstr(profile.path, "index_controller") != nullptr;
+        auto buildBindings = [&](bool withTouch, bool withThumbrest) {
+            std::vector<XrActionSuggestedBinding> b;
+            auto bind = [&](XrAction a, const char* path) { b.push_back({a, Path(inst, path)}); };
+            for (const char* side : {"left", "right"}) {
+                const std::string h = std::string("/user/hand/") + side;
+                bind(m_aimPose, (h + "/input/aim/pose").c_str());
+                bind(m_gripPose, (h + "/input/grip/pose").c_str());
+                bind(m_trigger, (h + "/input/trigger/value").c_str());
+                if (isWmr) bind(m_squeeze, (h + "/input/squeeze/click").c_str());
+                else bind(m_squeeze, (h + "/input/squeeze/value").c_str());
+                bind(m_stick, (h + "/input/thumbstick").c_str());
+                bind(m_stickClick, (h + "/input/thumbstick/click").c_str());
+                if (withTouch) {
+                    bind(m_touchStick, (h + "/input/thumbstick/touch").c_str());
+                    bind(m_touchTrigger, (h + "/input/trigger/touch").c_str());
+                }
+                if (withThumbrest) bind(m_touchThumbrest, (h + "/input/thumbrest/touch").c_str());
+                bind(m_haptic, (h + "/output/haptic").c_str());
             }
-            if (profile.thumbrest) bind(m_touchThumbrest, (h + "/input/thumbrest/touch").c_str());
-            bind(m_haptic, (h + "/output/haptic").c_str());
-        }
-        bind(m_primary, "/user/hand/left/input/x/click");
-        bind(m_secondary, "/user/hand/left/input/y/click");
-        bind(m_menu, "/user/hand/left/input/menu/click");
-        bind(m_primary, "/user/hand/right/input/a/click");
-        bind(m_secondary, "/user/hand/right/input/b/click");
-        if (profile.touchSensors) {
-            bind(m_touchPrimary, "/user/hand/left/input/x/touch");
-            bind(m_touchSecondary, "/user/hand/left/input/y/touch");
-            bind(m_touchPrimary, "/user/hand/right/input/a/touch");
-            bind(m_touchSecondary, "/user/hand/right/input/b/touch");
-        }
+            if (isWmr) {
+                bind(m_menu, "/user/hand/left/input/menu/click");
+                bind(m_menu, "/user/hand/right/input/menu/click");
+            } else if (isIndex) {
+                bind(m_primary, "/user/hand/left/input/a/click");
+                bind(m_secondary, "/user/hand/left/input/b/click");
+                bind(m_primary, "/user/hand/right/input/a/click");
+                bind(m_secondary, "/user/hand/right/input/b/click");
+                if (withTouch) {
+                    bind(m_touchPrimary, "/user/hand/left/input/a/touch");
+                    bind(m_touchSecondary, "/user/hand/left/input/b/touch");
+                    bind(m_touchPrimary, "/user/hand/right/input/a/touch");
+                    bind(m_touchSecondary, "/user/hand/right/input/b/touch");
+                }
+            } else {
+                bind(m_primary, "/user/hand/left/input/x/click");
+                bind(m_secondary, "/user/hand/left/input/y/click");
+                bind(m_menu, "/user/hand/left/input/menu/click");
+                bind(m_primary, "/user/hand/right/input/a/click");
+                bind(m_secondary, "/user/hand/right/input/b/click");
+                if (withTouch) {
+                    bind(m_touchPrimary, "/user/hand/left/input/x/touch");
+                    bind(m_touchSecondary, "/user/hand/left/input/y/touch");
+                    bind(m_touchPrimary, "/user/hand/right/input/a/touch");
+                    bind(m_touchSecondary, "/user/hand/right/input/b/touch");
+                }
+            }
+            return b;
+        };
+
         const XrPath path = Path(inst, profile.path);
         sb.interactionProfile = path;
+        auto b = buildBindings(profile.touchSensors, profile.thumbrest);
         sb.suggestedBindings = b.data();
         sb.countSuggestedBindings = uint32_t(b.size());
-        if (XR_FAILED(xrSuggestInteractionProfileBindings(inst, &sb))) RC_LOGW("Bindings for %s rejected", profile.path);
-        else m_controllerProfiles.push_back(path);
+        XrResult res = xrSuggestInteractionProfileBindings(inst, &sb);
+        if (XR_FAILED(res) && profile.thumbrest) {
+            b = buildBindings(profile.touchSensors, false);
+            sb.suggestedBindings = b.data();
+            sb.countSuggestedBindings = uint32_t(b.size());
+            res = xrSuggestInteractionProfileBindings(inst, &sb);
+        }
+        if (XR_FAILED(res) && profile.touchSensors) {
+            b = buildBindings(false, false);
+            sb.suggestedBindings = b.data();
+            sb.countSuggestedBindings = uint32_t(b.size());
+            res = xrSuggestInteractionProfileBindings(inst, &sb);
+        }
+        if (XR_SUCCEEDED(res)) {
+            m_controllerProfiles.push_back(path);
+        } else {
+            RC_LOGW("Bindings for %s rejected (%s)", profile.path, XrResultString(res));
+        }
     }
 
     // Hand tracking via the Khronos simple profile (aim pose + select = pinch).
@@ -279,9 +319,27 @@ void XrInput::UpdateHandTracking(XrTime time) {
             if (CreateHandTrackers()) RC_LOGI("Hand tracking started");
         }
     }
+    const int64_t now = rc::NowNs();
     for (int i = 0; i < 2; i++) {
         if (!m_trackers[i]) continue;
-        if (m_hands[i].held) {  // the controller is what plays; only its fingers are wanted
+        const bool controllerInput =
+            std::abs(m_hands[i].trigger) > 0.05f || std::abs(m_hands[i].squeeze) > 0.05f ||
+            m_hands[i].primary || m_hands[i].secondary || m_hands[i].menu ||
+            std::abs(m_hands[i].thumbstick.x) > 0.1f || std::abs(m_hands[i].thumbstick.y) > 0.1f;
+        const Vec3 dp = m_hands[i].grip.position - m_lastControllerPose[i].position;
+        const bool controllerMoved = (dp.x * dp.x + dp.y * dp.y + dp.z * dp.z) > (0.0015f * 0.0015f);
+        if (m_hands[i].active && (m_hands[i].aimValid || m_hands[i].gripValid)) {
+            if (controllerInput || controllerMoved || m_lastControllerActivityNs[i] == 0) {
+                m_lastControllerActivityNs[i] = now;
+                m_lastControllerPose[i] = m_hands[i].grip;
+            }
+        } else {
+            m_lastControllerActivityNs[i] = 0;
+        }
+        const bool controllerBusy = m_hands[i].held ||
+            (m_hands[i].active && (m_hands[i].aimValid || m_hands[i].gripValid) &&
+             (controllerInput || (now - m_lastControllerActivityNs[i] < 3'000'000'000LL)));
+        if (controllerBusy) {  // the controller is what plays; only its fingers are wanted
             m_hands[i].isHand = false;
             continue;
         }

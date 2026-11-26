@@ -16,7 +16,17 @@ namespace rv {
 #ifdef __ANDROID__
 
 bool AudioPlayer::Start() {
-    Stop();
+    std::lock_guard lock(m_mutex);
+    return StartLocked();
+}
+
+void AudioPlayer::Stop() {
+    std::lock_guard lock(m_mutex);
+    StopLocked();
+}
+
+bool AudioPlayer::StartLocked() {
+    StopLocked();
     if (!m_decoder.Init(rc::kAudioSampleRate, 2)) return false;
     m_jitter.Configure(2, rc::kAudioSampleRate, 30, 150);
     AAudioStreamBuilder* b = nullptr;
@@ -43,7 +53,7 @@ bool AudioPlayer::Start() {
     return true;
 }
 
-void AudioPlayer::Stop() {
+void AudioPlayer::StopLocked() {
     if (m_stream) {
         AAudioStream_requestStop(m_stream);
         AAudioStream_close(m_stream);
@@ -90,7 +100,17 @@ pa_simple* OpenPulse(pa_stream_direction_t direction, int channels, const char* 
 }  // namespace
 
 bool AudioPlayer::Start() {
-    Stop();
+    std::lock_guard lock(m_mutex);
+    return StartLocked();
+}
+
+void AudioPlayer::Stop() {
+    std::lock_guard lock(m_mutex);
+    StopLocked();
+}
+
+bool AudioPlayer::StartLocked() {
+    StopLocked();
     if (!m_decoder.Init(rc::kAudioSampleRate, 2)) return false;
     m_jitter.Configure(2, rc::kAudioSampleRate, 30, 150);
     m_stream = OpenPulse(PA_STREAM_PLAYBACK, 2, "PC audio", 20);
@@ -100,7 +120,7 @@ bool AudioPlayer::Start() {
     return true;
 }
 
-void AudioPlayer::Stop() {
+void AudioPlayer::StopLocked() {
     m_running = false;
     if (m_thread.joinable()) m_thread.join();
     if (m_stream) {
@@ -131,20 +151,25 @@ void AudioPlayer::Run() {
 int AudioPlayer::BufferedMs() { return m_jitter.BufferedFrames() * 1000 / int(rc::kAudioSampleRate); }
 
 void AudioPlayer::PushPacket(const uint8_t* data, size_t size) {
-    if (m_restart.exchange(false)) Start();  // device change (e.g. headphones plugged in)
     if (size < sizeof(rc::AudioPacketHeader)) return;
     rc::AudioPacketHeader h;
     std::memcpy(&h, data, sizeof(h));
     int16_t pcm[5760 * 2];
     std::lock_guard lock(m_mutex);
+    if (m_restart.exchange(false)) {
+        StartLocked();  // device change (e.g. headphones plugged in)
+    }
     // Too late (a newer packet was already played): playing it now would scramble the
     // sound. A big jump back means the PC restarted its stream.
     const int32_t ahead = int32_t(h.sequence - m_lastSeq);
     if (m_lastSeq && ahead <= 0 && ahead > -500) return;
-    if (m_lastSeq && h.sequence > m_lastSeq + 1 && h.sequence - m_lastSeq < 5) {
+    if (ahead <= 0) m_lastSeq = 0;
+    const uint32_t missing = (m_lastSeq && ahead > 1) ? uint32_t(ahead - 1) : 0;
+    if (missing > 0 && missing < 5) {
         // Packet loss concealment for short gaps.
-        for (uint32_t s = m_lastSeq + 1; s < h.sequence; s++) {
-            const int n = m_decoder.Decode(nullptr, 0, pcm, h.frameSamples);
+        const int plcSamples = (h.frameSamples >= 120 && h.frameSamples <= 5760) ? int(h.frameSamples) : 480;
+        for (uint32_t i = 0; i < missing; i++) {
+            const int n = m_decoder.Decode(nullptr, 0, pcm, plcSamples);
             if (n > 0) m_jitter.Push(pcm, n);
         }
     }
@@ -170,6 +195,7 @@ bool MicCapture::Start(PacketSink sink) {
     AAudioStreamBuilder_setSampleRate(b, rc::kAudioSampleRate);
     AAudioStreamBuilder_setInputPreset(b, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
     AAudioStreamBuilder_setDataCallback(b, Callback, this);
+    AAudioStreamBuilder_setErrorCallback(b, ErrorCallback, this);
     const aaudio_result_t r = AAudioStreamBuilder_openStream(b, &m_stream);
     AAudioStreamBuilder_delete(b);
     if (r != AAUDIO_OK) {
@@ -200,6 +226,13 @@ void MicCapture::Stop() {
 aaudio_data_callback_result_t MicCapture::Callback(AAudioStream*, void* user, void* audio, int32_t frames) {
     static_cast<MicCapture*>(user)->OnSamples(audio, frames);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+void MicCapture::ErrorCallback(AAudioStream*, void* user, aaudio_result_t error) {
+    if (error == AAUDIO_ERROR_DISCONNECTED) {
+        RC_LOGI("Microphone stream disconnected, scheduling restart");
+        static_cast<MicCapture*>(user)->ScheduleRestart();
+    }
 }
 
 #else  // PulseAudio: asked for 48 kHz mono 16-bit, so no conversion is needed
@@ -243,6 +276,17 @@ void MicCapture::Run() {
 }
 
 #endif
+
+void MicCapture::PollRestart() {
+    if (!m_restart.load() || !m_sink) return;
+    const int64_t now = rc::NowNs();
+    if (now - m_lastRestartNs < 1'000'000'000LL) return;
+    m_lastRestartNs = now;
+    m_restart.store(false);
+    if (!Start(m_sink)) {
+        m_restart.store(true);
+    }
+}
 
 void MicCapture::OnSamples(const void* audio, int32_t frames) {
     const auto* in = static_cast<const int16_t*>(audio);

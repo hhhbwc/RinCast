@@ -27,6 +27,7 @@
 #include "../keyboard/keyboard.h"
 #include "../xr/xr_context.h"
 #include "../xr/xr_input.h"
+#include "rc/frame_generation.h"
 #include "rc/link_policy.h"
 #include "rc/motion_field.h"
 #include "rc/percentile.h"
@@ -134,10 +135,6 @@ class App {
 
     const json& ServerInfo() const { return m_serverInfo; }
     const json& ServerStats() const { return m_serverStats; }
-    // TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.1: the stats panel's "frame generation" line reads
-    // the pace-policy observation (mode + smoothed game rate) and the quota bit.
-    rc::LinkPolicyState LinkPolicy() const { return m_linkPolicy; }
-    bool GenCreditArmed() const { return m_genCredit; }
     std::vector<GameInfo>& Games() { return m_games; }
     void RequestGames();
     void RequestGameImage(GameInfo& g);
@@ -146,7 +143,7 @@ class App {
     bool VrRunning() const { return m_vrState == "running"; }
     const std::deque<Notice>& Notices() const { return m_notices; }
     struct Stats {
-        double fps = 0, generatedFps = 0, latencyMs = 0, decodeMs = 0, mbps = 0, rttMs = 0;
+        double fps = 0, generatedFps = 0, generatedRejectedFps = 0, latencyMs = 0, decodeMs = 0, mbps = 0, rttMs = 0;
         std::string codec;
         int width = 0, height = 0;
         double stageMs[kStageCount] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};  // -1: not measured
@@ -272,8 +269,10 @@ class App {
     std::string m_spokenProblem;
     Vec3 m_smoothDir[2];
     void ReconnectTick();
+    void RecoverFailedDecoders();
     std::mutex m_decoderMutex;
     std::map<uint8_t, std::shared_ptr<VideoDecoder>> m_decoders;
+    std::map<uint8_t, int64_t> m_decoderRetryNs;
     std::map<uint8_t, DesktopStreamInfo> m_desktopStreams;
     std::map<uint8_t, XrSwapchainGl> m_monitorLayers;
     std::map<uint8_t, bool> m_monitorFresh;
@@ -313,14 +312,63 @@ class App {
     bool m_motionConsistent = true;  // ...and as one motion, not rotation or deformation
     int m_motionGateMoving = 0, m_motionGateMean = 0, m_motionGateSpread = 0, m_motionGateFar = 0;
     int m_motionGateCoherent = 0, m_motionGateGlobal = 0;
+    uint32_t m_motionPackets = 0, m_motionPacketFailures = 0;
+    uint32_t m_motionFailureCounts[4]{};  // 1: short metadata, 2: invalid header/timing, 3: bad runs
+    uint32_t m_motionHeaderFailures[5]{};  // width, height, block, timestamp, unknown
+    size_t m_motionMetadataBytes = 0;
+    rc::MotionHeader m_lastMotionHeader{};
+    rc::MotionHeader m_lastMotionFailureHeader{};
+    uint64_t m_lastMotionFailureTrackingNs = 0;
+    int m_motionFailure = 0;
     bool m_vrLatched = false;      // this display got a new VR frame
-    // TASK-QUOTA-GEN-2026-11-20 §1: a freshly decoded frame earns exactly one generated
-    // frame (the credit), spent by the first empty display slot that asks for one - the
-    // next empty slot repeats instead, so the extrapolation never reaches past ~1.
-    bool m_genCredit = false;
-    bool m_genQuotaAnnounced = false;  // the one-shot "quota armed" line was logged for this half-rate period
-    uint32_t m_generatedFrames = 0, m_generatedSkipped = 0;
+    // A freshly decoded frame earns exactly one generated frame, spent by the first empty
+    // display slot; the next empty slot repeats instead.
+    rc::FrameGenerationQuota m_genQuota{};
+    bool m_genQuotaAnnounced = false;
+    uint32_t m_generatedFrames = 0;
+    uint32_t m_generatedFramesWindow = 0;
+    rc::FrameGenerationStats m_generationWindow;
+    struct GenerationDiagnostics {
+        uint32_t calls = 0, attempts = 0, quotaBlocked = 0, generated = 0;
+        uint32_t acquireFailed = 0, drawFailed = 0, releaseFailed = 0;
+        rc::GenerationDecision last{};
+        void ResetWindow() {
+            calls = attempts = quotaBlocked = generated = 0;
+            acquireFailed = drawFailed = releaseFailed = 0;
+        }
+    } m_generationDiag;
+    struct LatchDiagnostics {
+        uint32_t noImage = 0, metadataMissing = 0, swapchainMissing = 0;
+        uint32_t acquireFailed = 0, releaseFailed = 0;
+        void ResetWindow() {
+            noImage = metadataMissing = swapchainMissing = 0;
+            acquireFailed = releaseFailed = 0;
+        }
+    } m_latchDiag;
+    size_t m_vrMetadataBytes = 0;
     int64_t m_generatedLogNs = 0;
+    // Zero-generation causal trace: at most 6 fixed-size samples per logging window,
+    // written in place (no per-frame allocation).  Printed as one extra line only in a
+    // window with attempts>0 but generated==0, to explain "30-50 frames, 0-2 generated".
+    struct ZeroGenSample {
+        // Wire sequence (VideoSender::m_frameIndex), NOT the PC's producer counter.  A stale
+        // or oversize drop on the PC advances only the producer, so the two spaces drift by
+        // the number of dropped frames; trackingTimestampNs is the shared key.
+        uint32_t frameIndex = 0;
+        uint32_t localSeq = 0;    // local rejection ordinal, orders samples inside a window
+        uint64_t trackingTimestampNs = 0;  // VrFrameMetadata field, byte-identical on both ends
+        uint8_t reason = 0;   // rc::GenerationRejectReason
+        uint8_t flags = 0;    // bit0 moves, bit1 consistent, bit2 hasMeta, bit3 quotaLeft>0
+        uint16_t motionBytes = 0;  // 0 = no motion field (off / mailbox miss / oversize)
+        float sinceMs = 0, smoothMs = 0, amount = 0, cap = 0;
+    };
+    ZeroGenSample m_zeroSamples[6]{};
+    uint8_t m_zeroSampleCount = 0;
+    uint32_t m_zeroGenFrameIndex = 0;
+    // Frame index of the most recent VR picture Latch() handed over. GenerateFrame() runs on
+    // display slots that latched nothing, so this is the last frame the PC could have keyed
+    // a warning by; it stays put until the next latch, it is not a local counter.
+    uint32_t m_vrFrameIndex = 0;
     uint32_t m_vrFrames = 0;
     uint32_t m_seqWindowMin = 0;  // ROUND20 T4: decoded-frame seq range for the diag line
     uint32_t m_seqWindowMax = 0;
@@ -340,6 +388,7 @@ class App {
     void TimeVrDraw(bool begin);
     void LogVrTiming(const FrameState& frame, int64_t wokeNs);
     int64_t m_vrLatchNs = 0;
+    int64_t m_vrLatchedDisplayNs = 0;
     double m_timingWakeLeadNs = 0, m_timingLatchNs = 0, m_timingSubmitNs = 0, m_timingGpuNs = 0;
     int m_timingFrames = 0, m_timingGpuFrames = 0;
     int64_t m_submitNs = 0;           // ROUND18 L8-TELEM: when xrEndFrame returned for the frame being logged
@@ -362,6 +411,7 @@ class App {
     rc::Pose m_controllerPose[2] = {};
     bool m_haveControllerPose[2] = {false, false};
     int m_flowDisplays = 0, m_flowShown = 0, m_flowLate = 0;
+    int m_diagFlowDisplays = 0, m_diagFlowShown = 0, m_diagFlowLate = 0;
     uint32_t m_flowGenerated = 0;  // TASK-POLICY-FIX-TESTS-2026-11-20 §B: this window's display slots drawn from an extrapolated frame
     uint32_t m_genFramesPrevSlot = 0;  // m_generatedFrames as of the previous display slot (per-slot delta, see LogVrTiming)
     uint32_t m_flowDecodedStart = 0;
@@ -475,7 +525,7 @@ class App {
     bool m_debugPoseHold = true;    // debug.rincast.pose_hold
     std::set<std::string> m_placed;  // windows that have been positioned at least once
     int64_t m_statsWindowStart = 0;
-    uint32_t m_statsFrames = 0, m_statsGenerated = 0;
+    rc::FrameGenerationStats m_genStats;
     double m_latencySum = 0;
     uint32_t m_latencyCount = 0;
     // A22 (TASK-LATENCY-EMA): the panels' latency display, an EMA over at most one latency

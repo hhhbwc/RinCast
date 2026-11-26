@@ -830,7 +830,6 @@ void SkyRenderer::Draw(const Mat4& projection, const Quat& headRotation, Environ
     glDisable(GL_BLEND);
     glDepthMask(GL_TRUE);
     glBindVertexArray(0);
-    GlCheck("sky draw");
 }
 
 }  // namespace rv

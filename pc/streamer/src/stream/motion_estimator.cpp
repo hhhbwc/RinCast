@@ -3,8 +3,11 @@
 #include <d3dcompiler.h>
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
+
+#include "rc/platform.h"
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -59,11 +62,20 @@ float2 ExpectedPixels(uint2 block) {
     const float un = (tx + f.x) / (f.x + f.y), vn = (f.z - ty) / (f.z + f.w);
     return float2((un - u) * eyeW, (vn - v) * size.y);
 }
-// The other eye's picture is no match: x, in pixels of an image size.x / scale wide.
-bool SameEye(int cornerX, int offsetX, int blockW, float scale) {
+// The other eye's picture is no match. The current block chooses the eye; a shifted window
+// never does. Coordinates are pixels of an image size / scale.
+int2 ClampOffset(int2 blockOrigin, int2 corner, int2 offset, int blockW, float scale) {
     const int eyeW = int(size.x * 0.5 / scale);
-    const int left = cornerX < eyeW ? 0 : eyeW;
-    return cornerX + offsetX >= left && cornerX + offsetX + blockW <= left + eyeW;
+    const int left = blockOrigin.x < eyeW ? 0 : eyeW;
+    offset.x = clamp(offset.x, left - corner.x, left + eyeW - blockW - corner.x);
+    offset.y = clamp(offset.y, -corner.y, int(size.y / scale) - blockW - corner.y);
+    return offset;
+}
+bool SameEye(int2 blockOrigin, int2 corner, int2 offset, int blockW, float scale) {
+    const int eyeW = int(size.x * 0.5 / scale);
+    const int left = blockOrigin.x < eyeW ? 0 : eyeW;
+    return corner.x + offset.x >= left && corner.x + offset.x + blockW <= left + eyeW &&
+           corner.y + offset.y >= 0 && corner.y + offset.y + blockW <= int(size.y / scale);
 }
 )";
 
@@ -74,25 +86,39 @@ const char* kCoarseCs = R"(
 Texture2D<float> cur : register(t0);
 Texture2D<float> prev : register(t1);
 RWTexture2D<float2> dst : register(u0);
+float CoarseSad(int2 blockOrigin, int2 corner, int2 offset, int2 base) {
+    const int eyeW = int(size.x * 0.5 / 16.0);
+    const int left = blockOrigin.x < eyeW ? 0 : eyeW;
+    const int right = left + eyeW;
+    float sad = 0;
+    int count = 0;
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            const int2 p = corner + int2(x, y);
+            const int2 q = p + offset;
+            if (p.x < left || p.x >= right || q.x < left || q.x >= right ||
+                p.y < 0 || p.y >= int(size.y / 16.0) || q.y < 0 || q.y >= int(size.y / 16.0)) continue;
+            sad += abs(cur.Load(int3(p, 0)) - prev.Load(int3(q, 0)));
+            count++;
+        }
+    }
+    // Compare mean error so a smaller boundary window cannot win by collecting less error.
+    return count >= 4 ? sad * (16.0 / float(count)) + 0.5 * (abs(offset.x - base.x) + abs(offset.y - base.y)) : 1e9;
+}
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= uint(size.x / 32.0) || id.y >= uint(size.y / 32.0)) return;
     float best = 1e9;
-    int2 bestOffset = 0;
-    const int2 corner = int2(id.xy) * 2 - 1;
-    const int2 base = int2(round(ExpectedPixels(id.xy) / 16.0));
-    bestOffset = base;
+    const uint eyeBlocks = uint(size.x / 64.0);
+    const int left = id.x < eyeBlocks ? 0 : int(eyeBlocks) * 2;
+    const int2 corner = int2(clamp(int(id.x) * 2 - 1, left, left + int(eyeBlocks) * 2 - 4),
+                             clamp(int(id.y) * 2 - 1, 0, int(size.y / 16.0) - 4));
+    const int2 base = ClampOffset(int2(id.xy) * 2, corner, int2(round(ExpectedPixels(id.xy) / 16.0)), 4, 16.0);
+    int2 bestOffset = base;
     for (int dy = -4; dy <= 4; dy++) {
         for (int dx = -8; dx <= 8; dx++) {
             const int2 o = base + int2(dx, dy);
-            if (!SameEye(corner.x, o.x, 4, 16.0)) continue;
-            float sad = 0;
-            for (int y = 0; y < 4; y++)
-                for (int x = 0; x < 4; x++)
-                    sad += abs(cur.Load(int3(corner + int2(x, y), 0)) - prev.Load(int3(corner + int2(x + o.x, y + o.y), 0)));
-            // Short vectors win ties, and by enough to matter on flat areas: their SAD is
-            // nearly the same everywhere, so without this a block of plain wall matched a
-            // hundred pixels away and the frame generation bent the picture by it.
-            sad += 0.5 * (abs(dx) + abs(dy));
+            float sad = CoarseSad(int2(id.xy) * 2, corner, o, base);
             if (sad < best) {
                 best = sad;
                 bestOffset = o;
@@ -119,15 +145,20 @@ float Sad(int2 corner, int2 o) {
 }
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= uint(size.x / 32.0) || id.y >= uint(size.y / 32.0)) return;
     const int2 corner = int2(id.xy) * 8;
-    const int2 base = int2(round(ExpectedPixels(id.xy) / 4.0));
+    const int2 base = ClampOffset(int2(id.xy) * 8, corner, int2(round(ExpectedPixels(id.xy) / 4.0)), 8, 4.0);
     const float zero = Sad(corner, base);
     float best = zero;
     int2 bestOffset = base;
+    const uint eyeBlocks = uint(size.x / 64.0);
     static const int2 near[5] = {int2(0, 0), int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)};
     for (int i = 0; i < 5; i++) {
-        const int2 c = int2(coarse.Load(int3(int2(id.xy) + near[i], 0))) * 4;
-        if (!SameEye(corner.x, c.x, 8, 4.0)) continue;
+        const int2 n = int2(id.xy) + near[i];
+        if (n.x < 0 || n.y < 0 || n.x >= int(size.x / 32.0) || n.y >= int(size.y / 32.0) ||
+            (n.x < int(eyeBlocks)) != (int(id.x) < int(eyeBlocks))) continue;
+        const int2 c = int2(coarse.Load(int3(n, 0))) * 4;
+        if (!SameEye(int2(id.xy) * 8, corner, c, 8, 4.0)) continue;
         const float sad = Sad(corner, c);
         if (sad < best) {
             best = sad;
@@ -137,7 +168,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     const int2 centre = bestOffset;
     for (int dy = -3; dy <= 3; dy++) {
         for (int dx = -3; dx <= 3; dx++) {
-            if (!SameEye(corner.x, centre.x + dx, 8, 4.0)) continue;
+            if (!SameEye(int2(id.xy) * 8, corner, centre + int2(dx, dy), 8, 4.0)) continue;
             const float sad = Sad(corner, centre + int2(dx, dy));
             if (sad < best) {
                 best = sad;
@@ -173,10 +204,15 @@ float Median(float v[9]) {
 }
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
+    uint dimX, dimY;
+    src.GetDimensions(dimX, dimY);
+    if (id.x >= dimX || id.y >= dimY) return;
     float x[9], y[9];
     for (int j = 0; j < 3; j++) {
         for (int i = 0; i < 3; i++) {
-            const float2 m = src.Load(int3(int2(id.xy) + int2(i - 1, j - 1), 0));
+            int2 n = clamp(int2(id.xy) + int2(i - 1, j - 1), int2(0, 0), int2(int(dimX), int(dimY)) - 1);
+            if ((n.x < int(dimX / 2)) != (id.x < dimX / 2)) n.x = id.x;
+            const float2 m = src.Load(int3(n, 0));
             x[j * 3 + i] = m.x;
             y[j * 3 + i] = m.y;
         }
@@ -185,15 +221,20 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
-ComPtr<ID3D11ComputeShader> Compile(ID3D11Device* device, const char* source) {
+ComPtr<ID3D11ComputeShader> Compile(ID3D11Device* device, const char* name, const char* source) {
     ComPtr<ID3DBlob> code, errors;
-    if (FAILED(D3DCompile(source, std::strlen(source), "motion", nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+    if (FAILED(D3DCompile(source, std::strlen(source), name, nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                           &code, &errors))) {
-        if (errors) OutputDebugStringA(static_cast<const char*>(errors->GetBufferPointer()));
+        RC_LOGE("Motion estimator: %s shader compile failed: %s", name,
+                errors ? static_cast<const char*>(errors->GetBufferPointer()) : "no compiler diagnostic");
         return nullptr;
     }
     ComPtr<ID3D11ComputeShader> cs;
-    device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &cs);
+    const HRESULT result = device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &cs);
+    if (FAILED(result)) {
+        RC_LOGE("Motion estimator: %s shader object creation failed: %08lx", name, static_cast<unsigned long>(result));
+        return nullptr;
+    }
     return cs;
 }
 
@@ -226,12 +267,15 @@ bool MotionEstimator::Init(ID3D11Device* device, uint32_t width, uint32_t height
     m_gridWidth = width / kBlockSize;
     m_gridHeight = height / kBlockSize;
     Reset();
-    m_lumaCs = Compile(device, kLumaCs);
-    m_downCs = Compile(device, kDownCs);
-    m_coarseCs = Compile(device, (std::string(kExpected) + kCoarseCs).c_str());
-    m_refineCs = Compile(device, (std::string(kExpected) + kRefineCs).c_str());
-    m_medianCs = Compile(device, kMedianCs);
-    if (!m_lumaCs || !m_downCs || !m_coarseCs || !m_refineCs || !m_medianCs) return false;
+    m_lumaCs = Compile(device, "motion-luma", kLumaCs);
+    m_downCs = Compile(device, "motion-down", kDownCs);
+    m_coarseCs = Compile(device, "motion-coarse", (std::string(kExpected) + kCoarseCs).c_str());
+    m_refineCs = Compile(device, "motion-refine", (std::string(kExpected) + kRefineCs).c_str());
+    m_medianCs = Compile(device, "motion-median", kMedianCs);
+    if (!m_lumaCs || !m_downCs || !m_coarseCs || !m_refineCs || !m_medianCs) {
+        RC_LOGE("Motion estimator init failed at %ux%u: one or more compute shaders are unavailable", width, height);
+        return false;
+    }
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = 96;
     bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -307,11 +351,7 @@ void MotionEstimator::Decode(const D3D11_MAPPED_SUBRESOURCE& map, std::vector<fl
     for (uint32_t y = 0; y < m_gridHeight; y++) {
         const auto* row = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(map.pData) + y * map.RowPitch);
         for (uint32_t x = 0; x < m_gridWidth * 2; x++) {
-            // Half float to float.
-            const uint16_t h = row[x];
-            const int exponent = (h >> 10) & 31;
-            const float magnitude = exponent == 0 ? (h & 1023) / 16777216.f : std::ldexp(float(1024 + (h & 1023)), exponent - 25);
-            out[size_t(y) * m_gridWidth * 2 + x] = (h & 0x8000) ? -magnitude : magnitude;
+            out[size_t(y) * m_gridWidth * 2 + x] = DecodeMotionHalf(row[x]);
         }
     }
 }
@@ -325,38 +365,109 @@ bool MotionEstimator::Read(ID3D11DeviceContext* ctx, std::vector<float>& out) {
     return true;
 }
 
-bool MotionEstimator::QueueRead(ID3D11DeviceContext* ctx) {
-    if (m_readPending[0] && m_readPending[1]) return false;
-    int slot = m_readWrite;
-    if (m_readPending[slot]) slot ^= 1;
-    ctx->CopyResource(m_staging[slot].Get(), m_field.tex.Get());
-    m_readPending[slot] = true;
-    m_readWrite ^= 1;
+#ifdef RINCAST_TEST_EXPOSE_MOTION_STAGES
+bool MotionEstimator::ReadCoarse(ID3D11DeviceContext* ctx, std::vector<float>& out) {
+    ctx->CopyResource(m_staging[0].Get(), m_coarse.tex.Get());
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (FAILED(ctx->Map(m_staging[0].Get(), 0, D3D11_MAP_READ, 0, &map))) return false;
+    Decode(map, out);
+    ctx->Unmap(m_staging[0].Get(), 0);
     return true;
 }
 
-bool MotionEstimator::TryRead(ID3D11DeviceContext* ctx, std::vector<float>& out, bool& slotConsumed) {
-    slotConsumed = false;
-    const int slot = m_readNext;
-    if (!m_readPending[slot]) {
-        m_readNext ^= 1;
-        return false;
-    }
+bool MotionEstimator::ReadRefined(ID3D11DeviceContext* ctx, std::vector<float>& out) {
+    ctx->CopyResource(m_staging[0].Get(), m_refined.tex.Get());
     D3D11_MAPPED_SUBRESOURCE map;
-    const HRESULT hr = ctx->Map(m_staging[slot].Get(), 0,
-                                static_cast<D3D11_MAP>(D3D11_MAP_READ | D3D11_MAP_FLAG_DO_NOT_WAIT), 0, &map);
-    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return false;
-    if (FAILED(hr)) {
+    if (FAILED(ctx->Map(m_staging[0].Get(), 0, D3D11_MAP_READ, 0, &map))) return false;
+    Decode(map, out);
+    ctx->Unmap(m_staging[0].Get(), 0);
+    return true;
+}
+
+bool MotionEstimator::RefineForTest(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* current,
+                                    ID3D11ShaderResourceView* previous, ID3D11ShaderResourceView* coarse,
+                                    const float headTurn[9], const float fovTan[2][4]) {
+    D3D11_MAPPED_SUBRESOURCE constants;
+    if (FAILED(ctx->Map(m_constants.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &constants))) return false;
+    auto* c = static_cast<float*>(constants.pData);
+    for (int row = 0; row < 3; row++) {
+        std::memcpy(c + row * 4, headTurn + row * 3, sizeof(float) * 3);
+        c[row * 4 + 3] = 0;
+    }
+    std::memcpy(c + 12, fovTan, sizeof(float) * 8);
+    c[20] = float(m_width);
+    c[21] = float(m_height);
+    ctx->Unmap(m_constants.Get(), 0);
+    ID3D11Buffer* buffer = m_constants.Get();
+    ctx->CSSetConstantBuffers(0, 1, &buffer);
+    ID3D11ShaderResourceView* inputs[3] = {current, previous, coarse};
+    Dispatch(ctx, m_refineCs.Get(), inputs, 3, m_refined.uav.Get(), Groups(m_gridWidth), Groups(m_gridHeight));
+    return true;
+}
+#endif
+
+bool MotionEstimator::QueueRead(ID3D11DeviceContext* ctx, const rc::MotionReadbackTiming& timing) {
+    int slot = -1;
+    for (int i = 0; i < kReadbackSlots; i++) {
+        const int candidate = (m_readWrite + i) % kReadbackSlots;
+        if (!m_readPending[candidate]) {
+            slot = candidate;
+            break;
+        }
+    }
+    // An old field is not worth stalling the capture path: retain the newest available fields.
+    if (slot < 0) {
+        slot = m_readNext;
+        m_readNext = (slot + 1) % kReadbackSlots;
         m_readPending[slot] = false;
-        m_readNext ^= 1;
+        m_readTiming[slot] = {};
+        m_readQuery[slot].Reset();
+        ++m_overwrittenReadbacks;
+    }
+    if (!m_readQuery[slot]) {
+        D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+        if (FAILED(m_device->CreateQuery(&qd, &m_readQuery[slot]))) return false;
+    }
+    ctx->CopyResource(m_staging[slot].Get(), m_field.tex.Get());
+    ctx->End(m_readQuery[slot].Get());
+    m_readTiming[slot] = timing;
+    m_readPending[slot] = true;
+    m_readWrite = (slot + 1) % kReadbackSlots;
+    return true;
+}
+
+bool MotionEstimator::TryRead(ID3D11DeviceContext* ctx, std::vector<float>& out, rc::MotionReadbackTiming& timing, bool& slotConsumed) {
+    slotConsumed = false;
+    timing = {};
+    int slot = -1;
+    for (int i = 0; i < kReadbackSlots; i++) {
+        const int candidate = (m_readNext + i) % kReadbackSlots;
+        if (m_readPending[candidate]) {
+            slot = candidate;
+            break;
+        }
+    }
+    if (slot < 0) return false;
+    BOOL done = FALSE;
+    const HRESULT query = ctx->GetData(m_readQuery[slot].Get(), &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (FAILED(query)) {
+        m_readPending[slot] = false;
+        m_readTiming[slot] = {};
+        m_readNext = (slot + 1) % kReadbackSlots;
         slotConsumed = true;
         return false;
     }
+    if (!done) return false;
+    D3D11_MAPPED_SUBRESOURCE map;
+    const HRESULT hr = ctx->Map(m_staging[slot].Get(), 0, D3D11_MAP_READ, 0, &map);
+    timing = m_readTiming[slot];
+    m_readPending[slot] = false;
+    m_readTiming[slot] = {};
+    m_readNext = (slot + 1) % kReadbackSlots;
+    slotConsumed = true;
+    if (FAILED(hr)) return false;
     Decode(map, out);
     ctx->Unmap(m_staging[slot].Get(), 0);
-    m_readPending[slot] = false;
-    m_readNext ^= 1;
-    slotConsumed = true;
     return true;
 }
 

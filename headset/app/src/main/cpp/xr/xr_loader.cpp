@@ -110,8 +110,26 @@ bool Load() {
         lib = dlopen(g_name, RTLD_NOW | RTLD_LOCAL);
         if (!lib) RC_LOGE("OpenXR: this is a Quest 1, which needs RinCast's Quest 1 build (%s)", dlerror());
     } else {
-        g_name = UsePicoLoader() ? kPico : kKhronos;
+        const char* primary = UsePicoLoader() ? kPico : kKhronos;
+        const char* secondary = (primary == kPico) ? kKhronos : kPico;
+        g_name = primary;
         lib = dlopen(g_name, RTLD_NOW | RTLD_LOCAL);
+        if (!lib) {
+            RC_LOGW("OpenXR: primary loader %s failed (%s), trying fallback %s", primary, dlerror(), secondary);
+            g_name = secondary;
+            lib = dlopen(g_name, RTLD_NOW | RTLD_LOCAL);
+        }
+        if (!lib) {
+            const char* systemLoaders[] = {"libopenxr_loader.so", "/system/lib64/libopenxr_loader.so", "/vendor/lib64/libopenxr_loader.so"};
+            for (const char* sysLib : systemLoaders) {
+                lib = dlopen(sysLib, RTLD_NOW | RTLD_LOCAL);
+                if (lib) {
+                    g_name = sysLib;
+                    RC_LOGI("OpenXR: loaded system loader %s", g_name);
+                    break;
+                }
+            }
+        }
     }
 #endif
     if (!lib) {

@@ -35,19 +35,23 @@ float Unsqueeze(float e, float a, float s) {
     if (p < a * s + F) return a + (p - a * s);
     return a + F + (p - a * s - F) / s;
 }
+float2 EyeUv(float2 p, float eye) {
+    return float2(clamp(p.x, eye * 0.5 + 0.5 * texel.x, eye * 0.5 + 0.5 - 0.5 * texel.x), p.y);
+}
 float4 ps(V i) : SV_Target {
     float eye = i.uv.x < 0.5 ? 0 : 1;
     float2 a = eye < 0.5 ? start.xy : start.zw;
     float ux = Unsqueeze(i.uv.x * 2 - eye, a.x, layout.y);
     float uy = Unsqueeze(i.uv.y, a.y, layout.z);
-    // Stay inside this eye's half.
-    float2 uv = float2(clamp((ux + eye) * 0.5, eye * 0.5 + texel.x, eye * 0.5 + 0.5 - texel.x), uy);
+    float2 uv = EyeUv(float2((ux + eye) * 0.5, uy), eye);
     // Taps a quarter of the covered stretch either side of the centre.
     float2 o = float2(ux < a.x || ux >= a.x + layout.x ? 0.25 * texel.x / layout.y : 0,
                       uy < a.y || uy >= a.y + layout.x ? 0.25 * texel.y / layout.z : 0);
     if (o.x == 0 && o.y == 0) return src.Sample(samp, uv);
-    return 0.25 * (src.Sample(samp, uv + float2(-o.x, -o.y)) + src.Sample(samp, uv + float2(o.x, -o.y)) +
-                   src.Sample(samp, uv + float2(-o.x, o.y)) + src.Sample(samp, uv + float2(o.x, o.y)));
+    return 0.25 * (src.Sample(samp, EyeUv(uv + float2(-o.x, -o.y), eye)) +
+                   src.Sample(samp, EyeUv(uv + float2(o.x, -o.y), eye)) +
+                   src.Sample(samp, EyeUv(uv + float2(-o.x, o.y), eye)) +
+                   src.Sample(samp, EyeUv(uv + float2(o.x, o.y), eye)));
 }
 )";
 

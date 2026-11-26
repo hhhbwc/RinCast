@@ -1,5 +1,13 @@
 # RinCast — capped-VBR 分支
 
+> [!IMPORTANT]
+> **项目独立迁移与重构公告**
+>
+> 本分支积累了极为庞大的底层架构重构（150+ 个文件、35,000+ 行代码），涵盖多品牌 OpenXR 通用化加固（PICO / Quest / HTC Vive）、SteamVR 多图层姿态重投影修正、全链路 7 国语言本地化以及工业级 Capped-VBR 抗弱网传输体系。由于改动规模已无法作为常规 Fork 承载，**本项目已正式转为全新独立开源项目进行维护**。
+>
+> 🔗 **全新独立项目主页（即将上线）：**
+> 👉 **[前往全新独立项目仓库（占位链接）](https://github.com/hhhbwc/)** 👈
+
 <!-- FORK-DOC: fork 专属文档（中文版），与上游 README.md 并存。English: FORK-README.md -->
 
 [English](FORK-README.md) | [中文](FORK-README.zh-CN.md)

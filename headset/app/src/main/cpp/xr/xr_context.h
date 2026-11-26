@@ -40,6 +40,8 @@ struct XrSwapchainGl {
     std::vector<GLuint> fbos;
     GLuint depth = 0;
     uint32_t acquired = 0;
+    bool imageAcquired = false;
+    std::string role = "swapchain";
 };
 
 struct EyeView {
@@ -67,6 +69,8 @@ class XrContext {
     bool StartSession(bool preferStage, bool velocitiesFromPoses);
     void Shutdown();
     const std::string& RuntimeName() const { return m_runtimeName; }
+    void SetCompatPlainOpenXr(bool v) { m_compatPlainOpenXr = v; }
+    bool IsCompatPlainOpenXr() const { return m_compatPlainOpenXr; }
 
     // Returns false if the app should exit.
     bool PollEvents();
@@ -76,16 +80,16 @@ class XrContext {
 
     bool BeginFrame(FrameState& frame);
     // Renders into the eye swapchain image; returns its FBO bound.
-    void BindEye(int eye);
+    bool BindEye(int eye);
     void EndFrame(const FrameState& frame, const std::vector<const XrCompositionLayerBaseHeader*>& underlays,
                   bool projectionHasAlpha, const std::vector<const XrCompositionLayerBaseHeader*>& overlays,
                   bool eyeLayer = true, int displayDeltaFrames = 0);
 
     bool CreateSwapchain(int width, int height, int64_t format, int arraySize, bool withDepth, XrSwapchainGl& out,
-                         int mipCount = 1);
-    void DestroySwapchain(XrSwapchainGl& sc);
+                         int mipCount = 1, const char* role = "swapchain");
+    bool DestroySwapchain(XrSwapchainGl& sc);
     GLuint AcquireImage(XrSwapchainGl& sc);   // returns FBO
-    void ReleaseImage(XrSwapchainGl& sc);
+    bool ReleaseImage(XrSwapchainGl& sc);
     // ROUND18 L8-TELEM: image count of the swapchain CreateSwapchain made last (the VR stream's
     // queue depth, when read right after its swapchain is built).
     uint32_t SwapchainImages() const { return m_swapchainImages; }
@@ -132,6 +136,7 @@ class XrContext {
     bool CreateSession(bool preferStage);
     bool CreateAppSpace();
     void HandleStateChange(XrSessionState state);
+    void RetryRetiredSwapchains();
 
     EGLDisplay m_display = EGL_NO_DISPLAY;
     EGLContext m_context = EGL_NO_CONTEXT;
@@ -155,6 +160,7 @@ class XrContext {
     std::string m_runtimeName;
     uint32_t m_recommendedWidth = 0, m_recommendedHeight = 0;
     XrSwapchainGl m_eyes[2];
+    std::vector<XrSwapchainGl> m_retiredSwapchains;
     uint32_t m_swapchainImages = 0;  // ROUND18 L8-TELEM: image count of the swapchain created last
     std::vector<float> m_refreshRates;
     void EnumerateRefreshRates();  // R2: swapchain-time ask, repeated at READY when it came back empty
@@ -178,6 +184,8 @@ class XrContext {
 
     PFN_xrConvertTimespecTimeToTimeKHR m_fromTimespec = nullptr;
     PFN_xrConvertTimeToTimespecTimeKHR m_toTimespec = nullptr;
+    bool m_compatPlainOpenXr = false;
+    int64_t m_measuredPeriodNs = 0;
 };
 
 const char* XrResultString(XrResult r);

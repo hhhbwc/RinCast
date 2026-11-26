@@ -77,6 +77,7 @@ struct HeadsetSettings {
     bool autoConnect = false;           // connect to lastPc as soon as it's found
     bool autoLaunchSteamVr = false;     // start SteamVR on the PC on connecting
     bool usbCable = false;              // use a USB cable to the PC when one is plugged in
+    bool compatPlainOpenXr = false;     // pure standard OpenXR simulation (bypasses vendor extensions)
     std::string manualPc;               // for networks that block discovery
     std::string deviceSecret;           // identity seed (hex), made on first start
 

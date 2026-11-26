@@ -159,9 +159,8 @@ float FoveaAxis(float u, float a, float s) {
     float e = u < a ? u * s : u < a + F ? a * s + (u - a) : a * s + F + (u - a - F) * s;
     return e / (F + (1.0 - F) * s);
 }
-vec2 Foveate(vec2 uv) {
+vec2 Foveate(vec2 uv, float eye) {
     if (uFoveated == 0) return uv;
-    float eye = uv.x < 0.5 ? 0.0 : 1.0;
     vec2 a = eye < 0.5 ? uFoveaStart.xy : uFoveaStart.zw;
     float x = FoveaAxis(uv.x * 2.0 - eye, a.x, uFoveaLayout.y);
     return vec2((x + eye) * 0.5, FoveaAxis(uv.y, a.y, uFoveaLayout.z));
@@ -175,7 +174,7 @@ out vec4 oColor;
 // Layer swapchains are sRGB: ToLayer() linearizes the gamma-encoded video, or with sRGB writes
 // off leaves it as it is.
 void main() {
-    vec2 uv = Foveate(vec2(vUv.x, 1.0 - vUv.y));
+    vec2 uv = Foveate(vec2(vUv.x, 1.0 - vUv.y), step(0.5, vUv.x));
     vec3 g = texture(uTex, uCrop.xy + uv * uCrop.zw).rgb;
     oColor = vec4(ToLayer(g), 1.0);
 }
@@ -187,13 +186,17 @@ uniform vec4 uCrop;
 in vec2 vUv;
 out vec4 oColor;
 void main() {
-    vec2 uv = Foveate(vec2(vUv.x, 1.0 - vUv.y));
+    vec2 uv = Foveate(vec2(vUv.x, 1.0 - vUv.y), step(0.5, vUv.x));
     oColor = vec4(texture(uTex, uCrop.xy + uv * uCrop.zw).rgb, 1.0);
 }
 )";
 // Snapdragon Game Super Resolution 1, RGBA mode, from Qualcomm's sgsr1_shader_mobile.frag.
 // Copyright (c) 2025, Qualcomm Innovation Center, Inc. SPDX-License-Identifier: BSD-3-Clause
 // Adapted: names, and the result goes through ToLayer() for the sRGB swapchain.
+// GatherEye coordinates: (base+1.0)/width centers the gather between texels so
+// u*W-0.5 = base+0.5 keeps 0.5 texel of float32 margin off the floor() edge; and
+// textureGather order is .x=(i,j+1) .y=(i+1,j+1) .z=(i+1,j) .w=(i,j), so the left
+// column is .x/.w — the left boundary replicates .w, not .z.
 static const char* kGsrFs = R"(
 precision mediump float;
 uniform highp vec4 uViewport;  // 1/width, 1/height, width, height
@@ -211,6 +214,18 @@ vec2 weightY(float dx, float dy, float c, float std) {
     float w = fastLanczos2(x);
     return vec2(w, w * c);
 }
+highp vec4 GatherEye(highp vec2 uv, float eye) {
+    highp float width = uViewport.z;
+    highp float lo = eye * 0.5 * width;
+    highp float hi = lo + 0.5 * width;
+    highp float footprint = uv.x * width - 0.5;
+    highp float base = floor(footprint);
+    base = clamp(base, lo, max(lo, hi - 2.0));
+    vec4 g = textureGather(uTex, vec2((base + 1.0) / width, uv.y), 1);
+    if (footprint < lo) return vec4(g.x, g.x, g.w, g.w);
+    if (footprint >= hi - 1.0) return vec4(g.y, g.y, g.z, g.z);
+    return g;
+}
 void main() {
     const int mode = 1;
     const float edgeThreshold = 8.0 / 255.0;
@@ -221,14 +236,15 @@ void main() {
     highp vec2 imgCoordPixel = floor(imgCoord);
     highp vec2 coord = imgCoordPixel * uViewport.xy;
     vec2 pl = imgCoord - imgCoordPixel;
-    vec4 left = textureGather(uTex, coord, mode);
+    float eye = step(0.5, vUv.x);
+    vec4 left = GatherEye(coord, eye);
     float edgeVote = abs(left.z - left.y) + abs(color[mode] - left.y) + abs(color[mode] - left.z);
     if (edgeVote > edgeThreshold) {
         coord.x += uViewport.x;
-        vec4 right = textureGather(uTex, coord + vec2(uViewport.x, 0.0), mode);
+        vec4 right = GatherEye(coord + vec2(uViewport.x, 0.0), eye);
         vec4 upDown;
-        upDown.xy = textureGather(uTex, coord + vec2(0.0, -uViewport.y), mode).wz;
-        upDown.zw = textureGather(uTex, coord + vec2(0.0, uViewport.y), mode).yx;
+        upDown.xy = GatherEye(coord + vec2(0.0, -uViewport.y), eye).wz;
+        upDown.zw = GatherEye(coord + vec2(0.0, uViewport.y), eye).yx;
         float mean = (left.y + left.z + right.x + right.w) * 0.25;
         left = left - vec4(mean);
         right = right - vec4(mean);
@@ -236,7 +252,7 @@ void main() {
         color.w = color[mode] - mean;
         float sum = abs(left.x) + abs(left.y) + abs(left.z) + abs(left.w) + abs(right.x) + abs(right.y) + abs(right.z) +
                     abs(right.w) + abs(upDown.x) + abs(upDown.y) + abs(upDown.z) + abs(upDown.w);
-        float std = 2.181818 / sum;
+        float std = 2.181818 / max(sum, 1e-5);
         vec2 aWY = weightY(pl.x, pl.y + 1.0, upDown.x, std);
         aWY += weightY(pl.x - 1.0, pl.y + 1.0, upDown.y, std);
         aWY += weightY(pl.x - 1.0, pl.y - 2.0, upDown.z, std);
@@ -275,15 +291,59 @@ uniform sampler2D uTex;
 uniform mediump sampler2D uMotion;
 uniform vec2 uScale;
 uniform vec2 uField;
+uniform vec2 uMotionHalfTexel;
+uniform vec2 uHalfTexel;
 in vec2 vUv;
 out vec4 oColor;
 void main() {
     vec2 uv = vec2(vUv.x, 1.0 - vUv.y);
-    vec2 m = texture(uMotion, uv * uField).rg;
-    uv -= m * uScale;
     float eye = step(0.5, vUv.x);
+    vec2 motionUv = uv * uField;
+    motionUv.x = clamp(motionUv.x, eye * 0.5 + uMotionHalfTexel.x, 0.5 + eye * 0.5 - uMotionHalfTexel.x);
+    motionUv.y = clamp(motionUv.y, uMotionHalfTexel.y, 1.0 - uMotionHalfTexel.y);
+    vec2 m = texture(uMotion, motionUv).rg;
+    uv -= m * uScale;
     uv.x = clamp(uv.x, eye * 0.5, 0.5 + eye * 0.5);
+    uv.y = clamp(uv.y, 0.0, 1.0);
+    uv.x = clamp(uv.x, eye * 0.5 + uHalfTexel.x, 0.5 + eye * 0.5 - uHalfTexel.x);
+    uv.y = clamp(uv.y, uHalfTexel.y, 1.0 - uHalfTexel.y);
     vec3 g = texture(uTex, vec2(uv.x, 1.0 - uv.y)).rgb;
+    oColor = vec4(ToLayer(g), 1.0);
+}
+)";
+// The decoder insets only the OUTER edge beside padding.  With one-sided padding the
+// seam sits 0.25 texel off crop.x+0.5*crop.z, so the inner seam needs 1.5 half-texels
+// to reach the true first in-eye column.  eyeMid keeps clamp() well-formed when
+// uCrop.z degenerates toward 0 (eyeMin > eyeMax would be undefined).
+static const char* kExternalMovedFs = R"(
+uniform samplerExternalOES uTex;
+uniform vec4 uCrop;
+uniform mediump sampler2D uMotion;
+uniform vec2 uScale;
+uniform vec2 uField;
+uniform vec2 uMotionHalfTexel;
+uniform vec2 uHalfTexel;
+in vec2 vUv;
+out vec4 oColor;
+void main() {
+    vec2 uv = vec2(vUv.x, 1.0 - vUv.y);
+    float eye = step(0.5, vUv.x);
+    vec2 motionUv = uv * uField;
+    motionUv.x = clamp(motionUv.x, eye * 0.5 + uMotionHalfTexel.x, 0.5 + eye * 0.5 - uMotionHalfTexel.x);
+    motionUv.y = clamp(motionUv.y, uMotionHalfTexel.y, 1.0 - uMotionHalfTexel.y);
+    vec2 m = texture(uMotion, motionUv).rg;
+    uv -= m * uScale;
+    uv.x = clamp(uv.x, eye * 0.5, 0.5 + eye * 0.5);
+    uv.y = clamp(uv.y, 0.0, 1.0);
+    vec2 sampleUv = uCrop.xy + Foveate(uv, eye) * uCrop.zw;
+    vec2 cropMin = uCrop.xy + eye * 0.5 * uCrop.zw;
+    vec2 cropMax = cropMin + 0.5 * uCrop.zw;
+    float eyeMin = cropMin.x + eye * 1.5 * uHalfTexel.x;
+    float eyeMax = cropMax.x - (1.0 - eye) * 1.5 * uHalfTexel.x;
+    float eyeMid = 0.5 * (cropMin.x + cropMax.x);
+    sampleUv.x = clamp(sampleUv.x, min(eyeMin, eyeMid), max(eyeMax, eyeMid));
+    sampleUv.y = clamp(sampleUv.y, uCrop.y, uCrop.y + uCrop.w);
+    vec3 g = texture(uTex, sampleUv).rgb;
     oColor = vec4(ToLayer(g), 1.0);
 }
 )";
@@ -298,7 +358,32 @@ static std::string WithExt(const char* fs) {
     return std::string("#extension GL_OES_EGL_image_external_essl3 : require\n") + kPanelFsCommon + fs;
 }
 
+SceneRenderer::~SceneRenderer() { Shutdown(); }
+
+void SceneRenderer::Shutdown() {
+    if (m_beamVao) {
+        glDeleteVertexArrays(1, &m_beamVao);
+        m_beamVao = 0;
+    }
+    if (m_beamVbo) {
+        glDeleteBuffers(1, &m_beamVbo);
+        m_beamVbo = 0;
+    }
+    if (m_gridVao) {
+        glDeleteVertexArrays(1, &m_gridVao);
+        m_gridVao = 0;
+    }
+    if (m_gridVbo) {
+        glDeleteBuffers(1, &m_gridVbo);
+        m_gridVbo = 0;
+    }
+}
+
 bool SceneRenderer::Init() {
+    m_beamVao = 0;
+    m_beamVbo = 0;
+    m_gridVao = 0;
+    m_gridVbo = 0;
     bool ok = m_panel2D.Build(kPanelVs, (std::string(kPanelFsCommon) + kPanel2DFs).c_str(), "panel2d");
     // GLSL requires #extension before any other statement: build the source with it first.
     const std::string extFs = WithExt(kPanelExtFs);
@@ -321,6 +406,8 @@ bool SceneRenderer::Init() {
     m_upscalerReady = m_gsr.Build(kBlitVs, (toLayer + kGsrFs).c_str(), "gsr") && m_upscalerReady;
     m_upscalerReady = m_kept.Build(kBlitVs, (toLayer + kKeptFs).c_str(), "kept") && m_upscalerReady;
     m_upscalerReady = m_keptMoved.Build(kBlitVs, (toLayer + kKeptMovedFs).c_str(), "keptMoved") && m_upscalerReady;
+    m_externalMovedReady = m_externalMoved.Build(kBlitVs, (ext + toLayer + kFoveateFs + kExternalMovedFs).c_str(), "externalMoved");
+    ok &= m_externalMovedReady;
     ok &= m_blitExt.Build(kBlitVs, blitExt.c_str(), "blitExt");
     ok &= m_blit2D.Build(kBlitVs, kBlit2DFs, "blit2d");
 
@@ -380,19 +467,18 @@ void SceneRenderer::Beam(const Vec3& from, const Vec3& to, float width, const Co
         to.x - side.x,   to.y - side.y,   to.z - side.z,   1, -1,
         to.x + side.x,   to.y + side.y,   to.z + side.z,   1, 1,
     };
-    static GLuint vao = 0, vbo = 0;
-    if (!vao) {
-        glGenVertexArrays(1, &vao);
-        glGenBuffers(1, &vbo);
-        glBindVertexArray(vao);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    if (!m_beamVao) {
+        glGenVertexArrays(1, &m_beamVao);
+        glGenBuffers(1, &m_beamVbo);
+        glBindVertexArray(m_beamVao);
+        glBindBuffer(GL_ARRAY_BUFFER, m_beamVbo);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 5 * sizeof(float), nullptr);
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(4 * sizeof(float)));
     }
-    glBindVertexArray(vao);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBindVertexArray(m_beamVao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_beamVbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
     m_beam.Use();
     glUniformMatrix4fv(m_beam.Uniform("uViewProj"), 1, GL_FALSE, m_viewProj.m);
@@ -445,9 +531,10 @@ static void SetFoveation(const Program& p, const VideoFoveation* f) {
     glUniform3f(p.Uniform("uFoveaLayout"), f->size, f->density[0], f->density[1]);
 }
 
-void SceneRenderer::BlitExternal(GLuint texture, int width, int height, const float* crop, float u0, float v0, float u1,
-                                 float v1, const VideoFoveation* foveation) {
+void SceneRenderer::BlitExternal(GLuint dstFbo, GLuint texture, int width, int height, const float* crop, float u0, float v0,
+                                 float u1, float v1, const VideoFoveation* foveation) {
     static const float kFull[4] = {0, 0, 1, 1};
+    glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
     glViewport(0, 0, width, height);
     glDisable(GL_BLEND);
     glDisable(GL_DEPTH_TEST);
@@ -466,7 +553,7 @@ void SceneRenderer::BlitExternal(GLuint texture, int width, int height, const fl
 
 void SceneRenderer::KeepVideo(GLuint texture, const float* crop, int width, int height, const VideoFoveation* foveation) {
     static const float kFull[4] = {0, 0, 1, 1};
-    if (width != m_gsrWidth || height != m_gsrHeight) {
+    if (rc::NeedsTextureResize(m_gsrWidth, m_gsrHeight, width, height)) {
         if (m_gsrFbo) glDeleteFramebuffers(1, &m_gsrFbo);
         if (m_gsrTexture) glDeleteTextures(1, &m_gsrTexture);
         glGenTextures(1, &m_gsrTexture);
@@ -501,6 +588,8 @@ void SceneRenderer::KeepVideo(GLuint texture, const float* crop, int width, int 
 void SceneRenderer::DrawKeptUpscaled(GLuint dstFbo, int dstW, int dstH) {
     glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
     glViewport(0, 0, dstW, dstH);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
     DiscardTarget();
     RawSrgbWrites raw(m_rawSrgbWrites);
     m_gsr.Use();
@@ -516,6 +605,8 @@ void SceneRenderer::DrawKeptUpscaled(GLuint dstFbo, int dstW, int dstH) {
 void SceneRenderer::DrawKept(GLuint dstFbo, int dstW, int dstH) {
     glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
     glViewport(0, 0, dstW, dstH);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
     DiscardTarget();
     RawSrgbWrites raw(m_rawSrgbWrites);
     m_kept.Use();
@@ -527,7 +618,8 @@ void SceneRenderer::DrawKept(GLuint dstFbo, int dstW, int dstH) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
-void SceneRenderer::DrawKeptMoved(GLuint dstFbo, int dstW, int dstH, float scaleX, float scaleY, float fieldU, float fieldV) {
+bool SceneRenderer::DrawKeptMoved(GLuint dstFbo, int dstW, int dstH, float scaleX, float scaleY, float fieldU, float fieldV) {
+    if (!dstFbo || !m_upscalerReady || !m_gsrTexture || !m_motionTexture) return false;
     glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
     glViewport(0, 0, dstW, dstH);
     DiscardTarget();
@@ -538,6 +630,12 @@ void SceneRenderer::DrawKeptMoved(GLuint dstFbo, int dstW, int dstH, float scale
     glUniform4f(m_keptMoved.Uniform("uRect"), 0, 0, 1, 1);
     glUniform2f(m_keptMoved.Uniform("uScale"), scaleX, scaleY);
     glUniform2f(m_keptMoved.Uniform("uField"), fieldU, fieldV);
+    glUniform2f(m_keptMoved.Uniform("uMotionHalfTexel"),
+                m_motionWidth > 0 ? 0.5f / float(m_motionWidth) : 0.f,
+                m_motionHeight > 0 ? 0.5f / float(m_motionHeight) : 0.f);
+    glUniform2f(m_keptMoved.Uniform("uHalfTexel"),
+                m_gsrWidth > 0 ? 0.5f / float(m_gsrWidth) : 0.f,
+                m_gsrHeight > 0 ? 0.5f / float(m_gsrHeight) : 0.f);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, m_gsrTexture);
     glUniform1i(m_keptMoved.Uniform("uTex"), 0);
@@ -547,10 +645,59 @@ void SceneRenderer::DrawKeptMoved(GLuint dstFbo, int dstW, int dstH, float scale
     glBindVertexArray(EmptyVao());
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glActiveTexture(GL_TEXTURE0);
+    return true;
+}
+
+void SceneRenderer::RememberExternal(GLuint texture, int width, int height, const float* crop,
+                                      const VideoFoveation* foveation) {
+    static const float kFull[4] = {0, 0, 1, 1};
+    m_externalTexture = texture;
+    m_externalWidth = width;
+    m_externalHeight = height;
+    std::memcpy(m_externalCrop, crop ? crop : kFull, sizeof(m_externalCrop));
+    m_externalFoveated = foveation != nullptr;
+    if (foveation) m_externalFoveation = *foveation;
+}
+
+void SceneRenderer::ClearExternal() {
+    RememberExternal(0, 0, 0, nullptr, nullptr);
+    m_externalFoveation = {};
+}
+
+bool SceneRenderer::DrawExternalMoved(GLuint dstFbo, int dstW, int dstH, float scaleX, float scaleY, float fieldU, float fieldV) {
+    if (!dstFbo || !m_externalMovedReady || !m_externalTexture || !m_motionTexture) return false;
+    glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+    glViewport(0, 0, dstW, dstH);
+    DiscardTarget();
+    RawSrgbWrites raw(m_rawSrgbWrites);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    m_externalMoved.Use();
+    glUniform4f(m_externalMoved.Uniform("uRect"), 0, 0, 1, 1);
+    glUniform4fv(m_externalMoved.Uniform("uCrop"), 1, m_externalCrop);
+    SetFoveation(m_externalMoved, m_externalFoveated ? &m_externalFoveation : nullptr);
+    glUniform2f(m_externalMoved.Uniform("uScale"), scaleX, scaleY);
+    glUniform2f(m_externalMoved.Uniform("uField"), fieldU, fieldV);
+    glUniform2f(m_externalMoved.Uniform("uMotionHalfTexel"),
+                m_motionWidth > 0 ? 0.5f / float(m_motionWidth) : 0.f,
+                m_motionHeight > 0 ? 0.5f / float(m_motionHeight) : 0.f);
+    glUniform2f(m_externalMoved.Uniform("uHalfTexel"),
+                m_externalWidth > 0 ? 0.5f / float(m_externalWidth) : 0.f,
+                m_externalHeight > 0 ? 0.5f / float(m_externalHeight) : 0.f);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_externalTexture);
+    glUniform1i(m_externalMoved.Uniform("uTex"), 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, m_motionTexture);
+    glUniform1i(m_externalMoved.Uniform("uMotion"), 1);
+    glBindVertexArray(EmptyVao());
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glActiveTexture(GL_TEXTURE0);
+    return true;
 }
 
 void SceneRenderer::UploadMotion(const int8_t* grid, int width, int height) {
-    if (width != m_motionWidth || height != m_motionHeight) {
+    if (rc::NeedsTextureResize(m_motionWidth, m_motionHeight, width, height)) {
         if (m_motionTexture) glDeleteTextures(1, &m_motionTexture);
         glGenTextures(1, &m_motionTexture);
         glBindTexture(GL_TEXTURE_2D, m_motionTexture);

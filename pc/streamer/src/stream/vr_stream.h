@@ -14,6 +14,7 @@
 #include "../encode/color_convert.h"
 #include "../encode/encoder.h"
 #include "rc/auto_tune.h"
+#include "rc/motion_field.h"
 #include "rc/platform.h"
 #include "rc/protocol.h"
 #include "rc/stale_flush.h"  // A72: the flush's chain state lives in the members below
@@ -125,6 +126,7 @@ class VrStream {
         uint32_t srcWidth = 0, srcHeight = 0;
         bool halfRate = false;
         bool foveated = false;  // squeezed around the gaze (foveaStart)
+        bool motionQueued = false;
         float foveaStart[2][2] = {};
         uint64_t frameIndex = 0;
         uint64_t headsetTargetNs = 0;
@@ -155,7 +157,6 @@ class VrStream {
         bool predictedDisplayTrackHit = false;
         float renderOrientation[4] = {}, renderPosition[3] = {};
         float fovTan[2][4] = {};
-        std::vector<uint8_t> motion;  // the motion field, already in its wire form
     };
 
     // An encoded frame waiting to be packetized and sent. On a thread of its own, so the
@@ -183,7 +184,9 @@ class VrStream {
     void RunEncoder();
     void RunSender();
     // Waits until the encoder is about to want the next frame (see Run).
-    int64_t WaitForEncoder(int64_t convertAvgNs);
+    int64_t WaitForEncoder(int64_t convertAvgNs, const std::function<bool()>& pollMotion = {});
+    // Wakes Run() to drain finished async motion readbacks for an encoded frame within a tight cap.
+    void WaitForMotionField(uint64_t frameIndex, uint64_t headsetTargetNs);
     // Where frames went, every 10 s while streaming (see Run).
     void LogFrameFlow(int64_t now);
     // Where each eye's full-density square starts for this frame, from the gaze.
@@ -261,6 +264,10 @@ class VrStream {
     DiagTiming m_diagHold, m_diagLock1s, m_diagConvertBlock, m_diagMotionRead;
     uint32_t m_diagJobRepl = 0;
     uint32_t m_diagMotionPending = 0;
+    std::atomic<uint32_t> m_diagMotionRequests{0};
+    rc::MotionMailboxStats m_diagMotionPrev;
+    bool m_motionDiagStateKnown = false;
+    bool m_motionDiagEnabled = false;
     std::atomic<uint32_t> m_diagSendWaitIdx{0};
     std::atomic<uint32_t> m_diagSendWaitCount{0};
     std::array<std::atomic<uint32_t>, kDiagRing> m_diagSendWaitUs{};
@@ -297,6 +304,12 @@ class VrStream {
     // whenever the estimator resets. The change's trade lives with the thresholds in
     // rc/motion_field.h.
     std::vector<int8_t> m_motionGridPrev;
+    rc::MotionFieldMailbox m_motionResults;
+    HANDLE m_motionWakeEvent = nullptr;
+    std::mutex m_motionSyncMutex;
+    std::condition_variable m_motionSyncCv;
+    std::atomic<uint32_t> m_motionWaiters{0};
+    std::atomic<bool> m_motionHasPendingRead{false};
 };
 
 }  // namespace rcs

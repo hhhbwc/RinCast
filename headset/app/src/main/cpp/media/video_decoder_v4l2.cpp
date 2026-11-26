@@ -139,16 +139,25 @@ DecoderCaps VideoDecoder::Capabilities() {
 
 bool VideoDecoder::Init(rc::VideoCodec codec, int width, int height, float fps) {
     LoadEglProcs();
+    ResetTextureGeometry();
     m_codec = codec;
     m_width = width;
     m_height = height;
     m_fps = fps > 1 ? fps : 72;  // ROUND18 L4 fallback
-    glGenTextures(1, &m_texture);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_texture);
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    if (!texture) {
+        RC_LOGE("Decoder %s %dx%d: glGenTextures failed", CodecName(codec), width, height);
+        m_failed = true;
+        return false;
+    }
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    const float crop[4] = {0, 0, 0, 0};
+    PublishTextureGeometry(texture, 0, 0, crop);
     if (!pCreateImage || !pImageTargetTexture) {
         RC_LOGE("Decoder %s: EGL can't import dmabufs (eglCreateImageKHR / glEGLImageTargetTexture2DOES missing)",
                 CodecName(codec));
@@ -217,49 +226,112 @@ bool VideoDecoder::Init(rc::VideoCodec codec, int width, int height, float fps) 
     return true;
 }
 
-void VideoDecoder::Shutdown() {
-    if (m_running.exchange(false)) {
-        m_cv.notify_all();
-        if (m_inputThread.joinable()) m_inputThread.join();
-        if (m_outputThread.joinable()) m_outputThread.join();
+void VideoDecoder::DestroyRetiredImagesLocked() {
+    // Caller holds m_pictureMutex AND a current EGL context (GL thread only).
+    if (!pDestroyImage) {
+        m_retiredImages.clear();
+        return;
     }
+    const EGLDisplay display = eglGetCurrentDisplay();
+    if (display == EGL_NO_DISPLAY) {
+        // A caller outside the GL thread (or an unusually early context teardown): keep the
+        // images queued instead of handing EGL_NO_DISPLAY to the driver, which would make
+        // the destroy a silent no-op and leak them.  The next GL-thread pass drains them.
+        return;
+    }
+    for (EGLImageKHR image : m_retiredImages) {
+        if (image != EGL_NO_IMAGE_KHR) pDestroyImage(display, image);
+    }
+    m_retiredImages.clear();
+}
+
+void VideoDecoder::Shutdown() {
+    m_running = false;
+    m_cv.notify_all();
+    if (m_inputThread.joinable()) m_inputThread.join();
+    if (m_outputThread.joinable()) m_outputThread.join();
     if (m_device >= 0) {
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         Ioctl(m_device, VIDIOC_STREAMOFF, &type);
         type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         Ioctl(m_device, VIDIOC_STREAMOFF, &type);
     }
-    for (auto& p : m_pictures) {
-        if (p.image != EGL_NO_IMAGE_KHR && pDestroyImage) pDestroyImage(eglGetCurrentDisplay(), p.image);
-        if (p.fd >= 0) close(p.fd);
+    {
+        std::lock_guard lock(m_pictureMutex);
+        // Shutdown runs on the GL thread: safe to destroy EGLImages here, but collect the
+        // live ones into the same retired queue so all destruction goes through one path.
+        for (auto& p : m_pictures)
+            if (p.image != EGL_NO_IMAGE_KHR) m_retiredImages.push_back(p.image);
+        DestroyRetiredImagesLocked();
+        for (auto& p : m_pictures)
+            if (p.fd >= 0) close(p.fd);
+        m_pictures.clear();
     }
-    m_pictures.clear();
     for (auto& b : m_bitstream) munmap(b.data, b.length);
     m_bitstream.clear();
     if (m_device >= 0) close(m_device);
     m_device = -1;
-    if (m_texture) {
-        glDeleteTextures(1, &m_texture);
-        m_texture = 0;
-    }
+    auto geometry = Geometry();
+    ResetTextureGeometry();
+    if (geometry.texture) glDeleteTextures(1, &geometry.texture);
+    m_configured = false;
+    m_captureReady = false;
+    m_captureFormat = m_captureWidth = m_captureHeight = m_captureStride = m_captureUvOffset = 0;
+    m_ready.clear();
+    m_shown = m_retiredPicture = -1;
+    ResetTextureGeometry();
 }
 
 // Called by the output thread once the driver knows the stream's size.
 bool VideoDecoder::SetUpCapture() {
+    const auto fail = [&] {
+        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        Ioctl(m_device, VIDIOC_STREAMOFF, &type);
+        {
+            std::lock_guard lock(m_pictureMutex);
+            // fail() runs on the output thread with NO current EGL context: eglGetCurrentDisplay()
+            // would be EGL_NO_DISPLAY and pDestroyImage would leak.  Queue the EGLImages for
+            // the GL thread to destroy in Latch()/Shutdown().
+            for (auto& picture : m_pictures) {
+                if (picture.image != EGL_NO_IMAGE_KHR) m_retiredImages.push_back(picture.image);
+                if (picture.fd >= 0) close(picture.fd);
+            }
+            m_pictures.clear();
+            m_ready.clear();
+            m_shown = m_retiredPicture = -1;
+            // Fail is a batch boundary just like a rebuild: a Latched copy already taken by
+            // the GL thread still carries the old generation, and must not bind, publish
+            // geometry or write m_shown after the queue was torn down.
+            ++m_batchGeneration;
+        }
+        m_configured = false;
+        m_captureReady = false;
+        m_captureFormat = m_captureWidth = m_captureHeight = m_captureStride = m_captureUvOffset = 0;
+        // Keep the GL texture handle alive until Shutdown() deletes it.  Resetting the
+        // geometry here set m_texture=0, making Shutdown's glDeleteTextures a no-op and
+        // leaking the object on every failed rollback / resolution change.
+        {
+            const float zero[4] = {0, 0, 0, 0};
+            const GLuint texture = Geometry().texture;  // locked snapshot
+            PublishTextureGeometry(texture, 0, 0, zero);
+            std::lock_guard lock(m_pictureMutex);
+            std::memcpy(m_pendingCrop, zero, sizeof(m_pendingCrop));
+        }
+        return false;
+    };
     v4l2_format fmt{};
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    if (Ioctl(m_device, VIDIOC_G_FMT, &fmt) < 0) return false;
+    if (Ioctl(m_device, VIDIOC_G_FMT, &fmt) < 0) return fail();
     // Linear NV12: what EGL can import as one dmabuf with two planes.
     fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
     if (Ioctl(m_device, VIDIOC_S_FMT, &fmt) < 0 || fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12) {
         RC_LOGE("Decoder: the driver won't give linear NV12 (%s)", strerror(errno));
-        return false;
+        return fail();
     }
-    m_captureWidth = fmt.fmt.pix_mp.width;
-    m_captureHeight = fmt.fmt.pix_mp.height;
-    m_captureStride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-    // NV12 in one buffer: the chroma rows follow the luma rows, padded to the buffer's height.
-    m_captureUvOffset = m_captureStride * m_captureHeight;
+    const uint32_t captureWidth = fmt.fmt.pix_mp.width;
+    const uint32_t captureHeight = fmt.fmt.pix_mp.height;
+    const uint32_t captureStride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+    const uint32_t captureUvOffset = captureStride * captureHeight;
 
     // The visible part (the rest is the decoder's padding).
     v4l2_selection sel{};
@@ -272,15 +344,18 @@ bool VideoDecoder::SetUpCapture() {
         vw = sel.r.width;
         vh = sel.r.height;
     }
-    const float W = float(m_captureWidth), H = float(m_captureHeight);
-    // Edges next to padding are pulled in by half a texel, as on Android.
+    if (!captureWidth || !captureHeight || !captureStride || !vw || !vh ||
+        uint64_t(vx) + vw > captureWidth || uint64_t(vy) + vh > captureHeight) {
+        RC_LOGE("Decoder: invalid capture geometry %ux%u stride %u visible %ux%u at %u,%u", captureWidth,
+                captureHeight, captureStride, vw, vh, vx, vy);
+        return fail();
+    }
+    const float W = float(captureWidth), H = float(captureHeight);
+    // Decoder crop already carries the outer half-texel insets used by both backends.
     const float x0 = (vx + (vx > 0 ? 0.5f : 0.f)) / W, y0 = (vy + (vy > 0 ? 0.5f : 0.f)) / H;
-    const float x1 = (vx + vw - (vx + vw < m_captureWidth ? 0.5f : 0.f)) / W;
-    const float y1 = (vy + vh - (vy + vh < m_captureHeight ? 0.5f : 0.f)) / H;
-    m_crop[0] = x0;
-    m_crop[1] = y0;
-    m_crop[2] = x1 - x0;
-    m_crop[3] = y1 - y0;
+    const float x1 = (vx + vw - (vx + vw < captureWidth ? 0.5f : 0.f)) / W;
+    const float y1 = (vy + vh - (vy + vh < captureHeight ? 0.5f : 0.f)) / H;
+    const float nextCrop[4] = {x0, y0, x1 - x0, y1 - y0};
 
     v4l2_control minBuffers{};
     minBuffers.id = V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
@@ -291,11 +366,26 @@ bool VideoDecoder::SetUpCapture() {
     req.memory = V4L2_MEMORY_MMAP;
     if (Ioctl(m_device, VIDIOC_REQBUFS, &req) < 0 || req.count == 0) {
         RC_LOGE("Decoder: no picture buffers (%s)", strerror(errno));
-        return false;
+        return fail();
     }
+    bool exported = true;
     {
         std::lock_guard lock(m_pictureMutex);
+        // Rebuilding the batch (resolution switch) must retire the previous generation's
+        // resources.  Old fd and EGLImage with them; queue the images for GL-thread
+        // destruction and close the fds here (close is safe on any thread).
+        // Ownership rule: an EGLImage stored in m_pictures is destroyed exactly once, through
+        // m_retiredImages.  Nothing else may destroy it — that is what made the old
+        // generation-mismatch path a double free.
+        for (auto& picture : m_pictures) {
+            if (picture.image != EGL_NO_IMAGE_KHR) m_retiredImages.push_back(picture.image);
+            if (picture.fd >= 0) close(picture.fd);
+        }
+        const uint64_t generation = ++m_batchGeneration;
         m_pictures.assign(req.count, {});
+        for (auto& picture : m_pictures) picture.generation = generation;
+        m_ready.clear();  // stale indices from the old batch must not be latched
+        m_shown = m_retiredPicture = -1;
         for (uint32_t i = 0; i < req.count; i++) {
             v4l2_exportbuffer ex{};
             ex.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -304,19 +394,32 @@ bool VideoDecoder::SetUpCapture() {
             ex.flags = O_RDONLY | O_CLOEXEC;
             if (Ioctl(m_device, VIDIOC_EXPBUF, &ex) < 0) {
                 RC_LOGE("Decoder: couldn't export picture buffer %u as a dmabuf (%s)", i, strerror(errno));
-                return false;
+                exported = false;
+                break;
             }
             m_pictures[i].fd = ex.fd;
         }
     }
+    if (!exported) return fail();
     for (uint32_t i = 0; i < req.count; i++) QueuePicture(int(i));
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     if (Ioctl(m_device, VIDIOC_STREAMON, &type) < 0) {
         RC_LOGE("Decoder: couldn't start the picture queue (%s)", strerror(errno));
-        return false;
+        return fail();
+    }
+    {
+        std::lock_guard lock(m_pictureMutex);
+        m_captureFormat = V4L2_PIX_FMT_NV12;
+        m_captureWidth = captureWidth;
+        m_captureHeight = captureHeight;
+        m_captureStride = captureStride;
+        m_captureUvOffset = captureUvOffset;
+        std::memcpy(m_pendingCrop, nextCrop, sizeof(m_pendingCrop));
+        // Geometry is published by Latch() once the first EGLImage of this batch is bound,
+        // so a resolution switch never exposes "new width/height + old picture".
     }
     RC_LOGI("Decoder %s: %ux%u NV12 pictures (stride %u, visible %ux%u at %u,%u), %u buffers", CodecName(m_codec),
-            m_captureWidth, m_captureHeight, m_captureStride, vw, vh, vx, vy, req.count);
+            captureWidth, captureHeight, captureStride, vw, vh, vx, vy, req.count);
     m_configured = true;
     return true;
 }
@@ -465,49 +568,130 @@ void VideoDecoder::OutputLoop() {
 bool VideoDecoder::Latch(DecodedFrameInfo& out) {
     int index = -1;
     std::vector<int> skipped;
+    // Everything read from the capture batch is copied under ONE lock.  SetUpCapture()
+    // (output thread) may rebuild m_pictures and rewrite m_capture* concurrently; the old
+    // code released the lock here then indexed m_pictures[m_capture*] unlocked ⇒ UAF/race.
+    struct Latched {
+        int fd = -1;
+        EGLImageKHR image = EGL_NO_IMAGE_KHR;
+        uint32_t frameIndex = 0;
+        uint64_t generation = 0;
+        uint32_t width = 0, height = 0, stride = 0, uvOffset = 0;
+        float crop[4] = {0, 0, 1, 1};
+        GLuint texture = 0;
+    } latched;
     {
         std::lock_guard lock(m_pictureMutex);
+        // Latch runs on the GL thread: destroy images retired by a rebuild/failure here.
+        DestroyRetiredImagesLocked();
         if (m_ready.empty()) return false;
         index = m_ready.back();  // the newest; older ones go straight back to the driver
         m_ready.pop_back();
         skipped.assign(m_ready.begin(), m_ready.end());
         m_ready.clear();
+        if (size_t(index) >= m_pictures.size()) return false;  // a rebuild raced us
+        Picture& pic = m_pictures[size_t(index)];
+        // A successful rebuild replaces m_pictures but may leave stale m_ready indices;
+        // such an entry belongs to the previous batch and must never be latched.
+        if (pic.generation != m_batchGeneration) return false;
+        latched.fd = pic.fd;
+        latched.image = pic.image;
+        latched.frameIndex = pic.frameIndex;
+        latched.generation = pic.generation;
+        latched.width = m_captureWidth;
+        latched.height = m_captureHeight;
+        latched.stride = m_captureStride;
+        latched.uvOffset = m_captureUvOffset;
+        std::memcpy(latched.crop, m_pendingCrop, sizeof(latched.crop));
+        // m_texture is owned by the geometry mutex, not m_pictureMutex — take a snapshot.
+        latched.texture = Geometry().texture;
     }
-    for (int i : skipped) QueuePicture(i);
+    {
+        std::lock_guard lock(m_pictureMutex);
+        // Hand back only indices that still belong to the live batch.  SetUpCapture()/fail()
+        // may have re-REQBUFS'd the queue while we were outside the lock; an old index would
+        // then mark an unrelated new buffer as filled (garbage picture, torn frame).
+        if (latched.generation == m_batchGeneration) {
+            for (int i : skipped) QueuePicture(i);
+        }
+    }
 
-    Picture& pic = m_pictures[size_t(index)];
-    if (pic.image == EGL_NO_IMAGE_KHR) {
+    if (latched.image == EGL_NO_IMAGE_KHR && latched.fd >= 0 && latched.width && latched.height) {
         const EGLint attribs[] = {
-            EGL_WIDTH, EGLint(m_captureWidth),
-            EGL_HEIGHT, EGLint(m_captureHeight),
+            EGL_WIDTH, EGLint(latched.width),
+            EGL_HEIGHT, EGLint(latched.height),
             EGL_LINUX_DRM_FOURCC_EXT, kDrmFormatNv12,
-            EGL_DMA_BUF_PLANE0_FD_EXT, pic.fd,
+            EGL_DMA_BUF_PLANE0_FD_EXT, latched.fd,
             EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-            EGL_DMA_BUF_PLANE0_PITCH_EXT, EGLint(m_captureStride),
-            EGL_DMA_BUF_PLANE1_FD_EXT, pic.fd,
-            EGL_DMA_BUF_PLANE1_OFFSET_EXT, EGLint(m_captureUvOffset),
-            EGL_DMA_BUF_PLANE1_PITCH_EXT, EGLint(m_captureStride),
+            EGL_DMA_BUF_PLANE0_PITCH_EXT, EGLint(latched.stride),
+            EGL_DMA_BUF_PLANE1_FD_EXT, latched.fd,
+            EGL_DMA_BUF_PLANE1_OFFSET_EXT, EGLint(latched.uvOffset),
+            EGL_DMA_BUF_PLANE1_PITCH_EXT, EGLint(latched.stride),
             // What the PC's encoders produce.
             EGL_YUV_COLOR_SPACE_HINT_EXT, EGL_ITU_REC709_EXT,
             EGL_SAMPLE_RANGE_HINT_EXT, EGL_YUV_NARROW_RANGE_EXT,
             EGL_NONE};
-        pic.image = pCreateImage(eglGetCurrentDisplay(), EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
-        if (pic.image == EGL_NO_IMAGE_KHR) {
+        latched.image = pCreateImage(eglGetCurrentDisplay(), EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
+        if (latched.image == EGL_NO_IMAGE_KHR) {
             Warn("EGL couldn't import a decoded picture (eglCreateImageKHR on a dmabuf)");
-            QueuePicture(index);
+            std::lock_guard lock(m_pictureMutex);
+            if (m_batchGeneration == latched.generation && size_t(index) < m_pictures.size())
+                QueuePicture(index);
+            return false;
+        }
+        // Cache the EGLImage on the batch entry under the same lock so it is imported once.
+        // Match by BATCH GENERATION, not fd: POSIX reuses the lowest free fd after close(),
+        // so a freshly exported dmabuf can collide with latched.fd from the old batch.  fd
+        // equality alone would write an old-resolution EGLImage into a new-batch slot (ABA).
+        std::lock_guard lock(m_pictureMutex);
+        const bool sameBatch = size_t(index) < m_pictures.size() &&
+                               m_batchGeneration == latched.generation &&
+                               m_pictures[size_t(index)].generation == latched.generation &&
+                               m_pictures[size_t(index)].fd == latched.fd;
+        if (sameBatch) {
+            m_pictures[size_t(index)].image = latched.image;
+        } else {
+            // Batch changed while we imported (or fd collided).  This image was just created
+            // and never stored in m_pictures, so it is NOT in m_retiredImages — destroying it
+            // here is the single owner's job.  Do NOT bind/publish a picture/geometry pair
+            // that no longer matches current capture settings.
+            const EGLDisplay display = eglGetCurrentDisplay();
+            if (latched.image != EGL_NO_IMAGE_KHR && pDestroyImage && display != EGL_NO_DISPLAY)
+                pDestroyImage(display, latched.image);
             return false;
         }
     }
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_texture);
-    pImageTargetTexture(GL_TEXTURE_EXTERNAL_OES, pic.image);
+    if (latched.image == EGL_NO_IMAGE_KHR) return false;
+    // Bind, publish and advance m_shown under ONE m_pictureMutex hold.  SetUpCapture() and
+    // fail() reset m_shown and bump m_batchGeneration under that same lock, so a rebuild
+    // landing between the bind and the m_shown update would otherwise write an old-batch
+    // index into the new batch: the next Latch would take a freshly filled buffer for the
+    // retired one and hand it back to the driver while the GPU still samples it.
+    {
+        std::lock_guard lock(m_pictureMutex);
+        if (latched.generation != m_batchGeneration) {
+            // The queue was rebuilt/torn down while we imported.  The rebuild already pushed
+            // THIS image into m_retiredImages (every image stored in m_pictures is retired
+            // there — and reaching this line implies it was read from m_pictures[index] or
+            // written into it above).  Destroying it here as well would free the same
+            // EGLImageKHR twice, so hand ownership to the retire queue: drain it once and
+            // publish nothing.
+            DestroyRetiredImagesLocked();
+            return false;
+        }
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, latched.texture);
+        pImageTargetTexture(GL_TEXTURE_EXTERNAL_OES, latched.image);
+        // Publish geometry only AFTER the EGLImage is bound: the publisher and the picture
+        // then always describe the same frame (no "new geometry + old picture" window).
+        PublishTextureGeometry(latched.texture, int(latched.width), int(latched.height), latched.crop);
+        // The picture shown before this one is still being read by the frame in flight; the
+        // one before that is free again.  fail() writes these under m_pictureMutex too.
+        if (m_retiredPicture >= 0) QueuePicture(m_retiredPicture);
+        m_retiredPicture = m_shown;
+        m_shown = index;
+    }
 
-    // The picture shown before this one is still being read by the frame in flight; the one
-    // before that is free again.
-    if (m_retiredPicture >= 0) QueuePicture(m_retiredPicture);
-    m_retiredPicture = m_shown;
-    m_shown = index;
-
-    const int64_t pts = int64_t(pic.frameIndex);
+    const int64_t pts = int64_t(latched.frameIndex);
     std::lock_guard lock(m_mutex);
     auto it = m_infos.find(pts);
     if (it != m_infos.end()) {

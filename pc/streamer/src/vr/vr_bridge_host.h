@@ -17,7 +17,7 @@ class VrBridgeHost {
    public:
     using HapticHandler = std::function<void(const rcvr::HapticEvent&)>;
 
-    bool Start();
+    bool Start(const rcvr::BridgeNames& names = {});
     void Stop();
 
     // Applies a headset display configuration. Recreates textures when the
@@ -83,6 +83,8 @@ class VrBridgeHost {
     mutable std::mutex m_mutex;
     HapticHandler m_onHaptic;
     LONG m_hapticsRead = 0;
+    uint32_t m_hapticsWaitTicks = 0;
+    int64_t m_hapticsWaitStartNs = 0;
     int64_t m_epochBaseNs = 0;
     std::atomic<double> m_pendingShiftNs{0};  // for the heartbeat loop, which owns the phase
     std::atomic<double> m_driftNsPerS{0};

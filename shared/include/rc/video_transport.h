@@ -6,7 +6,9 @@
 // monitor streams.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -18,6 +20,38 @@
 #include "rc/protocol.h"
 
 namespace rc {
+
+// Single shared per-frame fragment ceiling enforced by both VideoPacketizer::SendFrame
+// and VideoReassembler::HandleFragment/HandleParity. Kept at 2048 (rather than raising
+// to 0xFFFF) to preserve wire compatibility with deployed protocol v3 receivers and
+// keep A45 per-pending-frame fragment table allocations bounded.
+inline constexpr uint16_t kMaxFragmentsPerFrame = 2048;
+static_assert(kMaxFragmentsPerFrame < 0xFFFF);
+
+// T-59: single source of truth for FEC grouping, parity count, and frame wire-byte
+// billing shared by VideoPacketizer::SendFrame, rcs::FrameWireBytes, and offline tests.
+inline uint8_t VideoFecGroupSize(int fecPercent) {
+    return fecPercent > 0 ? uint8_t(std::clamp(100 / fecPercent, 2, 64)) : uint8_t(0);
+}
+
+inline size_t VideoParityFragmentCount(size_t count, size_t group) {
+    if (group < 2 || count < 2) return 0;
+    return count / group + (count % group > 1 ? size_t(1) : size_t(0));
+}
+
+inline size_t VideoFrameWireBytesFromCounts(size_t fragPayload, size_t totalPayload, size_t count, size_t nParity) {
+    if (fragPayload == 0 || totalPayload == 0 || count == 0) return 0;
+    return totalPayload + count * sizeof(VideoFragmentHeader) +
+           nParity * (sizeof(VideoParityHeader) + fragPayload);
+}
+
+inline size_t VideoFrameWireBytes(size_t fragPayload, size_t totalPayload, int fecPercent) {
+    if (fragPayload == 0 || totalPayload == 0) return 0;
+    const size_t count = (totalPayload + fragPayload - 1) / fragPayload;
+    const size_t group = VideoFecGroupSize(fecPercent);
+    const size_t nParity = VideoParityFragmentCount(count, group);
+    return VideoFrameWireBytesFromCounts(fragPayload, totalPayload, count, nParity);
+}
 
 class VideoPacketizer {
    public:
@@ -54,8 +88,8 @@ class VideoPacketizer {
     // A79 phase M (stale-flush attribution, reading only): the send-side pacing backlog,
     // max(m_nextSendNs - now, 0). m_nextSendNs is a plain send-thread-only int64_t (the
     // discipline note below), so reading it from the stats thread would be a data race;
-    // SendFrame instead stores a relaxed snapshot at the one point where the burst clock
-    // is re-anchored every frame, and this getter decays that snapshot against NowNs().
+    // SendFrame stores each burst anchor; ResetPacingDebtNs and leaving burst mode
+    // publish the reset clock as well. The getter decays that snapshot against NowNs().
     // 0 = the billing has elapsed, no burst-mode frame anchored the clock yet, or the
     // stream runs the legacy clock (which the card leaves unsnapshotted). No new
     // synchronisation: a relaxed load of a single-writer snapshot.
@@ -69,12 +103,19 @@ class VideoPacketizer {
     // above). In the legacy modes the clock holds at most kPaceMaxDebtNs, so the
     // reset is a harmless re-baseline; in burst mode it is what turns the flush
     // into an instant recovery.
-    void ResetPacingDebtNs(int64_t nowNs) { m_nextSendNs = nowNs; }
+    // SendFrame publishes each burst anchor; debt resets and mode switches publish the
+    // re-baselined clock too, so diagnostics cannot retain an already-forgiven backlog.
+    void ResetPacingDebtNs(int64_t nowNs) {
+        m_nextSendNs = nowNs;
+        m_nextSendNsPublished.store(nowNs, std::memory_order_relaxed);
+    }
 
     // Sends one frame. Returns number of datagrams sent. May return early (count <
-    // expected) once RequestStop() was called.
+    // expected) once RequestStop() was called. When outWireBytes is non-null, writes
+    // the frame's billed wire bytes computed under the same FEC snapshot (0 on early reject).
     size_t SendFrame(uint8_t streamId, VideoCodec codec, uint8_t frameFlags, uint32_t frameIndex,
-                     const void* metadata, uint16_t metadataSize, const uint8_t* bitstream, size_t bitstreamSize);
+                     const void* metadata, uint16_t metadataSize, const uint8_t* bitstream, size_t bitstreamSize,
+                     size_t* outWireBytes = nullptr);
 
     // Makes a SendFrame waiting in the pacer return at once (used by shutdown).
     void RequestStop();

@@ -87,7 +87,7 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
 
     // Called by the VR stream when the producer state changes.
     void NotifyVrState(const std::string& state, const std::string& producer, const std::string& app,
-                       const std::string& error = {});
+                       const std::string& error = {}, const std::string& errorKey = {});
     void OnSettingsChanged(const json& changed);
     void OwnSyncedSettings(const json& changed, const std::function<void()>& save);
     // Rebuild streams affected by build-time settings; live picture-tier moves do not call this.

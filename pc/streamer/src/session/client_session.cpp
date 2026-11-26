@@ -199,6 +199,7 @@ void ClientSession::ApplyInputSetting(bool announce) {
     if (announce && allowed != was) {
         SendControl({{"type", rc::msg::kNotice},
                      {"level", "info"},
+                     {"key", allowed ? "notice.inputAllowed" : "notice.inputDisabled"},
                      {"text", allowed ? "This PC now lets the headset use its mouse and keyboard."
                                       : "This PC turned off the headset's mouse and keyboard. You can still watch."}});
     }
@@ -565,7 +566,7 @@ void ClientSession::HandleMessage(const json& m) {
         // Steam VR launch timeout.
         if (m_steamVrLaunchNs && rc::NowNs() - m_steamVrLaunchNs > 90'000'000'000LL) {
             m_steamVrLaunchNs = 0;
-            NotifyVrState("error", "steamvr", "", "SteamVR did not start. Check SteamVR on your PC.");
+            NotifyVrState("error", "steamvr", "", "SteamVR did not start. Check SteamVR on your PC.", "notice.steamVrDidNotStart");
         }
         FollowSteamVrResolution();
         // A80-M1: the announced / fov-tan / rendered aspects on this same 1 s tick.
@@ -723,6 +724,7 @@ void ClientSession::HandleMessage(const json& m) {
         const std::string id = StrField(m, "id");  // A92: headset control message
         const bool ok = App::Get().Games().Launch(id);
         SendControl({{"type", rc::msg::kNotice}, {"level", ok ? "info" : "error"},
+                     {"key", ok ? "notice.launchingGame" : "notice.couldNotLaunchGame"},
                      {"text", ok ? "Launching game…" : "Could not launch the game"}});
         if (ok && !(m_vr && m_vr->Running())) NotifyVrState("launching", "steamvr", "");  // see LaunchSteamVr
         return;
@@ -1166,7 +1168,7 @@ void ClientSession::RunAutoTune() {
 
     Settings eff = pc;
     eff.streamProfile = EffectiveProfileLocked();
-    rc::AutoTuneInput in = BuildAutoTuneInput(eff, st, m_slowPath);
+    rc::AutoTuneInput in = BuildAutoTuneInput(eff, st, m_vr ? m_vr->Config() : VrStreamConfig{});
     in.dipAtMs = ProfileDipAtMs(eff.streamProfile);
     const int64_t now = rc::NowNs();
 
@@ -1332,6 +1334,7 @@ void ClientSession::StartDesktop(const json& m) {
     if (!pc.desktopInput)
         SendControl({{"type", rc::msg::kNotice},
                      {"level", "info"},
+                     {"key", "notice.inputDisabled"},
                      {"text", "This PC has the headset's mouse and keyboard turned off. You can still watch."}});
     for (auto& [id, ds] : created) ds->Start();
     std::lock_guard lock(m_mutex);
@@ -1498,6 +1501,7 @@ void ClientSession::StartVr() {
         // as the restart-SteamVR message below.
         SendControl({{"type", rc::msg::kNotice},
                      {"level", "warning"},
+                     {"key", "notice.h264FallbackHevc"},
                      {"text", "H.264 does not support this picture size; the stream switched to HEVC."}});
     }
     VrStreamConfig cfg = vrBuild.cfg;
@@ -1563,6 +1567,7 @@ void ClientSession::StartVr() {
         SendControl({{"type", rc::msg::kNotice},
                      {"level", "warning"},
                      {"action", "vr.restartSteamVR"},
+                     {"key", "notice.restartSteamVR"},
                      {"text", "Restart SteamVR to use the new resolution."}});
     }
 }
@@ -1630,7 +1635,7 @@ void ClientSession::StopVr() {
 
 void ClientSession::LaunchSteamVr() {
     if (!steamvr::SteamVrPath()) {
-        NotifyVrState("error", "steamvr", "", "SteamVR is not installed on this PC.");
+        NotifyVrState("error", "steamvr", "", "SteamVR is not installed on this PC.", "notice.steamVrNotInstalled");
         return;
     }
     if (SettingsStore::Get().Snapshot().autoRegisterSteamVrDriver) steamvr::RegisterDriver();
@@ -1657,20 +1662,21 @@ void ClientSession::LaunchSteamVr() {
 }
 
 void ClientSession::NotifyVrState(const std::string& state, const std::string& producer, const std::string& app,
-                                  const std::string& error) {
+                                  const std::string& error, const std::string& errorKey) {
     // While SteamVR is starting, "waiting" means "still launching" to the headset.
     std::string effective = state;
     if (state == "running") m_steamVrLaunchNs = 0;
     if (state == "waiting" && m_steamVrLaunchNs) effective = "launching";
     {
         std::lock_guard lock(m_mutex);
-        if (m_vrState == effective && m_vrProducer == producer && m_vrApp == app && error.empty()) return;
+        if (m_vrState == effective && m_vrProducer == producer && m_vrApp == app && error.empty() && errorKey.empty()) return;
         m_vrState = effective;
         m_vrProducer = producer;
         m_vrApp = app;
     }
     json msg{{"type", rc::msg::kVrState}, {"state", effective}, {"producer", producer}, {"app", app}};
     if (!error.empty()) msg["error"] = error;
+    if (!errorKey.empty()) msg["errorKey"] = errorKey;
     SendControl(msg);
     App::Get().OnVrStateChanged(effective, producer, app);
 }

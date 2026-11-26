@@ -711,13 +711,16 @@ static int RunPart2(const Options& opt) {
 }
 
 // ---------------------------------------------------------------------------
-// Leak probe - Part 1's gate: open/close the encoder session 60 times and
-// check handles / process VRAM come back where they started.
+// Leak probe - Part 1's gate: open/close the encoder session repeatedly and
+// separate first-use driver initialization from growth across later sessions.
 // ---------------------------------------------------------------------------
 
 static int RunLeakProbe(const Options& opt) {
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    (void)hr;
+    if (opt.leakCycles < 8) {
+        std::printf("leak-probe: --cycles must be at least 8\n");
+        return 2;
+    }
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 1;
     DXGI_ADAPTER_DESC1 ad{};
     auto adapter = PickAdapter(ad);
     if (!adapter) return 1;
@@ -741,9 +744,13 @@ static int RunLeakProbe(const Options& opt) {
     ec.fillMode = opt.kFillMode;
     ec.inputFormat = DXGI_FORMAT_P010;
 
+    bool vramAvailable = true;
     const auto vramNow = [&] {
         DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-        if (adapter3) adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info);
+        if (!adapter3 || FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+            vramAvailable = false;
+            return 0.0;
+        }
         return double(info.CurrentUsage) / (1024.0 * 1024.0);
     };
     const auto handlesNow = [&] {
@@ -770,8 +777,11 @@ static int RunLeakProbe(const Options& opt) {
     std::vector<uint8_t> upload;
     PackFrame(base, int(ec.width), int(ec.height), true, upload);
 
-    const double vramBefore = vramNow();
-    const long long handlesBefore = handlesNow();
+    const int warmupCycles = std::min(8, opt.leakCycles / 2);
+    const double vramStart = vramNow();
+    const long long handlesStart = handlesNow();
+    double vramWarm = vramStart;
+    long long handlesWarm = handlesStart;
     int initFail = 0, encFail = 0;
     for (int i = 0; i < opt.leakCycles; ++i) {
         auto encoder = CreateEncoder(dev.Get(), ad.VendorId, ec);
@@ -783,15 +793,26 @@ static int RunLeakProbe(const Options& opt) {
         EncodedFrame ef;
         if (!encoder->Encode(tex.Get(), i == 0, ef)) encFail++;
         encoder.reset();
+        if (i + 1 == warmupCycles) {
+            // DLL loading, the first upload and driver heaps are startup costs, not per-session leaks.
+            vramWarm = vramNow();
+            handlesWarm = handlesNow();
+        }
     }
     const double vramAfter = vramNow();
     const long long handlesAfter = handlesNow();
-    const double dVram = vramAfter - vramBefore;
-    const long long dHandles = handlesAfter - handlesBefore;
-    const bool ok = initFail == 0 && encFail == 0 && dHandles <= 10 && std::fabs(dVram) <= 60.0;
-    std::printf("leak-probe: cycles=%d initFail=%d encFail=%d handles %lld -> %lld (delta %lld), local vram %.1f -> %.1f MB (delta %.1f) verdict=%s\n",
-                opt.leakCycles, initFail, encFail, handlesBefore, handlesAfter, dHandles, vramBefore, vramAfter, dVram,
-                ok ? "OK" : "LEAK-SUSPECT");
+    const double startupVram = vramWarm - vramStart;
+    const double steadyVram = vramAfter - vramWarm;
+    const long long startupHandles = handlesWarm - handlesStart;
+    const long long steadyHandles = handlesAfter - handlesWarm;
+    const bool ok = initFail == 0 && encFail == 0 && vramAvailable &&
+                    steadyHandles <= 10 && std::fabs(steadyVram) <= 60.0;
+    std::printf("leak-probe: cycles=%d warmup=%d measured=%d initFail=%d encFail=%d "
+                "startup handles=%lld vram=%.1f MB, steady handles=%lld -> %lld (delta %lld), "
+                "local vram %.1f -> %.1f MB (delta %.1f) verdict=%s\n",
+                opt.leakCycles, warmupCycles, opt.leakCycles - warmupCycles, initFail, encFail,
+                startupHandles, startupVram, handlesWarm, handlesAfter, steadyHandles,
+                vramWarm, vramAfter, steadyVram, ok ? "OK" : "LEAK-SUSPECT");
     CoUninitialize();
     return ok ? 0 : 2;
 }

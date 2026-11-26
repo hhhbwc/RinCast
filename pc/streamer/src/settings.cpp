@@ -71,6 +71,7 @@ json Settings::ToJson(bool forUi) const {
 }
 
 void Settings::FromJson(const json& j) {
+    if (!j.is_object()) return;
     auto get = [&](const char* key, auto& field) {
         if (j.contains(key) && !j[key].is_null()) {
             try {
@@ -122,17 +123,36 @@ void Settings::FromJson(const json& j) {
     // A86b: the autoTune schema migration is gone with the persisted key. There is
     // no file state to migrate any more - the tuner is always on, and the only way
     // to force a rung is a process-lifetime environment variable (see app.cpp).
-    if (j.contains("trustedDevices") && j["trustedDevices"].is_array()) {
+    if (const auto it = j.find("trustedDevices"); it != j.end() && it->is_array()) {
         trustedDevices.clear();
-        for (const auto& d : j["trustedDevices"]) {
-            TrustedDevice td;
-            td.id = d.value("id", "");
-            td.name = d.value("name", "");
-            td.model = d.value("model", "");
-            td.firstSeen = d.value("firstSeen", int64_t(0));
-            td.lastSeen = d.value("lastSeen", int64_t(0));
-            td.publicKey = d.value("publicKey", "");
-            if (!td.id.empty()) trustedDevices.push_back(td);
+        for (const auto& d : *it) {
+            if (!d.is_object()) continue;
+            TrustedDevice td{};
+            td.firstSeen = 0;
+            td.lastSeen = 0;
+            auto getStr = [&](const char* key, std::string& out) {
+                if (const auto f = d.find(key); f != d.end() && f->is_string()) {
+                    try {
+                        out = f->get<std::string>();
+                    } catch (...) {
+                    }
+                }
+            };
+            auto getI64 = [&](const char* key, int64_t& out) {
+                if (const auto f = d.find(key); f != d.end() && f->is_number_integer()) {
+                    try {
+                        out = f->get<int64_t>();
+                    } catch (...) {
+                    }
+                }
+            };
+            getStr("id", td.id);
+            getStr("name", td.name);
+            getStr("model", td.model);
+            getI64("firstSeen", td.firstSeen);
+            getI64("lastSeen", td.lastSeen);
+            getStr("publicKey", td.publicKey);
+            if (!td.id.empty()) trustedDevices.push_back(std::move(td));
         }
     }
     // Clamp to sane ranges.

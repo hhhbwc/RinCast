@@ -722,6 +722,8 @@ function renderDependents() {
   // switch is off, matching EffectiveVrBitrate() on the server.
   const fromHeadset = !state.settings.pcBitrateWins && session?.headsetBitrateMbps > 0;
   setOff($("#vrBitrateBar"), !!fromHeadset);
+  const vrBadge = $("#vrBitrateHeadsetControl");
+  if (vrBadge) vrBadge.hidden = !fromHeadset;
   // "actual / ceiling": the throughput the encoder really managed, next to the cap,
   // so "set 140, got 90" is visible without opening the logs. Only while a stream
   // reports it; the plain cap shows before that.

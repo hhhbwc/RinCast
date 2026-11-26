@@ -2,24 +2,42 @@ import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import vm from 'node:vm';
+
+if (typeof vm.SourceTextModule !== 'function') {
+  const child = spawnSync(
+    process.execPath,
+    ['--experimental-vm-modules', ...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)],
+    { stdio: 'inherit' },
+  );
+  process.exit(child.status ?? 1);
+}
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const ui = resolve(repo, 'pc/streamer/ui');
 const current = readFileSync(resolve(ui, 'app.js'), 'utf8');
 const i18n = readFileSync(resolve(ui, 'i18n.js'), 'utf8');
-const keys = ['streamProfile', 'codec', 'tenBit', 'vrBitrateMbps', 'pcBitrateWins', 'desktopBitrateMbps', 'adaptiveBitrate', 'videoPacingMode', 'qualityProfileCbr', 'profileControlsVideo', 'fecPercent', 'foveatedEncoding', 'adaptiveQuantization', 'twoPassEncoding', 'desktopMaxHeight', 'desktopFps'];
-const bools = new Set(['tenBit', 'pcBitrateWins', 'adaptiveBitrate', 'qualityProfileCbr', 'profileControlsVideo', 'foveatedEncoding', 'adaptiveQuantization', 'twoPassEncoding']);
+const indexHtml = readFileSync(resolve(ui, 'index.html'), 'utf8');
+const keys = ['codec', 'tenBit', 'vrBitrateMbps', 'pcBitrateWins', 'desktopBitrateMbps', 'adaptiveBitrate', 'encodeScalePct', 'l7Autoscale', 'qualityProfileCbr', 'fillMode', 'fecPercent', 'foveatedEncoding', 'adaptiveQuantization', 'twoPassEncoding', 'desktopMaxHeight'];
+const bools = new Set(['tenBit', 'pcBitrateWins', 'adaptiveBitrate', 'l7Autoscale', 'qualityProfileCbr', 'fillMode', 'foveatedEncoding', 'adaptiveQuantization', 'twoPassEncoding']);
+const radios = new Set(['codec', 'encodeScalePct', 'fecPercent', 'desktopMaxHeight']);
 const strings = new Set(['codec']);
 const initial = Object.fromEntries(keys.map(k => [k, bools.has(k) ? true : strings.has(k) ? 'auto' : 1]));
 initial.pcName = 'fixture';
 initial._revision = 1;
 
+for (const key of keys) {
+  assert.ok(indexHtml.includes(`data-setting="${key}"`), `index.html missing UI setting control for ${key}`);
+}
+for (const retired of ['streamProfile', 'profileControlsVideo']) {
+  assert.ok(!indexHtml.includes(`data-setting="${retired}"`), `index.html still exposes retired control ${retired}`);
+}
+
 class Element {
   constructor(key = '') {
     this.dataset = { setting: key };
-    this.type = bools.has(key) ? 'checkbox' : strings.has(key) ? 'radio' : 'range';
+    this.type = bools.has(key) ? 'checkbox' : radios.has(key) ? 'radio' : 'range';
     this.checked = true;
     this.value = '1';
     this.min = '0'; this.max = '500';
@@ -199,11 +217,27 @@ for (const [pcWins, headset, disabled] of [[true, 123, false], [false, 123, true
   assert.equal(regression.other.get('#overrideNote').textContent.includes('123'), disabled);
 }
 results.push({ test: 'round7_pc_bitrate_wins', cases: 3 });
-for (const [profile, controls, match, slow, disabled] of [[2, true, false, false, false], [2, true, true, false, true], [2, true, false, true, true], [1, true, false, false, true], [2, false, false, false, true]]) {
-  regression.api.testRenderDependents({ ...initial, streamProfile: profile, profileControlsVideo: controls }, { matchSteamVr: match, slowPath: slow });
+for (const [session, disabled] of [[null, false], [{ matchSteamVr: false, slowPath: false }, false], [{ matchSteamVr: true, slowPath: false }, true], [{ matchSteamVr: false, slowPath: true }, true], [{ matchSteamVr: true, slowPath: true }, true]]) {
+  regression.api.testRenderDependents({ ...initial }, session);
   assert.equal(regression.other.get('#cbrRow').disabled, disabled);
 }
-results.push({ test: 'round7_cbr_gates', cases: 5 });
+results.push({ test: 'a86b_cbr_link_gates', cases: 5 });
+for (const [codec, encWidth, headsetCodec, gaze, tenBitOff, foveatedOff, codecHintHidden] of [
+  ['auto', 4800, 'auto', false, false, false, true],
+  ['h264', 4800, 'auto', false, true, false, false],
+  ['h264', 3840, 'auto', true, true, true, true],
+  ['auto', 4800, 'h264', true, false, true, false],
+]) {
+  regression.api.testRenderDependents(
+    { ...initial, codec },
+    { headsetCodec, headsetGazeFoveation: gaze, vr: { encWidth } },
+  );
+  assert.equal(regression.other.get('#tenBitRow').disabled, tenBitOff);
+  assert.equal(regression.other.get('#tenBitHint').hidden, !tenBitOff);
+  assert.equal(regression.other.get('#foveatedRow').disabled, foveatedOff);
+  assert.equal(regression.other.get('#codecHint').hidden, codecHintHidden);
+}
+results.push({ test: 'a86b_independent_video_toggles', cases: 4 });
 regression.api.testEarlyPushes();
 results.push({ test: 'round7_pushes_before_initial_state', status: 'PASS' });
 

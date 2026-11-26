@@ -170,6 +170,7 @@ void App::OnSessionStarted(ClientSession* session) {
     if (approved)
         session->SendControl({{"type", rc::msg::kNotice},
                               {"level", "info"},
+                              {"key", "notice.pcAllowedConnect"},
                               {"text", "This PC allowed the headset to connect."}});
     bool remember = true;
     {

@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <system_error>
 
 #include "rc/platform.h"
 
@@ -24,6 +26,7 @@ json HeadsetSettings::ToJson() const {
             {"autoConnect", autoConnect},
             {"autoLaunchSteamVr", autoLaunchSteamVr},
             {"usbCable", usbCable},
+            {"compatPlainOpenXr", compatPlainOpenXr},
             {"refreshRate", refreshRate},
             {"codec", codec},
             {"tenBit", tenBit},
@@ -93,6 +96,7 @@ void HeadsetSettings::FromJson(const json& j) {
     get("autoConnect", autoConnect);
     get("autoLaunchSteamVr", autoLaunchSteamVr);
     get("usbCable", usbCable);
+    get("compatPlainOpenXr", compatPlainOpenXr);
     get("refreshRate", refreshRate);
     get("codec", codec);
     get("tenBit", tenBit);
@@ -166,12 +170,23 @@ HeadsetSettings HeadsetSettings::Load(const std::string& path) {
 }
 
 void HeadsetSettings::Save(const std::string& path) const {
+    const auto toPath = [](const std::string& p) {
+        const auto* u8 = reinterpret_cast<const char8_t*>(p.data());
+        return std::filesystem::path(u8, u8 + p.size());
+    };
     const std::string tmp = path + ".tmp";
     {
-        std::ofstream f(tmp, std::ios::trunc);
+        std::ofstream f(toPath(tmp), std::ios::trunc);
         f << ToJson().dump(2);
+        f.flush();
+        if (!f) {
+            RC_LOGW("settings.json write failed, keeping existing");
+            return;
+        }
     }
-    std::rename(tmp.c_str(), path.c_str());
+    std::error_code ec;
+    std::filesystem::rename(toPath(tmp), toPath(path), ec);
+    if (ec) RC_LOGW("settings.json rename failed: %s", ec.message().c_str());
 }
 
 }  // namespace rv

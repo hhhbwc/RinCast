@@ -562,9 +562,10 @@ void MicPlayer::PushPacket(const uint8_t* payload, size_t size) {
     if (ahead <= 0) m_lastSeq = 0;
     int16_t pcm[5760];
     // Conceal up to 5 lost packets (50 ms) with Opus PLC; after longer gaps just carry on.
-    const uint32_t missing = m_lastSeq ? h.sequence - m_lastSeq - 1 : 0;
+    const uint32_t missing = (m_lastSeq && ahead > 1) ? uint32_t(ahead - 1) : 0;
+    const int plcSamples = (h.frameSamples >= 120 && h.frameSamples <= 5760) ? int(h.frameSamples) : 480;
     for (uint32_t i = 0; i < missing && i < 5; i++) {
-        const int n = m_decoder.Decode(nullptr, 0, pcm, h.frameSamples);
+        const int n = m_decoder.Decode(nullptr, 0, pcm, plcSamples);
         if (n > 0) m_jitter.Push(pcm, n);
     }
     m_lastSeq = h.sequence;

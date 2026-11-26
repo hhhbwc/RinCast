@@ -248,12 +248,12 @@ inline DesktopStreamConfig BuildDesktopStreamConfig(const Settings& pc, const Cl
 //     the live stream is built at, and 0 is a lie about it whenever the stream runs
 //     at 1 or 2 - the climb would then step up from 0 and the cut would land on a
 //     rung the stream is not at.
-inline rc::AutoTuneInput BuildAutoTuneInput(const Settings& pc, const ClientStreamSettings& st, bool slowPath) {
-    const bool match = st.matchSteamVr && !slowPath;  // StartVr's own condition
+inline rc::AutoTuneInput BuildAutoTuneInput(const Settings& pc, const ClientStreamSettings& st,
+                                             const VrStreamConfig& built) {
     rc::AutoTuneInput in;
     in.cbrOn = rcs::QualityProfileCbr(pc.qualityProfileCbr);
-    // Both gates must hold for a fovea to exist in the built stream.
-    in.foveaOn = pc.foveatedEncoding && st.gazeFoveation;
+    const bool squeeze = built.foveatedEyeWidth > 0 && built.foveatedEyeHeight > 0;
+    in.foveaOn = squeeze;
     // The headset's own switch; auto never writes synced keys.
     in.foveaPossible = st.gazeFoveation;
     // A84b §3 above: `pc` is the EFFECTIVE snapshot (see ClientSession::RunAutoTune),

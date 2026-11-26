@@ -11,6 +11,7 @@
 namespace rc {
 
 constexpr uint16_t kProtocolVersion = 3;
+static_assert(kProtocolVersion == 3);
 
 // Ports. Discovery is UDP, everything else is multiplexed on a single UDP
 // socket so that the same code path works locally, hole-punched and relayed.
@@ -162,6 +163,16 @@ struct VrFrameMetadata {
     int64_t pcEncodeStartNs;
     int64_t pcEncodeEndNs;
 };
+static_assert(sizeof(VrFrameMetadata) == 104);
+static_assert(offsetof(VrFrameMetadata, trackingTimestampNs) == 0);
+static_assert(offsetof(VrFrameMetadata, renderPose) == 8);
+static_assert(offsetof(VrFrameMetadata, fovTan) == 36);
+static_assert(offsetof(VrFrameMetadata, ipd) == 68);
+static_assert(offsetof(VrFrameMetadata, eyeWidth) == 72);
+static_assert(offsetof(VrFrameMetadata, eyeHeight) == 76);
+static_assert(offsetof(VrFrameMetadata, pcSubmitNs) == 80);
+static_assert(offsetof(VrFrameMetadata, pcEncodeStartNs) == 88);
+static_assert(offsetof(VrFrameMetadata, pcEncodeEndNs) == 96);
 
 // Foveated encoding: the PC keeps every pixel of a square around where the eyes look and half
 // of them elsewhere, which the headset undoes when it draws the frame. A VR stream whose config
@@ -182,6 +193,8 @@ struct DesktopFrameMetadata {
     int32_t cursorX;     // in pixels, -1 when hidden
     int32_t cursorY;
 };
+static_assert(sizeof(VrFoveationMetadata) == 16);
+static_assert(sizeof(DesktopFrameMetadata) == 32);
 
 // --- Tracking ----------------------------------------------------------------
 enum ControllerButtons : uint32_t {

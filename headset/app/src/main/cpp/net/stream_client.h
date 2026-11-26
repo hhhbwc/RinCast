@@ -182,7 +182,8 @@ class StreamClient {
         float TakeQueueMs();  // average over the frames since the last call; -1 without any
     };
     struct StreamRx {
-        std::unique_ptr<rc::VideoReassembler> reassembler;
+        std::shared_ptr<rc::VideoReassembler> reassembler;
+        uint64_t generation = 0;
         DelayTracker delay;
         bool keyframeRequested = false;
         double decodeMs = 0;
@@ -191,6 +192,7 @@ class StreamClient {
     };
     std::mutex m_streamsMutex;
     std::map<uint8_t, StreamRx> m_streams;
+    std::map<uint8_t, uint64_t> m_streamGenerations;
     std::map<uint8_t, bool> m_pendingKeyframe;
     std::atomic<bool> m_feedbackNow{false};  // a loss: tell the PC without waiting for the next tick
     int64_t m_lastFeedbackNs = 0;  // start of the current feedback window

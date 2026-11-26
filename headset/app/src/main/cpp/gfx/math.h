@@ -37,13 +37,19 @@ inline Vec3 Cross(const Vec3& a, const Vec3& b) {
     return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
 }
 inline float Length(const Vec3& v) { return std::sqrt(Dot(v, v)); }
-inline Vec3 Normalize(const Vec3& v) {
-    const float l = Length(v);
-    return l > 1e-8f ? v * (1.f / l) : Vec3{0, 0, -1};
+inline bool IsFinite(const Vec3& v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); }
+inline Vec3 NormalizeOr(const Vec3& v, const Vec3& fallback) {
+    if (!IsFinite(v)) return fallback;
+    const float scale = std::max({std::fabs(v.x), std::fabs(v.y), std::fabs(v.z)});
+    if (!(scale > 0.f)) return fallback;
+    const Vec3 scaled{v.x / scale, v.y / scale, v.z / scale};
+    const float l = std::sqrt(Dot(scaled, scaled));
+    return l > 0.f && scale * l > 1e-8f ? scaled * (1.f / l) : fallback;
 }
+inline Vec3 Normalize(const Vec3& v) { return NormalizeOr(v, Vec3{0, 0, -1}); }
 inline Vec3 Lerp(const Vec3& a, const Vec3& b, float t) { return a + (b - a) * t; }
 inline float Lerp(float a, float b, float t) { return a + (b - a) * t; }
-inline float Clamp01(float v) { return std::clamp(v, 0.f, 1.f); }
+inline float Clamp01(float v) { return std::isnan(v) ? 0.f : std::clamp(v, 0.f, 1.f); }
 inline float SmoothStep(float e0, float e1, float x) {
     const float t = Clamp01((x - e0) / (e1 - e0));
     return t * t * (3 - 2 * t);
@@ -77,26 +83,43 @@ struct Quat {
     }
 };
 
+inline bool IsFinite(const Quat& q) {
+    return std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) && std::isfinite(q.w);
+}
 inline Quat Normalize(const Quat& q) {
-    const float l = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
-    return l > 0 ? Quat{q.x / l, q.y / l, q.z / l, q.w / l} : Quat{};
+    if (!IsFinite(q)) return Quat{};
+    const float scale = std::max({std::fabs(q.x), std::fabs(q.y), std::fabs(q.z), std::fabs(q.w)});
+    if (!(scale > 0.f)) return Quat{};
+    const Quat scaled{q.x / scale, q.y / scale, q.z / scale, q.w / scale};
+    const float l = std::sqrt(scaled.x * scaled.x + scaled.y * scaled.y + scaled.z * scaled.z + scaled.w * scaled.w);
+    return l > 0.f && scale * l > 1e-8f ? Quat{scaled.x / l, scaled.y / l, scaled.z / l, scaled.w / l} : Quat{};
 }
 inline Quat Slerp(Quat a, Quat b, float t) {
+    a = Normalize(a);
+    b = Normalize(b);
+    t = std::isfinite(t) ? Clamp01(t) : 0.f;
     float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
     if (d < 0) {
         b = {-b.x, -b.y, -b.z, -b.w};
         d = -d;
     }
+    d = std::clamp(d, -1.f, 1.f);
     if (d > 0.9995f)
         return Normalize(Quat{Lerp(a.x, b.x, t), Lerp(a.y, b.y, t), Lerp(a.z, b.z, t), Lerp(a.w, b.w, t)});
     const float th = std::acos(d), s = std::sin(th);
     const float wa = std::sin((1 - t) * th) / s, wb = std::sin(t * th) / s;
-    return {a.x * wa + b.x * wb, a.y * wa + b.y * wb, a.z * wa + b.z * wb, a.w * wa + b.w * wb};
+    return Normalize(Quat{a.x * wa + b.x * wb, a.y * wa + b.y * wb, a.z * wa + b.z * wb, a.w * wa + b.w * wb});
 }
 // Rotation that looks along `forward` (-Z) with `up`.
 inline Quat LookRotation(const Vec3& forward, const Vec3& up = {0, 1, 0}) {
-    const Vec3 f = Normalize(forward);
-    const Vec3 r = Normalize(Cross(up, -f));
+    const Vec3 f = NormalizeOr(forward, {0, 0, -1});
+    const Vec3 upHint = NormalizeOr(up, std::fabs(f.y) < 0.9f ? Vec3{0, 1, 0} : Vec3{1, 0, 0});
+    Vec3 cr = Cross(upHint, -f);
+    if (Dot(cr, cr) < 1e-12f) {
+        const Vec3 axis = std::fabs(f.z) < 0.9f ? Vec3{0, 0, 1} : Vec3{1, 0, 0};
+        cr = Cross(axis, -f);
+    }
+    const Vec3 r = NormalizeOr(cr, {1, 0, 0});
     const Vec3 u = Cross(-f, r);
     // Rotation matrix columns: r, u, -f
     const float m00 = r.x, m01 = u.x, m02 = -f.x;
@@ -135,6 +158,13 @@ struct Pose {
         return {inv, inv.Rotate(-position)};
     }
 };
+
+inline Pose SanitizePose(const Pose& p) {
+    Pose r;
+    r.orientation = Normalize(p.orientation);
+    r.position = IsFinite(p.position) ? p.position : Vec3{};
+    return r;
+}
 
 struct Mat4 {
     float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};  // column-major
@@ -183,14 +213,27 @@ struct Mat4 {
 
     // Asymmetric projection from tangent half-angles (OpenXR fov).
     static Mat4 Projection(float tanLeft, float tanRight, float tanUp, float tanDown, float nearZ, float farZ) {
+        if (!std::isfinite(tanLeft) || !std::isfinite(tanRight) || !std::isfinite(tanUp) || !std::isfinite(tanDown) ||
+            !std::isfinite(nearZ) || !std::isfinite(farZ) || nearZ <= 0.f) {
+            return Identity();
+        }
+        const float w = tanRight - tanLeft;
+        const float h = tanUp - tanDown;
+        const float depth = farZ - nearZ;
+        const float depthSum = farZ + nearZ;
+        const float depthProduct = 2 * farZ * nearZ;
+        if (!std::isfinite(w) || !std::isfinite(h) || !std::isfinite(depth) || !std::isfinite(depthSum) ||
+            !std::isfinite(depthProduct) || w <= 1e-6f || h <= 1e-6f || depth <= 1e-6f) {
+            return Identity();
+        }
+
         Mat4 r;
-        const float w = tanRight - tanLeft, h = tanUp - tanDown;
         r(0, 0) = 2 / w;
         r(0, 2) = (tanRight + tanLeft) / w;
         r(1, 1) = 2 / h;
         r(1, 2) = (tanUp + tanDown) / h;
-        r(2, 2) = -(farZ + nearZ) / (farZ - nearZ);
-        r(2, 3) = -(2 * farZ * nearZ) / (farZ - nearZ);
+        r(2, 2) = -depthSum / depth;
+        r(2, 3) = -depthProduct / depth;
         r(3, 2) = -1;
         r(3, 3) = 0;
         return r;

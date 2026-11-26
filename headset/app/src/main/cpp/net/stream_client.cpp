@@ -24,6 +24,56 @@
 
 namespace rv {
 
+namespace {
+
+const char* SessionPath(const rc::NetAddress& address, bool usb, bool vpn, bool remote) {
+    if (usb) return "usb";
+    if (!address.valid()) return remote ? "remote" : vpn ? "vpn" : "unknown";
+    if (vpn || (!address.v6 && rc::IsCgnat(address.ip))) return "vpn";
+    if (!address.v6 && rc::IsPrivateLan(address.ip)) return "lan";
+    return remote ? "remote" : "internet";
+}
+
+void LogSessionEnd(bool warning, const char* reason, rc::Connection* connection, int64_t nowNs, bool usb, bool vpn,
+                   bool remote) {
+    if (!connection) {
+        const char* path = SessionPath({}, usb, vpn, remote);
+        if (warning)
+            RC_LOGW("Stream session ended: reason=%s lastReceiveAgeMs=n/a remote=n/a sessionId=n/a bytes=n/a "
+                    "packets=n/a rejected=n/a rttMs=n/a path=%s",
+                    reason, path);
+        else
+            RC_LOGI("Stream session ended: reason=%s lastReceiveAgeMs=n/a remote=n/a sessionId=n/a bytes=n/a "
+                    "packets=n/a rejected=n/a rttMs=n/a path=%s",
+                    reason, path);
+        return;
+    }
+    const rc::NetAddress address = connection->Remote();
+    const rc::ConnectionStats stats = connection->Stats();
+    const int64_t lastReceiveNs = connection->LastReceiveNs();
+    const double lastReceiveAgeMs = double(std::max<int64_t>(0, nowNs - lastReceiveNs)) / 1e6;
+    const char* path = SessionPath(address, usb, vpn, remote);
+    // bytes and packets are rx/tx; all values come from Connection's existing getters.
+    if (warning)
+        RC_LOGW("Stream session ended: reason=%s lastReceiveAgeMs=%.1f remote=%s sessionId=%u "
+                "bytes=%llu/%llu packets=%llu/%llu rejected=%llu rttMs=%.3f path=%s",
+                reason, lastReceiveAgeMs, address.ToString().c_str(), connection->SessionId(),
+                static_cast<unsigned long long>(stats.bytesReceived), static_cast<unsigned long long>(stats.bytesSent),
+                static_cast<unsigned long long>(stats.packetsReceived),
+                static_cast<unsigned long long>(stats.packetsSent),
+                static_cast<unsigned long long>(stats.packetsRejected), stats.rttMs, path);
+    else
+        RC_LOGI("Stream session ended: reason=%s lastReceiveAgeMs=%.1f remote=%s sessionId=%u "
+                "bytes=%llu/%llu packets=%llu/%llu rejected=%llu rttMs=%.3f path=%s",
+                reason, lastReceiveAgeMs, address.ToString().c_str(), connection->SessionId(),
+                static_cast<unsigned long long>(stats.bytesReceived), static_cast<unsigned long long>(stats.bytesSent),
+                static_cast<unsigned long long>(stats.packetsReceived),
+                static_cast<unsigned long long>(stats.packetsSent),
+                static_cast<unsigned long long>(stats.packetsRejected), stats.rttMs, path);
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
@@ -237,7 +287,8 @@ void StreamClient::Connect(const ConnectTarget& target, const json& hello) {
 }
 
 void StreamClient::Disconnect() {
-    if (m_running.exchange(false)) {
+    const bool wasRunning = m_running.exchange(false);
+    if (wasRunning) {
         {
             std::lock_guard lock(m_mutex);
             if (m_connection) m_connection->SendDisconnect();
@@ -246,6 +297,8 @@ void StreamClient::Disconnect() {
         if (m_thread.joinable()) m_thread.join();
     }
     std::lock_guard lock(m_mutex);
+    if (m_connection)
+        LogSessionEnd(false, "local-close", m_connection.get(), rc::NowNs(), IsUsb(), IsVpn(), IsRemote());
     m_connection.reset();
     std::lock_guard sl(m_streamsMutex);
     m_streams.clear();
@@ -276,6 +329,9 @@ std::string StreamClient::StatusText() {
         else if (m_remote) key = m_peers.empty() ? "computers.timeout.remoteOffline" : "computers.timeout.remoteNoDirect";
         return Tr(key);
     }
+    if (m_status == "The PC ended the session.") return Tr("notice.pcEndedSession");
+    if (m_status == "The PC refused the connection.") return Tr("notice.pcRefused");
+    if (m_status == "Connection lost.") return Tr("notice.connectionLost");
     return m_status;
 }
 
@@ -375,6 +431,7 @@ void StreamClient::SetLastGoodFrame(uint8_t streamId, uint32_t frame) {
 
 void StreamClient::ResetStream(uint8_t streamId) {
     std::lock_guard lock(m_streamsMutex);
+    ++m_streamGenerations[streamId];
     m_streams.erase(streamId);
     m_pendingKeyframe[streamId] = true;
 }
@@ -419,12 +476,14 @@ void StreamClient::OnPacket(rc::PacketType type, const uint8_t* payload, size_t 
         case rc::PacketType::VideoParity: {
             if (size < 1) return;
             const uint8_t streamId = payload[0];
-            rc::VideoReassembler* r;
+            std::shared_ptr<rc::VideoReassembler> r;
             {
                 std::lock_guard lock(m_streamsMutex);
                 auto& s = m_streams[streamId];
-                if (!s.reassembler)
-                    s.reassembler = std::make_unique<rc::VideoReassembler>([this](rc::ReceivedFrame&& f) {
+                const uint64_t gen = m_streamGenerations[streamId];
+                if (!s.reassembler) {
+                    s.generation = gen;
+                    s.reassembler = std::make_shared<rc::VideoReassembler>([this, gen](rc::ReceivedFrame&& f) {
                         int64_t sentNs = 0;  // PC clock: when the PC finished encoding (and sent) the frame
                         if (f.streamId == rc::kVrStreamId && f.metadata.size() >= sizeof(rc::VrFrameMetadata)) {
                             rc::VrFrameMetadata m;
@@ -436,15 +495,20 @@ void StreamClient::OnPacket(rc::PacketType type, const uint8_t* payload, size_t 
                             std::memcpy(&m, f.metadata.data(), sizeof(m));
                             sentNs = m.pcEncodeEndNs;
                         }
-                        if (sentNs) {
+                        {
                             std::lock_guard lock(m_streamsMutex);
-                            // First fragment: how late the frame started arriving is the queue in front of
-                            // it. Its own transfer time (large frames on a slow link) isn't a queue.
-                            m_streams[f.streamId].delay.Add(f.firstFragmentNs - sentNs, f.completeNs);
+                            const auto it = m_streams.find(f.streamId);
+                            if (it == m_streams.end() || it->second.generation != gen) return;
+                            if (sentNs) {
+                                // First fragment: how late the frame started arriving is the queue in front of
+                                // it. Its own transfer time (large frames on a slow link) isn't a queue.
+                                it->second.delay.Add(f.firstFragmentNs - sentNs, f.completeNs);
+                            }
                         }
                         if (m_cb.onVideoFrame) m_cb.onVideoFrame(std::move(f));
                     });
-                r = s.reassembler.get();
+                }
+                r = s.reassembler;
             }
             if (type == rc::PacketType::Video)
                 r->HandleFragment(payload, size);
@@ -864,9 +928,13 @@ void StreamClient::Run(ConnectTarget target, json hello) {
             }
         }
         if (c->PeerDisconnected() || now - c->LastReceiveNs() > 6'000'000'000LL) {
+            const bool peerDisconnected = c->PeerDisconnected();
+            LogSessionEnd(true, peerDisconnected ? "peer-disconnect" : "receive-timeout", c, now, IsUsb(), IsVpn(),
+                          IsRemote());
             std::lock_guard lock(m_mutex);
-            m_status = c->PeerDisconnected() ? "The PC ended the session." : "Connection lost.";
+            m_status = peerDisconnected ? "The PC ended the session." : "Connection lost.";
             m_state = State::Failed;
+            m_connection.reset();
             break;
         }
     }

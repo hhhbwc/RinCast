@@ -82,11 +82,9 @@
                  so what is left here is a sentence saying so - no control. The note is
                  static text: there is nothing for the user to set, and nothing to grey
                  out. -->
+
             <div class="row">
-              <p class="note" id="autoTuneNote" data-i18n="video.autoTuneAlways">Picture follows the link on its own: smoother when it gets busy, sharper when it does not.</p>
-            </div>
-            <div class="row">
-              <h3 data-i18n="video.bitrateGames">Games</h3>
+              <h3><span data-i18n="video.bitrateGames">Games</span> <span class="badge" id="vrBitrateHeadsetControl" hidden data-i18n="video.controlledByHeadset">Controlled by headset</span></h3>
               <label class="bar" id="vrBitrateBar"><input type="range" min="20" max="500" step="10" data-setting="vrBitrateMbps" aria-label="Bitrate limit for games" data-i18n-aria="video.bitrateGamesAria"><output></output></label>
               <p class="note" id="streamNote" hidden></p>
               <label class="check" id="adaptiveBitrateRow"><input type="checkbox" data-setting="adaptiveBitrate"><span data-i18n="video.adaptive">Automatic bitrate</span></label>
@@ -135,55 +133,58 @@
       <section class="card fold" id="advanced">
         <h2 class="fold-title"><button type="button" id="advancedHead" aria-labelledby="l-advanced" aria-controls="advancedBody" aria-expanded="false"><span id="l-advanced" data-i18n="video.advanced">Advanced</span></button></h2>
         <div class="fold-body" id="advancedBody" hidden>
+          <!-- 分组 1: 编码画质 -->
+          <div class="group-title" data-i18n="video.groupQuality">Encoding quality</div>
           <div class="row">
-            <h3 id="l-enc-scale" data-i18n="video.encScale">VR picture size</h3>
-            <div class="options" role="radiogroup" aria-labelledby="l-enc-scale" aria-describedby="encScaleNote">
+            <label class="check" id="tenBitRow"><input type="checkbox" data-setting="tenBit"><span data-i18n="video.tenBit">10-bit color</span><small id="tenBitHint" hidden data-i18n="video.tenBitHint">Needs HEVC or AV1.</small></label>
+          </div>
+          <div class="row">
+            <label class="check" id="foveatedRow"><input type="checkbox" data-setting="foveatedEncoding"><span data-i18n="video.foveated">Foveated encoding</span><small id="foveatedHint" data-i18n="video.foveatedHint">Lighter edges. NVIDIA only.</small></label>
+          </div>
+          <div class="row">
+            <label class="check" id="aqRow" data-i18n-title="video.aqHint"><input type="checkbox" data-setting="adaptiveQuantization"><span data-i18n="video.aq">Adaptive quantization (AQ)</span></label>
+          </div>
+          <div class="row">
+            <label class="check" id="twoPassRow" data-i18n-title="video.twoPassHint"><input type="checkbox" data-setting="twoPassEncoding"><span data-i18n="video.twoPass">Two-pass encoding</span></label>
+          </div>
+
+          <!-- 分组 2: 缩放与码率策略 -->
+          <div class="group-title" data-i18n="video.groupScaleRate">Scale and bitrate policy</div>
+          <div class="row">
+            <h3 id="l-enc-scale" data-i18n="video.encScale">Encode scale</h3>
+            <div class="options" role="radiogroup" aria-labelledby="l-enc-scale">
               <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="0"><span data-i18n="video.encScaleAuto">Automatic</span></label>
               <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="100"><span data-i18n="video.encScaleFull">Full</span></label>
               <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="85"><span>85%</span></label>
               <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="67"><span>67%</span></label>
               <label><input type="radio" name="encodeScalePct" data-setting="encodeScalePct" value="50"><span>50%</span></label>
             </div>
-            <p class="note" id="encScaleNote" data-i18n="video.encScaleHint">Fewer pixels, still fills the view.</p>
           </div>
           <div class="row">
-            <label class="check sub" id="l7Row"><input type="checkbox" data-setting="l7Autoscale"><span data-i18n="video.l7Autoscale">Shrink size when decoding is slow</span><small data-i18n="video.l7AutoscaleHint">Steps down only; the reset climbs back.</small></label>
+            <label class="check sub" id="l7Row"><input type="checkbox" data-setting="l7Autoscale"><span data-i18n="video.l7Autoscale">Auto-downscale on slow decode</span></label>
             <p class="note" id="l7LevelLine" hidden><span data-i18n="video.l7Level">Current size</span>: <b id="l7Level">—</b> <button id="l7Reset" data-i18n="video.l7Reset">Reset to 100%</button></p>
           </div>
-          <!-- A86b: "Quality follows profile" is gone with the tier it followed.
-               CBR stands on its own now: it never turns itself on because auto
-               climbed a rung (that coupling made the link oscillate). -->
           <div class="row">
-            <label class="check sub" id="cbrRow"><input type="checkbox" data-setting="qualityProfileCbr"><span data-i18n="video.cbr">Full bitrate every frame</span><small data-i18n="video.cbrHint">Steadier, but always uses the full link.</small></label>
+            <label class="check sub" id="cbrRow" data-i18n-title="video.cbrHint"><input type="checkbox" data-setting="qualityProfileCbr"><span data-i18n="video.cbr">Constant bitrate (CBR)</span></label>
           </div>
           <div class="row">
-            <label class="check" id="pcBitrateRow"><input type="checkbox" data-setting="pcBitrateWins"><span data-i18n="video.pcBitrate">Use this PC's limit</span><small data-i18n="video.pcBitrateHint">Off follows the headset.</small></label>
+            <label class="check" id="fillModeRow" data-i18n-title="video.fillModeHint"><input type="checkbox" data-setting="fillMode"><span data-i18n="video.fillMode">Low-FPS bitrate boost</span></label>
           </div>
           <div class="row">
-            <label class="check" id="tenBitRow"><input type="checkbox" data-setting="tenBit"><span data-i18n="video.tenBit">10-bit color</span><small id="tenBitHint" hidden data-i18n="video.tenBitHint">Needs HEVC or AV1.</small></label>
+            <label class="check" id="pcBitrateRow"><input type="checkbox" data-setting="pcBitrateWins"><span data-i18n="video.pcBitrate">Use PC bitrate limit</span></label>
           </div>
+
+          <!-- 分组 3: 网络容错 -->
+          <div class="group-title" data-i18n="video.groupNetwork">Network resilience</div>
           <div class="row">
-            <label class="check" id="aqRow"><input type="checkbox" data-setting="adaptiveQuantization"><span data-i18n="video.aq">Smart detail</span><small data-i18n="video.aqHint">Fewer blocks in flat areas.</small></label>
-          </div>
-          <div class="row">
-            <label class="check" id="foveatedRow"><input type="checkbox" data-setting="foveatedEncoding"><span data-i18n="video.foveated">Sharp center in VR</span><small id="foveatedHint" data-i18n="video.foveatedHint">Lighter edges. NVIDIA only.</small></label>
-          </div>
-          <div class="row">
-            <label class="check" id="twoPassRow"><input type="checkbox" data-setting="twoPassEncoding"><span data-i18n="video.twoPass">Two-pass encoding</span><small data-i18n="video.twoPassHint">Steadier motion, slower encode.</small></label>
-          </div>
-          <div class="row">
-            <h3 id="l-fec" data-i18n="video.fec">Repair lost packets</h3>
-            <div class="options" role="radiogroup" aria-labelledby="l-fec" aria-describedby="fecNote">
+            <h3 id="l-fec" data-i18n="video.fec">Packet recovery (FEC)</h3>
+            <div class="options" role="radiogroup" aria-labelledby="l-fec">
               <label><input type="radio" name="fecPercent" data-setting="fecPercent" value="0"><span data-i18n="video.fecOff">Off</span></label>
               <label><input type="radio" name="fecPercent" data-setting="fecPercent" value="3"><span data-i18n="video.fecLight">Light</span></label>
               <label><input type="radio" name="fecPercent" data-setting="fecPercent" value="5"><span data-i18n="video.fecBalanced">Balanced</span></label>
               <label><input type="radio" name="fecPercent" data-setting="fecPercent" value="10"><span data-i18n="video.fecStrong">Strong</span></label>
               <label><input type="radio" name="fecPercent" data-setting="fecPercent" value="20"><span data-i18n="video.fecMax">Maximum</span></label>
             </div>
-            <p class="note" id="fecNote" data-i18n="video.fecNote">Stronger repair costs bitrate.</p>
-          </div>
-          <div class="row">
-            <label class="check" id="fillModeRow"><input type="checkbox" data-setting="fillMode"><span data-i18n="video.fillMode">Sharper when frames drop</span><small data-i18n="video.fillModeHint">More bitrate per frame; floor 45 fps.</small></label>
           </div>
         </div>
       </section>

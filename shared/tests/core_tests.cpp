@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,7 @@
 #include "rc/audio_codec.h"
 #include "rc/connection.h"
 #include "rc/discovery.h"
+#include "rc/frame_generation.h"
 #include "rc/hand_skeleton.h"
 #include "rc/handshake.h"
 #include "rc/motion_field.h"
@@ -474,6 +476,89 @@ static void TestAudio() {
     for (int i = 0; i < 3; i++) jb.Pop(o.data(), 480);
     CHECK(jb.TargetMs() == 40);
     CHECK(jb.Pop(o.data(), 480) == 0);  // priming again, to the new target
+
+    // Guard check: Opus PLC must clamp maxFrameSamples <= 5760 and reject non-positive / null
+    // arguments so a malformed wire AudioPacketHeader::frameSamples cannot smash stack buffers.
+    std::vector<int16_t> guarded(5760 * 2 + 64, 0x5A5A);
+    const int plcClamped = dec.Decode(nullptr, 0, guarded.data(), 65535);
+    CHECK(plcClamped > 0 && plcClamped <= 5760);
+    for (size_t i = size_t(5760) * 2; i < guarded.size(); i++) CHECK(guarded[i] == 0x5A5A);
+    CHECK(dec.Decode(nullptr, 0, guarded.data(), 0) < 0);
+    CHECK(dec.Decode(nullptr, 0, guarded.data(), -10) < 0);
+    CHECK(dec.Decode(nullptr, 0, nullptr, 480) < 0);
+
+    // Overflow eviction & Clear(): bounded latency under burst pushes.
+    jb.Configure(2, 48000, 20, 60);  // max = 2880 frames (60 ms)
+    for (int i = 0; i < 12; i++) jb.Push(pcm.data(), 480);
+    CHECK(jb.BufferedFrames() <= 2880);
+    jb.Clear();
+    CHECK(jb.BufferedFrames() == 0);
+    CHECK(jb.Pop(o.data(), 480) == 0);
+
+    // Boundary & malformed-input hardening: negative/null/oversized pushes & invalid configs.
+    jb.Push(pcm.data(), -5);
+    CHECK(jb.BufferedFrames() == 0);
+
+    constexpr int kMaxFrames = 48000 * 60 / 1000;
+    constexpr int kCapFrames = kMaxFrames * 2;
+    std::vector<int16_t> bigPcm(size_t(kCapFrames) * 2 * 2);
+    for (int f = 0; f < kCapFrames * 2; f++) {
+        const int16_t val = (f < kCapFrames) ? int16_t(1111) : int16_t(2000 + ((f - kCapFrames) % 1000));
+        bigPcm[size_t(f) * 2] = val;
+        bigPcm[size_t(f) * 2 + 1] = val;
+    }
+    jb.Push(bigPcm.data(), kCapFrames * 2);
+    CHECK(jb.BufferedFrames() == kCapFrames);
+    std::vector<int16_t> tailOut(40 * 2, 0);
+    CHECK(jb.Pop(tailOut.data(), 40) == 40);
+    for (int f = 0; f < 40; f++) {
+        const int16_t expected = int16_t(2000 + (f % 1000));
+        CHECK(tailOut[size_t(f) * 2] == expected && tailOut[size_t(f) * 2 + 1] == expected);
+    }
+    CHECK(jb.BufferedFrames() == kCapFrames - 40);
+    jb.Push(pcm.data(), 480);
+    CHECK(jb.BufferedFrames() <= kMaxFrames);
+
+    jb.Clear();
+    jb.Push(nullptr, 480);
+    CHECK(jb.BufferedFrames() == 0);
+    CHECK(jb.Pop(nullptr, 480) == 0);
+    CHECK(jb.Pop(o.data(), -4) == 0);
+    CHECK(jb.Pop(o.data(), 0) == 0);
+
+    jb.Configure(0, 0, 20, 60);
+    CHECK(jb.TargetMs() == 0);
+    CHECK(jb.BufferedFrames() == 0);
+    jb.Push(pcm.data(), 480);
+    CHECK(jb.BufferedFrames() == 0);
+    std::fill(o.begin(), o.end(), int16_t(1234));
+    CHECK(jb.Pop(o.data(), 480) == 0);
+    CHECK(o[0] == 0 && o.back() == 0);
+
+    jb.Configure(9, 48000, 20, 60);
+    CHECK(jb.TargetMs() == 0 && jb.BufferedFrames() == 0);
+    jb.Configure(-2, 48000, 20, 60);
+    CHECK(jb.TargetMs() == 0 && jb.BufferedFrames() == 0);
+    jb.Configure(2, 48000, 20, -10);
+    CHECK(jb.TargetMs() == 0 && jb.BufferedFrames() == 0);
+    jb.Configure(2, 48000, 120, 60);
+    CHECK(jb.TargetMs() == 60);
+    jb.Configure(2, 48000, -10, 60);
+    CHECK(jb.TargetMs() == 0);
+    jb.Configure(2, 192000, 50, 20000);
+    CHECK(jb.TargetMs() == 50);
+    jb.Configure(2, 500, 1, 1);
+    CHECK(jb.BufferedFrames() == 0);
+    jb.Push(pcm.data(), 1);
+    CHECK(jb.BufferedFrames() == 1);
+
+    CHECK(enc.Encode(nullptr, 480, packet, sizeof(packet)) < 0);
+    CHECK(enc.Encode(pcm.data(), 480, nullptr, sizeof(packet)) < 0);
+    CHECK(enc.Encode(pcm.data(), 0, packet, sizeof(packet)) < 0);
+    CHECK(enc.Encode(pcm.data(), 480, packet, 0) < 0);
+    CHECK(enc.Encode(pcm.data(), -10, packet, sizeof(packet)) < 0);
+    AudioEncoder uninitEnc;
+    CHECK(uninitEnc.Encode(pcm.data(), 480, packet, sizeof(packet)) < 0);
 }
 
 // Reordering: parity first must not lose the frame's flags; pacing spreads a frame out.
@@ -589,7 +674,7 @@ struct LoopbackPair {
     DropPlan drop2, drop3;
     std::atomic<int> dropped{0};
 
-    bool Open() {
+    bool Open(size_t maxDatagram = kMaxDatagramLan) {
         if (!tx.Open(0) || !rx.Open(0)) return false;
         tx.SetBuffers(8 << 20, 1 << 20);
         rx.SetBuffers(1 << 20, 8 << 20);
@@ -599,9 +684,9 @@ struct LoopbackPair {
         auto ck = crypto::DeriveSessionKeys(client.secretKey, server.publicKey, client.publicKey, server.publicKey, ctx);
         auto sk = crypto::DeriveSessionKeys(server.secretKey, client.publicKey, client.publicKey, server.publicKey, ctx);
         sendConn = std::make_unique<Connection>(&tx, NetAddress{0x7F000001, rx.LocalPort()}, 7, sk, true,
-                                                kMaxDatagramLan);
+                                                maxDatagram);
         recvConn = std::make_unique<Connection>(&rx, NetAddress{0x7F000001, tx.LocalPort()}, 7, ck, false,
-                                                kMaxDatagramLan);
+                                                maxDatagram);
         reasm = std::make_unique<VideoReassembler>([this](ReceivedFrame&& f) {
             std::lock_guard lock(mutex);
             frames.push_back(std::move(f));
@@ -1261,8 +1346,491 @@ static void TestMotionRuns() {
     std::vector<uint8_t> stillRuns;
     rc::EncodeMotionRuns(still.data(), 1000, stillRuns);
     CHECK(stillRuns.size() < 16);
+    CHECK(rc::DecodeMotionRuns(stillRuns.data(), stillRuns.size(), 1000, back));
+    CHECK(back == still);
     CHECK(!rc::DecodeMotionRuns(runs.data(), runs.size() - 1, 1000, back));
     CHECK(!rc::DecodeMotionRuns(runs.data(), runs.size(), 999, back));
+    std::vector<int8_t> sentinel{7, -8};
+    const uint8_t tiny[2] = {255, 0};
+    CHECK(!rc::DecodeMotionRuns(tiny, sizeof(tiny), size_t(65535) * 65535, sentinel));
+    CHECK(sentinel == std::vector<int8_t>({7, -8}));
+    CHECK(!rc::DecodeMotionRuns(tiny, sizeof(tiny), (std::numeric_limits<size_t>::max)(), sentinel));
+    CHECK(sentinel == std::vector<int8_t>({7, -8}));
+
+    CHECK(rc::MotionFieldExtent(78, 32) == 2496.f);
+    CHECK(rc::MotionFieldUvScale(78, 32, 2496) == 1.f);
+    CHECK(rc::MotionFieldUvScale(78, 32, 1248) == 0.5f);
+    CHECK(rc::MotionFieldUvScale(78, 32, 0) == 0.f);
+    CHECK(rc::MotionFieldUvScale(0, 32, 2496) == 0.f);
+    CHECK(std::isfinite(rc::MotionFieldExtent(65535, 65535)));
+    CHECK(rc::MotionFieldExtent(65535, 65535) > 4e9f);
+    for (uint32_t outputWidth : {2496u, 2500u, 1248u}) {
+        constexpr uint32_t cells = 78, blockSize = 32;
+        const float scale = rc::MotionFieldUvScale(cells, blockSize, outputWidth);
+        for (uint32_t x = 0; x < outputWidth; x += 37) {
+            const float uv = (float(x) + 0.5f) / float(outputWidth);
+            const float shaderUv = std::clamp(uv * scale, 0.5f / cells, 1.f - 0.5f / cells);
+            const float sourceX = uv * outputWidth;
+            const float cpuCell = std::clamp(sourceX / blockSize - 0.5f, 0.f, float(cells - 1));
+            const float cpuUv = (cpuCell + 0.5f) / cells;
+            CHECK(std::fabs(shaderUv - cpuUv) < 1e-6f);
+        }
+    }
+    // Upscaling makes the swapchain larger than the PC picture; motion UV scaling
+    // must keep using the source picture dimensions rather than the upscaled swapchain.
+    {
+        constexpr uint32_t eyeW = 1440, eyeH = 1440, cellsW = (eyeW * 2) / 32, cellsH = eyeH / 32, blockSize = 32;
+        const float scale = rc::ResolveVrUpscale(true, 2064, eyeW, true);
+        CHECK(rc::MotionFieldUvScale(cellsW, blockSize, eyeW * 2) == 1.f);
+        CHECK(rc::MotionFieldUvScale(cellsH, blockSize, eyeH) == 1.f);
+        CHECK(rc::MotionFieldUvScale(cellsW, blockSize, uint32_t(float(eyeW * 2) * scale)) > 1.4f);
+        CHECK(rc::MotionFieldUvScale(cellsH, blockSize, uint32_t(float(eyeH) * scale)) > 1.4f);
+    }
+}
+
+static void TestMotionMetadataWireLimit() {
+    std::printf("motion metadata wire limit: ");
+    constexpr size_t baseBytes = sizeof(rc::VrFrameMetadata) + sizeof(rc::VrFoveationMetadata);
+    constexpr size_t wireLimit = std::numeric_limits<uint16_t>::max();
+    rc::MotionFieldMailbox mailbox;
+
+    std::vector<uint8_t> exactPacket(wireLimit - baseBytes, 0);
+    mailbox.Put(1, 1000, std::move(exactPacket), 1000);
+    std::vector<uint8_t> exactMeta(baseBytes, 0x5a);
+    bool rejectedOversize = true;
+    CHECK(rc::AttachMotionField(true, mailbox, 1, 1000, exactMeta, &rejectedOversize));
+    CHECK(!rejectedOversize && exactMeta.size() == wireLimit);
+    CHECK(mailbox.Stats().hits == 1);
+
+    mailbox.Put(1, 500, {9}, 500);
+    mailbox.Put(2, 2000, std::vector<uint8_t>(wireLimit - baseBytes + 1, 0), 2000);
+    std::vector<uint8_t> oversizedMeta(baseBytes, 0x5a);
+    const auto original = oversizedMeta;
+    const auto beforeReject = mailbox.Stats();
+    CHECK(!rc::AttachMotionField(true, mailbox, 2, 2000, oversizedMeta, &rejectedOversize));
+    CHECK(rejectedOversize && oversizedMeta == original);
+    const auto afterReject = mailbox.Stats();
+    CHECK(afterReject.hits == beforeReject.hits);
+    CHECK(afterReject.expired == beforeReject.expired);
+    CHECK(afterReject.pending == beforeReject.pending);
+    CHECK(afterReject.produced == beforeReject.produced);
+    CHECK(afterReject.misses == beforeReject.misses);
+    CHECK(afterReject.invalid == beforeReject.invalid);
+    CHECK(mailbox.HasTimestamp(1, 500) && mailbox.HasTimestamp(2, 2000));
+
+    std::vector<uint8_t> retryMeta(baseBytes - 1, 0x5a);
+    CHECK(rc::AttachMotionField(true, mailbox, 2, 2000, retryMeta, &rejectedOversize));
+    CHECK(!rejectedOversize && retryMeta.size() == wireLimit);
+    CHECK(mailbox.Stats().hits == beforeReject.hits + 1);
+    CHECK(mailbox.Stats().expired == beforeReject.expired + 1);
+    CHECK(mailbox.Stats().pending == 0);
+
+    constexpr uint16_t gridW = 256, gridH = 128;
+    std::vector<float> field(size_t(gridW) * gridH * 2, 12.f);
+    std::vector<int8_t> gridPrev;
+    std::vector<uint8_t> packet;
+    rc::AppendMotionPacket(gridW, gridH, 32, field, 3000, 100, gridPrev, packet);
+    CHECK(packet.size() == 65810);
+    mailbox.Put(3, 3000, std::move(packet), 3000);
+    std::vector<uint8_t> legalMaxMeta(baseBytes, 0x5a);
+    CHECK(!rc::AttachMotionField(true, mailbox, 3, 3000, legalMaxMeta, &rejectedOversize));
+    CHECK(rejectedOversize && legalMaxMeta == std::vector<uint8_t>(baseBytes, 0x5a));
+    std::printf("exact limit accepted, overflow preserved without stats or metadata changes, retry succeeds\n");
+}
+
+static void TestMotionTiming() {
+    std::printf("motion timing: ");
+    CHECK(rc::MotionPreviousTimestamp(100, 10) == 90);
+    CHECK(rc::MotionPreviousTimestamp(100, 22) == 78);
+    CHECK(rc::MotionPreviousTimestamp(100, 0) == 100);
+    CHECK(rc::MotionPreviousTimestamp(100, 101) == 100);
+    std::printf("ok\n");
+}
+
+static void TestMotionReadbackPairing() {
+    std::printf("motion readback pairing: ");
+    rc::MotionFieldMailbox mailbox;
+    std::vector<uint8_t> packet;
+    CHECK(!mailbox.TakeUnboundedForTest(100, 100, packet));
+    mailbox.Put(1, 0, {99}, 0);
+    mailbox.Put(2, 133, {3}, 1'000);
+    mailbox.Put(3, 111, {1}, 2'000);
+    mailbox.Put(4, 122, {2}, 3'000);
+    CHECK(!mailbox.TakeUnboundedForTest(5, 120, packet));
+    CHECK(mailbox.TakeUnboundedForTest(3, 111, packet) && packet == std::vector<uint8_t>{1});
+    CHECK(!mailbox.TakeUnboundedForTest(3, 111, packet));
+    CHECK(mailbox.TakeUnboundedForTest(4, 122, packet) && packet == std::vector<uint8_t>{2});
+    CHECK(!mailbox.TakeUnboundedForTest(2, 133, packet) && packet == std::vector<uint8_t>{2});
+
+    rc::MotionHeader h{};
+    h.gridWidth = 78;
+    h.gridHeight = 41;
+    h.blockSize = 32;
+    h.previousTimestampNs = rc::MotionPreviousTimestamp(122, 22);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&h);
+    mailbox.Put(6, 122, std::vector<uint8_t>(bytes, bytes + sizeof(h)), 4'000);
+    CHECK(!mailbox.TakeUnboundedForTest(7, 133, packet));
+    CHECK(mailbox.TakeUnboundedForTest(6, 122, packet));
+    CHECK(packet.size() == sizeof(h));
+    rc::MotionHeader decoded{};
+    std::memcpy(&decoded, packet.data(), sizeof(decoded));
+    CHECK(decoded.previousTimestampNs == 100);
+    CHECK(decoded.gridWidth == 78 && decoded.gridHeight == 41 && decoded.blockSize == 32);
+
+    for (uint64_t timestamp = 200; timestamp <= 200 + rc::MotionFieldMailbox::kCapacity; timestamp++)
+        mailbox.Put(timestamp, timestamp, {uint8_t(timestamp)}, 5'000 + timestamp);
+    CHECK(!mailbox.TakeUnboundedForTest(200, 200, packet));
+    CHECK(mailbox.TakeUnboundedForTest(201, 201, packet) && packet == std::vector<uint8_t>{201});
+    mailbox.Clear();
+    CHECK(!mailbox.TakeUnboundedForTest(202, 202, packet));
+    std::printf("exact frame/endpoint match, stale rejection, bounded FIFO\n");
+}
+
+static void TestMotionMailboxStats() {
+    std::printf("motion mailbox stats: ");
+    rc::MotionFieldMailbox mailbox;
+    std::vector<uint8_t> packet{99};
+    CHECK(!mailbox.TakeUnboundedForTest(100, 100, packet) && packet == std::vector<uint8_t>{99});
+    mailbox.Put(1, 0, {1}, 0);
+    mailbox.Put(2, 10, {1}, 1'000);
+    mailbox.Put(3, 20, {2}, 2'000);
+    mailbox.Put(4, 30, {3}, 3'000);
+    auto stats = mailbox.Stats();
+    CHECK(stats.invalid == 1 && stats.produced == 3 && stats.misses == 1);
+    CHECK(stats.pending == 3 && stats.oldestTimestampNs == 10 && stats.newestTimestampNs == 30);
+    CHECK(stats.oldestEnqueuedNs == 1'000 && stats.newestEnqueuedNs == 3'000);
+    CHECK(mailbox.TakeUnboundedForTest(3, 20, packet) && packet == std::vector<uint8_t>{2});
+    CHECK(!mailbox.TakeUnboundedForTest(3, 20, packet) && packet == std::vector<uint8_t>{2});
+    stats = mailbox.Stats();
+    CHECK(stats.hits == 1 && stats.misses == 2 && stats.expired == 1);
+    CHECK(stats.pending == 1 && stats.oldestTimestampNs == 30 && stats.newestTimestampNs == 30);
+    CHECK(stats.oldestEnqueuedNs == 3'000 && stats.newestEnqueuedNs == 3'000);
+
+    for (uint64_t timestamp = 100; timestamp <= 100 + rc::MotionFieldMailbox::kCapacity; timestamp++)
+        mailbox.Put(timestamp, timestamp, {uint8_t(timestamp)}, 5'000 + timestamp);
+    stats = mailbox.Stats();
+    CHECK(stats.evicted == 2 && stats.pending == rc::MotionFieldMailbox::kCapacity);
+    CHECK(stats.oldestTimestampNs == 101 && stats.newestTimestampNs == 100 + rc::MotionFieldMailbox::kCapacity);
+    CHECK(stats.oldestEnqueuedNs == 5'101 && stats.newestEnqueuedNs == 5'000 + 100 + rc::MotionFieldMailbox::kCapacity);
+    CHECK(mailbox.TakeUnboundedForTest(102, 102, packet));
+    mailbox.Clear();
+    stats = mailbox.Stats();
+    CHECK(stats.cleared == rc::MotionFieldMailbox::kCapacity - 2 && stats.pending == 0);
+    CHECK(stats.oldestTimestampNs == 0 && stats.newestTimestampNs == 0);
+    CHECK(stats.oldestEnqueuedNs == 0 && stats.newestEnqueuedNs == 0);
+    std::printf("produced, attached, missed, expired, evicted, cleared, invalid, producer-clock age\n");
+}
+
+static void TestMotionMailboxIdentity() {
+    std::printf("motion mailbox frame identity: ");
+    rc::MotionFieldMailbox mailbox;
+    std::vector<uint8_t> packet;
+    mailbox.Put(10, 1000, {1}, 100);
+    mailbox.Put(11, 1000, {2}, 200);
+    CHECK(mailbox.Stats().pending == 2);
+    CHECK(mailbox.TakeUnboundedForTest(10, 1000, packet) && packet == std::vector<uint8_t>{1});
+    CHECK(mailbox.TakeUnboundedForTest(11, 1000, packet) && packet == std::vector<uint8_t>{2});
+
+    mailbox.Put(20, 500, {3}, 300);
+    mailbox.Put(21, 400, {4}, 400);
+    CHECK(mailbox.TakeUnboundedForTest(20, 500, packet) && packet == std::vector<uint8_t>{3});
+    CHECK(mailbox.HasTimestamp(21, 400));
+    CHECK(mailbox.TakeUnboundedForTest(21, 400, packet) && packet == std::vector<uint8_t>{4});
+
+    mailbox.Put(30, 700, {5}, 500);
+    CHECK(!mailbox.TakeUnboundedForTest(30, 701, packet));
+    CHECK(mailbox.Stats().invalid == 1 && mailbox.Stats().pending == 1);
+    CHECK(mailbox.TakeUnboundedForTest(30, 700, packet) && packet == std::vector<uint8_t>{5});
+    std::printf("duplicate targets, rewound targets and endpoint mismatch ok\n");
+}
+
+static void TestMotionHeaderFailureDiagnostics() {
+    std::printf("motion header failure diagnostics: ");
+    constexpr uint64_t targetNs = 100;
+    auto meta = std::vector<uint8_t>(sizeof(rc::VrFrameMetadata) + sizeof(rc::MotionHeader), 0);
+    auto* header = reinterpret_cast<rc::MotionHeader*>(meta.data() + sizeof(rc::VrFrameMetadata));
+    header->gridWidth = 1;
+    header->gridHeight = 1;
+    header->blockSize = 32;
+    header->previousTimestampNs = 90;
+    rc::HeadsetMotionState hs;
+    const auto check = [&](uint8_t expected) {
+        const auto res = rc::DecodeVrMotionMetadata(true, false, targetNs, meta, hs);
+        CHECK(!res.decoded && res.failureStage == 2 && res.headerFailure == expected);
+        CHECK(!hs.moves && !hs.consistent && hs.frameNs == 0);
+    };
+    header->gridWidth = 0;
+    check(rc::kMotionHeaderZeroWidth);
+    header->gridWidth = 1;
+    header->gridHeight = 0;
+    check(rc::kMotionHeaderZeroHeight);
+    header->gridHeight = 1;
+    header->blockSize = 0;
+    check(rc::kMotionHeaderZeroBlock);
+    header->blockSize = 32;
+    header->previousTimestampNs = targetNs;
+    check(rc::kMotionHeaderNonAdvancingTimestamp);
+    header->previousTimestampNs = targetNs + 1;
+    check(rc::kMotionHeaderNonAdvancingTimestamp);
+    header->gridWidth = header->gridHeight = header->blockSize = 0;
+    check(rc::kMotionHeaderFailureMask);
+    header->gridWidth = header->gridHeight = 4;
+    header->blockSize = 32;
+    header->previousTimestampNs = 90;
+    meta.insert(meta.end(), {0, 16});
+    for (int i = 0; i < 16; i++) meta.insert(meta.end(), {2, 0});
+    const auto good = rc::DecodeVrMotionMetadata(true, false, targetNs, meta, hs);
+    CHECK(good.decoded && good.failureStage == 0 && good.headerFailure == 0 && hs.consistent);
+    const auto shortRes = rc::DecodeVrMotionMetadata(true, false, targetNs,
+        std::vector<uint8_t>(sizeof(rc::VrFrameMetadata)), hs);
+    CHECK(shortRes.failureStage == 1 && shortRes.headerFailure == 0);
+    std::printf("individual and combined stage-2 causes without relaxed validation ok\n");
+}
+
+// Every block gets a direction no 8-neighbour shares (types sit on one parity class each), so a
+// field of pure matching noise must come out empty.
+static void FillScatteredNoise(std::vector<int8_t>& grid, int w, int h, size_t skipFrom = size_t(-1),
+                               size_t skipBlocks = 0) {
+    grid.assign(size_t(w) * size_t(h) * 2, 0);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            const size_t block = size_t(y) * size_t(w) + size_t(x);
+            if (block >= skipFrom && block < skipFrom + skipBlocks) continue;
+            const int8_t vx = (x % 2) ? -1 : (y % 2 ? 0 : 1);
+            const int8_t vy = (y % 2) ? ((x % 2) ? -1 : 1) : 0;
+            grid[block * 2] = vx;
+            grid[block * 2 + 1] = vy;
+        }
+    }
+}
+
+static void TestMotionFieldLocalConsensus() {
+    std::printf("motion field local consensus: ");
+    constexpr int w = 6, h = 3;
+    std::vector<int8_t> grid;
+
+    // Scattered noise: every block has zero agreeing neighbours -> whole field clears.
+    FillScatteredNoise(grid, w, h);
+    auto gate = rc::JudgeMotionField(grid, w, h);
+    CHECK(!gate.worth);
+    rc::FilterMotionFieldLocalConsensus(grid, w, h);
+    CHECK(std::all_of(grid.begin(), grid.end(), [](int8_t v) { return v == 0; }));
+
+    // A 2x2 patch is the smallest thing that survives (3 agreeing neighbours each).
+    FillScatteredNoise(grid, w, h, 0, 0);
+    const size_t patch[4] = {0, 1, size_t(w), size_t(w) + 1};  // (0,0) (1,0) (0,1) (1,1)
+    for (size_t block : patch) {
+        grid[block * 2] = 3;
+        grid[block * 2 + 1] = -2;
+    }
+    rc::FilterMotionFieldLocalConsensus(grid, w, h);
+    for (size_t block : patch) CHECK(grid[block * 2] == 3 && grid[block * 2 + 1] == -2);
+    CHECK(grid[(size_t(2) * size_t(w) + size_t(2)) * 2] == 0);  // far noise stays cleared
+
+    // The eye seam is not a support surface: (2,1) in the left eye only has right-eye company.
+    std::vector<int8_t> seam(size_t(w) * size_t(h) * 2, 0);
+    const auto set = [&](int x, int y, int8_t vx, int8_t vy) {
+        seam[(size_t(y) * size_t(w) + size_t(x)) * 2] = vx;
+        seam[(size_t(y) * size_t(w) + size_t(x)) * 2 + 1] = vy;
+    };
+    set(2, 1, 1, 0);  // left eye, rightmost column
+    set(3, 0, 1, 0);
+    set(3, 1, 1, 0);  // right eye, leftmost column
+    set(3, 2, 1, 0);
+    rc::FilterMotionFieldLocalConsensus(seam, w, h);
+    CHECK(seam[(size_t(1) * size_t(w) + size_t(2)) * 2] == 0);  // would survive if eyes mixed
+    CHECK(seam[(size_t(1) * size_t(w) + size_t(3)) * 2] == 0);
+
+    // Degenerate geometry and short buffers are no-ops, not reads past the end.
+    std::vector<int8_t> shortGrid(3, 7);
+    rc::FilterMotionFieldLocalConsensus(shortGrid, w, h);
+    CHECK(shortGrid == std::vector<int8_t>(3, 7));
+    std::vector<int8_t> empty;
+    rc::FilterMotionFieldLocalConsensus(empty, 0, 0);
+    CHECK(empty.empty());
+    std::printf("noise cleared, 2x2 kept, eyes isolated, guards hold\n");
+}
+
+static void TestMotionFilterRunsBeforeUpload() {
+    std::printf("motion filter runs before upload: ");
+    constexpr int w = 4, h = 4;
+    std::vector<int8_t> grid;
+    rc::HeadsetMotionState hs;
+    const auto decode = [&](const std::vector<int8_t>& field) {
+        std::vector<uint8_t> meta(sizeof(rc::VrFrameMetadata), 0);
+        rc::MotionHeader header{};
+        header.gridWidth = uint16_t(w);
+        header.gridHeight = uint16_t(h);
+        header.blockSize = 32;
+        header.previousTimestampNs = 90;
+        const auto* bytes = reinterpret_cast<const uint8_t*>(&header);
+        meta.insert(meta.end(), bytes, bytes + sizeof(header));
+        std::vector<uint8_t> runs;
+        rc::EncodeMotionRuns(field.data(), size_t(w) * size_t(h), runs);
+        meta.insert(meta.end(), runs.begin(), runs.end());
+        return rc::DecodeVrMotionMetadata(true, false, 100, meta, hs);
+    };
+
+    FillScatteredNoise(grid, w, h);
+    auto res = decode(grid);
+    CHECK(res.decoded && !res.gate.worth && !hs.consistent);
+    CHECK(!hs.moves && !res.uploadMotion);  // pure noise must never reach the GPU
+
+    // A real 2x2 object survives the cleaning; the noise around it does not.
+    FillScatteredNoise(grid, w, h, 0, 0);
+    const size_t patch[4] = {0, 1, size_t(w), size_t(w) + 1};
+    for (size_t block : patch) {
+        grid[block * 2] = 2;
+        grid[block * 2 + 1] = 0;
+    }
+    res = decode(grid);
+    CHECK(res.decoded && !res.gate.worth);
+    CHECK(res.uploadMotion && hs.moves);
+    for (size_t block : patch) CHECK(hs.grid[block * 2] == 2 && hs.grid[block * 2 + 1] == 0);
+    CHECK(hs.grid[(size_t(3) * size_t(w) + size_t(3)) * 2] == 0);
+    CHECK(!hs.consistent);  // the gate's verdict is untouched: only the upload changed
+    std::printf("noise dropped, local object kept, gate verdict untouched\n");
+}
+
+static void TestMotionDiagnosticPolicy() {
+    std::printf("motion diagnostic policy: ");
+    rc::MotionMailboxStats quiet{};
+    CHECK(!rc::MotionMailboxHasActivity(quiet, quiet));
+    quiet.pending = 1;
+    CHECK(rc::MotionMailboxHasActivity(quiet, {}));
+    quiet = {};
+    for (auto member : {&rc::MotionMailboxStats::produced, &rc::MotionMailboxStats::hits,
+                        &rc::MotionMailboxStats::misses, &rc::MotionMailboxStats::expired,
+                        &rc::MotionMailboxStats::evicted, &rc::MotionMailboxStats::cleared,
+                        &rc::MotionMailboxStats::invalid}) {
+        rc::MotionMailboxStats active{};
+        active.*member = 1;
+        CHECK(rc::MotionMailboxHasActivity(active, quiet));
+    }
+    CHECK(rc::ShouldLogMotionDiagnostics(false, false, false, false));
+    CHECK(rc::ShouldLogMotionDiagnostics(true, false, true, false));
+    CHECK(rc::ShouldLogMotionDiagnostics(false, false, true, true));
+    CHECK(rc::ShouldLogMotionDiagnostics(false, true, true, false));
+    CHECK(rc::ShouldLogMotionDiagnostics(true, true, true, true));
+    CHECK(!rc::ShouldLogMotionDiagnostics(false, false, true, false));
+    std::printf("first observation, enable transitions, activity and quiet disabled windows ok\n");
+}
+
+static void TestMotionProductionAttachmentPath() {
+    std::printf("motion production attachment: ");
+    constexpr uint16_t kW = 8, kH = 4, kBlock = 32;
+    constexpr size_t kBlocks = size_t(kW) * kH;
+    rc::MotionFieldMailbox mailbox;
+    std::vector<int8_t> gridPrev;
+    std::vector<float> field(kBlocks * 2, 0.f);
+    for (size_t b = 0; b < kBlocks; b++) field[b * 2] = 12.f;
+
+    // Rejected publish gates must neither enqueue nor mutate hysteresis state.
+    CHECK(!rc::PublishMotionField(mailbox, false, {1000, 100, 1}, kW, kH, kBlock, field, gridPrev, 5000));
+    CHECK(!rc::PublishMotionField(mailbox, true, {0, 100, 2}, kW, kH, kBlock, field, gridPrev, 5000));
+    CHECK(!rc::PublishMotionField(mailbox, true, {1000, 0, 3}, kW, kH, kBlock, field, gridPrev, 5000));
+    CHECK(!rc::PublishMotionField(mailbox, true, {1000, 100, 0}, kW, kH, kBlock, field, gridPrev, 5000));
+    CHECK(!rc::PublishMotionField(mailbox, true, {1000, 100, 1}, 0, kH, kBlock, field, gridPrev, 5000));
+    CHECK(!rc::PublishMotionField(mailbox, true, {1000, 100, 1}, kW, 0, kBlock, field, gridPrev, 5000));
+    CHECK(!rc::PublishMotionField(mailbox, true, {1000, 100, 1}, kW, kH, 0, field, gridPrev, 5000));
+    CHECK(!rc::PublishMotionField(mailbox, true, {1000, 1001, 1}, kW, kH, kBlock, field, gridPrev, 5000));
+    CHECK(!rc::PublishMotionField(mailbox, true, {1000, 100, 1}, kW, kH, kBlock,
+                                  std::vector<float>(field.size() - 1, 0.f), gridPrev, 5000));
+    CHECK(!rc::PublishMotionField(mailbox, true, {1000, 100, 1}, kW, kH, kBlock,
+                                  std::vector<float>(field.size() + 1, 0.f), gridPrev, 5000));
+    CHECK(gridPrev.empty());
+    CHECK(mailbox.Stats().produced == 0);
+
+    // Disabled motion field must not consume mailbox entries or count misses.
+    CHECK(rc::PublishMotionField(mailbox, true, {1000, 100, 4}, kW, kH, kBlock, field, gridPrev, 5000));
+    std::vector<uint8_t> disabledMeta(sizeof(rc::VrFrameMetadata), 0);
+    CHECK(!rc::AttachMotionField(false, mailbox, 4, 1000, disabledMeta));
+    CHECK(!rc::AttachMotionField(false, mailbox, 99, 9999, disabledMeta));
+    CHECK(disabledMeta.size() == sizeof(rc::VrFrameMetadata));
+    auto stats = mailbox.Stats();
+    CHECK(stats.produced == 1 && stats.hits == 0 && stats.misses == 0 && stats.pending == 1);
+
+    // Multi-frame hysteresis + out-of-order expiration + metadata attachment + wire decode.
+    std::vector<float> frame2Field(kBlocks * 2, 0.f);
+    for (size_t b = 0; b < kBlocks; b++)
+        frame2Field[b * 2] = ((b / kW + b % kW) & 1) == 0 ? 8.f : 1.f;
+    CHECK(rc::PublishMotionField(mailbox, true, {2000, 111, 5}, kW, kH, kBlock, frame2Field, gridPrev, 6000));
+
+    // Attach frame 2000 right after VrFrameMetadata + VrFoveationMetadata; 1000 expires cleanly.
+    std::vector<uint8_t> frameMeta(sizeof(rc::VrFrameMetadata) + sizeof(rc::VrFoveationMetadata), 0x42);
+    CHECK(rc::AttachMotionField(true, mailbox, 5, 2000, frameMeta));
+    CHECK(frameMeta.size() > sizeof(rc::VrFrameMetadata) + sizeof(rc::VrFoveationMetadata) + sizeof(rc::MotionHeader));
+    stats = mailbox.Stats();
+    CHECK(stats.produced == 2 && stats.hits == 1 && stats.expired == 1 && stats.misses == 0 && stats.pending == 0);
+
+    // Unmatched frame increments misses without modifying frameMeta.
+    const size_t beforeMiss = frameMeta.size();
+    CHECK(!rc::AttachMotionField(true, mailbox, 99, 3000, frameMeta));
+    CHECK(frameMeta.size() == beforeMiss);
+    CHECK(mailbox.Stats().misses == 1);
+
+    // Decode the attached payload exactly as App::ReadMotion does.
+    const size_t at = sizeof(rc::VrFrameMetadata) + sizeof(rc::VrFoveationMetadata);
+    rc::MotionHeader hdr{};
+    std::memcpy(&hdr, frameMeta.data() + at, sizeof(hdr));
+    CHECK(hdr.gridWidth == kW && hdr.gridHeight == kH && hdr.blockSize == kBlock);
+    CHECK(hdr.previousTimestampNs == 1889);
+    std::vector<int8_t> decoded;
+    const size_t runsAt = at + sizeof(hdr);
+    CHECK(rc::DecodeMotionRuns(frameMeta.data() + runsAt, frameMeta.size() - runsAt, kBlocks, decoded));
+    CHECK(decoded == gridPrev);
+    // Half moving (true checkerboard cells, no connected majority) is rejected by JudgeMotionField.
+    CHECK(!rc::JudgeMotionField(decoded, kW, kH).worth);
+
+    // Coherent majority field attaches after plain VrFrameMetadata and passes JudgeMotionField.
+    std::vector<float> frame3Field(kBlocks * 2, 0.f);
+    for (size_t b = 0; b < kBlocks; b++) frame3Field[b * 2] = (b < (kBlocks * 3) / 4) ? 12.f : 0.f;
+    CHECK(rc::PublishMotionField(mailbox, true, {3000, 100, 6}, kW, kH, kBlock, frame3Field, gridPrev, 7000));
+    std::vector<uint8_t> plainMeta(sizeof(rc::VrFrameMetadata), 0x11);
+    CHECK(rc::AttachMotionField(true, mailbox, 6, 3000, plainMeta));
+    std::memcpy(&hdr, plainMeta.data() + sizeof(rc::VrFrameMetadata), sizeof(hdr));
+    CHECK(hdr.previousTimestampNs == 2900);
+    CHECK(rc::DecodeMotionRuns(plainMeta.data() + sizeof(rc::VrFrameMetadata) + sizeof(hdr),
+                               plainMeta.size() - sizeof(rc::VrFrameMetadata) - sizeof(hdr), kBlocks, decoded));
+    const rc::MotionGate coherentGate = rc::JudgeMotionField(decoded, kW, kH);
+    CHECK(coherentGate.worth && coherentGate.global == 3);
+
+    // Non-mutating lookup + shared-target interval resolution.
+    CHECK(!mailbox.HasTimestamp(7, 4000));
+    CHECK(rc::PublishMotionField(mailbox, true, {4000, 100, 7}, kW, kH, kBlock, frame3Field, gridPrev, 8000));
+    CHECK(mailbox.HasTimestamp(7, 4000));
+    CHECK(mailbox.Stats().misses == 1);  // HasTimestamp must not count as a miss
+    CHECK(rc::ResolveMotionIntervalNs(1'000'000'000, 0, 500'000'000, 400'000'000, 13'000'000) == 0);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'014'000'000, 1'000'000'000'000, 500'000'000, 400'000'000, 13'000'000) == 14'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'014'000'000, 1'000'000'000'000, 500'000'000, 400'000'000, 0) == 14'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'000'000'000, 1'000'000'000'000, 508'000'000, 500'000'000, 13'000'000) == 13'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'000'000'000, 1'000'000'000'000, 500'200'000, 500'000'000, 13'000'000) == 13'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(999'999'999'999, 1'000'000'000'000, 500'200'000, 500'000'000, 13'000'000) == 13'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'000'000'000, 1'000'000'000'000, 508'000'000, 500'000'000, 0) == 8'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'000'000'000, 1'000'000'000'000, 500'200'000, 500'000'000, 0) == 4'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'000'000'000, 1'000'000'000'000, 0, 0, 13'000'000) == 13'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'000'200'000, 1'000'000'000'000, 0, 0, 0) == 4'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'250'000'000, 1'000'000'000'000, 0, 0, 13'000'000) == 13'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'250'000'000, 1'000'000'000'000, 0, 0, 0) == 200'000'000);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'000'000'000, 1'000'000'000'000, 0, 0, 1'000'000) == 0);
+    CHECK(rc::ResolveMotionIntervalNs(1'000'000'000'000, 1'000'000'000'000, 508'000'000, 500'000'000, 250'000'000) == 8'000'000);
+    std::printf("ok\n");
+}
+
+static void TestMotionFrameGapReset() {
+    std::printf("motion frame-gap reset: ");
+    CHECK(!rc::ShouldResetMotionPrevious(0, 0, false));
+    CHECK(!rc::ShouldResetMotionPrevious(11, 10, false));
+    CHECK(!rc::ShouldResetMotionPrevious(12, 10, true));
+    CHECK(rc::ShouldResetMotionPrevious(12, 10, false));
+    CHECK(rc::ShouldResetMotionPrevious(13, 10, true));
+    CHECK(!rc::ShouldResetMotionPrevious(11, 10, true));
+    CHECK(rc::ShouldResetMotionPrevious(10, 10, false));
+    CHECK(rc::ShouldResetMotionPrevious(9, 10, false));
+    CHECK(rc::ShouldResetMotionPrevious(0, 10, false));
+    CHECK(!rc::ShouldResetMotionPrevious(0xFFFFFFFFu, 0xFFFFFFFEu, false));
+    CHECK(rc::ShouldResetMotionPrevious(0xFFFFFFFFu, 0xFFFFFFFFu, true));
+    std::printf("consecutive, deliberate two-frame skip, unexpected gap, rewind and wraparound ok\n");
 }
 
 // A18 (TASK-MOTION-HYSTERESIS-2026-11-22): the Schmidt hysteresis that keeps block-matching
@@ -1403,7 +1971,7 @@ static void TestMotionGate() {
         auto grid = liveShaped(moving);
         const rc::MotionGate gate = rc::JudgeMotionField(grid, w, h);
         CHECK(!gate.worth);
-        CHECK(gate.global == 0);
+        CHECK(gate.global > 0);
         CHECK(gate.moving == moving);
     }
     {
@@ -1416,7 +1984,74 @@ static void TestMotionGate() {
     }
     {
         auto grid = make(3, -1, blocks * 2 / 5);
-        CHECK(!rc::JudgeMotionField(grid, w, h).worth);
+        const auto gate = rc::JudgeMotionField(grid, w, h);
+        CHECK(gate.worth);
+        CHECK(gate.global == 4);
+        CHECK(gate.coherent == blocks * 2 / 5);
+        CHECK(gate.spread == 0);
+    }
+    {
+        auto grid = make(0, 0, 0);
+        constexpr int x0 = 30, y0 = 30, side = 24;
+        for (int y = y0; y < y0 + side; y++) {
+            for (int x = x0; x < x0 + side; x++) {
+                const size_t i = (size_t(y) * w + size_t(x)) * 2;
+                grid[i] = 2;
+                grid[i + 1] = -1;
+            }
+        }
+        const auto gate = rc::JudgeMotionField(grid, w, h);
+        CHECK(gate.worth);
+        CHECK(gate.global == 3);
+        CHECK(gate.moving == side * side);
+        CHECK(gate.coherent == side * side && gate.spread == 0);
+    }
+    {
+        constexpr int liveW = 168, liveH = 84, liveBlocks = liveW * liveH;
+        constexpr int x0 = 60, y0 = 20, side = 32;
+        std::vector<int8_t> grid(size_t(liveBlocks) * 2, 0);
+        for (int y = y0; y < y0 + side; y++) {
+            for (int x = x0; x < x0 + side; x++) {
+                const size_t i = (size_t(y) * liveW + size_t(x)) * 2;
+                grid[i] = 2;
+                grid[i + 1] = -1;
+            }
+        }
+        const auto gate = rc::JudgeMotionField(grid, liveW, liveH);
+        CHECK(gate.worth);
+        CHECK(gate.global == 3);
+        CHECK(gate.moving == side * side);
+        CHECK(gate.coherent == side * side && gate.spread == 0);
+    }
+    {
+        constexpr int liveW = 168, liveH = 84, liveBlocks = liveW * liveH;
+        std::vector<int8_t> grid(size_t(liveBlocks) * 2, 0);
+        size_t at = 0;
+        const auto fill = [&](int count, int x) {
+            for (int i = 0; i < count; i++, at++) grid[at * 2] = int8_t(x);
+        };
+        fill(727, 1);
+        fill(261, 3);
+        fill(261, -3);
+        const auto gate = rc::JudgeMotionField(grid, liveW, liveH);
+        CHECK(gate.worth);
+        CHECK(gate.moving == 1249 && gate.global == 1);
+        CHECK(gate.coherent == 988 && gate.spread == 261);
+    }
+    {
+        auto grid = make(0, 0, 0);
+        constexpr int side = 8;
+        for (int y = 20; y < 20 + side; y++) {
+            for (int x = 20; x < 20 + side; x++) {
+                const size_t i = (size_t(y) * w + size_t(x)) * 2;
+                grid[i] = 3;
+                grid[i + 1] = -1;
+            }
+        }
+        const auto gate = rc::JudgeMotionField(grid, w, h);
+        CHECK(!gate.worth);
+        CHECK(gate.global == 4);
+        CHECK(gate.moving == side * side && gate.coherent == side * side);
     }
     {
         auto grid = make(0, 0, 0);
@@ -1424,7 +2059,20 @@ static void TestMotionGate() {
             grid[2 * i] = int8_t(i % 2 ? -5 : 5);
             grid[2 * i + 1] = int8_t(i % 3 ? -2 : 2);
         }
-        CHECK(!rc::JudgeMotionField(grid, w, h).worth);
+        const auto gate = rc::JudgeMotionField(grid, w, h);
+        CHECK(!gate.worth);
+    }
+    {
+        auto grid = make(0, 0, 0);
+        for (int y = 0; y < h; y += 2) {
+            for (int x = 0; x < w; x += 2) {
+                const size_t i = (size_t(y) * w + size_t(x)) * 2;
+                grid[i] = 3;
+            }
+        }
+        const auto gate = rc::JudgeMotionField(grid, w, h);
+        CHECK(!gate.worth);
+        CHECK(gate.global == 3);
     }
     {
         auto grid = make(3, -1, blocks * 7 / 10);
@@ -1435,11 +2083,420 @@ static void TestMotionGate() {
         for (int i = blocks * 7 / 10; i < blocks * 4 / 5; i++) CHECK(grid[2 * i] == 0);
     }
     {
+        constexpr int liveW = 168, liveH = 84, liveBlocks = liveW * liveH;
+        std::vector<float> field(size_t(liveBlocks) * 2, 0.f);
+        for (int i = 0; i < 11039; i++) field[size_t(i) * 2] = i < 825 ? 40.f : 8.f;
+        std::vector<int8_t> grid;
+        rc::ApplyMotionHysteresis(field, grid);
+        std::vector<uint8_t> runs;
+        std::vector<int8_t> decoded;
+        rc::EncodeMotionRuns(grid.data(), liveBlocks, runs);
+        CHECK(rc::DecodeMotionRuns(runs.data(), runs.size(), liveBlocks, decoded));
+        const auto gate = rc::JudgeMotionField(decoded, liveW, liveH);
+        CHECK(gate.worth);
+        CHECK(gate.moving == 11039 && gate.mean == 2 && gate.spread == 825);
+        CHECK(gate.coherent == 10214 && gate.global == 2);
+        rc::GenerationInput in;
+        in.enabled = in.vr = in.hasFrame = in.swapchain = in.motionMoves = in.motionConsistent = true;
+        in.motionFrameNs = in.sinceFrameNs = in.motionIntervalSmoothNs = 22'222'222;
+        in.displayNs = 11'111'111;
+        in.externalReady = true;
+        in.fieldWidth = 5376;
+        in.fieldHeight = 2688;
+        rc::FrameGenerationQuota quota;
+        quota.Arm(true);
+        const auto decision = rc::DecideFrameGeneration(quota, in);
+        CHECK(decision.draw && decision.reason == rc::GenerationRejectReason::None);
+        rc::FrameGenerationStats stats;
+        stats.Record(decision);
+        CHECK(stats.attempts == 1 && stats.generated == 1 && stats.RejectedFps(1) == 0);
+    }
+    {
+        auto grid = liveShaped(5687);
+        std::vector<float> field(grid.size());
+        for (size_t i = 0; i < grid.size(); i++) field[i] = float(grid[i]) * rc::kMotionUnitPixels;
+        std::vector<int8_t> quantized;
+        rc::ApplyMotionHysteresis(field, quantized);
+        std::vector<uint8_t> runs;
+        std::vector<int8_t> decoded;
+        rc::EncodeMotionRuns(quantized.data(), blocks, runs);
+        CHECK(rc::DecodeMotionRuns(runs.data(), runs.size(), blocks, decoded));
+        const auto gate = rc::JudgeMotionField(decoded, w, h);
+        CHECK(!gate.worth);
+        rc::GenerationInput in;
+        in.enabled = in.vr = in.hasFrame = in.swapchain = in.motionMoves = true;
+        in.motionConsistent = gate.worth;
+        in.motionFrameNs = in.sinceFrameNs = 22'222'222;
+        in.externalReady = true;
+        in.fieldWidth = 2688;
+        in.fieldHeight = 2688;
+        rc::FrameGenerationQuota quota;
+        quota.Arm(true);
+        const auto decision = rc::DecideFrameGeneration(quota, in);
+        CHECK(decision.attempt && !decision.draw && decision.inconsistent);
+        CHECK(decision.reason == rc::GenerationRejectReason::InconsistentMotion);
+        rc::FrameGenerationStats stats;
+        stats.Record(decision);
+        CHECK(stats.attempts == 1 && stats.generated == 0 && stats.RejectedFps(1) == 1);
+        CHECK(stats.rejected[size_t(decision.reason)] == 1);
+    }
+    {
         auto grid = make(1, 0, 0);
         CHECK(!rc::JudgeMotionField(grid, 0, h).worth);
         CHECK(!rc::JudgeMotionField(grid, w, h).worth);
     }
-    std::printf("motion gate: live-shaped false fields rejected, coherent pan accepted\n");
+    std::printf("motion gate: connected local motion accepted, false fields rejected, recorded live field and wire-to-generation path accepted\n");
+}
+
+static void TestMotionGateExternalRegressions() {
+    std::printf("motion gate external regressions: ");
+    constexpr int w = 168, h = 84, blocks = w * h;
+    {
+        std::vector<int8_t> grid(size_t(blocks) * 2, 0);
+        for (int eye = 0; eye < 2; eye++) {
+            for (int y = 20; y < 40; y++) {
+                for (int x = 20; x < 40; x++) {
+                    const size_t at = (size_t(y) * w + size_t(eye * 84 + x)) * 2;
+                    grid[at] = 2;
+                }
+            }
+        }
+        for (int i = 0; i < 4; i++) grid[size_t(i) * 2] = 2;
+        const auto gate = rc::JudgeMotionField(grid, w, h);
+        CHECK(gate.worth);
+        CHECK(gate.moving == 804 && gate.coherent == 804 && gate.spread == 0);
+    }
+    {
+        std::vector<int8_t> seamGrid(size_t(6) * 2, 0);
+        for (size_t i = 0; i < 6; i++) seamGrid[i * 2] = 2;
+        CHECK(!rc::JudgeMotionField(seamGrid, 6, 1).worth);
+    }
+    {
+        std::vector<int8_t> grid(size_t(400) * 2, 0);
+        for (size_t i = 0; i < grid.size(); i += 2) {
+            grid[i] = i < 236 * 2 ? 1 : 0;
+            grid[i + 1] = 1;
+        }
+        const auto gate = rc::JudgeMotionField(grid, 20, 20);
+        CHECK(gate.worth);
+        CHECK(gate.global == 2 && gate.coherent == 400 && gate.spread == 0);
+    }
+    {
+        std::vector<int8_t> grid(size_t(blocks) * 2, 0);
+        for (size_t i = 0; i < 727; i++) grid[i * 2] = 1;
+        for (size_t i = 727; i < 988; i++) grid[i * 2] = 3;
+        for (size_t i = 988; i < 1249; i++) grid[i * 2] = -3;
+        const auto gate = rc::JudgeMotionField(grid, w, h);
+        CHECK(gate.worth);
+        CHECK(gate.moving == 1249 && gate.coherent == 988 && gate.spread == 261);
+        for (size_t i = 988; i < 1249; i++) CHECK(grid[i * 2] == 0 && grid[i * 2 + 1] == 0);
+    }
+    {
+        std::vector<int8_t> exact(size_t(blocks) * 2, 0);
+        for (size_t i = 0; i < 600; i++) exact[i * 2] = 2;
+        const auto expected = rc::JudgeMotionField(exact, w, h);
+        for (size_t extra : {size_t(1), size_t(20)}) {
+            auto grid = exact;
+            grid.resize(exact.size() + extra, 127);
+            const auto gate = rc::JudgeMotionField(grid, w, h);
+            CHECK(gate.worth == expected.worth && gate.moving == expected.moving &&
+                  gate.coherent == expected.coherent && gate.spread == expected.spread &&
+                  gate.farRejected == expected.farRejected);
+        }
+        auto shortGrid = exact;
+        shortGrid.pop_back();
+        CHECK(!rc::JudgeMotionField(shortGrid, w, h).worth);
+    }
+    {
+        std::vector<float> field{std::numeric_limits<float>::quiet_NaN(),
+                                 std::numeric_limits<float>::infinity(),
+                                 -std::numeric_limits<float>::infinity()};
+        std::vector<int8_t> grid{2, 2, 2};
+        rc::ApplyMotionHysteresis(field, grid);
+        CHECK(grid == std::vector<int8_t>({0, 0, 0}));
+    }
+    std::printf("ok\n");
+}
+
+// Replays multi-frame headset metadata decoding + latch display timing + generation decisions
+// using the same shared helpers called by App::ReadMotion / App::GenerateFrame.
+static void TestHeadsetMotionPipelineReplay() {
+    constexpr uint16_t kW = 168, kH = 84, kBlock = 32;
+    constexpr size_t kBlocks = size_t(kW) * kH;
+    std::vector<float> coherentField(kBlocks * 2, 0.f);
+    for (size_t i = 0; i < kBlocks; i++) coherentField[i * 2] = 8.f;
+    std::vector<float> stillField(kBlocks * 2, 0.f);
+
+    const auto makeWireMeta = [&](bool foveated, uint64_t targetNs, uint64_t intervalNs,
+                                  const std::vector<float>& field, std::vector<int8_t>& gridPrev) {
+        rc::VrFrameMetadata base{};
+        base.trackingTimestampNs = targetNs;
+        std::vector<uint8_t> meta(sizeof(base), 0);
+        std::memcpy(meta.data(), &base, sizeof(base));
+        if (foveated) {
+            rc::VrFoveationMetadata fm{};
+            meta.insert(meta.end(), reinterpret_cast<const uint8_t*>(&fm),
+                        reinterpret_cast<const uint8_t*>(&fm) + sizeof(fm));
+        }
+        rc::AppendMotionPacket(kW, kH, kBlock, field, targetNs, intervalNs, gridPrev, meta);
+        return meta;
+    };
+
+    // 1. Over-predicted latency (motionAge -45.4 ms at 20 fps, 72 Hz display): must generate, not
+    // waste quota on negative AmountTooSmall rejections.
+    {
+        std::vector<int8_t> pcPrev;
+        rc::HeadsetMotionState hs;
+        rc::FrameGenerationQuota quota;
+        rc::FrameGenerationStats stats;
+        int64_t latchedDisplayNs = 0;
+        const int64_t displayStepNs = 13'888'889LL;  // 72 Hz
+        int64_t nowDisplayNs = 2'000'000'000LL;
+        int generatedSlots = 0, blockedSlots = 0;
+
+        for (int frame = 0; frame < 4; frame++) {
+            const uint64_t trackingTs = uint64_t(nowDisplayNs + 45'400'000LL);
+            const auto meta = makeWireMeta(true, trackingTs, 50'000'000ULL, coherentField, pcPrev);
+            const auto res = rc::DecodeVrMotionMetadata(true, true, trackingTs, meta, hs);
+            CHECK(res.decoded && res.failureStage == 0 && res.uploadMotion);
+            latchedDisplayNs = nowDisplayNs;
+            const int generationSlots = rc::FrameGenerationSlots(hs.intervalSmoothNs, double(displayStepNs));
+            CHECK(generationSlots == 3);
+            quota.Arm(true, generationSlots);
+
+            // Three empty display slots before the next 20 fps decoded frame all draw.
+            // Rejected attempts do not spend this fresh per-decoded-frame budget.
+            for (int empty = 1; empty <= 3; empty++) {
+                nowDisplayNs += displayStepNs;
+                rc::GenerationInput in;
+                in.enabled = in.vr = in.hasFrame = in.swapchain = in.externalReady = true;
+                in.motionMoves = hs.moves;
+                in.motionConsistent = hs.consistent;
+                in.motionFrameNs = hs.frameNs;
+                in.motionIntervalSmoothNs = hs.intervalSmoothNs;
+                in.sinceFrameNs = rc::ElapsedSinceLatchedFrameNs(nowDisplayNs, latchedDisplayNs, int64_t(trackingTs));
+                in.displayNs = double(displayStepNs);
+                in.fieldWidth = rc::MotionFieldExtent(uint32_t(hs.width), uint32_t(hs.block));
+                in.fieldHeight = rc::MotionFieldExtent(uint32_t(hs.height), uint32_t(hs.block));
+                const auto d = rc::DecideFrameGeneration(quota, in);
+                stats.Record(d);
+                if (empty <= generationSlots) {
+                    CHECK(d.draw && d.reason == rc::GenerationRejectReason::None);
+                    generatedSlots++;
+                } else {
+                    CHECK(!d.draw && d.quotaBlocked);
+                    blockedSlots++;
+                }
+            }
+            nowDisplayNs += displayStepNs;
+        }
+        CHECK(generatedSlots == 12 && blockedSlots == 0);
+        CHECK(stats.rejected[size_t(rc::GenerationRejectReason::AmountTooSmall)] == 0);
+        CHECK(stats.rejected[size_t(rc::GenerationRejectReason::AmountAboveCap)] == 0);
+    }
+
+    // 2. Network-delayed packet (trackingTimestampNs 25 ms behind latchedDisplayNs): no AmountAboveCap.
+    {
+        const int64_t latchedDisplayNs = 3'000'000'000LL;
+        const int64_t trackingTs = latchedDisplayNs - 25'000'000LL;
+        rc::GenerationInput in;
+        in.enabled = in.vr = in.hasFrame = in.swapchain = in.externalReady = true;
+        in.motionMoves = in.motionConsistent = true;
+        in.motionFrameNs = 22'222'222LL;
+        in.motionIntervalSmoothNs = 22'222'222.0;
+        in.displayNs = 11'111'111.0;
+        in.fieldWidth = 5376;
+        in.fieldHeight = 2688;
+        in.sinceFrameNs = rc::ElapsedSinceLatchedFrameNs(latchedDisplayNs + 11'111'111LL, latchedDisplayNs, trackingTs);
+        rc::FrameGenerationQuota quota;
+        quota.Arm(true);
+        const auto d = rc::DecideFrameGeneration(quota, in);
+        CHECK(d.draw && d.reason == rc::GenerationRejectReason::None);
+    }
+
+    // 3. Failure-recovery sequence: short-header / invalid-header / invalid-runs must clear stale
+    // consistent & frameNs state so ReadMotion never leaks prior frame validity.
+    {
+        std::vector<int8_t> pcPrev;
+        rc::HeadsetMotionState hs;
+        const auto good = makeWireMeta(false, 4'000'000'000ULL, 22'000'000ULL, coherentField, pcPrev);
+        const auto okRes = rc::DecodeVrMotionMetadata(true, false, 4'000'000'000ULL, good, hs);
+        CHECK(okRes.decoded && okRes.failureStage == 0 && hs.moves && hs.consistent && hs.frameNs == 22'000'000LL);
+
+        // Short header (104-byte metadata on foveated stream): stage 1, clears stale consistent & frameNs.
+        std::vector<uint8_t> shortMeta(sizeof(rc::VrFrameMetadata) + sizeof(rc::VrFoveationMetadata), 0);
+        const auto shortRes = rc::DecodeVrMotionMetadata(true, true, 4'022'000'000ULL, shortMeta, hs);
+        CHECK(!shortRes.decoded && shortRes.failureStage == 1 && !hs.moves && !hs.consistent && hs.frameNs == 0);
+
+        // Re-arm valid coherent state, then test invalid-header (previousTimestampNs == trackingTimestampNs -> stage 2).
+        CHECK(rc::DecodeVrMotionMetadata(true, false, 4'050'000'000ULL,
+                                         makeWireMeta(false, 4'050'000'000ULL, 28'000'000ULL, coherentField, pcPrev), hs)
+                  .decoded);
+        const auto badTiming = makeWireMeta(false, 4'078'000'000ULL, 0ULL, coherentField, pcPrev);
+        const auto badHdrRes = rc::DecodeVrMotionMetadata(true, false, 4'078'000'000ULL, badTiming, hs);
+        CHECK(!badHdrRes.decoded && badHdrRes.failureStage == 2 && !hs.moves && !hs.consistent && hs.frameNs == 0);
+
+        // Re-arm valid state, then truncate RLE payload (stage 3).
+        CHECK(rc::DecodeVrMotionMetadata(true, false, 4'100'000'000ULL,
+                                         makeWireMeta(false, 4'100'000'000ULL, 22'000'000ULL, coherentField, pcPrev), hs)
+                  .decoded);
+        auto truncated = good;
+        truncated.resize(sizeof(rc::VrFrameMetadata) + sizeof(rc::MotionHeader) + 2);
+        const auto badRunRes = rc::DecodeVrMotionMetadata(true, false, 4'122'000'000ULL, truncated, hs);
+        CHECK(!badRunRes.decoded && badRunRes.failureStage == 3 && !hs.moves && !hs.consistent && hs.frameNs == 0);
+
+        // Valid all-still packet (232 bytes): failureStage 0, moves false -> NoMotion (not inconsistent).
+        pcPrev.clear();
+        const auto allStill = makeWireMeta(true, 4'150'000'000ULL, 28'000'000ULL, stillField, pcPrev);
+        const auto stillRes = rc::DecodeVrMotionMetadata(true, true, 4'150'000'000ULL, allStill, hs);
+        CHECK(stillRes.decoded && stillRes.failureStage == 0 && !stillRes.uploadMotion && !hs.moves && !hs.consistent);
+    }
+    std::printf("headset motion pipeline replay: latency skew, failure reset, and recovery verified\n");
+}
+
+// Multi-threaded producer-encoder synchronization test: proves bounded wake-wait prevents
+// readback races when GPU motion readback completes 1-3 ms after NVENC finishes, while capping
+// worst-case stalls and preserving mailbox entries across transient frame skips.
+static void TestMotionReadbackConcurrency() {
+    constexpr uint16_t kW = 80, kH = 45, kBlock = 32;
+    const std::vector<float> field(size_t(kW) * kH * 2, 8.f);
+
+    // 1. Late readback race (GPU finishes 2 ms after encoder) with wake + bounded 5 ms wait: 100% attached.
+    {
+        rc::MotionFieldMailbox mailbox;
+        std::vector<int8_t> gridPrev;
+        std::mutex syncMutex, jobMutex;
+        std::condition_variable syncCv, jobCv, wakeCv;
+        std::atomic<bool> running{true};
+        std::atomic<bool> hasPendingRead{false};
+        std::atomic<uint32_t> waiters{0};
+        struct Job {
+            uint64_t frameIndex = 0;
+            uint64_t targetNs = 0;
+            bool queued = false;
+        };
+        std::optional<Job> pendingJob;
+        uint64_t inFlightFrameIndex = 0, inFlightTarget = 0, inFlightInterval = 0;
+        int64_t inFlightReadyAtNs = 0;
+        bool wakeRequested = false;
+
+        std::thread producer([&] {
+            uint64_t prevTarget = 0;
+            int64_t prevSubmit = 0;
+            uint64_t lastInterval = 0;
+            for (int i = 1; i <= 25; i++) {
+                const int64_t submitNs = rc::NowNs();
+                // Alternate unique and shared headsetTargetNs to cover both cadences under concurrency.
+                const uint64_t targetNs = (i % 5 == 0) ? prevTarget : uint64_t(1'000'000'000ULL + uint64_t(i) * 14'000'000ULL);
+                const uint64_t interval = rc::ResolveMotionIntervalNs(targetNs, prevTarget, submitNs, prevSubmit, lastInterval);
+                const bool queued = interval > 0;
+                if (queued) {
+                    inFlightFrameIndex = uint64_t(i);
+                    inFlightTarget = targetNs;
+                    inFlightInterval = interval;
+                    inFlightReadyAtNs = rc::NowNs() + 6'000'000LL;  // finishes 2 ms AFTER 4 ms encoder
+                    hasPendingRead.store(true, std::memory_order_release);
+                    lastInterval = interval;
+                }
+                prevTarget = targetNs;
+                prevSubmit = submitNs;
+                {
+                    std::lock_guard lk(jobMutex);
+                    pendingJob = Job{uint64_t(i), targetNs, queued};
+                }
+                jobCv.notify_one();
+
+                // Drain loop matching VrStream::Run: wakes immediately on wakeRequested, else 1 ms slices.
+                while (hasPendingRead.load(std::memory_order_acquire) && running) {
+                    if (rc::NowNs() >= inFlightReadyAtNs) {
+                        rc::PublishMotionField(mailbox, true, {inFlightTarget, inFlightInterval, inFlightFrameIndex}, kW, kH,
+                                               kBlock, field, gridPrev, uint64_t(rc::NowNs()));
+                        hasPendingRead.store(false, std::memory_order_release);
+                        {
+                            std::lock_guard sl(syncMutex);
+                            syncCv.notify_all();
+                        }
+                        break;
+                    }
+                    std::unique_lock wl(syncMutex);
+                    wakeCv.wait_for(wl, std::chrono::milliseconds(waiters.load() > 0 ? 0 : 1),
+                                    [&] { return !running || wakeRequested; });
+                    wakeRequested = false;
+                }
+                rc::SleepMs(1);
+            }
+            {
+                std::lock_guard lk(jobMutex);
+                running = false;
+            }
+            jobCv.notify_all();
+        });
+
+        uint32_t encoded = 0;
+        std::thread encoder([&] {
+            for (;;) {
+                Job j;
+                {
+                    std::unique_lock lk(jobMutex);
+                    jobCv.wait(lk, [&] { return pendingJob.has_value() || !running; });
+                    if (!pendingJob.has_value()) break;
+                    j = *pendingJob;
+                    pendingJob.reset();
+                }
+                rc::SleepMs(4);  // NVENC finishes 2 ms BEFORE GPU readback (6 ms)
+                if (j.queued && !mailbox.HasTimestamp(j.frameIndex, j.targetNs) && hasPendingRead.load(std::memory_order_acquire)) {
+                    waiters.fetch_add(1, std::memory_order_acq_rel);
+                    {
+                        std::lock_guard wl(syncMutex);
+                        wakeRequested = true;
+                        wakeCv.notify_one();
+                    }
+                    {
+                        std::unique_lock sl(syncMutex);
+                        syncCv.wait_for(sl, std::chrono::milliseconds(15), [&] {
+                            return !running || mailbox.HasTimestamp(j.frameIndex, j.targetNs) ||
+                                   !hasPendingRead.load(std::memory_order_acquire);
+                        });
+                    }
+                    waiters.fetch_sub(1, std::memory_order_acq_rel);
+                }
+                std::vector<uint8_t> meta(sizeof(rc::VrFrameMetadata), 0);
+                rc::AttachMotionField(true, mailbox, j.frameIndex, j.targetNs, meta);
+                ++encoded;
+            }
+        });
+
+        producer.join();
+        encoder.join();
+        const auto stats = mailbox.Stats();
+        // Frame 1 has no previous frame (interval == 0 -> not queued, 1 miss); remaining 24 must all attach.
+        CHECK(encoded == 25);
+        CHECK(stats.produced == 24 && stats.hits == 24 && stats.misses == 1 && stats.expired == 0);
+    }
+
+    // 2. Bridge skip + bounded stall cap: mailbox preserves pending field across skip, wait caps cleanly.
+    {
+        rc::MotionFieldMailbox mailbox;
+        std::vector<int8_t> gridPrev;
+        CHECK(rc::PublishMotionField(mailbox, true, {2000, 100, 1}, kW, kH, kBlock, field, gridPrev, 1000));
+        // Transient skip leaves existing mailbox entry intact (no Clear()).
+        std::vector<uint8_t> meta(sizeof(rc::VrFrameMetadata), 0);
+        CHECK(rc::AttachMotionField(true, mailbox, 1, 2000, meta));
+        CHECK(mailbox.Stats().cleared == 0);
+
+        // Missing stalled frame unblocks at bounded timeout without deadlocking.
+        std::mutex m;
+        std::condition_variable cv;
+        const int64_t t0 = rc::NowNs();
+        {
+            std::unique_lock lk(m);
+            cv.wait_for(lk, std::chrono::milliseconds(5), [&] { return mailbox.HasTimestamp(9999, 9999); });
+        }
+        const int64_t waitedMs = (rc::NowNs() - t0) / 1'000'000;
+        CHECK(waitedMs >= 3 && waitedMs < 100);
+        CHECK(!rc::AttachMotionField(true, mailbox, 9999, 9999, meta));
+    }
+    std::printf("motion readback concurrency: bounded encoder sync + shared target + skip preservation ok\n");
 }
 
 // An Ogg Opus file of a stereo sine, built the way an encoder lays it out (no CRCs: the
@@ -3213,7 +4270,7 @@ static void TestStaleFlushChainGate() {
 // is judged against. One row = one RunSender pickup as the streamer's own log reported it:
 // `lateMs` is the number that log printed ("last N ms late" / "N ms from its display
 // moment"), i.e. how far past its display moment the pickup found the frame. The rows and
-// their source lines in C:\Users\wzy\AppData\Local\RinCast\logs\streamer.log (the user's
+// their source lines in %LOCALAPPDATA%\RinCast\logs\streamer.log (that machine's
 // 23:09-23:11 run, the "stutters, then smears" the card was written from):
 //   2058 + 2062  23:10:16/17  8 frames dropped, last one   1 ms late
 //   2074         23:10:20     14 frames dropped, last one  0 ms late
@@ -5523,6 +6580,169 @@ static void TestSuggestStartFps() {
     std::printf("ok\n");
 }
 
+// Steady cadence (force): keep every hard dependency, drop the "field isn't worth it"
+// veto and the amount edges, so a slow stream still gets a predictable 2x.
+static void TestFrameGenerationForceCadence() {
+    rc::FrameGenerationQuota quota;
+    const double displayNs = 1e9 / 72;
+    rc::GenerationInput in;
+    in.enabled = in.vr = in.hasFrame = in.swapchain = true;
+    in.motionMoves = true;
+    in.motionConsistent = false;  // gate says inconsistent -> old path skips
+    in.motionFrameNs = 1e9 / 30;
+    in.sinceFrameNs = 10'000'000;
+    in.displayNs = displayNs;
+    in.motionIntervalSmoothNs = 1e9 / 30;
+    in.externalReady = true;
+    in.fieldWidth = 2496;
+    in.fieldHeight = 1312;
+
+    quota.Arm(true, 2);
+    auto d = rc::DecideFrameGeneration(quota, in);
+    CHECK(!d.draw && d.reason == rc::GenerationRejectReason::InconsistentMotion && quota.credit == 2);
+
+    in.force = true;
+    d = rc::DecideFrameGeneration(quota, in);
+    CHECK(d.draw && d.inconsistent && d.amount > 0.05f && d.amount <= d.cap && quota.credit == 1);
+    CHECK(d.cap == 1.0f);  // rejected field: extrapolate at most one source interval
+
+    // Almost no time since the last picture: drawing would copy the latched one, so the slot
+    // keeps it and the credit is not spent.
+    in.sinceFrameNs = 1;
+    d = rc::DecideFrameGeneration(quota, in);
+    CHECK(!d.draw && d.reason == rc::GenerationRejectReason::AmountTooSmall && quota.credit == 1);
+
+    // Overshoot: hold at the cap instead of dropping the slot.
+    quota.Arm(true, 1);
+    in.sinceFrameNs = 400'000'000;
+    d = rc::DecideFrameGeneration(quota, in);
+    CHECK(d.draw && d.amount == d.cap && quota.credit == 0);
+    // The drawn offset must be the clamped one. The raw ratio here is 12 source intervals;
+    // a scale built from it would push the shader 12x while the log claimed cap.
+    {
+        const float unit = 0.85f * 127.f * float(rc::kMotionUnitPixels);
+        CHECK(std::abs(d.scaleX * float(in.fieldWidth) / unit - d.amount) < 1e-3f);
+    }
+
+    // No motion field at all still skips: generating would only repeat the last picture.
+    quota.Arm(true, 2);
+    in.motionMoves = false;
+    in.sinceFrameNs = 10'000'000;
+    d = rc::DecideFrameGeneration(quota, in);
+    CHECK(!d.draw && d.reason == rc::GenerationRejectReason::NoMotion && quota.credit == 2);
+
+    // A field the gate accepted keeps a wider, but still bounded, extrapolation.
+    quota.Arm(true, 1);
+    in.motionMoves = true;
+    in.motionConsistent = true;
+    in.sinceFrameNs = 400'000'000;
+    d = rc::DecideFrameGeneration(quota, in);
+    CHECK(d.draw && !d.inconsistent && d.cap == 1.5f && d.amount == 1.5f && quota.credit == 0);
+    std::printf("ok\n");
+}
+
+// Forcing is a repair for a stream that cannot fill the panel, not a default.
+static void TestShouldForceFrameGeneration() {
+    std::printf("force only below the panel's fill rate: ");
+    const double at72 = 1e9 / 72;
+    CHECK(!rc::ShouldForceFrameGeneration(1e9 / 72, int64_t(1e9 / 72), at72));
+    CHECK(!rc::ShouldForceFrameGeneration(1e9 / 65, int64_t(1e9 / 65), at72));
+    CHECK(rc::ShouldForceFrameGeneration(1e9 / 55, int64_t(1e9 / 55), at72));
+    CHECK(rc::ShouldForceFrameGeneration(1e9 / 30, int64_t(1e9 / 30), at72));
+    // A jolt counts even while the EMA still believes 72 fps.
+    CHECK(rc::ShouldForceFrameGeneration(1e9 / 72, int64_t(1e9 / 30), at72));
+    CHECK(!rc::ShouldForceFrameGeneration(0, 0, at72));  // no timing signal: never force
+    CHECK(!rc::ShouldForceFrameGeneration(1e9 / 30, int64_t(1e9 / 30), 0));
+    CHECK(rc::ShouldForceFrameGeneration(1e9 / 72, int64_t(1e9 / 72), 1e9 / 90));  // 72 into 90 Hz
+    std::printf("ok\n");
+}
+
+// The quota must widen on the first slow frame, not 4-5 frames later when the EMA catches up.
+static void TestFrameGenerationSlotJolt() {
+    std::printf("frame generation slots survive a rate jolt: ");
+    const double at72 = 1e9 / 72;
+    CHECK(rc::FrameGenerationSlots(at72, at72) == 1);
+    CHECK(rc::FrameGenerationSlots(std::max(at72, 1e9 / 30), at72) == 2);
+    CHECK(rc::FrameGenerationSlots(std::max(0.0, 1e9 / 30), at72) == 2);
+    std::printf("ok\n");
+}
+
+static void TestFrameGenerationQuota() {
+    std::printf("frame generation quota: ");
+    rc::FrameGenerationQuota quota;
+    CHECK(quota.credit == 0 && !quota.HasCredit() && !quota.Spend());
+    quota.Arm(true);
+    CHECK(quota.credit == 1 && quota.HasCredit());
+    CHECK(quota.Spend());
+    CHECK(quota.credit == 0 && !quota.Spend());
+
+    quota.Arm(true, 3);
+    CHECK(quota.credit == 3);
+    CHECK(quota.Spend() && quota.Spend() && quota.Spend());
+    CHECK(!quota.Spend());
+    quota.Arm(true, 3);
+    CHECK(quota.Spend() && quota.credit == 2);
+    quota.Arm(true, 1);
+    CHECK(quota.credit == 1 && quota.Spend() && !quota.Spend());
+    quota.Arm(true, -1);
+    CHECK(quota.credit == 0);
+    quota.Arm(true, 99);
+    CHECK(quota.credit == 4);
+    quota.Arm(false, 3);
+    CHECK(quota.credit == 0 && !quota.Spend());
+
+    const double displayNs = 1e9 / 72.0;
+    CHECK(rc::FrameGenerationSlots(0, displayNs) == 1);
+    CHECK(rc::FrameGenerationSlots(-1, displayNs) == 1);
+    CHECK(rc::FrameGenerationSlots(std::numeric_limits<double>::quiet_NaN(), displayNs) == 1);
+    CHECK(rc::FrameGenerationSlots(50'000'000, 0) == 1);
+    CHECK(rc::FrameGenerationSlots(1e9 / 90, displayNs) == 1);
+    CHECK(rc::FrameGenerationSlots(1e9 / 72, displayNs) == 1);
+    CHECK(rc::FrameGenerationSlots(1e9 / 60, displayNs) == 1);
+    CHECK(rc::FrameGenerationSlots(1e9 / 45, displayNs) == 2);
+    CHECK(rc::FrameGenerationSlots(1e9 / 36, displayNs) == 2);
+    CHECK(rc::FrameGenerationSlots(1e9 / 30, displayNs) == 2);
+    CHECK(rc::FrameGenerationSlots(1e9 / 24, displayNs) == 3);
+    CHECK(rc::FrameGenerationSlots(50'000'000, displayNs) == 3);
+    CHECK(rc::FrameGenerationSlots(1e9 / 15, displayNs) == 3);
+
+    rc::GenerationInput in;
+    in.enabled = in.vr = in.hasFrame = in.swapchain = true;
+    in.motionFrameNs = 50'000'000;
+    in.sinceFrameNs = 10'000'000;
+    in.displayNs = displayNs;
+    in.motionIntervalSmoothNs = 50'000'000;
+    in.externalReady = true;
+    in.fieldWidth = 2496;
+    in.fieldHeight = 1312;
+    quota.Arm(true, 3);
+    auto decision = rc::DecideFrameGeneration(quota, in);
+    CHECK(decision.attempt && decision.reason == rc::GenerationRejectReason::NoMotion && quota.credit == 3);
+    in.motionMoves = true;
+    decision = rc::DecideFrameGeneration(quota, in);
+    CHECK(decision.reason == rc::GenerationRejectReason::InconsistentMotion && quota.credit == 3);
+    in.motionConsistent = true;
+    in.externalReady = false;
+    decision = rc::DecideFrameGeneration(quota, in);
+    CHECK(decision.reason == rc::GenerationRejectReason::TextureUnavailable && quota.credit == 3);
+    in.externalReady = true;
+    in.sinceFrameNs = 0;
+    decision = rc::DecideFrameGeneration(quota, in);
+    CHECK(decision.reason == rc::GenerationRejectReason::AmountTooSmall && quota.credit == 3);
+    in.sinceFrameNs = 200'000'000;
+    decision = rc::DecideFrameGeneration(quota, in);
+    CHECK(decision.reason == rc::GenerationRejectReason::AmountAboveCap && quota.credit == 3);
+    in.sinceFrameNs = 10'000'000;
+    CHECK(rc::DecideFrameGeneration(quota, in).draw && quota.credit == 2);
+    in.sinceFrameNs = 20'000'000;
+    CHECK(rc::DecideFrameGeneration(quota, in).draw && quota.credit == 1);
+    in.sinceFrameNs = 30'000'000;
+    CHECK(rc::DecideFrameGeneration(quota, in).draw && quota.credit == 0);
+    decision = rc::DecideFrameGeneration(quota, in);
+    CHECK(!decision.attempt && decision.quotaBlocked && quota.credit == 0);
+    std::printf("ok\n");
+}
+
 
 // ROUND19 T3: the disconnect/reconnect state machine at the connection level (the
 // session-level paths are mapped in the stick's AUDIT; the streamer owns those and
@@ -5633,7 +6853,10 @@ static void TestSessionDisconnectReconnect() {
         std::string big(100000, 'z');
         l.a.conn->SendControl(big);
         l.a.conn->SendDisconnect();  // in-flight chunks abandoned mid-reassembly
-        SleepMs(200);
+        // 100 KB plus the disconnect does not always land inside a fixed 200 ms on a loaded
+        // box (one run in four missed it). Poll to a deadline: the assertion is delivery,
+        // not scheduler luck.
+        for (int waited = 0; waited < 1500 && !l.b.conn->PeerDisconnected(); waited += 20) SleepMs(20);
         CHECK(l.b.conn->PeerDisconnected());
     }
     // 8. clock offset is per-session: measured on the old connection, fresh = unknown.
@@ -5733,9 +6956,9 @@ struct A12Num {
 };
 
 enum {
-    A12FillMode = 0, A12QualityProfileCbr, A12ProfileControlsVideo, A12L7Autoscale,
+    A12FillMode = 0, A12QualityProfileCbr, A12FrameGeneration, A12L7Autoscale,
     A12AdaptiveBitrate, A12PcBitrateWins, A12FoveatedEncoding, A12TenBit,
-    A12AdaptiveQuantization, A12TwoPassEncoding, A12AutoTune, A12DesktopInput,
+    A12AdaptiveQuantization, A12TwoPassEncoding, A12MatchSteamVr, A12DesktopInput,
     A12StreamAudio, A12MicPassthrough,
 };
 
@@ -5746,9 +6969,9 @@ const char* A12CodecName(int i) {
 
 // The bool names in mask-bit order, for the repro lines.
 const char* A12BoolName(int i) {
-    static const char* kNames[] = {"fillMode", "qualityProfileCbr", "profileControlsVideo", "l7Autoscale",
+    static const char* kNames[] = {"fillMode", "qualityProfileCbr", "frameGeneration", "l7Autoscale",
                                    "adaptiveBitrate", "pcBitrateWins", "foveatedEncoding", "tenBit",
-                                   "adaptiveQuantization", "twoPassEncoding", "autoTune", "desktopInput",
+                                   "adaptiveQuantization", "twoPassEncoding", "matchSteamVr", "desktopInput",
                                    "streamAudio", "micPassthrough"};
     return kNames[i];
 }
@@ -5900,6 +7123,281 @@ void A12Note(const char* assertion, const bool* b, const A12Num& n, bool gazeFov
 
 }  // namespace
 
+static void TestFrameGenerationCartesian() {
+    std::printf("frame generation Cartesian: ");
+    const auto t0 = std::chrono::steady_clock::now();
+    long long decisions = 0;
+    const int64_t intervals[] = {0, 11'111'111, 22'222'222, 33'333'333};
+    const int64_t ages[] = {-1, 0, 1, 555'555, 11'111'111, 22'222'222, 30'000'000, 90'000'000};
+    const double displays[] = {0, 8'333'333.0, 11'111'111.0, 16'666'667.0};
+    const double smooths[] = {0, 11'111'111.0, 22'222'222.0, 50'000'000.0};
+    for (int mask = 0; mask < 512; mask++) {
+        for (int armed = 0; armed < 2; armed++) {
+            for (const int64_t interval : intervals) {
+                for (const int64_t age : ages) {
+                    for (const double display : displays) {
+                        for (const double smooth : smooths) {
+                            rc::GenerationInput in;
+                            in.enabled = (mask & 1) != 0;
+                            in.vr = (mask & 2) != 0;
+                            in.latched = (mask & 4) != 0;
+                            in.hasFrame = (mask & 8) != 0;
+                            in.swapchain = (mask & 16) != 0;
+                            in.motionMoves = (mask & 32) != 0;
+                            in.motionConsistent = (mask & 64) != 0;
+                            in.upscaled = (mask & 128) != 0;
+                            in.externalReady = (mask & 256) != 0;
+                            in.motionFrameNs = interval;
+                            in.sinceFrameNs = age;
+                            in.displayNs = display;
+                            in.motionIntervalSmoothNs = smooth;
+                            in.fieldWidth = 2496;
+                            in.fieldHeight = 1312;
+                            rc::FrameGenerationQuota quota;
+                            quota.Arm(armed != 0);
+                            const auto d = rc::DecideFrameGeneration(quota, in);
+                            const bool attempt = in.enabled && in.vr && !in.latched && armed;
+                            const bool valid = in.motionMoves && in.motionConsistent && in.hasFrame && in.swapchain &&
+                                               interval > 0 && in.fieldWidth > 0 && in.fieldHeight > 0;
+                            const float amount = interval > 0 ? float(double(age) / double(interval)) : 0;
+                            const double displayNs = display > 0 ? display : 1e9 / 90.0;
+                            const float cap = float(std::clamp(smooth > 0 ? smooth / displayNs + 0.3 : 1.2, 1.0, 2.5));
+                            const bool inRange = std::isfinite(amount) && amount > 0.05f && amount <= cap;
+                            const auto path = !in.upscaled && in.externalReady ? rc::GenerationPath::External
+                                                                              : rc::GenerationPath::Kept;
+                            const bool draw = attempt && valid && inRange && (in.upscaled || in.externalReady);
+                            CHECK(d.attempt == attempt);
+                            CHECK(quota.credit == (armed != 0 && !draw));
+                            CHECK(d.quotaBlocked == (in.enabled && in.vr && !in.latched && !armed));
+                            CHECK(d.inconsistent == (attempt && in.motionMoves && !in.motionConsistent));
+                            CHECK(d.draw == draw);
+                            CHECK(d.path == (draw ? path : rc::GenerationPath::None));
+                            CHECK(!d.attempt || ((d.reason == rc::GenerationRejectReason::None) == draw));
+                            if (attempt && !draw) {
+                                if (in.motionMoves && !in.motionConsistent) CHECK(d.reason == rc::GenerationRejectReason::InconsistentMotion);
+                                else if (!in.motionMoves) CHECK(d.reason == rc::GenerationRejectReason::NoMotion);
+                                else if (!in.hasFrame) CHECK(d.reason == rc::GenerationRejectReason::MissingFrame);
+                                else if (!in.swapchain) CHECK(d.reason == rc::GenerationRejectReason::MissingSwapchain);
+                                else if (interval <= 0) CHECK(d.reason == rc::GenerationRejectReason::InvalidMotionTiming);
+                                else if (!inRange) CHECK(d.reason == (amount <= 0.05f ? rc::GenerationRejectReason::AmountTooSmall
+                                                                                     : rc::GenerationRejectReason::AmountAboveCap));
+                                else CHECK(d.reason == rc::GenerationRejectReason::TextureUnavailable);
+                            }
+                            if (draw) {
+                                CHECK(d.amount == amount && d.cap == cap);
+                                const float pixels = amount * 0.85f * 127.f * rc::kMotionUnitPixels;
+                                CHECK(d.scaleX == pixels / in.fieldWidth && d.scaleY == pixels / in.fieldHeight);
+                            }
+                            rc::FrameGenerationStats stats;
+                            stats.Record(d);
+                            CHECK(stats.quotaBlocked == uint32_t(d.quotaBlocked));
+                            CHECK(stats.attempts == uint32_t(d.attempt));
+                            CHECK(stats.generated == uint32_t(d.draw));
+                            uint32_t rejected = 0;
+                            for (uint32_t count : stats.rejected) rejected += count;
+                            CHECK(rejected == stats.attempts - stats.generated);
+                            CHECK(stats.GeneratedFps(2) == (draw ? 0.5 : 0.0));
+                            CHECK(stats.RejectedFps(2) == (attempt && !draw ? 0.5 : 0.0));
+                            stats.Reset();
+                            CHECK(stats.source == 0 && stats.generated == 0 && stats.attempts == 0 && stats.quotaBlocked == 0);
+                            for (uint32_t count : stats.rejected) CHECK(count == 0);
+                            decisions++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        rc::GenerationInput in;
+        in.enabled = in.vr = in.hasFrame = in.swapchain = in.motionMoves = in.motionConsistent = true;
+        in.motionFrameNs = in.sinceFrameNs = 10'000'000;
+        in.upscaled = true;
+        rc::FrameGenerationQuota quota;
+        quota.Arm(true);
+        const auto invalidField = rc::DecideFrameGeneration(quota, in);
+        CHECK(invalidField.reason == rc::GenerationRejectReason::InvalidField);
+        in.fieldWidth = 2496;
+        in.fieldHeight = 1312;
+        quota.Arm(true);
+        const auto draw = rc::DecideFrameGeneration(quota, in);
+        CHECK(draw.draw);
+        rc::FrameGenerationStats stats;
+        stats.Record(invalidField);
+        stats.Record(draw, false);
+        CHECK(stats.attempts == 2 && stats.generated == 0 && stats.RejectedFps(1) == 2);
+        CHECK(stats.rejected[size_t(rc::GenerationRejectReason::InvalidField)] == 1);
+        CHECK(stats.rejected[size_t(rc::GenerationRejectReason::DrawFailed)] == 1);
+    }
+
+    // Over-predicted latency (trackingTimestampNs ahead of actual display) must still generate
+    // at 20 fps instead of spending quota on a negative AmountTooSmall rejection.
+    {
+        const int64_t latchedDisplayNs = 1'000'000'000LL;
+        const int64_t slotDisplayNs = latchedDisplayNs + 11'111'111LL;
+        const int64_t aheadTargetNs = latchedDisplayNs + 45'000'000LL;
+        const int64_t delayedTargetNs = latchedDisplayNs - 25'000'000LL;
+        CHECK(rc::ElapsedSinceLatchedFrameNs(slotDisplayNs, latchedDisplayNs, aheadTargetNs) == 11'111'111LL);
+        CHECK(rc::ElapsedSinceLatchedFrameNs(slotDisplayNs, latchedDisplayNs, delayedTargetNs) == 11'111'111LL);
+        CHECK(rc::ElapsedSinceLatchedFrameNs(slotDisplayNs, 0, delayedTargetNs) == slotDisplayNs - delayedTargetNs);
+
+        rc::GenerationInput in;
+        in.enabled = in.vr = in.hasFrame = in.swapchain = in.motionMoves = in.motionConsistent = true;
+        in.motionFrameNs = 50'000'000LL;
+        in.motionIntervalSmoothNs = 50'000'000.0;
+        in.displayNs = 11'111'111.0;
+        in.upscaled = true;
+        in.fieldWidth = 2496;
+        in.fieldHeight = 1312;
+        in.sinceFrameNs = rc::ElapsedSinceLatchedFrameNs(slotDisplayNs, latchedDisplayNs, aheadTargetNs);
+        rc::FrameGenerationQuota quota;
+        quota.Arm(true);
+        const auto decision = rc::DecideFrameGeneration(quota, in);
+        CHECK(decision.draw);
+        CHECK(decision.reason == rc::GenerationRejectReason::None);
+        CHECK(decision.amount > 0.2f && decision.amount < 0.25f);
+    }
+
+    const double bpps[] = {0.0299, 0.03, 0.04, 0.05, 0.0501};
+    for (int active = 0; active < 2; active++) {
+        for (int skip = 0; skip < 2; skip++) {
+            rc::HalfRateState state{active != 0, skip != 0};
+            for (const double bpp : bpps) {
+                const bool before = state.active;
+                if (bpp < 0.03) state.active = true;
+                else if (bpp > 0.05) state.active = false;
+                const bool expectedSkip = state.active && !state.skipNext;
+                state = rc::StepHalfRate(state, bpp);
+                CHECK(state.active == (bpp < 0.03 ? true : bpp > 0.05 ? false : before));
+                CHECK(state.skipNext == expectedSkip);
+            }
+        }
+    }
+
+    const uint32_t widths[] = {0, 1, 1000, 1050, 1051, 2000};
+    for (bool enabled : {false, true})
+        for (bool ready : {false, true})
+            for (uint32_t recommended : widths)
+                for (uint32_t eye : widths) {
+                    const float expected = std::min(2.f, float(recommended) / float(std::max(1u, eye)));
+                    CHECK(rc::ResolveVrUpscale(enabled, recommended, eye, ready) ==
+                          (enabled && expected > 1.05f && ready ? expected : 1.f));
+                }
+    for (int oldW : {0, 832, 1664})
+        for (int oldH : {0, 1728})
+            for (int w : {0, 832, 1664})
+                for (int h : {0, 1728})
+                    CHECK(rc::NeedsTextureResize(oldW, oldH, w, h) == (oldW != w || oldH != h));
+    CHECK(rc::SmoothMotionInterval(0, 22'222'222) == 22'222'222.0);
+    CHECK(rc::SmoothMotionInterval(10'000'000, 20'000'000) == 12'000'000.0);
+    CHECK(rc::SmoothMotionInterval(10'000'000, 0) == 10'000'000.0);
+    CHECK(rc::SmoothMotionInterval(10'000'000, 3'999'999) == 10'000'000.0);
+    CHECK(rc::SmoothMotionInterval(10'000'000, 200'000'001) == 10'000'000.0);
+    CHECK(rc::SmoothMotionInterval(0, 1'000'000) == 0.0);
+    CHECK(rc::SmoothMotionInterval(0, 201'000'000) == 0.0);
+    CHECK(std::fabs(rc::SmoothMotionInterval(10'000'000, 4'000'000) - 8'800'000.0) < 0.01);
+    CHECK(std::fabs(rc::SmoothMotionInterval(10'000'000, 200'000'000) - 48'000'000.0) < 0.01);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("%lld gate/path/stat decisions, half-rate hysteresis and resize boundaries in %.2f s\n", decisions, secs);
+    CHECK(secs < 60.0);
+}
+
+static void TestQualityGenerationProduct() {
+    std::printf("quality x generation product (configuration plumbing; motion/texture success assumed): ");
+    const auto t0 = std::chrono::steady_clock::now();
+    const int scales[] = {50, 67, 85, 100, 0};
+    const int bitrates[] = {20, 150, 500};
+    const float refreshes[] = {60, 72, 90, 120};
+    const uint32_t eyeWidths[] = {832, 1248, 1664, 1920, 2208};
+    const rc::VideoCodec codecs[] = {rc::VideoCodec::H264, rc::VideoCodec::HEVC, rc::VideoCodec::AV1,
+                                     rc::VideoCodec::HEVC};
+    long long configs = 0, draws = 0, halfRateConfigs = 0;
+    for (int flags = 0; flags < 64; flags++) {
+        const bool frameGeneration = (flags & 1) != 0;
+        const bool upscaling = (flags & 2) != 0;
+        const bool gaze = (flags & 4) != 0;
+        const bool tenBit = (flags & 8) != 0;
+        const bool slowPath = (flags & 16) != 0;
+        const bool match = (flags & 32) != 0;
+        for (int adaptive = 0; adaptive < 4; adaptive++)
+            for (const int scale : scales)
+                for (const int bitrate : bitrates)
+                    for (const float refresh : refreshes)
+                        for (const uint32_t eyeWidth : eyeWidths)
+                            for (const rc::VideoCodec codec : codecs) {
+                                rcs::Settings pc;
+                                pc.vrBitrateMbps = bitrate;
+                                pc.pcBitrateWins = (adaptive & 1) != 0;
+                                pc.adaptiveBitrate = (adaptive & 2) != 0;
+                                pc.encodeScalePct = scale;
+                                pc.foveatedEncoding = true;
+                                rcs::ClientStreamSettings st;
+                                st.vrBitrateMbps = bitrate == 20 ? 100 : bitrate;
+                                st.frameGeneration = frameGeneration;
+                                st.gazeFoveation = gaze;
+                                st.tenBit = tenBit;
+                                st.adaptiveBitrate = true;
+                                st.matchSteamVr = match;
+                                const auto build = rcs::BuildVrStreamConfig(pc, st, codec, slowPath, match && !slowPath,
+                                                                             100, eyeWidth, 1728, refresh);
+                                const auto& cfg = build.cfg;
+                                const bool squeeze = cfg.foveatedEyeWidth > 0 && cfg.foveatedEyeHeight > 0;
+                                CHECK(cfg.motionField == frameGeneration);
+                                CHECK(cfg.tenBit == (tenBit && codec != rc::VideoCodec::H264));
+                                CHECK(squeeze == (gaze && cfg.encodeScale >= 1.f));
+                                CHECK(cfg.bitrateKbps == uint32_t((pc.pcBitrateWins ? bitrate : st.vrBitrateMbps) * 1000) ||
+                                      (slowPath && cfg.bitrateKbps == 60000));
+                                CHECK(!slowPath || (cfg.fecPercent >= 12 && cfg.pacingMode == 2 && cfg.adaptive &&
+                                                    cfg.startBitrateKbps <= 12000));
+                                CHECK(cfg.adaptive == (slowPath || (st.adaptiveBitrate && pc.adaptiveBitrate)));
+                                const auto tune = rcs::BuildAutoTuneInput(pc, st, cfg);
+                                CHECK(tune.foveaOn == squeeze);
+                                CHECK(tune.foveaPossible == gaze);
+                                const uint32_t encW = rc::ScaledEncodeSize(squeeze ? cfg.foveatedEyeWidth * 2 : eyeWidth * 2,
+                                                                          cfg.encodeScale);
+                                const uint32_t encH = rc::ScaledEncodeSize(squeeze ? cfg.foveatedEyeHeight : 1728,
+                                                                          cfg.encodeScale);
+                                const double bpp = double(cfg.bitrateKbps) * 1000.0 / (double(encW) * encH * refresh);
+                                auto half = rc::StepHalfRate({}, bpp);
+                                half = rc::StepHalfRate(half, bpp);
+                                if (half.active) halfRateConfigs++;
+                                const double sourceInterval = (half.active ? 2.0 : 1.0) * 1e9 / refresh;
+                                const float resolved = rc::ResolveVrUpscale(upscaling, eyeWidth * 2, eyeWidth, true);
+                                rc::GenerationInput in;
+                                in.enabled = frameGeneration;
+                                in.vr = true;
+                                in.hasFrame = in.swapchain = in.motionMoves = in.motionConsistent = true;
+                                in.motionFrameNs = int64_t(sourceInterval);
+                                in.sinceFrameNs = int64_t(sourceInterval * 1.1);
+                                in.displayNs = 1e9 / refresh;
+                                in.motionIntervalSmoothNs = sourceInterval;
+                                in.upscaled = resolved > 1.f;
+                                in.externalReady = !in.upscaled;
+                                in.fieldWidth = float(encW);
+                                in.fieldHeight = float(encH);
+                                rc::FrameGenerationQuota quota;
+                                quota.Arm(frameGeneration);
+                                const auto decision = rc::DecideFrameGeneration(quota, in);
+                                CHECK(decision.draw == frameGeneration);
+                                CHECK(decision.path == (frameGeneration
+                                                           ? (in.upscaled ? rc::GenerationPath::Kept
+                                                                          : rc::GenerationPath::External)
+                                                           : rc::GenerationPath::None));
+                                if (frameGeneration) CHECK(decision.cap >= 1.f && decision.cap <= 2.5f);
+                                if (decision.draw) draws++;
+                                configs++;
+                            }
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("%lld configs x generation path (%lld draws, %lld half-rate) in %.2f s\n", configs, draws,
+                halfRateConfigs, secs);
+    CHECK(configs == 307200);
+    CHECK(draws == configs / 2);
+    CHECK(halfRateConfigs > 0 && halfRateConfigs < configs);
+    CHECK(secs < 60.0);
+}
+
 // The full sweep itself (pure logic; timed; the card requires < 60 s).
 static void TestVrConfigComboSweep() {
     g_a12Fails.clear();
@@ -5942,9 +7440,12 @@ static void TestVrConfigComboSweep() {
                 const bool slowPath = (quadrant & 2) != 0;
                 st.tenBit = b[A12TenBit];
                 st.gazeFoveation = gazeFovea;
+                st.frameGeneration = b[A12FrameGeneration];
+                st.matchSteamVr = b[A12MatchSteamVr];
                 const int autoscalePct = pc.l7Autoscale ? 85 : 100;  // a stepped ladder level
+                const bool match = st.matchSteamVr && !slowPath;
                 const rcs::VrStreamBuild build =
-                    rcs::BuildVrStreamConfig(pc, st, codec, slowPath, /*match=*/false, autoscalePct, kEyeW, kEyeH, kFps);
+                    rcs::BuildVrStreamConfig(pc, st, codec, slowPath, match, autoscalePct, kEyeW, kEyeH, kFps);
                 const rcs::VrStreamConfig& cfg = build.cfg;
                 vrBuilds++;
                 char detail[96];
@@ -5952,7 +7453,9 @@ static void TestVrConfigComboSweep() {
                 // ---- §1.1: no crash (reaching here), no NaN/Inf, domains ----
                 A12_CHECK(std::isfinite(cfg.encodeScale) && cfg.encodeScale >= 0.5f && cfg.encodeScale <= 1.0f,
                           "A1-domain", b, n, gazeFovea, slowPath, "encodeScale out of [0.5,1]");
-                A12_CHECK(std::isfinite(cfg.fps) && cfg.fps > 0, "A1-domain", b, n, gazeFovea, slowPath, "fps");
+                A12_CHECK(cfg.motionField == st.frameGeneration, "A-frame-generation", b, n, gazeFovea, slowPath,
+                          "motion field producer disagrees with the headset switch");
+                A12_CHECK(cfg.fps == kFps, "A1-domain", b, n, gazeFovea, slowPath, "fps");
                 A12_CHECK(std::isfinite(cfg.foveaSize) && cfg.foveaSize >= rcs::Foveator::kFoveaSize - 1e-6f &&
                               cfg.foveaSize <= 0.8f + 1e-6f,
                           "A1-domain", b, n, gazeFovea, slowPath, "foveaSize out of [0.45,0.8]");
@@ -6064,11 +7567,12 @@ static void TestVrConfigComboSweep() {
 
                 // ---- §1.6: autoTune agreement (full) + decision probes (stride) ----
                 {
-                    const rc::AutoTuneInput in = rcs::BuildAutoTuneInput(pc, st, slowPath);
+                    const rc::AutoTuneInput in = rcs::BuildAutoTuneInput(pc, st, cfg);
                     A12_CHECK(in.cbrOn == !cfg.cappedVbr, "A6-autotune-input", b, n, gazeFovea, slowPath,
                               "autoTune's CBR view disagrees with the built config");
-                    A12_CHECK(in.foveaOn == (pc.foveatedEncoding && gazeFovea), "A6-autotune-input", b, n, gazeFovea,
-                              slowPath, "autoTune's fovea view disagrees");
+                    A12_CHECK(in.foveaOn == (cfg.foveatedEyeWidth > 0 && cfg.foveatedEyeHeight > 0),
+                              "A6-autotune-input", b, n, gazeFovea, slowPath,
+                              "autoTune's fovea view disagrees with the built geometry");
                     A12_CHECK(in.foveaPossible == gazeFovea, "A6-autotune-input", b, n, gazeFovea, slowPath,
                               "autoTune's fovea possibility disagrees");
                     A12_CHECK(in.profileId == pc.streamProfile, "A6-autotune-input", b, n, gazeFovea, slowPath,
@@ -6111,7 +7615,7 @@ static void TestVrConfigComboSweep() {
                         rc::BottleneckSignal linkSig;
                         linkSig.queueMs = 150.0;
                         linkSig.nominalFps = double(cfg.fps);
-                        const rc::AutoTuneInput linkIn = rcs::BuildAutoTuneInput(pc, st, slowPath);
+                        const rc::AutoTuneInput linkIn = rcs::BuildAutoTuneInput(pc, st, cfg);
                         A12_CHECK(linkIn.profileId == int(cfg.profile), "A6-autotune-input", b, n, gazeFovea,
                                   slowPath, "autoTune's rung is not the profile the config builds at");
                         (void)link.Update(linkSig, linkIn, 0);
@@ -6384,7 +7888,9 @@ static void TestConfigCouplingCases() {
         pc.qualityProfileCbr = true;   // effective CBR on (below)
         pc.streamProfile = 2;
         st.tenBit = false;
-        const auto in = rcs::BuildAutoTuneInput(pc, st, false);
+        const auto build =
+            rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::HEVC, false, false, 100, kEyeW, kEyeH, 72.f);
+        const auto in = rcs::BuildAutoTuneInput(pc, st, build.cfg);
         CHECK(in.cbrOn);
         CHECK(in.profileId == pc.streamProfile);
         rc::AutoTune tuner;
@@ -6566,16 +8072,12 @@ static void TestFecWireBillingLoopback() {
         const size_t expectedParity = group ? (dataFrags + group - 1) / group - (dataFrags % size_t(group) == 1 ? 1u : 0u)
                                             : 0;
         CHECK(parity == expectedParity);
-        // The billing formula must cover what actually left (never under-count) and
-        // miss it by at most that one parity datagram (FINDING A12-F2: the wire-ceiling
-        // and the token-bucket billing both use ceil; the packetizer may emit one
-        // parity datagram less when the final group has a single member - conservative
-        // direction, <= 1 datagram per frame).
+        // T-59: billing formula and packetizer share one FEC rule — single-member
+        // trailing groups emit no parity and must be billed 0 parity bytes.
         const size_t billed = rcs::FrameWireBytes(fragPayload, total, fec);
         const size_t actualBilled =
             total + dataFrags * sizeof(VideoFragmentHeader) + parity * (sizeof(VideoParityHeader) + fragPayload);
-        CHECK(billed >= actualBilled);
-        CHECK(billed - actualBilled <= sizeof(VideoParityHeader) + fragPayload);
+        CHECK(billed == actualBilled);
         // The receiver saw every datagram (or the socket refused some - that escape
         // hatch is what SendFailures tracks) and reassembled the frame.
         CHECK(l.arrivals.size() >= sent1 + sent2 || pkt.SendFailures() > 0);
@@ -6586,6 +8088,394 @@ static void TestFecWireBillingLoopback() {
         l.Stop();
         std::printf("A12 wire billing fec=%d%%: %zu data + %zu parity datagrams, billed %.1f KB/frame\n", fec,
                     dataFrags, parity, billed / 1024.0);
+    }
+}
+
+// T-59: full FEC wire-billing matrix (count = 1..64 x fec = {0, 3, 5, 10, 20, 25, 100}),
+// covering count % group == 1 trailing single-fragment groups across pure math and
+// live LoopbackPair VideoPacketizer emission.
+static void TestFecWireBillingMatrix() {
+    constexpr int kFecCases[] = {0, 3, 5, 10, 20, 25, 100};
+
+    // 1. Pure-function matrix across count = 1..64 x fecPercent = {0, 3, 5, 10, 20, 25, 100}
+    //    (both full last fragment and partial last fragment), compared against an independent
+    //    group-by-group emission simulation.
+    {
+        constexpr size_t kFragPayload =
+            kMaxDatagramLan - sizeof(PacketHeader) - kMacSize - sizeof(VideoFragmentHeader);
+        int pureChecks = 0;
+        for (int fec : kFecCases) {
+            const size_t group = fec > 0 ? size_t(std::clamp(100 / fec, 2, 64)) : 0;
+            for (size_t count = 1; count <= 64; count++) {
+                for (bool partial : {false, true}) {
+                    const size_t total =
+                        partial ? (count == 1 ? size_t(128) : (count - 1) * kFragPayload + 1) : count * kFragPayload;
+                    size_t expectedWire = 0;
+                    size_t groupMembers = 0;
+                    for (size_t i = 0; i < count; i++) {
+                        const size_t len = std::min(kFragPayload, total - i * kFragPayload);
+                        expectedWire += sizeof(VideoFragmentHeader) + len;
+                        if (group > 0) {
+                            groupMembers++;
+                            const bool groupEnd = ((i + 1) % group == 0) || (i + 1 == count);
+                            if (groupEnd) {
+                                if (groupMembers > 1) expectedWire += sizeof(VideoParityHeader) + kFragPayload;
+                                groupMembers = 0;
+                            }
+                        }
+                    }
+                    const size_t billed = rcs::FrameWireBytes(kFragPayload, total, fec);
+                    CHECK(billed == expectedWire);
+                    pureChecks++;
+                }
+            }
+        }
+        std::printf("T-59 pure matrix: %d (fec, count, tail) combinations checked\n", pureChecks);
+    }
+
+    // 2. Explicit count % group == 1 and control cases through VideoPacketizer + LoopbackPair,
+    //    verifying packetizer-emitted wire bytes on both sendConn and recvConn match FrameWireBytes.
+    {
+        struct MatrixProbe {
+            size_t count;
+            int fec;
+            size_t expectedParity;
+            bool partialTail;
+        };
+        const MatrixProbe probes[] = {
+            {1, 25, 0, false},   // 1f@25% (1 % 4 == 1): 0 parity
+            {1, 25, 0, true},    // 1f partial@25%: 0 parity
+            {5, 25, 1, false},   // 5f@25% (5 % 4 == 1): 1 parity
+            {5, 25, 1, true},    // 5f partial@25%: 1 parity
+            {6, 25, 2, false},   // 6f@25% (6 % 4 == 2): 2 parity (control)
+            {11, 20, 2, false},  // 11f@20% (11 % 5 == 1): 2 parity
+            {21, 5, 1, false},   // 21f@5% (21 % 20 == 1): 1 parity
+            {34, 3, 1, false},   // 34f@3% (34 % 33 == 1): 1 parity
+            {3, 100, 1, false},  // 3f@100% (3 % 2 == 1): 1 parity
+            {1, 0, 0, false},    // 1f@0%: 0 parity
+        };
+        for (const MatrixProbe& p : probes) {
+            LoopbackPair l;
+            CHECK(l.Open());
+            std::mutex rxMu;
+            std::condition_variable rxCv;
+            size_t rxDataPkts = 0;
+            size_t rxParityPkts = 0;
+            size_t rxWireBytes = 0;
+            l.recvConn->SetPacketHandler([&](PacketType t, const uint8_t*, size_t n) {
+                std::lock_guard lock(rxMu);
+                if (t == PacketType::Video) {
+                    rxDataPkts++;
+                    rxWireBytes += n;
+                } else if (t == PacketType::VideoParity) {
+                    rxParityPkts++;
+                    rxWireBytes += n;
+                }
+                rxCv.notify_all();
+            });
+            l.Start();
+            VideoPacketizer pkt(l.sendConn.get());
+            pkt.SetFecPercent(p.fec);
+            pkt.SetPacingKbps(0);
+            pkt.SetPacingFrameBudgetNs(0);
+            const size_t maxHdr = std::max(sizeof(VideoFragmentHeader), sizeof(VideoParityHeader));
+            const size_t fragPayload = l.sendConn->MaxPayload() - maxHdr;
+            VrFrameMetadata meta{};
+            const size_t total = p.partialTail
+                                     ? (p.count == 1 ? (2 + sizeof(meta) + 16) : (p.count - 1) * fragPayload + 1)
+                                     : p.count * fragPayload;
+            std::vector<uint8_t> bits(total - 2 - sizeof(meta), 0x4B);
+            const auto before = l.sendConn->Stats();
+            const size_t sent = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta),
+                                              bits.data(), bits.size());
+            const auto after = l.sendConn->Stats();
+            const size_t expectedSent = p.count + p.expectedParity;
+            CHECK(sent == expectedSent);
+            CHECK(pkt.SendFailures() == 0);
+            const size_t sendWire =
+                size_t(after.bytesSent - before.bytesSent) - sent * (sizeof(PacketHeader) + kMacSize);
+            {
+                std::unique_lock lock(rxMu);
+                rxCv.wait_for(lock, std::chrono::milliseconds(500),
+                              [&] { return rxDataPkts + rxParityPkts >= expectedSent; });
+            }
+            l.Stop();
+            CHECK(rxDataPkts == p.count);
+            CHECK(rxParityPkts == p.expectedParity);
+            CHECK(rxWireBytes == sendWire);
+            const size_t billed = rcs::FrameWireBytes(fragPayload, total, p.fec);
+            CHECK(billed == sendWire);
+            CHECK(billed == rxWireBytes);
+        }
+        std::printf("T-59 loopback probes: %zu count%%group==1 & control cases checked\n", std::size(probes));
+    }
+
+    // 3. Full LoopbackPair matrix over count = 1..64 x fecPercent = {0, 3, 5, 10, 20, 25, 100}.
+    {
+        int loopbackFrames = 0;
+        for (int fec : kFecCases) {
+            LoopbackPair l;
+            CHECK(l.Open(256));
+            std::mutex rxMu;
+            std::condition_variable rxCv;
+            size_t rxPkts = 0;
+            size_t rxWireBytes = 0;
+            l.recvConn->SetPacketHandler([&](PacketType t, const uint8_t*, size_t n) {
+                if (t == PacketType::Video || t == PacketType::VideoParity) {
+                    std::lock_guard lock(rxMu);
+                    rxPkts++;
+                    rxWireBytes += n;
+                    rxCv.notify_all();
+                }
+            });
+            l.Start();
+            VideoPacketizer pkt(l.sendConn.get());
+            pkt.SetFecPercent(fec);
+            pkt.SetPacingKbps(0);
+            pkt.SetPacingFrameBudgetNs(0);
+            const size_t maxHdr = std::max(sizeof(VideoFragmentHeader), sizeof(VideoParityHeader));
+            const size_t fragPayload = l.sendConn->MaxPayload() - maxHdr;
+            VrFrameMetadata meta{};
+            size_t expectedTotalPkts = 0;
+            size_t prevRxWireBytes = 0;
+            for (size_t count = 1; count <= 64; count++) {
+                const size_t total = count * fragPayload;
+                std::vector<uint8_t> bits(total - 2 - sizeof(meta), uint8_t(count));
+                const auto before = l.sendConn->Stats();
+                const size_t sent = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, uint32_t(count), &meta,
+                                                  sizeof(meta), bits.data(), bits.size());
+                const auto after = l.sendConn->Stats();
+                CHECK(pkt.SendFailures() == 0);
+                CHECK(after.packetsSent - before.packetsSent == sent);
+                const size_t sendWire =
+                    size_t(after.bytesSent - before.bytesSent) - sent * (sizeof(PacketHeader) + kMacSize);
+                expectedTotalPkts += sent;
+                size_t rxFrameWire = 0;
+                {
+                    std::unique_lock lock(rxMu);
+                    rxCv.wait_for(lock, std::chrono::milliseconds(500), [&] { return rxPkts >= expectedTotalPkts; });
+                    rxFrameWire = rxWireBytes - prevRxWireBytes;
+                    prevRxWireBytes = rxWireBytes;
+                }
+                const size_t billed = rcs::FrameWireBytes(fragPayload, total, fec);
+                CHECK(billed == sendWire);
+                CHECK(billed == rxFrameWire);
+                loopbackFrames++;
+            }
+            const auto finalSendStats = l.sendConn->Stats();
+            const size_t totalSendWire =
+                size_t(finalSendStats.bytesSent) - size_t(finalSendStats.packetsSent) * (sizeof(PacketHeader) + kMacSize);
+            l.Stop();
+            CHECK(rxPkts == expectedTotalPkts);
+            CHECK(rxWireBytes == totalSendWire);
+        }
+        std::printf("T-59 full loopback matrix: %d (fec, count) frames verified\n", loopbackFrames);
+    }
+}
+
+// T-59 Step B: SendFrame(..., &outWireBytes) single-snapshot consistency, concurrent
+// SetFecPercent stress, early-reject zeroing, and pure-function zero boundaries.
+static void TestFecOutWireBytesAndBoundaries() {
+    // (iv) Pure-function boundary checks: 0 fragPayload or 0 totalPayload -> 0 wire bytes.
+    CHECK(rcs::FrameWireBytes(0, 0, 0) == 0);
+    CHECK(rcs::FrameWireBytes(0, 0, 25) == 0);
+    CHECK(rcs::FrameWireBytes(0, 1024, 0) == 0);
+    CHECK(rcs::FrameWireBytes(0, 1024, 25) == 0);
+    CHECK(rcs::FrameWireBytes(1352, 0, 0) == 0);
+    CHECK(rcs::FrameWireBytes(1352, 0, 25) == 0);
+    CHECK(rc::VideoFrameWireBytes(0, 1024, 25) == 0);
+    CHECK(rc::VideoFrameWireBytes(1352, 0, 25) == 0);
+    CHECK(rc::VideoFecGroupSize(0) == 0);
+    CHECK(rc::VideoFecGroupSize(-5) == 0);
+    CHECK(rc::VideoFecGroupSize(100) == 2);
+    CHECK(rc::VideoFecGroupSize(1) == 64);
+    CHECK(rc::VideoParityFragmentCount(0, 4) == 0);
+    CHECK(rc::VideoParityFragmentCount(1, 4) == 0);
+    CHECK(rc::VideoParityFragmentCount(5, 4) == 1);
+    CHECK(rc::VideoParityFragmentCount(6, 4) == 2);
+    CHECK(rc::VideoParityFragmentCount(5, 0) == 0);
+    CHECK(rc::VideoParityFragmentCount(5, 1) == 0);
+
+    // (i) SendFrame(..., &outWireBytes) == rcs::FrameWireBytes == LastBilledWireBytesForTest()
+    //     across FEC% and sizes (including count % group == 1 and partial tails).
+    {
+        constexpr int kFecs[] = {0, 3, 5, 10, 20, 25, 100};
+        constexpr size_t kCounts[] = {1, 2, 3, 5, 6, 11, 21, 34};
+        int checked = 0;
+        for (int fec : kFecs) {
+            LoopbackPair l;
+            CHECK(l.Open(256));
+            l.recvConn->SetPacketHandler([](PacketType, const uint8_t*, size_t) {});
+            l.Start();
+            VideoPacketizer pkt(l.sendConn.get());
+            pkt.SetFecPercent(fec);
+            const size_t maxHdr = std::max(sizeof(VideoFragmentHeader), sizeof(VideoParityHeader));
+            const size_t fragPayload = l.sendConn->MaxPayload() - maxHdr;
+            VrFrameMetadata meta{};
+            for (size_t count : kCounts) {
+                for (bool partial : {false, true}) {
+                    const size_t total =
+                        partial ? (count == 1 ? (2 + sizeof(meta) + 12) : (count - 1) * fragPayload + 1)
+                                : count * fragPayload;
+                    std::vector<uint8_t> bits(total - 2 - sizeof(meta), 0x6D);
+
+                    // Burst mode: outWireBytes, LastBilledWireBytesForTest(), FrameWireBytes, and emitted bytes all match.
+                    pkt.SetPacingKbps(1'000'000);
+                    pkt.SetPacingFrameBudgetNs(10'000'000);
+                    size_t outBurst = 0;
+                    const auto beforeB = l.sendConn->Stats();
+                    const size_t sentB = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, uint32_t(checked + 1),
+                                                       &meta, sizeof(meta), bits.data(), bits.size(), &outBurst);
+                    const auto afterB = l.sendConn->Stats();
+                    CHECK(pkt.SendFailures() == 0);
+                    const size_t emittedB =
+                        size_t(afterB.bytesSent - beforeB.bytesSent) - sentB * (sizeof(PacketHeader) + kMacSize);
+                    const size_t formula = rcs::FrameWireBytes(fragPayload, total, fec);
+                    CHECK(outBurst == formula);
+                    CHECK(outBurst == pkt.LastBilledWireBytesForTest());
+                    CHECK(outBurst == emittedB);
+
+                    // Unpaced mode: outWireBytes still matches FrameWireBytes and emitted bytes;
+                    // LastBilledWireBytesForTest() remains untouched from the prior burst frame.
+                    pkt.SetPacingKbps(0);
+                    pkt.SetPacingFrameBudgetNs(0);
+                    size_t outUnpaced = 0;
+                    const auto beforeU = l.sendConn->Stats();
+                    const size_t sentU = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, uint32_t(checked + 1000),
+                                                       &meta, sizeof(meta), bits.data(), bits.size(), &outUnpaced);
+                    const auto afterU = l.sendConn->Stats();
+                    CHECK(pkt.SendFailures() == 0);
+                    const size_t emittedU =
+                        size_t(afterU.bytesSent - beforeU.bytesSent) - sentU * (sizeof(PacketHeader) + kMacSize);
+                    CHECK(outUnpaced == formula);
+                    CHECK(outUnpaced == emittedU);
+                    CHECK(pkt.LastBilledWireBytesForTest() == outBurst);
+                    checked++;
+                }
+            }
+            l.Stop();
+        }
+        std::printf("T-59 outWireBytes matrix: %d (fec, count, tail) burst+unpaced pairs matched\n", checked);
+    }
+
+    // (ii) Concurrent SetFecPercent stress: outWireBytes ALWAYS equals exact datagram wire bytes
+    //      emitted by that SendFrame call (frag*hdr + data + parity*(hdr+fragPayload)), and matches
+    //      LastBilledWireBytesForTest() in burst mode.
+    {
+        for (bool burst : {true, false}) {
+            LoopbackPair l;
+            CHECK(l.Open(256));
+            l.recvConn->SetPacketHandler([](PacketType, const uint8_t*, size_t) {});
+            l.Start();
+            VideoPacketizer pkt(l.sendConn.get());
+            if (burst) {
+                pkt.SetPacingKbps(1'000'000);
+                pkt.SetPacingFrameBudgetNs(10'000'000);
+            } else {
+                pkt.SetPacingKbps(0);
+                pkt.SetPacingFrameBudgetNs(0);
+            }
+            const size_t maxHdr = std::max(sizeof(VideoFragmentHeader), sizeof(VideoParityHeader));
+            const size_t fragPayload = l.sendConn->MaxPayload() - maxHdr;
+            constexpr size_t kCount = 13;
+            VrFrameMetadata meta{};
+            const size_t totalFull = kCount * fragPayload;
+            const size_t totalPart = (kCount - 1) * fragPayload + 1;
+            std::vector<uint8_t> fullBits(totalFull - 2 - sizeof(meta), 0x2A);
+            std::vector<uint8_t> partBits(totalPart - 2 - sizeof(meta), 0x2B);
+
+            constexpr int kFlipTable[] = {0, 3, 5, 8, 10, 12, 20, 25, 33, 50, 100};
+            std::atomic<bool> stopFlip{false};
+            std::thread flipper([&] {
+                size_t idx = 0;
+                while (!stopFlip.load(std::memory_order_relaxed)) {
+                    pkt.SetFecPercent(kFlipTable[idx % std::size(kFlipTable)]);
+                    idx++;
+                }
+            });
+
+            for (uint32_t f = 1; f <= 2000; f++) {
+                const bool usePart = (f & 1u) != 0;
+                const auto& bits = usePart ? partBits : fullBits;
+                const size_t total = usePart ? totalPart : totalFull;
+                const auto before = l.sendConn->Stats();
+                size_t outWire = 0;
+                const size_t sent = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, f, &meta, sizeof(meta),
+                                                  bits.data(), bits.size(), &outWire);
+                const auto after = l.sendConn->Stats();
+                CHECK(pkt.SendFailures() == 0);
+                CHECK(sent >= kCount);
+                CHECK(after.packetsSent - before.packetsSent == sent);
+                const size_t actualEmitted =
+                    size_t(after.bytesSent - before.bytesSent) - sent * (sizeof(PacketHeader) + kMacSize);
+                const size_t nParity = sent - kCount;
+                const size_t expectedFromDatagrams =
+                    kCount * sizeof(VideoFragmentHeader) + total + nParity * (sizeof(VideoParityHeader) + fragPayload);
+                CHECK(outWire == actualEmitted);
+                CHECK(outWire == expectedFromDatagrams);
+                if (burst) CHECK(outWire == pkt.LastBilledWireBytesForTest());
+            }
+
+            stopFlip.store(true, std::memory_order_relaxed);
+            flipper.join();
+            l.Stop();
+        }
+        std::printf("T-59 concurrent SetFecPercent stress: 4000 burst+unpaced frames exact outWire==emitted\n");
+    }
+
+    // (iii) Early reject (maxPayload <= maxHdr and > 2048 fragments) sets *outWireBytes == 0.
+    {
+        UdpSocket sock;
+        CHECK(sock.Open(0));
+        auto keys = crypto::DeriveSessionKeys(crypto::KeyPair::Generate().secretKey,
+                                              crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey, "t59-rej");
+        for (size_t payloadCap : {size_t(0), size_t(1), size_t(15), sizeof(VideoFragmentHeader)}) {
+            Connection conn(&sock, NetAddress{0x7F000001, 1}, 0x7590001u, keys, true,
+                            sizeof(PacketHeader) + kMacSize + payloadCap);
+            VideoPacketizer pkt(&conn);
+            pkt.SetFecPercent(25);
+            pkt.SetPacingKbps(500'000);
+            pkt.SetPacingFrameBudgetNs(10'000'000);
+            DesktopFrameMetadata meta{};
+            uint8_t data[32] = {};
+            size_t outWire = 999999;
+            const size_t sent = pkt.SendFrame(1, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), data, sizeof(data),
+                                              &outWire);
+            CHECK(sent == 0);
+            CHECK(outWire == 0);
+            CHECK(pkt.LastBilledWireBytesForTest() == 0);
+        }
+
+        LoopbackPair l;
+        CHECK(l.Open(256));
+        l.recvConn->SetPacketHandler([](PacketType, const uint8_t*, size_t) {});
+        l.Start();
+        VideoPacketizer pkt(l.sendConn.get());
+        pkt.SetFecPercent(25);
+        pkt.SetPacingKbps(500'000);
+        pkt.SetPacingFrameBudgetNs(10'000'000);
+        VrFrameMetadata meta{};
+        std::vector<uint8_t> smallBits(64, 0x1E);
+        size_t outOk = 0;
+        const size_t sentOk = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, kVideoKeyframe, 1, &meta, sizeof(meta),
+                                            smallBits.data(), smallBits.size(), &outOk);
+        CHECK(sentOk == 1);
+        CHECK(outOk > 0);
+        CHECK(pkt.LastBilledWireBytesForTest() == outOk);
+
+        const size_t maxHdr = std::max(sizeof(VideoFragmentHeader), sizeof(VideoParityHeader));
+        const size_t fragPayload = l.sendConn->MaxPayload() - maxHdr;
+        std::vector<uint8_t> overBits(kMaxFragmentsPerFrame * fragPayload + 1 - 2 - sizeof(meta), 0x7F);
+        size_t outOver = 999999;
+        const size_t sentOver = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta),
+                                              overBits.data(), overBits.size(), &outOver);
+        CHECK(sentOver == 0);
+        CHECK(outOver == 0);
+        CHECK(pkt.LastBilledWireBytesForTest() == 0);
+        l.Stop();
+        std::printf("T-59 early-reject outWireBytes==0: small MTU & 2049-fragment bounds verified\n");
     }
 }
 
@@ -6888,16 +8778,337 @@ static void TestTransportRobustPacketizer() {
         DesktopFrameMetadata meta{};
         pkt.SendFrame(1, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), big.data(), big.size());
         CHECK(pkt.NextSendNsForTest() <= NowNs() + 40'000'000LL + 2'000'000LL);
+        CHECK(pkt.SendBacklogNs() > 0);
+        const int64_t resetNowNs = NowNs();
+        pkt.ResetPacingDebtNs(resetNowNs);
+        CHECK(pkt.NextSendNsForTest() == resetNowNs);
+        CHECK(pkt.SendBacklogNs() == 0);
+        pkt.SendFrame(1, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta), big.data(), big.size());
+        CHECK(pkt.SendBacklogNs() > 0);
         const uint32_t resets = pkt.ModeSwitchResetsForTest();
         pkt.SetPacingKbps(0);           // exit burst pacing entirely
         pkt.SetPacingFrameBudgetNs(0);  // switch back to legacy mode
         uint8_t tiny[8] = {};
-        pkt.SendFrame(1, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta), tiny, sizeof(tiny));
+        pkt.SendFrame(1, VideoCodec::HEVC, 0, 3, &meta, sizeof(meta), tiny, sizeof(tiny));
         CHECK(pkt.ModeSwitchResetsForTest() == resets + 1);
+        CHECK(pkt.SendBacklogNs() == 0);
         l.Stop();
     }
 
+    // --- T-57 (1): unopened UdpSocket, 1-fragment frame (FEC=0, pacing=0) ---
+    // Socket send fails => SendFrame must return 0, not 1.
+    {
+        UdpSocket dead;
+        CHECK(!dead.IsOpen());
+        auto keys = crypto::DeriveSessionKeys(crypto::KeyPair::Generate().secretKey,
+                                              crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey, "t57-1");
+        Connection conn(&dead, NetAddress{0x7F000001, 1}, 0x7570001u, keys, true, kMaxDatagramLan);
+        VideoPacketizer pkt(&conn);
+        pkt.SetFecPercent(0);
+        pkt.SetPacingKbps(0);
+        pkt.SetPacingFrameBudgetNs(0);
+        DesktopFrameMetadata meta{};
+        uint8_t data[64] = {};
+        const size_t sent = pkt.SendFrame(1, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), data, sizeof(data));
+        CHECK(sent == 0);
+        CHECK(pkt.SendFailures() == 1);
+        CHECK(conn.Stats().packetsSent == 0);
+        CHECK(conn.Stats().bytesSent == 0);
+    }
+
+    // --- T-57 (2): unopened UdpSocket, multi-fragment + FEC=25 (group=4) ---
+    // Covers 6-frag/2-parity (attempted=8), 5-frag/1-parity (attempted=6), and 1-frag/0-parity (attempted=1),
+    // plus cumulative SendFailures across repeated failed frames.
+    {
+        UdpSocket dead;
+        CHECK(!dead.IsOpen());
+        auto keys = crypto::DeriveSessionKeys(crypto::KeyPair::Generate().secretKey,
+                                              crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey, "t57-2");
+        struct FecCase {
+            size_t dataFrags;
+            size_t parityFrags;
+        };
+        const FecCase cases[] = {
+            {6, 2},  // 4 + 2 => 2 parity datagrams, attempted = 8
+            {5, 1},  // 4 + 1 (single-member tail has no parity) => 1 parity datagram, attempted = 6
+            {1, 0},  // single fragment with FEC=25 => 0 parity datagrams, attempted = 1
+        };
+        uint32_t sid = 0x7570010u;
+        for (const FecCase& c : cases) {
+            Connection conn(&dead, NetAddress{0x7F000001, 2}, sid++, keys, true, kMaxDatagramLan);
+            VideoPacketizer pkt(&conn);
+            pkt.SetFecPercent(25);  // group = clamp(100 / 25, 2, 64) = 4
+            pkt.SetPacingKbps(0);
+            pkt.SetPacingFrameBudgetNs(0);
+            const size_t fragPayload = conn.MaxPayload() - sizeof(VideoFragmentHeader);
+            VrFrameMetadata meta{};
+            const size_t bitstreamSize = c.dataFrags * fragPayload - 2 - sizeof(meta);
+            std::vector<uint8_t> frame(bitstreamSize, 0x5B);
+            const size_t attempted = c.dataFrags + c.parityFrags;
+            const size_t sent = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta),
+                                              frame.data(), frame.size());
+            CHECK(sent == 0);
+            CHECK(pkt.SendFailures() == attempted);
+            CHECK(conn.Stats().packetsSent == 0);
+            CHECK(conn.Stats().bytesSent == 0);
+        }
+        {
+            Connection conn(&dead, NetAddress{0x7F000001, 2}, sid++, keys, true, kMaxDatagramLan);
+            VideoPacketizer pkt(&conn);
+            pkt.SetFecPercent(25);
+            pkt.SetPacingKbps(0);
+            pkt.SetPacingFrameBudgetNs(0);
+            const size_t fragPayload = conn.MaxPayload() - sizeof(VideoFragmentHeader);
+            VrFrameMetadata meta{};
+            std::vector<uint8_t> frame6(6 * fragPayload - 2 - sizeof(meta), 0x6C);
+            std::vector<uint8_t> frame5(5 * fragPayload - 2 - sizeof(meta), 0x5C);
+            CHECK(pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 1, &meta, sizeof(meta), frame6.data(),
+                                frame6.size()) == 0);
+            CHECK(pkt.SendFailures() == 8);
+            CHECK(pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta), frame5.data(),
+                                frame5.size()) == 0);
+            CHECK(pkt.SendFailures() == 14);
+            CHECK(conn.Stats().packetsSent == 0);
+            CHECK(conn.Stats().bytesSent == 0);
+        }
+    }
+
+    // --- T-57 (3): LoopbackPair success control returns actual datagrams and delivers frames ---
+    {
+        LoopbackPair l;
+        CHECK(l.Open());
+        l.Start();
+        VideoPacketizer pkt(l.sendConn.get());
+        pkt.SetFecPercent(0);
+        pkt.SetPacingKbps(0);
+        pkt.SetPacingFrameBudgetNs(0);
+        const size_t fragPayload = l.sendConn->MaxPayload() - sizeof(VideoFragmentHeader);
+        VrFrameMetadata meta{};
+
+        const std::vector<uint8_t> bits1(64, 0xA1);
+        const size_t sent1 = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, kVideoKeyframe, 1, &meta, sizeof(meta),
+                                           bits1.data(), bits1.size());
+        CHECK(sent1 == 1);
+
+        pkt.SetFecPercent(25);  // group = 4
+        std::vector<uint8_t> bits6(6 * fragPayload - 2 - sizeof(meta), 0xA6);
+        const size_t sent2 = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta),
+                                           bits6.data(), bits6.size());
+        CHECK(sent2 == 8);  // 6 data + 2 parity
+
+        std::vector<uint8_t> bits5(5 * fragPayload - 2 - sizeof(meta), 0xA5);
+        const size_t sent3 = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 3, &meta, sizeof(meta),
+                                           bits5.data(), bits5.size());
+        CHECK(sent3 == 6);  // 5 data + 1 parity
+
+        const size_t totalSent = sent1 + sent2 + sent3;
+        CHECK(totalSent == 15);
+        CHECK(pkt.SendFailures() == 0);
+        CHECK(l.sendConn->Stats().packetsSent == totalSent);
+        CHECK(l.sendConn->Stats().bytesSent > 0);
+
+        for (int i = 0; i < 100; i++) {
+            {
+                std::lock_guard lock(l.mutex);
+                if (l.frames.size() >= 3 && l.arrivals.size() >= totalSent) break;
+            }
+            SleepMs(5);
+        }
+        l.Stop();
+        CHECK(l.arrivals.size() == totalSent);
+        CHECK(l.recvConn->Stats().packetsReceived == totalSent);
+        CHECK(l.frames.size() == 3);
+        if (l.frames.size() == 3) {
+            CHECK(l.frames[0].bitstream == bits1);
+            CHECK(l.frames[1].bitstream == bits6);
+            CHECK(l.frames[2].bitstream == bits5);
+        }
+    }
+
+    // --- T-57 Stage 2 Robustness: null/0-byte payload & burst-paced unopened socket ---
+    {
+        UdpSocket dead;
+        auto keys = crypto::DeriveSessionKeys(crypto::KeyPair::Generate().secretKey,
+                                              crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey,
+                                              crypto::KeyPair::Generate().publicKey, "t57-rob");
+        Connection conn(&dead, NetAddress{0x7F000001, 3}, 0x7570099u, keys, true, kMaxDatagramLan);
+        VideoPacketizer pkt(&conn);
+        pkt.SetFecPercent(25);
+        // Zero-byte metadata + nullptr payload must still serialize cleanly (2B len) and report 0 sent.
+        CHECK(pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 1, nullptr, 0, nullptr, 0) == 0);
+        CHECK(pkt.SendFailures() == 1);
+
+        // Burst-paced multi-fragment + parity frame on failed socket must still report 0 sent cleanly.
+        pkt.SetPacingKbps(24000);
+        pkt.SetPacingFrameBudgetNs(8'000'000);
+        const size_t fragPayload = conn.MaxPayload() - sizeof(VideoFragmentHeader);
+        VrFrameMetadata meta{};
+        std::vector<uint8_t> frame6(6 * fragPayload - 2 - sizeof(meta), 0x5D);
+        CHECK(pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta), frame6.data(),
+                            frame6.size()) == 0);
+        CHECK(pkt.SendFailures() == 9);
+        CHECK(conn.Stats().packetsSent == 0);
+        CHECK(conn.Stats().bytesSent == 0);
+    }
+
+    // --- T-58 (1): count == 2048 boundary (FEC=0, 256-byte MTU, 50 Mbps pacing) reassembles byte-exact ---
+    {
+        constexpr size_t kLimitFragments = 2048;
+        LoopbackPair l;
+        CHECK(l.Open(256));
+        l.Start();
+        VideoPacketizer pkt(l.sendConn.get());
+        pkt.SetFecPercent(0);
+        pkt.SetPacingKbps(50000);
+        pkt.SetPacingFrameBudgetNs(0);
+        const size_t maxHdr = std::max(sizeof(VideoFragmentHeader), sizeof(VideoParityHeader));
+        const size_t fragPayload = l.sendConn->MaxPayload() - maxHdr;
+        VrFrameMetadata meta{};
+        meta.trackingTimestampNs = 987654321ULL;
+        const size_t total = kLimitFragments * fragPayload;
+        CHECK((total + fragPayload - 1) / fragPayload == kLimitFragments);
+        std::vector<uint8_t> bits(total - 2 - sizeof(meta));
+        for (size_t i = 0; i < bits.size(); i++) bits[i] = uint8_t((i * 131 + 17) & 0xFF);
+        const size_t sent = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, kVideoKeyframe, 1, &meta, sizeof(meta),
+                                          bits.data(), bits.size());
+        CHECK(sent == kLimitFragments);
+        CHECK(pkt.SendFailures() == 0);
+        CHECK(l.sendConn->Stats().packetsSent == kLimitFragments);
+        for (int i = 0; i < 400; i++) {
+            {
+                std::lock_guard lock(l.mutex);
+                if (l.frames.size() >= 1 && l.arrivals.size() >= kLimitFragments) break;
+            }
+            SleepMs(5);
+        }
+        l.Stop();
+        const auto rstats = l.reasm->TakeStats();
+        CHECK(l.arrivals.size() == kLimitFragments);
+        CHECK(l.recvConn->Stats().packetsReceived == kLimitFragments);
+        CHECK(rstats.packetsDropped == 0);
+        CHECK(rstats.framesComplete == 1);
+        CHECK(rstats.framesLost == 0);
+        CHECK(l.frames.size() == 1);
+        if (l.frames.size() == 1) {
+            CHECK(l.frames[0].bitstream == bits);
+            CHECK(l.frames[0].metadata.size() == sizeof(meta));
+            if (l.frames[0].metadata.size() == sizeof(meta)) {
+                VrFrameMetadata gotMeta{};
+                std::memcpy(&gotMeta, l.frames[0].metadata.data(), sizeof(gotMeta));
+                CHECK(gotMeta.trackingTimestampNs == meta.trackingTimestampNs);
+            }
+        }
+    }
+
+    // --- T-58 (2): count == 2049 (1 over limit) across LAN/WAN/256 MTUs emits 0 packets & leaves state clean ---
+    {
+        constexpr size_t kLimitFragments = 2048;
+        const size_t maxHdr = std::max(sizeof(VideoFragmentHeader), sizeof(VideoParityHeader));
+        for (size_t mtu : {kMaxDatagramLan, kMaxDatagramWan, size_t(256)}) {
+            LoopbackPair l;
+            CHECK(l.Open(mtu));
+            l.Start();
+            VideoPacketizer pkt(l.sendConn.get());
+            pkt.SetFecPercent(0);
+            pkt.SetPacingKbps(500000);
+            pkt.SetPacingFrameBudgetNs(13'888'888LL);
+            const size_t fragPayload = l.sendConn->MaxPayload() - maxHdr;
+            const size_t total = kLimitFragments * fragPayload + 1;
+            CHECK((total + fragPayload - 1) / fragPayload == kLimitFragments + 1);
+            VrFrameMetadata meta{};
+            std::vector<uint8_t> bits(total - 2 - sizeof(meta), 0x5E);
+            const size_t sent = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, kVideoKeyframe, 1, &meta,
+                                              sizeof(meta), bits.data(), bits.size());
+            if (sent > 0) {
+                for (int i = 0; i < 100; i++) {
+                    {
+                        std::lock_guard lock(l.mutex);
+                        if (l.arrivals.size() >= sent) break;
+                    }
+                    SleepMs(5);
+                }
+            } else {
+                l.Drain(20);
+            }
+            l.Stop();
+            const auto rstats = l.reasm->TakeStats();
+            const auto cstats = l.sendConn->Stats();
+            std::printf("T-58 oversize probe mtu=%zu total=%zuB sent=%zu packetsSent=%llu arrivals=%zu dropped=%u "
+                        "frames=%zu framesLost=%u lastBilled=%llu nextSendNs=%lld\n",
+                        mtu, total, sent, (unsigned long long)cstats.packetsSent, l.arrivals.size(),
+                        rstats.packetsDropped, l.frames.size(), rstats.framesLost,
+                        (unsigned long long)pkt.LastBilledWireBytesForTest(),
+                        (long long)pkt.NextSendNsForTest());
+            CHECK(sent == 0);
+            CHECK(pkt.SendFailures() == 0);
+            CHECK(pkt.LastBilledWireBytesForTest() == 0);
+            CHECK(pkt.NextSendNsForTest() == 0);
+            CHECK(cstats.packetsSent == 0);
+            CHECK(cstats.bytesSent == 0);
+            CHECK(l.arrivals.empty());
+            CHECK(l.recvConn->Stats().packetsReceived == 0);
+            CHECK(l.frames.empty());
+            CHECK(rstats.packetsDropped == 0);
+            CHECK(rstats.framesLost == 0);
+        }
+    }
+
+    // --- T-58 (3): rejecting 2049-fragment frame after prior burst frame clears LastBilledWireBytes & preserves clock/failures ---
+    {
+        constexpr size_t kLimitFragments = 2048;
+        const size_t maxHdr = std::max(sizeof(VideoFragmentHeader), sizeof(VideoParityHeader));
+        LoopbackPair l;
+        CHECK(l.Open(kMaxDatagramLan));
+        l.Start();
+        VideoPacketizer pkt(l.sendConn.get());
+        pkt.SetFecPercent(25);
+        pkt.SetPacingKbps(500000);
+        pkt.SetPacingFrameBudgetNs(13'888'888LL);
+        VrFrameMetadata meta{};
+        const std::vector<uint8_t> smallBits(64, 0x3A);
+        const size_t sent1 = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, kVideoKeyframe, 1, &meta, sizeof(meta),
+                                           smallBits.data(), smallBits.size());
+        CHECK(sent1 == 1);
+        CHECK(pkt.LastBilledWireBytesForTest() > 0);
+        const int64_t prevNextSendNs = pkt.NextSendNsForTest();
+        CHECK(prevNextSendNs > 0);
+        const uint32_t prevResets = pkt.ModeSwitchResetsForTest();
+        const uint32_t prevFailures = pkt.SendFailures();
+        const auto prevStats = l.sendConn->Stats();
+
+        const size_t fragPayload = l.sendConn->MaxPayload() - maxHdr;
+        std::vector<uint8_t> overBits(kLimitFragments * fragPayload + 1 - 2 - sizeof(meta), 0x7C);
+        const size_t sent2 = pkt.SendFrame(rc::kVrStreamId, VideoCodec::HEVC, 0, 2, &meta, sizeof(meta),
+                                           overBits.data(), overBits.size());
+        for (int i = 0; i < 40; i++) {
+            {
+                std::lock_guard lock(l.mutex);
+                if (l.frames.size() >= 1 && (sent2 == 0 || l.arrivals.size() >= sent1 + sent2)) break;
+            }
+            SleepMs(5);
+        }
+        l.Stop();
+        const auto rstats = l.reasm->TakeStats();
+        CHECK(sent2 == 0);
+        CHECK(pkt.LastBilledWireBytesForTest() == 0);
+        CHECK(pkt.NextSendNsForTest() == prevNextSendNs);
+        CHECK(pkt.ModeSwitchResetsForTest() == prevResets);
+        CHECK(pkt.SendFailures() == prevFailures);
+        CHECK(l.sendConn->Stats().packetsSent == prevStats.packetsSent);
+        CHECK(l.sendConn->Stats().bytesSent == prevStats.bytesSent);
+        CHECK(l.arrivals.size() == 1);
+        CHECK(l.frames.size() == 1);
+        CHECK(rstats.packetsDropped == 0);
+    }
+
     std::printf("A45 packetizer: small MTU safe, parity billing exact, FEC race safe, clock bounded\n");
+    std::printf("T-57 packetizer send-count: unopened socket returns 0 (1-frag/FEC0 + 6f2p/5f1p/1f0p FEC25 + null/0B + burst-paced), loopback matches exact datagrams\n");
+    std::printf("T-58 packetizer max-fragments: 2048 boundary reassembled byte-exact, 2049 rejected with 0 wire packets and untouched clock/failures\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -7187,8 +9398,22 @@ int main() {
     TestLinkLocalDiscovery();
     TestMusic();
     TestMotionRuns();
+    TestMotionMetadataWireLimit();
+    TestMotionTiming();
+    TestMotionReadbackPairing();
+    TestMotionMailboxStats();
+    TestMotionMailboxIdentity();
+    TestMotionHeaderFailureDiagnostics();
+    TestMotionFieldLocalConsensus();
+    TestMotionFilterRunsBeforeUpload();
+    TestMotionDiagnosticPolicy();
+    TestMotionProductionAttachmentPath();
+    TestMotionFrameGapReset();
     TestMotionHysteresis();  // A18 (TASK-MOTION-HYSTERESIS-2026-11-22)
     TestMotionGate();
+    TestMotionGateExternalRegressions();
+    TestHeadsetMotionPipelineReplay();
+    TestMotionReadbackConcurrency();
     TestHandSkeleton();
     NetInit();
     TestAddresses();
@@ -7265,6 +9490,8 @@ int main() {
     TestConfigCouplingCases();
     TestH264CapsFallback();  // TASK-CAPS-GUARD: the H264 width-cap fallback cases
     TestFecWireBillingLoopback();
+    TestFecWireBillingMatrix();
+    TestFecOutWireBytesAndBoundaries();
     TestPaceBaseKbps();  // A33 (TASK-PACE-FOLLOW-2026-11-22): the burst pacer's billing base
     TestFoveaPlacement();  // A61: the fovea square's placement rule
     TestFoveaQpDelta();  // A62: the foveated QP ramp's NaN rule
@@ -7292,6 +9519,12 @@ int main() {
     TestSettingsSchemaMigration();  // A84b §2: the autoTune default migration, out of settings.cpp
     TestLinkPolicy();
     TestSuggestStartFps();
+    TestFrameGenerationForceCadence();
+    TestShouldForceFrameGeneration();
+    TestFrameGenerationSlotJolt();
+    TestFrameGenerationQuota();
+    TestFrameGenerationCartesian();
+    TestQualityGenerationProduct();
     TestSessionDisconnectReconnect();
     TestFecDeterministic();
     TestHandshakeHardening();  // A44 (TASK-HANDSHAKE-HARDEN-2026-11-22)

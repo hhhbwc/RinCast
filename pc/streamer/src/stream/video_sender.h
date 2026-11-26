@@ -37,20 +37,13 @@ struct VideoSenderStats {
     int64_t lastFeedbackNs = 0;  // last usable headset feedback, 0 = none
 };
 
-// R4.2 (TASK-COMBO-SWEEP-2026-11-21): the wire bytes one frame costs on the path -
-// its payload fragments, their per-fragment headers, and one parity datagram per FEC
-// group (exactly what the packetizer puts on the wire, headers and FEC included).
-// Extracted verbatim from VideoSender::Send so the wire-ceiling accounting and the
-// offline sweep use the one formula. `fragPayload` is the per-datagram payload
-// (Connection::MaxPayload() - sizeof(rc::VideoFragmentHeader)), `totalPayload` the
-// frame's [2-byte metadata size][metadata][bitstream] size, `fecPercent` the FEC the
-// packetizer currently runs.
+// R4.2 (TASK-COMBO-SWEEP-2026-11-21) & T-59: the wire bytes one frame costs on the
+// path - its payload fragments, their per-fragment headers, and one parity datagram per
+// FEC group of >= 2 fragments (exactly what the packetizer puts on the wire, headers
+// and FEC included). Delegates to rc::VideoFrameWireBytes so wire-ceiling accounting,
+// packetizer billing, and offline sweeps share the single source of truth.
 inline size_t FrameWireBytes(size_t fragPayload, size_t totalPayload, int fecPercent) {
-    const size_t count = fragPayload ? (totalPayload + fragPayload - 1) / fragPayload : 0;
-    const size_t group = fecPercent > 0 ? size_t(std::clamp(100 / fecPercent, 2, 64)) : 0;
-    const size_t nParity = group ? (count + group - 1) / group : 0;
-    return totalPayload + count * sizeof(rc::VideoFragmentHeader) +
-           nParity * (sizeof(rc::VideoParityHeader) + fragPayload);
+    return rc::VideoFrameWireBytes(fragPayload, totalPayload, fecPercent);
 }
 
 // A33 (TASK-PACE-FOLLOW-2026-11-22): the billing base one Send feeds the pacer (the

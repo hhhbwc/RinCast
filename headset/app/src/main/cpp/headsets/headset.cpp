@@ -39,6 +39,9 @@ std::vector<const char*> Headset::Extensions() {
         XR_BD_FACIAL_SIMULATION_EXTENSION_NAME,
         kBdMotionTrackingExtension,
         kPicoConfigurationExtension,
+        // HTC Vive
+        XR_HTC_VIVE_FOCUS3_CONTROLLER_INTERACTION_EXTENSION_NAME,
+        XR_HTC_HAND_INTERACTION_EXTENSION_NAME,
         // Android XR
         kAndroidXrMarkerExtension,
         // Any: where the eyes look, for foveated encoding
@@ -47,11 +50,24 @@ std::vector<const char*> Headset::Extensions() {
 }
 
 std::vector<ControllerProfile> Headset::Controllers() const {
-    // A runtime of no known family most likely knows Touch controllers.
-    return {{"/interaction_profiles/oculus/touch_controller", nullptr, true, true}};
+    // Return standard Touch-compatible layouts in order of preference.
+    // XrInput gracefully binds whichever profile the runtime supports.
+    return {
+        {"/interaction_profiles/oculus/touch_controller", nullptr, true, true},
+        {"/interaction_profiles/bytedance/pico_ultra_controller_bd", XR_BD_ULTRA_CONTROLLER_INTERACTION_EXTENSION_NAME, false, true},
+        {"/interaction_profiles/bytedance/pico4_controller", XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME, false, true},
+        {"/interaction_profiles/bytedance/pico_neo3_controller", XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME, false, true},
+        {"/interaction_profiles/htc/vive_focus3_controller", XR_HTC_VIVE_FOCUS3_CONTROLLER_INTERACTION_EXTENSION_NAME, false, true},
+        {"/interaction_profiles/valve/index_controller", nullptr, false, true},
+        {"/interaction_profiles/microsoft/motion_controller", nullptr, false, false},
+    };
 }
 
 std::unique_ptr<Headset> Headset::Create(XrContext& xr) {
+    if (xr.IsCompatPlainOpenXr()) {
+        RC_LOGI("compatPlainOpenXr active: forcing generic standard OpenXR headset");
+        return std::make_unique<Headset>();
+    }
     std::string runtime = xr.RuntimeName();
     std::transform(runtime.begin(), runtime.end(), runtime.begin(), [](unsigned char c) { return char(std::tolower(c)); });
     const auto has = [&](const char* s) { return runtime.find(s) != std::string::npos; };

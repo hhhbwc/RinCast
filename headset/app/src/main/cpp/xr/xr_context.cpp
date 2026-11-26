@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstring>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <ctime>
 #include <unistd.h>
 
@@ -58,6 +60,31 @@ std::string RefreshRateOverride() {
 #else
     return {};
 #endif
+}
+
+enum class ProjectionOmission { NoRender, EyeLayerOff, NotAcquired, ReleaseFailed };
+
+// EndFrame runs on the render thread. Keep expected omissions (a non-rendering frame or an
+// eye layer that is off) out of the warning path, but leave one low-rate summary when they happen.
+void NoteProjectionOmission(ProjectionOmission reason) {
+    struct Counts {
+        uint64_t noRender = 0, eyeLayerOff = 0, notAcquired = 0, releaseFailed = 0;
+        int64_t lastLogNs = 0;
+    };
+    static Counts counts;
+    switch (reason) {
+        case ProjectionOmission::NoRender: counts.noRender++; break;
+        case ProjectionOmission::EyeLayerOff: counts.eyeLayerOff++; break;
+        case ProjectionOmission::NotAcquired: counts.notAcquired++; break;
+        case ProjectionOmission::ReleaseFailed: counts.releaseFailed++; break;
+    }
+    const int64_t now = rc::NowNs();
+    if (counts.lastLogNs && now - counts.lastLogNs < 5'000'000'000LL) return;
+    RC_LOGI("Projection omitted: noRender=%llu eyeLayerOff=%llu notAcquired=%llu releaseFailed=%llu",
+            static_cast<unsigned long long>(counts.noRender), static_cast<unsigned long long>(counts.eyeLayerOff),
+            static_cast<unsigned long long>(counts.notAcquired), static_cast<unsigned long long>(counts.releaseFailed));
+    counts.noRender = counts.eyeLayerOff = counts.notAcquired = counts.releaseFailed = 0;
+    counts.lastLogNs = now;
 }
 
 }  // namespace
@@ -215,6 +242,17 @@ bool XrContext::CreateInstance(android_app* app, const std::vector<const char*>&
     RC_LOGI("Graphics: OpenGL ES context through XR_MNDX_egl_enable, as %s",
             m_glNotEs ? "XR_KHR_opengl_enable (the runtime has no GL ES extension)" : "XR_KHR_opengl_es_enable");
 #endif
+    if (m_compatPlainOpenXr) {
+        auto isVendorExt = [](const char* name) {
+            return strncmp(name, "XR_FB_", 6) == 0 ||
+                   strncmp(name, "XR_META_", 8) == 0 ||
+                   strncmp(name, "XR_BD_", 6) == 0 ||
+                   strncmp(name, "XR_HTC_", 7) == 0;
+        };
+        std::erase_if(enabled, [&](const char* e) { return isVendorExt(e); });
+        std::erase_if(m_extensions, [&](const std::string& e) { return isVendorExt(e.c_str()); });
+        RC_LOGI("compatPlainOpenXr: stripped vendor extensions, left %zu pure Khronos/standard extensions", enabled.size());
+    }
     m_cylinder = HasExtension(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
     m_layerSettings = HasExtension(XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME);
     m_handTracking = HasExtension(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
@@ -232,7 +270,7 @@ bool XrContext::CreateInstance(android_app* app, const std::vector<const char*>&
     ci.applicationInfo.applicationVersion = 1;
     strcpy(ci.applicationInfo.engineName, "RinCast");
     ci.applicationInfo.engineVersion = 1;
-    ci.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 34);
+    ci.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
     ci.enabledExtensionCount = uint32_t(enabled.size());
     ci.enabledExtensionNames = enabled.data();
     XR_CHECK(xrCreateInstance(&ci, &m_instance));
@@ -295,18 +333,50 @@ bool XrContext::CreateSession(bool preferStage) {
 
     // Eye swapchains.
     uint32_t viewCount = 0;
-    xrEnumerateViewConfigurationViews(m_instance, m_system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount,
-                                      nullptr);
+    XR_CHECK(xrEnumerateViewConfigurationViews(m_instance, m_system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0,
+                                               &viewCount, nullptr));
+    if (viewCount < 2) {
+        RC_LOGE("OpenXR reported %u primary stereo views; two eye buffers are required", viewCount);
+        return false;
+    }
     std::vector<XrViewConfigurationView> views(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
-    xrEnumerateViewConfigurationViews(m_instance, m_system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount,
-                                      &viewCount, views.data());
+    XR_CHECK(xrEnumerateViewConfigurationViews(m_instance, m_system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                               viewCount, &viewCount, views.data()));
+    if (viewCount < 2 || views.size() < 2) {
+        RC_LOGE("OpenXR filled %u of %zu primary stereo views; two eye buffers are required", viewCount, views.size());
+        return false;
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        const XrViewConfigurationView& view = views[i];
+        if (view.recommendedImageRectWidth == 0 || view.recommendedImageRectHeight == 0 ||
+            view.maxImageRectWidth == 0 || view.maxImageRectHeight == 0) {
+            RC_LOGE("OpenXR view %u has an empty image rect: recommended=%ux%u max=%ux%u", i,
+                    view.recommendedImageRectWidth, view.recommendedImageRectHeight, view.maxImageRectWidth,
+                    view.maxImageRectHeight);
+            return false;
+        }
+    }
     m_recommendedWidth = views[0].recommendedImageRectWidth;
     m_recommendedHeight = views[0].recommendedImageRectHeight;
     // Supersample the UI slightly for crisper text (within runtime limits).
     const int w = int(std::min<float>(views[0].maxImageRectWidth, m_recommendedWidth * 1.2f));
     const int h = int(std::min<float>(views[0].maxImageRectHeight, m_recommendedHeight * 1.2f));
-    for (int eye = 0; eye < 2; eye++)
-        if (!CreateSwapchain(w, h, GL_SRGB8_ALPHA8, 1, true, m_eyes[eye])) return false;
+    if (w <= 0 || h <= 0) {
+        RC_LOGE("Eye buffer size %dx%d is invalid (recommended %ux%u, max %ux%u)", w, h, m_recommendedWidth,
+                m_recommendedHeight, views[0].maxImageRectWidth, views[0].maxImageRectHeight);
+        return false;
+    }
+    for (int eye = 0; eye < 2; eye++) {
+        if (!CreateSwapchain(w, h, GL_SRGB8_ALPHA8, 1, true, m_eyes[eye], 1,
+                             eye == 0 ? "eye-left" : "eye-right")) {
+            for (int previous = 0; previous < eye; previous++) {
+                if (!DestroySwapchain(m_eyes[previous]))
+                    RC_LOGE("Eye %d swapchain failed and %s could not be released immediately", eye,
+                            m_eyes[previous].role.c_str());
+            }
+            return false;
+        }
+    }
     RC_LOGI("Eye buffers %dx%d (recommended %ux%u)", w, h, m_recommendedWidth, m_recommendedHeight);
 
     EnumerateRefreshRates();
@@ -396,6 +466,7 @@ bool XrContext::StartSession(bool preferStage, bool velocitiesFromPoses) {
 
 void XrContext::Shutdown() {
     for (auto& e : m_eyes) DestroySwapchain(e);
+    RetryRetiredSwapchains();
     if (m_passthroughLayer) GetProc<PFN_xrDestroyPassthroughLayerFB>(m_instance, "xrDestroyPassthroughLayerFB")(m_passthroughLayer);
     if (m_passthrough) GetProc<PFN_xrDestroyPassthroughFB>(m_instance, "xrDestroyPassthroughFB")(m_passthrough);
     if (m_appSpace) xrDestroySpace(m_appSpace);
@@ -403,6 +474,14 @@ void XrContext::Shutdown() {
     if (m_session) xrDestroySession(m_session);
     if (m_instance) xrDestroyInstance(m_instance);
     if (m_display != EGL_NO_DISPLAY) {
+        const auto deleteGl = [](XrSwapchainGl& sc) {
+            if (!sc.fbos.empty()) glDeleteFramebuffers(GLsizei(sc.fbos.size()), sc.fbos.data());
+            if (sc.depth) glDeleteRenderbuffers(1, &sc.depth);
+            sc = {};
+        };
+        for (auto& e : m_eyes) deleteGl(e);
+        for (auto& sc : m_retiredSwapchains) deleteGl(sc);
+        m_retiredSwapchains.clear();
         eglMakeCurrent(m_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (m_surface != EGL_NO_SURFACE) eglDestroySurface(m_display, m_surface);
         if (m_context != EGL_NO_CONTEXT) eglDestroyContext(m_display, m_context);
@@ -477,8 +556,35 @@ bool XrContext::PollEvents() {
     return true;
 }
 
+void XrContext::RetryRetiredSwapchains() {
+    if (m_retiredSwapchains.empty()) return;
+    std::erase_if(m_retiredSwapchains, [this](XrSwapchainGl& sc) { return DestroySwapchain(sc); });
+}
+
 bool XrContext::CreateSwapchain(int width, int height, int64_t format, int arraySize, bool withDepth,
-                                XrSwapchainGl& out, int mipCount) {
+                                XrSwapchainGl& out, int mipCount, const char* role) {
+    RetryRetiredSwapchains();
+    XrSwapchainGl created{};
+    created.role = role ? role : "swapchain";
+    const auto fail = [&](const char* reason) {
+        RC_LOGE("Swapchain creation failed: %s role=%s size=%dx%d", reason, created.role.c_str(), width, height);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (created.handle) {
+            const XrResult destroyResult = xrDestroySwapchain(created.handle);
+            if (XR_FAILED(destroyResult)) {
+                RC_LOGE("Swapchain partial-create cleanup failed: %s role=%s result=%d",
+                        XrResultString(destroyResult), created.role.c_str(), int(destroyResult));
+                m_retiredSwapchains.push_back(std::move(created));
+                return false;
+            }
+            created.handle = XR_NULL_HANDLE;
+        }
+        if (!created.fbos.empty()) glDeleteFramebuffers(GLsizei(created.fbos.size()), created.fbos.data());
+        if (created.depth) glDeleteRenderbuffers(1, &created.depth);
+        return false;
+    };
+    if (width <= 0 || height <= 0 || arraySize <= 0 || mipCount <= 0)
+        return fail("invalid swapchain dimensions");
     XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     ci.format = format;
@@ -488,63 +594,126 @@ bool XrContext::CreateSwapchain(int width, int height, int64_t format, int array
     ci.faceCount = 1;
     ci.arraySize = uint32_t(arraySize);
     ci.mipCount = uint32_t(mipCount);
-    XR_CHECK(xrCreateSwapchain(m_session, &ci, &out.handle));
+    XrResult result = xrCreateSwapchain(m_session, &ci, &created.handle);
+    if (XR_FAILED(result))
+        return fail(rc::StrFormat("xrCreateSwapchain result=%d (%s)", int(result), XrResultString(result)).c_str());
     uint32_t n = 0;
-    xrEnumerateSwapchainImages(out.handle, 0, &n, nullptr);
+    result = xrEnumerateSwapchainImages(created.handle, 0, &n, nullptr);
+    if (XR_FAILED(result))
+        return fail(rc::StrFormat("image count result=%d (%s)", int(result), XrResultString(result)).c_str());
+    if (!n) return fail("runtime returned zero images");
     // OpenGL and OpenGL ES swapchain images have the same layout, only their type differs.
     std::vector<XrSwapchainImageOpenGLESKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
 #ifndef __ANDROID__
     if (m_glNotEs)
         for (auto& i : imgs) i.type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
 #endif
-    xrEnumerateSwapchainImages(out.handle, n, &n, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
-    m_swapchainImages = n;  // ROUND18 L8-TELEM: how many buffers the runtime queues this swapchain with
-    out.width = width;
-    out.height = height;
+    result = xrEnumerateSwapchainImages(created.handle, n, &n, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+    if (XR_FAILED(result))
+        return fail(rc::StrFormat("image enumeration result=%d (%s)", int(result), XrResultString(result)).c_str());
+    if (n != imgs.size()) return fail("runtime changed the swapchain image count during enumeration");
+    created.width = width;
+    created.height = height;
     if (withDepth) {
-        glGenRenderbuffers(1, &out.depth);
-        glBindRenderbuffer(GL_RENDERBUFFER, out.depth);
+        glGenRenderbuffers(1, &created.depth);
+        if (!created.depth) return fail("glGenRenderbuffers failed");
+        glBindRenderbuffer(GL_RENDERBUFFER, created.depth);
         glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, width, height);
     }
     for (const auto& img : imgs) {
-        out.images.push_back(img.image);
+        created.images.push_back(img.image);
         GLuint fbo = 0;
         glGenFramebuffers(1, &fbo);
+        if (!fbo) return fail("glGenFramebuffers failed");
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, img.image, 0);
-        if (withDepth) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, out.depth);
-        out.fbos.push_back(fbo);
+        if (withDepth) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, created.depth);
+        created.fbos.push_back(fbo);
+        const GLenum framebufferStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (framebufferStatus != GL_FRAMEBUFFER_COMPLETE)
+            return fail(rc::StrFormat("framebuffer status=%d", int(framebufferStatus)).c_str());
         if (mipCount > 1) {
             glBindTexture(GL_TEXTURE_2D, img.image);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
         }
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    out = std::move(created);
+    m_swapchainImages = n;  // ROUND18 L8-TELEM: how many buffers the runtime queues this swapchain with
     return true;
 }
 
-void XrContext::DestroySwapchain(XrSwapchainGl& sc) {
-    if (!sc.handle) return;
+static void WarnSwapchain(const char* operation, const XrSwapchainGl& sc, XrResult result);
+
+bool XrContext::DestroySwapchain(XrSwapchainGl& sc) {
+    if (!sc.handle) return true;
+    if (sc.imageAcquired && !ReleaseImage(sc)) return false;
+    const XrResult result = xrDestroySwapchain(sc.handle);
+    if (XR_FAILED(result)) {
+        WarnSwapchain("destroy failed", sc, result);
+        return false;
+    }
     if (!sc.fbos.empty()) glDeleteFramebuffers(GLsizei(sc.fbos.size()), sc.fbos.data());
     if (sc.depth) glDeleteRenderbuffers(1, &sc.depth);
-    xrDestroySwapchain(sc.handle);
     sc = {};
+    return true;
+}
+
+static void WarnSwapchain(const char* operation, const XrSwapchainGl& sc, XrResult result) {
+    static std::mutex mutex;
+    static std::map<std::string, int64_t> lastWarnNs;
+    const std::string key = sc.role + ":" + operation;
+    std::lock_guard lock(mutex);
+    const int64_t now = rc::NowNs();
+    auto& last = lastWarnNs[key];
+    if (last && now - last < 5'000'000'000LL) return;
+    last = now;
+    if (XR_SUCCEEDED(result))
+        RC_LOGW("Swapchain: %s role=%s images=%zu image=%u outstanding=%d result=%d", operation, sc.role.c_str(),
+                sc.fbos.size(), sc.acquired, int(sc.imageAcquired), int(result));
+    else
+        RC_LOGW("Swapchain %s: %s role=%s images=%zu image=%u outstanding=%d result=%d", operation,
+                XrResultString(result), sc.role.c_str(), sc.fbos.size(), sc.acquired, int(sc.imageAcquired), int(result));
 }
 
 GLuint XrContext::AcquireImage(XrSwapchainGl& sc) {
+    if (!sc.handle || sc.fbos.empty()) return 0;
+    if (sc.imageAcquired && !ReleaseImage(sc)) return 0;
     XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     uint32_t index = 0;
-    xrAcquireSwapchainImage(sc.handle, &ai, &index);
+    XrResult result = xrAcquireSwapchainImage(sc.handle, &ai, &index);
+    if (XR_FAILED(result)) {
+        WarnSwapchain("acquire failed", sc, result);
+        return 0;
+    }
+    sc.acquired = index;
+    sc.imageAcquired = true;
+    if (index >= sc.fbos.size() || !sc.fbos[index]) {
+        ReleaseImage(sc);
+        WarnSwapchain("returned an invalid image index", sc, XR_SUCCESS);
+        return 0;
+    }
     XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wi.timeout = XR_INFINITE_DURATION;
-    xrWaitSwapchainImage(sc.handle, &wi);
-    sc.acquired = index;
+    result = xrWaitSwapchainImage(sc.handle, &wi);
+    if (XR_FAILED(result)) {
+        ReleaseImage(sc);
+        WarnSwapchain("wait failed", sc, result);
+        return 0;
+    }
     return sc.fbos[index];
 }
 
-void XrContext::ReleaseImage(XrSwapchainGl& sc) {
+bool XrContext::ReleaseImage(XrSwapchainGl& sc) {
+    if (!sc.handle || !sc.imageAcquired) return true;
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(sc.handle, &ri);
+    const XrResult result = xrReleaseSwapchainImage(sc.handle, &ri);
+    if (XR_SUCCEEDED(result)) {
+        sc.imageAcquired = false;
+        return true;
+    }
+    WarnSwapchain("release failed", sc, result);
+    return false;
 }
 
 bool XrContext::LocateSpace(XrSpace space, XrTime time, Pose& pose, Vec3* linVel, Vec3* angVel) {
@@ -556,7 +725,7 @@ bool XrContext::LocateSpace(XrSpace space, XrTime time, Pose& pose, Vec3* linVel
     const bool valid = (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
                        (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
     if (!valid) return false;
-    pose = ToPose(loc.pose);
+    pose = SanitizePose(ToPose(loc.pose));
     if ((linVel || angVel) && m_velocitiesFromPoses) {
         // From where it will be a little later, in the app's space like the pose.
         constexpr XrDuration kStep = 5'000'000;
@@ -564,7 +733,7 @@ bool XrContext::LocateSpace(XrSpace space, XrTime time, Pose& pose, Vec3* linVel
         Pose next = pose;
         if (XR_SUCCEEDED(xrLocateSpace(space, m_appSpace, time + kStep, &later)) &&
             (later.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) && (later.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
-            next = ToPose(later.pose);
+            next = SanitizePose(ToPose(later.pose));
         const float dt = float(kStep) * 1e-9f;
         if (linVel) *linVel = (next.position - pose.position) * (1.f / dt);
         if (angVel) {
@@ -591,6 +760,16 @@ bool XrContext::BeginFrame(FrameState& frame) {
     XR_CHECK(xrBeginFrame(m_session, nullptr));
     frame.predictedDisplayTime = fs.predictedDisplayTime;
     frame.period = fs.predictedDisplayPeriod;
+    if (fs.predictedDisplayPeriod > 0) {
+        m_measuredPeriodNs = fs.predictedDisplayPeriod;
+        if (m_compatPlainOpenXr || !HasExtension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) {
+            const float measured = std::clamp(std::round(1e9f / float(m_measuredPeriodNs)), 45.f, 144.f);
+            if (m_refreshRates.empty() || std::fabs(m_refreshRates[0] - measured) >= 0.5f) {
+                m_refreshRates = {measured};
+                RC_LOGI("Measured display refresh rate (no XR_FB_display_refresh_rate): %.0f Hz", measured);
+            }
+        }
+    }
     frame.shouldRender = fs.shouldRender;
 
     XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
@@ -616,7 +795,7 @@ bool XrContext::BeginFrame(FrameState& frame) {
     }
     for (int eye = 0; eye < 2; eye++) {
         EyeView& e = frame.eyes[eye];
-        e.pose = ToPose(views[eye].pose);
+        e.pose = SanitizePose(ToPose(views[eye].pose));
         e.fov = views[eye].fov;
         e.projection = Mat4::Projection(std::tan(e.fov.angleLeft), std::tan(e.fov.angleRight), std::tan(e.fov.angleUp),
                                         std::tan(e.fov.angleDown), 0.05f, 500.f);
@@ -627,17 +806,37 @@ bool XrContext::BeginFrame(FrameState& frame) {
     return true;
 }
 
-void XrContext::BindEye(int eye) {
+bool XrContext::BindEye(int eye) {
     const GLuint fbo = AcquireImage(m_eyes[eye]);
+    if (!fbo) return false;
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glViewport(0, 0, m_eyes[eye].width, m_eyes[eye].height);
+    return true;
 }
 
 void XrContext::EndFrame(const FrameState& frame, const std::vector<const XrCompositionLayerBaseHeader*>& underlays,
                          bool projectionHasAlpha, const std::vector<const XrCompositionLayerBaseHeader*>& overlays,
                          bool eyeLayer, int displayDeltaFrames) {
-    for (int eye = 0; eye < 2; eye++)
-        if (frame.shouldRender && eyeLayer) ReleaseImage(m_eyes[eye]);
+    bool projectionReady = false;
+    if (eyeLayer) {
+        const bool acquired0 = m_eyes[0].imageAcquired;
+        const bool acquired1 = m_eyes[1].imageAcquired;
+        projectionReady = acquired0 && acquired1;
+        const bool released0 = ReleaseImage(m_eyes[0]);
+        const bool released1 = ReleaseImage(m_eyes[1]);
+        projectionReady = projectionReady && released0 && released1;
+        if (!frame.shouldRender) {
+            NoteProjectionOmission(ProjectionOmission::NoRender);
+        } else if (!acquired0 || !acquired1) {
+            NoteProjectionOmission(ProjectionOmission::NotAcquired);
+        } else if (!released0 || !released1) {
+            NoteProjectionOmission(ProjectionOmission::ReleaseFailed);
+        }
+    } else {
+        ReleaseImage(m_eyes[0]);
+        ReleaseImage(m_eyes[1]);
+        NoteProjectionOmission(frame.shouldRender ? ProjectionOmission::EyeLayerOff : ProjectionOmission::NoRender);
+    }
 
     XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                               {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
@@ -662,7 +861,7 @@ void XrContext::EndFrame(const FrameState& frame, const std::vector<const XrComp
     }
     if (frame.shouldRender) {
         layers.insert(layers.end(), underlays.begin(), underlays.end());
-        if (eyeLayer) layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&proj));
+        if (projectionReady) layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&proj));
         layers.insert(layers.end(), overlays.begin(), overlays.end());
     }
     XrFrameEndInfo fei{XR_TYPE_FRAME_END_INFO};
@@ -677,14 +876,27 @@ void XrContext::EndFrame(const FrameState& frame, const std::vector<const XrComp
     fei.layers = layers.data();
     const XrResult r = xrEndFrame(m_session, &fei);
     if (XR_FAILED(r)) RC_LOGW("xrEndFrame: %s", XrResultString(r));
+    RetryRetiredSwapchains();
 }
 
 float XrContext::RefreshRate() const {
-    if (!HasExtension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) return 72.f;
+    if (m_compatPlainOpenXr || !HasExtension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) {
+        if (m_measuredPeriodNs > 0) {
+            float measured = std::round(1e9f / float(m_measuredPeriodNs));
+            return std::clamp(measured, 45.f, 144.f);
+        }
+        return 72.f;
+    }
     auto get = GetProc<PFN_xrGetDisplayRefreshRateFB>(m_instance, "xrGetDisplayRefreshRateFB");
     // 0 when it can't be read: a failed read reported as 72 would send the PC to 72 for nothing.
     float hz = 0;
-    if (!get || XR_FAILED(get(m_session, &hz))) return 0;
+    if (!get || XR_FAILED(get(m_session, &hz))) {
+        if (m_measuredPeriodNs > 0) {
+            float measured = std::round(1e9f / float(m_measuredPeriodNs));
+            return std::clamp(measured, 45.f, 144.f);
+        }
+        return 0;
+    }
     return hz;
 }
 
@@ -706,7 +918,16 @@ void XrContext::SetPerformanceLevels() {
 // is checked now - a call made before the session is ready can come back empty, and the
 // READY handler asks again instead of silently living on the 72 Hz fallback.
 void XrContext::EnumerateRefreshRates() {
-    if (!HasExtension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) return;
+    if (m_compatPlainOpenXr || !HasExtension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) {
+        if (m_measuredPeriodNs > 0) {
+            float measured = std::clamp(std::round(1e9f / float(m_measuredPeriodNs)), 45.f, 144.f);
+            m_refreshRates = {measured};
+        } else {
+            m_refreshRates = {72.f};
+        }
+        RC_LOGI("Supported refresh rates (measured/fallback): %.0f Hz", m_refreshRates[0]);
+        return;
+    }
     auto enumRates = GetProc<PFN_xrEnumerateDisplayRefreshRatesFB>(m_instance, "xrEnumerateDisplayRefreshRatesFB");
     if (!enumRates) return;
     uint32_t rc = 0;

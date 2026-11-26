@@ -16,6 +16,12 @@ e2e-data/
 *.h264
 *.h265
 *.in-use-*
+*.pdb
+__pycache__/
+*.pyc
+HANDOFF-*.md
+
+
 
 # Editors
 .vs/

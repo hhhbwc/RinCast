@@ -29,10 +29,10 @@ inline bool FrameNewer(uint32_t a, uint32_t b) { return int32_t(a - b) > 0; }
 // future (~2-3 frame periods at VR rates). A single huge IDR frame at a low kbps
 // must not park m_nextSendNs hundreds of ms ahead and stall the next frame.
 constexpr int64_t kMaxFrameDebtNs = 40'000'000;
-// A45 §1.5: bounds for the receive-side pending table - a malformed fragment with
+// A45 §1.5: bounds for the receive-side pending table (paired with
+// rc::kMaxFragmentsPerFrame in video_transport.h) - a malformed fragment with
 // fragmentCount=65535 must not allocate ~1.5 MB of vector headers per frame index,
 // and a flood of distinct frame indices must not grow m_pending without limit.
-constexpr uint16_t kMaxFragmentsPerFrame = 2048;
 constexpr size_t kMaxPendingFrames = 64;
 
 // Inside this window to the due time, send right away instead of waiting.
@@ -142,7 +142,7 @@ bool VideoPacketizer::WaitDue(int64_t dueNs, bool precise) {
 
 size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t frameFlags, uint32_t frameIndex,
                                   const void* metadata, uint16_t metadataSize, const uint8_t* bitstream,
-                                  size_t bitstreamSize) {
+                                  size_t bitstreamSize, size_t* outWireBytes) {
     m_frame.resize(2 + metadataSize + bitstreamSize);
     std::memcpy(m_frame.data(), &metadataSize, 2);
     if (metadataSize) std::memcpy(m_frame.data() + 2, metadata, metadataSize);
@@ -154,20 +154,30 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
     // (Both headers are 16 bytes on the wire, so legitimate payloads are unchanged.)
     const size_t maxHdr = std::max(sizeof(VideoFragmentHeader), sizeof(VideoParityHeader));
     const size_t maxPayload = m_connection->MaxPayload();
-    if (maxPayload <= maxHdr) return 0;
+    if (maxPayload <= maxHdr) {
+        if (outWireBytes) *outWireBytes = 0;
+        m_lastBilledWireBytes = 0;
+        return 0;
+    }
     const size_t fragPayload = maxPayload - maxHdr;
     const size_t total = m_frame.size();
     const size_t count = (total + fragPayload - 1) / fragPayload;
-    if (count > 0xFFFF) {
-        RC_LOGE("Video frame too large (%zu bytes)", total);
+    if (count > kMaxFragmentsPerFrame) {
+        RC_LOGE("Video frame too large (%zu bytes, %zu fragments > max %u)", total, count,
+                unsigned(kMaxFragmentsPerFrame));
+        if (outWireBytes) *outWireBytes = 0;
+        m_lastBilledWireBytes = 0;
         return 0;
     }
 
-    // A45 §1.3: one relaxed snapshot - no TOCTOU divide-by-zero if another thread
-    // flips FEC off between the check and the 100 / fecPct divide.
-    uint8_t group = 0;
+    // A45 §1.3 & T-59: one relaxed snapshot - no TOCTOU divide-by-zero if another
+    // thread flips FEC off, and one shared FEC/parity/wireBytes derivation for packet
+    // emission, token-bucket billing, and caller wire-ceiling accounting.
     const int fecPct = m_fecPercent.load(std::memory_order_relaxed);
-    if (fecPct > 0) group = uint8_t(std::clamp(100 / fecPct, 2, 64));
+    const uint8_t group = VideoFecGroupSize(fecPct);
+    const size_t nParity = VideoParityFragmentCount(count, group);
+    const size_t wireBytes = VideoFrameWireBytesFromCounts(fragPayload, total, count, nParity);
+    if (outWireBytes) *outWireBytes = wireBytes;
 
     VideoFragmentHeader h{};
     h.streamId = streamId;
@@ -186,8 +196,8 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
     // congestion guard see nothing - the one loss source neither of them can explain.
     // Count it and say so now and then, so a local stall leaves a trace.
     const auto send = [this, streamId](PacketType type, const void* header, size_t headerSize, const uint8_t* data,
-                                       size_t len) {
-        if (m_connection->Send2(type, header, headerSize, data, len)) return;
+                                       size_t len) -> bool {
+        if (m_connection->Send2(type, header, headerSize, data, len)) return true;
         m_sendFailures.fetch_add(1, std::memory_order_relaxed);
         const int64_t now = NowNs();
         if (now - m_lastSendFailLogNs > 5'000'000'000LL) {
@@ -195,6 +205,7 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
             RC_LOGW("Stream %u: %u datagrams refused by the socket so far (the path never saw them)", streamId,
                     m_sendFailures.load());
         }
+        return false;
     };
     const size_t lastSize = total - (count - 1) * fragPayload;
     const uint32_t kbps = m_pacingKbps.load(std::memory_order_relaxed);
@@ -221,18 +232,12 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
     // burst may have left m_nextSendNs future-dated; the legacy pacer only resets a
     // 0 / too-old clock, so without this the mode switch would stall on stale debt.
     if (m_wasBurstMode && !(budgetNs > 0 && paced)) {
-        m_nextSendNs = NowNs();
+        ResetPacingDebtNs(NowNs());
         m_modeSwitchResets++;
     }
     m_wasBurstMode = (budgetNs > 0 && paced);
     if (budgetNs > 0 && paced) {
         burstTokens = true;
-        // A45 §1.2: a final group with a single member sends NO parity (the shipped
-        // rule at the groupEnd block below), so ceil((count)/group) over-counts by
-        // one when count % group == 1. Match the actual datagram count exactly.
-        const size_t nParity = group ? (count / group + (count % group > 1 ? 1u : 0u)) : 0;
-        const size_t wireBytes = total + count * sizeof(VideoFragmentHeader) +
-                                 nParity * (sizeof(VideoParityHeader) + fragPayload);
         m_lastBilledWireBytes = wireBytes;  // A45 test observability
         // The previous frame's billing may still be running: wait it out once, here at
         // the frame boundary (RequestStop cancels it for shutdown), then send whole.
@@ -245,9 +250,8 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
         // next-frame start arbitrarily far into the future (A26 stale-flush intent).
         m_nextSendNs = frameStartNs + std::min<int64_t>(int64_t(double(wireBytes) * nsPerByte), kMaxFrameDebtNs);
         // A79 phase M (reading only): publish the re-anchored clock as a relaxed snapshot
-        // for SendBacklogNs(). This is the one point where the burst clock is anchored
-        // every frame; m_nextSendNs itself stays send-thread-only (header discipline
-        // note), so the stats/diag threads read the snapshot, never the raw field.
+        // for SendBacklogNs(). Debt resets publish the same field through ResetPacingDebtNs;
+        // m_nextSendNs itself stays send-thread-only, so stats/diag never read the raw field.
         m_nextSendNsPublished.store(m_nextSendNs, std::memory_order_relaxed);
     } else if (paced) {
         const int64_t now = NowNs();
@@ -268,8 +272,7 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
             const int64_t now = NowNs();
             if (m_nextSendNs < now - kPaceMaxDebtNs) m_nextSendNs = now - kPaceMaxDebtNs;
         }
-        send(PacketType::Video, &h, sizeof(h), m_frame.data() + offset, len);
-        sent++;
+        if (send(PacketType::Video, &h, sizeof(h), m_frame.data() + offset, len)) sent++;
         if (paced && !burstTokens) m_nextSendNs += int64_t(double(sizeof(h) + len) * nsPerByte);
         if (group) {
             for (size_t b = 0; b < len; b++) parity[b] ^= m_frame[offset + b];
@@ -295,8 +298,7 @@ size_t VideoPacketizer::SendFrame(uint8_t streamId, VideoCodec codec, uint8_t fr
                         const int64_t now = NowNs();
                         if (m_nextSendNs < now - kPaceMaxDebtNs) m_nextSendNs = now - kPaceMaxDebtNs;
                     }
-                    send(PacketType::VideoParity, &ph, sizeof(ph), parity.data(), fragPayload);
-                    sent++;
+                    if (send(PacketType::VideoParity, &ph, sizeof(ph), parity.data(), fragPayload)) sent++;
                     if (paced && !burstTokens) m_nextSendNs += int64_t(double(sizeof(ph) + fragPayload) * nsPerByte);
                 }
                 std::fill(parity.begin(), parity.end(), uint8_t(0));

@@ -1,5 +1,13 @@
 # RinCast — capped-VBR fork
 
+> [!IMPORTANT]
+> **Project Relocation Announcement**
+>
+> This fork has accumulated extensive architectural changes (35,000+ lines across 150+ files) including multi-brand OpenXR hardening (PICO, Quest, HTC Vive), SteamVR layer reprojection fixes, full 7-language i18n, and robust Capped-VBR transmission. Due to the scale of these changes, this work is transitioning into a **standalone independent project**.
+>
+> 🔗 **Standalone Project Link (Coming Soon):**
+> 👉 **[Visit New Standalone Project Repository (Placeholder)](https://github.com/hhhbwc/)** 👈
+
 <!-- FORK-DOC: fork-specific doc, lives alongside the upstream README.md. Chinese: FORK-README.zh-CN.md -->
 
 [English](FORK-README.md) | [中文](FORK-README.zh-CN.md)

@@ -1,6 +1,7 @@
 // Android XR (Samsung Galaxy XR): its controllers answer to the Touch profile, and hand tracking,
 // most people's main input there, is a permission the user grants at run time.
 #include "../headset.h"
+#include "rc/platform.h"
 
 namespace rv {
 
@@ -12,8 +13,14 @@ class AndroidXrHeadset : public Headset {
 
     // The Galaxy XR, the one Android XR headset so far.
     bool PanelSize(uint32_t& width, uint32_t& height) const override {
-        width = 3552, height = 3840;
-        return true;
+        const std::string model = SystemProperty("ro.product.model");
+        const std::string device = SystemProperty("ro.product.device");
+        if (model.find("Galaxy XR") != std::string::npos || device.find("Galaxy XR") != std::string::npos ||
+            model.find("SM-I130") != std::string::npos) {
+            width = 3552, height = 3840;
+            return true;
+        }
+        return false;
     }
 
     // Hands are how most people use the Galaxy XR, so this is asked for right away rather than

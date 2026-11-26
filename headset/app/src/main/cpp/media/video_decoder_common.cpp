@@ -2,6 +2,7 @@
 // to the hardware, the statistics and the log.
 #include "video_decoder.h"
 
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -9,6 +10,25 @@
 #include "rc/platform.h"
 
 namespace rv {
+
+bool IsValidDecodedCrop(uint32_t width, uint32_t height, int32_t left, int32_t top, int32_t right,
+                        int32_t bottom) {
+    return width > 0 && height > 0 && left >= 0 && top >= 0 && right > left && bottom > top &&
+           uint32_t(right) <= width && uint32_t(bottom) <= height;
+}
+
+void VideoDecoder::PublishTextureGeometry(GLuint texture, int width, int height, const float crop[4]) {
+    std::lock_guard lock(m_geometryMutex);
+    m_texture = texture;
+    m_textureWidth = width;
+    m_textureHeight = height;
+    std::memcpy(m_crop, crop, sizeof(m_crop));
+}
+
+void VideoDecoder::ResetTextureGeometry() {
+    const float crop[4] = {0, 0, 0, 0};
+    PublishTextureGeometry(0, 0, 0, crop);
+}
 
 const char* VideoDecoder::CodecName(rc::VideoCodec c) {
     switch (c) {
@@ -22,24 +42,41 @@ const char* VideoDecoder::CodecName(rc::VideoCodec c) {
 // What can go wrong on every frame is logged at most once every 5 seconds per decoder and
 // reason, with how often it happened since, so a missing picture shows up in the log without
 // flooding it.
-void VideoDecoder::Warn(const char* what) {
-    static std::mutex mutex;
-    static std::map<std::string, std::pair<int64_t, uint32_t>> seen;  // last logged, count since
-    const std::string key = std::to_string(uintptr_t(this)) + what;
-    std::lock_guard lock(mutex);
-    auto& [last, count] = seen[key];
+void VideoDecoder::Warn(const char* what, const char* detail) {
+    const char* reason = what ? what : "";
+    std::lock_guard lock(m_warnMutex);
+    auto& [last, count] = m_warnSeen[reason];
     count++;
     const int64_t now = rc::NowNs();
     if (last && now - last < 5'000'000'000LL) return;
-    RC_LOGW("Decoder %s %dx%d: %s (%u times)", CodecName(m_codec), m_width, m_height, what, count);
+    if (detail && *detail)
+        RC_LOGW("Decoder %s %dx%d: %s (%u times) %s", CodecName(m_codec), m_width, m_height, reason, count, detail);
+    else
+        RC_LOGW("Decoder %s %dx%d: %s (%u times)", CodecName(m_codec), m_width, m_height, reason, count);
     last = now;
     count = 0;
+}
+
+void VideoDecoder::Fail(const char* what, const char* detail) {
+    Warn(what, detail);
+    m_failed = true;
+    m_running = false;
+    m_cv.notify_all();
 }
 
 void VideoDecoder::Submit(uint32_t frameIndex, bool keyframe, bool recovery, std::vector<uint8_t>&& bitstream,
                           std::vector<uint8_t>&& metadata, int64_t receivedNs) {
     std::lock_guard lock(m_mutex);
     if (m_hadKeyframe && !keyframe && frameIndex <= m_lastFrameIndex) return;  // stale duplicate / reordered
+    if (bitstream.empty()) {
+        Warn("empty bitstream rejected before queueing",
+             rc::StrFormat("frame=%u keyframe=%d", frameIndex, int(keyframe)).c_str());
+        m_queue.clear();
+        m_seenKeyframe = false;
+        m_lastFrameIndex = m_lastQueued;
+        m_needKeyframe = true;
+        return;
+    }
     // Frames are predicted from the ones before. If any frame went missing (lost on
     // the network, or arrived too late), everything after it would decode into smeared
     // garbage, so keep showing the last good picture and ask the PC right away for a
@@ -72,6 +109,14 @@ void VideoDecoder::Submit(uint32_t frameIndex, bool keyframe, bool recovery, std
         }
     }
     m_lastFrameIndex = frameIndex;
+    // Both VR and desktop frame metadata are at least this large. The decoder does not own the
+    // stream id, so report the generic protocol floor rather than guessing a stream role.
+    if (metadata.size() < sizeof(rc::DesktopFrameMetadata)) {
+        Warn("metadata truncated", rc::StrFormat("stage=submit frame=%u metadata=%zu minimum=%zu bitstream=%zu",
+                                                 frameIndex, metadata.size(), sizeof(rc::DesktopFrameMetadata),
+                                                 bitstream.size())
+                                     .c_str());
+    }
     DecodedFrameInfo info;
     info.frameIndex = frameIndex;
     info.metadata = std::move(metadata);

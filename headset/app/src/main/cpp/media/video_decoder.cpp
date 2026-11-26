@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "rc/platform.h"
+#include "../platform/jni_bridge.h"
 
 namespace rv {
 
@@ -68,27 +69,45 @@ int NalType(const std::vector<uint8_t>& d, size_t start, rc::VideoCodec codec) {
 VideoDecoder::~VideoDecoder() { Shutdown(); }
 
 DecoderCaps VideoDecoder::Capabilities() {
-    // Quest, PICO and Android XR headsets decode H.264 and HEVC (10-bit too) up to 8K wide in
-    // hardware; AV1 only where a decoder for it exists.
     DecoderCaps caps;
-    caps.hevc10 = true;
-    // Only a hardware AV1 decoder counts. Android's own software one (c2.android.*, OMX.google.*)
-    // exists on headsets without AV1 hardware (Quest 1 and 2) and is far too slow for a stream.
-    if (AMediaCodec* av1 = AMediaCodec_createDecoderByType("video/av01")) {
-        char* name = nullptr;
-        AMediaCodec_getName(av1, &name);
-        const bool software = name && (!strncmp(name, "c2.android.", 11) || !strncmp(name, "OMX.google.", 11));
-        caps.av1 = caps.av110 = !software;
-        RC_LOGI("AV1 decoder: %s%s", name ? name : "?", software ? " (software, not used)" : "");
-        if (name) AMediaCodec_releaseName(av1, name);
-        AMediaCodec_delete(av1);
+    caps.h264 = true;
+    caps.hevc = true;
+    caps.hevc10 = false;
+    caps.av1 = false;
+    caps.av110 = false;
+    caps.maxWidth = 4096;
+    caps.maxHeight = 2160;
+
+    auto jniCaps = Platform::VideoDecoderCaps();
+    if (jniCaps.valid) {
+        caps.h264 = jniCaps.h264;
+        caps.hevc = jniCaps.hevc;
+        caps.hevc10 = jniCaps.hevc10;
+        caps.av1 = jniCaps.av1;
+        caps.av110 = jniCaps.av110;
+        caps.maxWidth = jniCaps.maxWidth;
+        caps.maxHeight = jniCaps.maxHeight;
+        RC_LOGI("Decoder dynamic caps (from MediaCodecList): hevc10=%d av1=%d av110=%d max=%dx%d",
+                caps.hevc10, caps.av1, caps.av110, caps.maxWidth, caps.maxHeight);
+    } else {
+        // Fallback for native/Linux or if JNI query failed
+        caps.hevc10 = true;
+        if (AMediaCodec* av1 = AMediaCodec_createDecoderByType("video/av01")) {
+            char* name = nullptr;
+            AMediaCodec_getName(av1, &name);
+            const bool software = name && (!strncmp(name, "c2.android.", 11) || !strncmp(name, "OMX.google.", 11));
+            caps.av1 = caps.av110 = !software;
+            RC_LOGI("AV1 decoder: %s%s", name ? name : "?", software ? " (software, not used)" : "");
+            if (name) AMediaCodec_releaseName(av1, name);
+            AMediaCodec_delete(av1);
+        }
+        char device[PROP_VALUE_MAX] = {};
+        __system_property_get("ro.product.device", device);
+        const bool quest1 = !strcmp(device, "monterey");
+        caps.maxWidth = quest1 ? 4096 : 8192;
+        caps.maxHeight = quest1 ? 2160 : 4096;
     }
-    // The Quest 1's Snapdragon 835 decodes up to 4K; later chips up to 8K.
-    char device[PROP_VALUE_MAX] = {};
-    __system_property_get("ro.product.device", device);
-    const bool quest1 = !strcmp(device, "monterey");
-    caps.maxWidth = quest1 ? 4096 : 8192;
-    caps.maxHeight = quest1 ? 2160 : 4096;
+
     // ROUND18 L3: report a frame-rate ceiling for devices where we MEASURED a
     // decode wall (our own PICO 4: HEVC 2688x2688 topped out near 45 fps). This is
     // a hint, not a hard cap; the PC only warns. Unknown devices stay at 0 = no
@@ -104,40 +123,68 @@ DecoderCaps VideoDecoder::Capabilities() {
 
 bool VideoDecoder::Init(rc::VideoCodec codec, int width, int height, float fps) {
     LoadEglProcs();
+    ResetTextureGeometry();
     m_codec = codec;
     m_width = width;
     m_height = height;
     m_fps = fps > 1 ? fps : 72;  // ROUND18 L4 fallback
-    const media_status_t st = AImageReader_newWithUsage(width, height, AIMAGE_FORMAT_PRIVATE,
-                                                        AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 8, &m_reader);
-    if (st != AMEDIA_OK) {
-        RC_LOGE("Decoder %s %dx%d: AImageReader_newWithUsage failed (%d)", Mime(codec), width, height, st);
+    media_status_t st = AImageReader_newWithUsage(width, height, AIMAGE_FORMAT_PRIVATE,
+                                                  AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 8, &m_reader);
+    if (st != AMEDIA_OK || !m_reader) {
+        // Fallback to 4 buffers if 8 fails due to memory constraints on certain GPU architectures
+        st = AImageReader_newWithUsage(width, height, AIMAGE_FORMAT_PRIVATE,
+                                       AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 4, &m_reader);
+    }
+    if (st != AMEDIA_OK || !m_reader) {
+        RC_LOGE("Decoder %s %dx%d: AImageReader_newWithUsage failed (%d, reader=%p)", Mime(codec), width, height,
+                int(st), static_cast<void*>(m_reader));
+        m_reader = nullptr;
         m_failed = true;
         return false;
     }
-    AImageReader_getWindow(m_reader, &m_window);
-    glGenTextures(1, &m_texture);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_texture);
+    const media_status_t windowStatus = AImageReader_getWindow(m_reader, &m_window);
+    if (windowStatus != AMEDIA_OK || !m_window) {
+        RC_LOGE("Decoder %s %dx%d: AImageReader_getWindow failed (%d, window=%p)", Mime(codec), width, height,
+                int(windowStatus), static_cast<void*>(m_window));
+        AImageReader_delete(m_reader);
+        m_reader = nullptr;
+        m_window = nullptr;
+        m_failed = true;
+        return false;
+    }
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    if (!texture) {
+        RC_LOGE("Decoder %s %dx%d: glGenTextures failed", Mime(codec), width, height);
+        AImageReader_delete(m_reader);
+        m_reader = nullptr;
+        m_window = nullptr;
+        m_failed = true;
+        return false;
+    }
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    const float crop[4] = {0, 0, 0, 0};
+    PublishTextureGeometry(texture, 0, 0, crop);
     m_running = true;
     m_inputThread = std::thread([this] { InputLoop(); });
     return true;
 }
 
 void VideoDecoder::Shutdown() {
-    if (m_running.exchange(false)) {
-        m_cv.notify_all();
-        if (m_inputThread.joinable()) m_inputThread.join();
-        if (m_outputThread.joinable()) m_outputThread.join();
-    }
+    m_running = false;
+    m_cv.notify_all();
+    if (m_inputThread.joinable()) m_inputThread.join();
+    if (m_outputThread.joinable()) m_outputThread.join();
     if (m_codecHandle) {
         AMediaCodec_stop(m_codecHandle);
         AMediaCodec_delete(m_codecHandle);
         m_codecHandle = nullptr;
     }
+    m_configured = false;
     ReleaseImage(m_image, m_eglImage);
     m_image = nullptr;
     m_eglImage = EGL_NO_IMAGE_KHR;
@@ -148,78 +195,110 @@ void VideoDecoder::Shutdown() {
     if (m_reader) {
         AImageReader_delete(m_reader);
         m_reader = nullptr;
+        m_window = nullptr;
     }
-    if (m_texture) {
-        glDeleteTextures(1, &m_texture);
-        m_texture = 0;
-    }
+    auto geometry = Geometry();
+    ResetTextureGeometry();
+    if (geometry.texture) glDeleteTextures(1, &geometry.texture);
 }
 
 bool VideoDecoder::Configure(const std::vector<uint8_t>& keyframe) {
-    m_codecHandle = AMediaCodec_createDecoderByType(Mime(m_codec));
-    if (!m_codecHandle) {
-        RC_LOGE("No decoder for %s", Mime(m_codec));
+    if (!m_window) {
+        RC_LOGE("Decoder %s %dx%d: missing output window", Mime(m_codec), m_width, m_height);
         m_failed = true;
         return false;
     }
-    AMediaFormat* fmt = AMediaFormat_new();
-    AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, Mime(m_codec));
-    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, m_width);
-    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, m_height);
-    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_WIDTH, m_width);
-    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_HEIGHT, m_height);
-    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, m_width * m_height);
-    // Latency over everything else.
-    AMediaFormat_setInt32(fmt, "low-latency", 1);
-    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_PRIORITY, 0);
-    // Twice the stream's frame rate, so each frame decodes in half a frame's time. Not the
-    // maximum (32767): the Quest 2's video driver books a stream asking for that at the most it
-    // could ever decode (960 fps for 1080p), its whole budget, and then refuses every other
-    // stream ("H/W is overloaded ... MBPS limit exceeded"): a second monitor, or the game.
-    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_FRAME_RATE, int32_t(m_fps + 0.5f));
-    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_OPERATING_RATE, int32_t(m_fps * 2 + 0.5f));
-    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-low-latency.enable", 1);
-    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-picture-order.enable", 1);
-    // VD-OFFLINE (TASK 2026-11-20 §2.3): three more Qualcomm keys that cannot
-    // change sync or parse semantics. Keys a decoder doesn't know are ignored,
-    // so a non-Qualcomm codec simply no-ops these. Deliberately NOT set here:
-    //   - vendor.qti-ext-output-fence.enable / .fence_type: changes the decoder's
-    //     output synchronisation semantics; we don't consume fences, so this
-    //     needs a real device before it may be added.
-    //   - vendor.qti-ext-extradata-enable.types: interacts with the out-of-band
-    //     csd-0/csd-1 parameter sets below; needs a real device first.
-    //   - operating-rate stays twice the stream rate (see the comment above:
-    //     the maximum books the whole decoder budget on Quest 2 and starves the
-    //     second stream).
-    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-info-misr.disable", 1);
-    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-instant-decode.enable", 1);
-    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-error-correction.conceal", 1);
 
-    // Parameter sets as codec-specific data (they are also repeated inline).
-    if (m_codec != rc::VideoCodec::AV1) {
-        std::vector<uint8_t> csd0, csd1;
-        for (auto [off, len] : SplitNals(keyframe)) {
-            const int t = NalType(keyframe, off, m_codec);
-            if (m_codec == rc::VideoCodec::H264) {
-                if (t == 7) csd0.insert(csd0.end(), keyframe.begin() + off, keyframe.begin() + off + len);
-                if (t == 8) csd1.insert(csd1.end(), keyframe.begin() + off, keyframe.begin() + off + len);
-            } else if (t == 32 || t == 33 || t == 34) {
-                csd0.insert(csd0.end(), keyframe.begin() + off, keyframe.begin() + off + len);
+    auto tryConfigure = [&](bool safeFallback) -> bool {
+        if (m_codecHandle) {
+            AMediaCodec_stop(m_codecHandle);
+            AMediaCodec_delete(m_codecHandle);
+            m_codecHandle = nullptr;
+        }
+        m_codecHandle = AMediaCodec_createDecoderByType(Mime(m_codec));
+        if (!m_codecHandle) {
+            RC_LOGE("No decoder for %s", Mime(m_codec));
+            return false;
+        }
+        char* component = nullptr;
+        const media_status_t componentStatus = AMediaCodec_getName(m_codecHandle, &component);
+        std::string compName = component ? component : "";
+        if (component) AMediaCodec_releaseName(m_codecHandle, component);
+
+        std::string compLower = compName;
+        std::transform(compLower.begin(), compLower.end(), compLower.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        const bool isQualcomm = (compLower.find("qti") != std::string::npos || compLower.find("qcom") != std::string::npos);
+
+        RC_LOGI("Decoder component: %s (attempt: %s, qualcomm: %d)",
+                compName.c_str(), safeFallback ? "safe-fallback" : "optimized", isQualcomm);
+
+        AMediaFormat* fmt = AMediaFormat_new();
+        if (!fmt) {
+            RC_LOGE("Decoder %s %dx%d: AMediaFormat_new failed", Mime(m_codec), m_width, m_height);
+            AMediaCodec_delete(m_codecHandle);
+            m_codecHandle = nullptr;
+            return false;
+        }
+        AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, Mime(m_codec));
+        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, m_width);
+        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, m_height);
+
+        if (!safeFallback) {
+            AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_WIDTH, m_width);
+            AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_HEIGHT, m_height);
+            AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, m_width * m_height);
+            // Latency over everything else.
+            AMediaFormat_setInt32(fmt, "low-latency", 1);
+            AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_PRIORITY, 0);
+            AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_FRAME_RATE, int32_t(m_fps + 0.5f));
+            AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_OPERATING_RATE, int32_t(m_fps * 2 + 0.5f));
+
+            if (isQualcomm && !s_compatPlain) {
+                AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-low-latency.enable", 1);
+                AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-picture-order.enable", 1);
+                AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-info-misr.disable", 1);
+                AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-instant-decode.enable", 1);
+                AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-error-correction.conceal", 1);
             }
         }
-        if (!csd0.empty()) AMediaFormat_setBuffer(fmt, "csd-0", csd0.data(), csd0.size());
-        if (!csd1.empty()) AMediaFormat_setBuffer(fmt, "csd-1", csd1.data(), csd1.size());
+
+        // Parameter sets as codec-specific data (they are also repeated inline).
+        if (m_codec != rc::VideoCodec::AV1) {
+            std::vector<uint8_t> csd0, csd1;
+            for (auto [off, len] : SplitNals(keyframe)) {
+                const int t = NalType(keyframe, off, m_codec);
+                if (m_codec == rc::VideoCodec::H264) {
+                    if (t == 7) csd0.insert(csd0.end(), keyframe.begin() + off, keyframe.begin() + off + len);
+                    if (t == 8) csd1.insert(csd1.end(), keyframe.begin() + off, keyframe.begin() + off + len);
+                } else if (t == 32 || t == 33 || t == 34) {
+                    csd0.insert(csd0.end(), keyframe.begin() + off, keyframe.begin() + off + len);
+                }
+            }
+            if (!csd0.empty()) AMediaFormat_setBuffer(fmt, "csd-0", csd0.data(), csd0.size());
+            if (!csd1.empty()) AMediaFormat_setBuffer(fmt, "csd-1", csd1.data(), csd1.size());
+        }
+        media_status_t st = AMediaCodec_configure(m_codecHandle, fmt, m_window, nullptr, 0);
+        AMediaFormat_delete(fmt);
+        const media_status_t started = (st == AMEDIA_OK) ? AMediaCodec_start(m_codecHandle) : st;
+        if (st != AMEDIA_OK || started != AMEDIA_OK) {
+            RC_LOGW("Decoder %s %dx%d: %s (attempt: %s) failed (st=%d started=%d)", Mime(m_codec), m_width, m_height,
+                    st != AMEDIA_OK ? "configure" : "start", safeFallback ? "safe-fallback" : "optimized",
+                    int(st), int(started));
+            AMediaCodec_delete(m_codecHandle);
+            m_codecHandle = nullptr;
+            return false;
+        }
+        return true;
+    };
+
+    bool ok = tryConfigure(false);
+    if (!ok) {
+        RC_LOGW("Decoder %s %dx%d: Attempt 1 failed, retrying with Attempt 2 (universal safe degradation)",
+                Mime(m_codec), m_width, m_height);
+        ok = tryConfigure(true);
     }
-    media_status_t st = AMediaCodec_configure(m_codecHandle, fmt, m_window, nullptr, 0);
-    AMediaFormat_delete(fmt);
-    const media_status_t started = st == AMEDIA_OK ? AMediaCodec_start(m_codecHandle) : st;
-    if (st != AMEDIA_OK || started != AMEDIA_OK) {
-        // A headset has only so much decoding hardware; another stream still being decoded
-        // can be what's in the way (an "insufficient resource" error, -10000 and below).
-        RC_LOGE("Decoder %s %dx%d: %s failed (%d)", Mime(m_codec), m_width, m_height,
-                st != AMEDIA_OK ? "configure" : "start", st != AMEDIA_OK ? st : started);
-        AMediaCodec_delete(m_codecHandle);
-        m_codecHandle = nullptr;
+    if (!ok) {
+        RC_LOGE("Decoder %s %dx%d: Both configuration attempts failed", Mime(m_codec), m_width, m_height);
         m_failed = true;
         return false;
     }
@@ -242,14 +321,28 @@ void VideoDecoder::InputLoop() {
             p = std::move(m_queue.front());
             m_queue.pop_front();
         }
+        if (!m_running) break;
         if (!m_configured) {
             if (!p.keyframe || !Configure(p.data)) continue;
         }
         ssize_t index = -1;
-        for (int attempt = 0; attempt < 50 && m_running && index < 0; attempt++)
+        for (int attempt = 0; attempt < 50 && m_running && index < 0; attempt++) {
             index = AMediaCodec_dequeueInputBuffer(m_codecHandle, 2000);
+            if (index < 0 && index != AMEDIACODEC_INFO_TRY_AGAIN_LATER) break;
+        }
+        if (!m_running) break;
+        if (index < 0 && index != AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
+            Fail("dequeueInputBuffer returned an error",
+                 rc::StrFormat("status=%lld frame=%u data=%zu", static_cast<long long>(index), p.frameIndex,
+                               p.data.size())
+                     .c_str());
+            break;
+        }
         if (index < 0) {
-            Warn("no free input buffer for 100 ms, the decoder is falling behind");
+            Warn("no free input buffer for 100 ms, the decoder is falling behind",
+                 rc::StrFormat("status=%lld frame=%u data=%zu attempts=50 timeoutMs=100", static_cast<long long>(index),
+                               p.frameIndex, p.data.size())
+                     .c_str());
             // This frame never reaches the decoder, so the chain breaks here.
             std::lock_guard lock(m_mutex);
             m_queue.clear();
@@ -261,14 +354,38 @@ void VideoDecoder::InputLoop() {
         size_t capacity = 0;
         uint8_t* buf = AMediaCodec_getInputBuffer(m_codecHandle, size_t(index), &capacity);
         const size_t n = std::min(capacity, p.data.size());
-        std::memcpy(buf, p.data.data(), n);
+        if (!buf || capacity == 0 || p.data.size() > capacity) {
+            Warn(!buf || capacity == 0 ? "queue-in empty input buffer" : "queue-in bitstream exceeds input buffer",
+                 rc::StrFormat("frame=%u index=%zu buffer=%p capacity=%zu data=%zu copied=%zu", p.frameIndex,
+                               size_t(index), static_cast<void*>(buf), capacity, p.data.size(), n)
+                     .c_str());
+            const media_status_t returnStatus =
+                AMediaCodec_queueInputBuffer(m_codecHandle, size_t(index), 0, 0, uint64_t(p.frameIndex), 0);
+            if (returnStatus != AMEDIA_OK)
+                Fail("queueInputBuffer empty-buffer return failed",
+                     rc::StrFormat("status=%d frame=%u index=%zu", int(returnStatus), p.frameIndex, size_t(index)).c_str());
+            std::lock_guard lock(m_mutex);
+            m_queue.clear();
+            m_seenKeyframe = false;
+            m_lastFrameIndex = m_lastQueued;
+            m_needKeyframe = true;
+            continue;
+        }
+        if (n > 0) std::memcpy(buf, p.data.data(), n);
+        const media_status_t queueStatus =
+            AMediaCodec_queueInputBuffer(m_codecHandle, size_t(index), 0, n, uint64_t(p.frameIndex), 0);
+        if (queueStatus != AMEDIA_OK) {
+            Fail("queueInputBuffer failed",
+                 rc::StrFormat("status=%d frame=%u index=%zu offset=0 size=%zu capacity=%zu data=%zu pts=%u",
+                               int(queueStatus), p.frameIndex, size_t(index), n, capacity, p.data.size(), p.frameIndex)
+                     .c_str());
+            break;
+        }
         {
             std::lock_guard lock(m_statsMutex);
             m_inputTimes[int64_t(p.frameIndex)] = rc::NowNs();
             while (m_inputTimes.size() > 64) m_inputTimes.erase(m_inputTimes.begin());
         }
-        if (AMediaCodec_queueInputBuffer(m_codecHandle, size_t(index), 0, n, uint64_t(p.frameIndex), 0) != AMEDIA_OK)
-            Warn("queueInputBuffer failed");
         m_lastQueued = p.frameIndex;
     }
 }
@@ -303,15 +420,32 @@ void VideoDecoder::OutputLoop() {
                 std::lock_guard lock(m_heldMutex);
                 m_held.push_back(size_t(index));
             } else {
-                AMediaCodec_releaseOutputBuffer(m_codecHandle, size_t(index), false);
+                const media_status_t releaseStatus =
+                    AMediaCodec_releaseOutputBuffer(m_codecHandle, size_t(index), false);
+                if (releaseStatus != AMEDIA_OK) {
+                    Fail("releaseOutputBuffer failed",
+                         rc::StrFormat("status=%d index=%lld pts=%llu size=%zu flags=%u render=0", int(releaseStatus),
+                                       static_cast<long long>(index),
+                                       static_cast<unsigned long long>(info.presentationTimeUs), info.size,
+                                       uint32_t(info.flags))
+                             .c_str());
+                    break;
+                }
             }
             if (!m_decoded++) RC_LOGI("Decoder %s %dx%d: first frame decoded", Mime(m_codec), m_width, m_height);
         } else if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
             AMediaFormat* f = AMediaCodec_getOutputFormat(m_codecHandle);
-            RC_LOGI("Decoder output format: %s", AMediaFormat_toString(f));
-            AMediaFormat_delete(f);
+            if (!f) {
+                Warn("AMediaCodec_getOutputFormat returned null");
+            } else {
+                const char* formatText = AMediaFormat_toString(f);
+                RC_LOGI("Decoder output format: %s", formatText ? formatText : "?");
+                AMediaFormat_delete(f);
+            }
         } else if (index != AMEDIACODEC_INFO_TRY_AGAIN_LATER && index != AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
-            Warn("dequeueOutputBuffer returned an error");
+            Fail("dequeueOutputBuffer returned an error",
+                 rc::StrFormat("status=%lld queuedFrame=%u", static_cast<long long>(index), m_lastQueued.load()).c_str());
+            break;
         }
         std::lock_guard lock(m_heldMutex);
         HandOver();
@@ -335,24 +469,53 @@ void VideoDecoder::HandOver() {
     // OUTPUT side (already-decoded pictures) cannot break the reference chain, so
     // it never smears the picture - the cost is only a skipped/held frame.
     while (m_held.size() > StaleDropThreshold()) {
-        AMediaCodec_releaseOutputBuffer(m_codecHandle, m_held.front(), false);
+        const size_t index = m_held.front();
+        const media_status_t releaseStatus = AMediaCodec_releaseOutputBuffer(m_codecHandle, index, false);
+        if (releaseStatus != AMEDIA_OK) {
+            Fail("releaseOutputBuffer failed",
+                 rc::StrFormat("status=%d index=%zu render=0 held=%zu staleDropThreshold=%u", int(releaseStatus), index,
+                               m_held.size(), StaleDropThreshold())
+                     .c_str());
+            return;
+        }
         m_held.pop_front();
         m_skipped++;
     }
-    AMediaCodec_releaseOutputBuffer(m_codecHandle, m_held.front(), true);
+    const size_t index = m_held.front();
+    const media_status_t releaseStatus = AMediaCodec_releaseOutputBuffer(m_codecHandle, index, true);
+    if (releaseStatus != AMEDIA_OK) {
+        Fail("releaseOutputBuffer failed",
+             rc::StrFormat("status=%d index=%zu render=1 held=%zu staleDropThreshold=%u", int(releaseStatus), index,
+                           m_held.size(), StaleDropThreshold())
+                 .c_str());
+        return;
+    }
     m_held.pop_front();
     m_inReaderSinceNs = now;
 }
 
 void VideoDecoder::ReleaseImage(AImage* image, EGLImageKHR egl) {
-    if (egl != EGL_NO_IMAGE_KHR && pDestroyImage) pDestroyImage(eglGetCurrentDisplay(), egl);
+    if (egl != EGL_NO_IMAGE_KHR && pDestroyImage) {
+        if (const EGLDisplay display = eglGetCurrentDisplay(); display != EGL_NO_DISPLAY)
+            pDestroyImage(display, egl);
+    }
     if (image) AImage_delete(image);
 }
 
 bool VideoDecoder::Latch(DecodedFrameInfo& out) {
     if (!m_reader) return false;
     AImage* image = nullptr;
-    if (AImageReader_acquireLatestImage(m_reader, &image) != AMEDIA_OK || !image) return false;
+    const media_status_t acquireStatus = AImageReader_acquireLatestImage(m_reader, &image);
+    if (acquireStatus != AMEDIA_OK) {
+        // No new picture is the normal result between decoder outputs, not a warning.
+        const int acquireCode = int(acquireStatus);
+        if (acquireCode != int(AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) &&
+            acquireCode != int(AMEDIACODEC_INFO_TRY_AGAIN_LATER))
+            Warn("acquireLatestImage failed",
+                 rc::StrFormat("status=%d image=%p", int(acquireStatus), static_cast<void*>(image)).c_str());
+        return false;
+    }
+    if (!image) return false;
     int waiting = 0;
     {
         // Room in the reader again: the next picture the decoder holds goes in (see HandOver).
@@ -369,53 +532,100 @@ bool VideoDecoder::Latch(DecodedFrameInfo& out) {
         } else if (!m_behindSinceNs) {
             m_behindSinceNs = now;
         } else if (now - m_behindSinceNs > 500'000'000LL && now >= m_catchUpHeldUntilNs) {
-            for (size_t index : m_held) AMediaCodec_releaseOutputBuffer(m_codecHandle, index, false);
-            m_skipped += uint32_t(m_held.size());
-            m_held.clear();
+            const size_t dropped = m_held.size();
+            while (!m_held.empty()) {
+                const size_t index = m_held.front();
+                const media_status_t releaseStatus =
+                    AMediaCodec_releaseOutputBuffer(m_codecHandle, index, false);
+                if (releaseStatus != AMEDIA_OK) {
+                    Fail("releaseOutputBuffer failed",
+                         rc::StrFormat("status=%d index=%zu render=0 dropped=%zu held=%zu",
+                                       int(releaseStatus), index, dropped, m_held.size())
+                             .c_str());
+                    break;
+                }
+                m_held.pop_front();
+                m_skipped++;
+            }
             m_behindSinceNs = 0;
         }
-        HandOver();
+        if (!Failed()) HandOver();
+    }
+    if (Failed()) {
+        ReleaseImage(image, nullptr);
+        return false;
     }
     AHardwareBuffer* hb = nullptr;
-    AImage_getHardwareBuffer(image, &hb);
-    if (!hb || !pCreateImage) {
-        Warn("a decoded picture has no hardware buffer to show");
+    const media_status_t bufferStatus = AImage_getHardwareBuffer(image, &hb);
+    if (bufferStatus != AMEDIA_OK || !hb)
+        Warn("a decoded picture has no hardware buffer to show",
+             rc::StrFormat("status=%d eglError=0x%x buffer=%p image=%p", int(bufferStatus),
+                           static_cast<unsigned>(eglGetError()), static_cast<void*>(hb), static_cast<void*>(image))
+                 .c_str());
+    if (!pCreateImage || !pGetNativeClientBuffer || !pImageTargetTexture)
+        Warn("EGL import procedure unavailable",
+             rc::StrFormat("eglError=0x%x createImage=%d nativeClientBuffer=%d imageTargetTexture=%d",
+                           static_cast<unsigned>(eglGetError()), int(pCreateImage != nullptr),
+                           int(pGetNativeClientBuffer != nullptr), int(pImageTargetTexture != nullptr))
+                 .c_str());
+    if (!hb || !pCreateImage || !pGetNativeClientBuffer || !pImageTargetTexture) {
+        AImage_delete(image);
+        return false;
+    }
+    AHardwareBuffer_Desc desc{};
+    AHardwareBuffer_describe(hb, &desc);
+    if (!desc.width || !desc.height) {
+        Warn("decoded image has an empty hardware buffer",
+             rc::StrFormat("width=%u height=%u", desc.width, desc.height).c_str());
+        AImage_delete(image);
+        return false;
+    }
+    AImageCropRect crop{0, 0, int32_t(desc.width), int32_t(desc.height)};
+    const media_status_t cropStatus = AImage_getCropRect(image, &crop);
+    if (cropStatus != AMEDIA_OK ||
+        !IsValidDecodedCrop(desc.width, desc.height, crop.left, crop.top, crop.right, crop.bottom)) {
+        Warn("decoded image crop invalid",
+             rc::StrFormat("status=%d width=%u height=%u crop=%d,%d-%d,%d", int(cropStatus), desc.width, desc.height,
+                           crop.left, crop.top, crop.right, crop.bottom)
+                 .c_str());
+        crop = {0, 0, int32_t(desc.width), int32_t(desc.height)};
+    }
+    const float W = float(desc.width), H = float(desc.height);
+    // Crop edges beside padding carry half-texel insets; publish them only after EGL import succeeds.
+    const float x0 = (crop.left + (crop.left > 0 ? 0.5f : 0.f)) / W;
+    const float y0 = (crop.top + (crop.top > 0 ? 0.5f : 0.f)) / H;
+    const float x1 = (crop.right - (uint32_t(crop.right) < desc.width ? 0.5f : 0.f)) / W;
+    const float y1 = (crop.bottom - (uint32_t(crop.bottom) < desc.height ? 0.5f : 0.f)) / H;
+    const float nextCrop[4] = {x0, y0, x1 - x0, y1 - y0};
+    const EGLDisplay display = eglGetCurrentDisplay();
+    EGLClientBuffer clientBuffer = display != EGL_NO_DISPLAY ? pGetNativeClientBuffer(hb) : nullptr;
+    if (!clientBuffer) {
+        Warn("decoded picture had no EGL client buffer",
+             rc::StrFormat("display=%d width=%d height=%d buffer=%p", int(display != EGL_NO_DISPLAY), m_width,
+                           m_height, static_cast<void*>(hb))
+                 .c_str());
         AImage_delete(image);
         return false;
     }
     const EGLint attribs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
-    EGLImageKHR egl = pCreateImage(eglGetCurrentDisplay(), EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID,
-                                   pGetNativeClientBuffer(hb), attribs);
+    EGLImageKHR egl = pCreateImage(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuffer, attribs);
     if (egl == EGL_NO_IMAGE_KHR) {
-        Warn("couldn't turn a decoded picture into a texture");
+        Warn("couldn't turn a decoded picture into a texture",
+             rc::StrFormat("eglError=0x%x width=%d height=%d buffer=%p", static_cast<unsigned>(eglGetError()),
+                           m_width, m_height, static_cast<void*>(hb))
+                 .c_str());
         AImage_delete(image);
         return false;
     }
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_texture);
     pImageTargetTexture(GL_TEXTURE_EXTERNAL_OES, egl);
-
-    // Hardware decoders pad their buffers (e.g. 1080 -> 1088 rows, or the width to the
-    // GPU's alignment). The texture covers the whole buffer, so sample only the
-    // visible crop rectangle. Edges that border padding are pulled in by half a
-    // texel so bilinear filtering never blends in the padding.
-    AHardwareBuffer_Desc desc{};
-    AHardwareBuffer_describe(hb, &desc);
-    AImageCropRect crop{0, 0, int32_t(desc.width), int32_t(desc.height)};
-    if (AImage_getCropRect(image, &crop) != AMEDIA_OK || crop.right <= crop.left || crop.bottom <= crop.top)
-        crop = {0, 0, int32_t(desc.width), int32_t(desc.height)};
-    if (desc.width && desc.height) {
-        const float W = float(desc.width), H = float(desc.height);
-        const float x0 = (crop.left + (crop.left > 0 ? 0.5f : 0.f)) / W;
-        const float y0 = (crop.top + (crop.top > 0 ? 0.5f : 0.f)) / H;
-        const float x1 = (crop.right - (uint32_t(crop.right) < desc.width ? 0.5f : 0.f)) / W;
-        const float y1 = (crop.bottom - (uint32_t(crop.bottom) < desc.height ? 0.5f : 0.f)) / H;
-        const float next[4] = {x0, y0, x1 - x0, y1 - y0};
-        if (std::memcmp(next, m_crop, sizeof(next)) != 0) {
-            RC_LOGI("Decoder output %ux%u, visible %d,%d-%d,%d", desc.width, desc.height, crop.left, crop.top,
-                    crop.right, crop.bottom);
-            std::memcpy(m_crop, next, sizeof(next));
-        }
+    const auto geometry = Geometry();
+    if (geometry.width != int(desc.width) || geometry.height != int(desc.height) ||
+        std::memcmp(nextCrop, geometry.crop, sizeof(nextCrop)) != 0) {
+        RC_LOGI("Decoder output %ux%u, visible %d,%d-%d,%d", desc.width, desc.height, crop.left, crop.top,
+                crop.right, crop.bottom);
     }
+    PublishTextureGeometry(Texture(), int(desc.width), int(desc.height), nextCrop);
 
     // Keep the previous images alive for a couple of frames (GPU may still read them).
     if (m_image) m_retired.push_back({m_image, m_eglImage});
@@ -427,14 +637,23 @@ bool VideoDecoder::Latch(DecodedFrameInfo& out) {
     m_eglImage = egl;
 
     int64_t ts = 0;
-    AImage_getTimestamp(image, &ts);
+    const media_status_t timestampStatus = AImage_getTimestamp(image, &ts);
     const int64_t pts = ts / 1000;
+    if (timestampStatus != AMEDIA_OK)
+        Warn("AImage_getTimestamp failed",
+             rc::StrFormat("status=%d timestamp=%lld pts=%lld width=%u height=%u", int(timestampStatus),
+                           static_cast<long long>(ts), static_cast<long long>(pts), desc.width, desc.height)
+                 .c_str());
     std::lock_guard lock(m_mutex);
     auto it = m_infos.find(pts);
     if (it != m_infos.end()) {
         out = it->second;
         m_infos.erase(m_infos.begin(), std::next(it));
     } else {
+        Warn("metadata missing for decoded frame",
+             rc::StrFormat("pts=%lld timestamp=%lld queuedFrame=%u width=%u height=%u", static_cast<long long>(pts),
+                           static_cast<long long>(ts), m_lastQueued.load(), desc.width, desc.height)
+                 .c_str());
         out = {};
         out.frameIndex = uint32_t(pts);
     }

@@ -30,13 +30,19 @@ std::string Narrow(const std::wstring& s) {
 
 std::filesystem::path DataDir() {
     static const std::filesystem::path dir = [] {
-        PWSTR path = nullptr;
+        wchar_t custom[MAX_PATH]{};
+        const DWORD customLen = GetEnvironmentVariableW(L"RINCAST_DATA_DIR", custom, MAX_PATH);
         std::filesystem::path p;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &path))) {
-            p = std::filesystem::path(path) / L"RinCast";
-            CoTaskMemFree(path);
+        if (customLen > 0 && customLen < MAX_PATH) {
+            p = std::filesystem::path(custom);
         } else {
-            p = std::filesystem::temp_directory_path() / L"RinCast";
+            PWSTR path = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &path))) {
+                p = std::filesystem::path(path) / L"RinCast";
+                CoTaskMemFree(path);
+            } else {
+                p = std::filesystem::temp_directory_path() / L"RinCast";
+            }
         }
         std::error_code ec;
         std::filesystem::create_directories(p, ec);

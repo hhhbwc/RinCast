@@ -153,7 +153,10 @@ void Stat(Ui& ui, float x, float y, const std::string& label, const std::string&
 // The same line the PC draws (threshold unchanged); A22: judged on the panel's EMA
 // (LatencyDisplayMs), not the raw 1 s window average the diagnostics keep.
 bool PoorLatency(double latencyMs) { return latencyMs >= 80; }
-bool PoorFrameRate(const App::Stats& s, float wanted) { return s.fps > 0 && wanted > 0 && s.fps < wanted * 0.9f; }
+bool PoorFrameRate(const App::Stats& s, float wanted) {
+    const double shown = s.fps + s.generatedFps;
+    return shown > 0 && wanted > 0 && shown < wanted * 0.9f;
+}
 
 // ---- Pages of the main panel ----------------------------------------------------
 
@@ -589,7 +592,6 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
         changed = true;
     }
     changed |= CheckRow(ui, l, "match-steamvr", Tr("vr.matchSteamVr"), s.matchSteamVr, Tr("vr.matchSteamVrHint"));
-    Label(ui, l, Tr("vr.resolutionHint"));
     l.y += 14;
     Label(ui, l, Tr("vr.fpsLabel"));
     std::vector<std::string> rates;
@@ -679,7 +681,7 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
         changed = true;
         if (s.fingersWithControllers && exclusive) s.bodyTracking = false;
     }
-    changed |= CheckRow(ui, c, "handsgames", Tr("vr.handsInGames"), s.handsInGames, Tr("vr.handsHint"));
+    changed |= CheckRow(ui, c, "handsgames", Tr("vr.handsInGames"), s.handsInGames);
     if (device.FaceSupported(app.Xr()))
         changed |= CheckRow(ui, c, "face", Tr("vr.faceTracking"), s.faceTracking, device.FaceHint());
     changed |= CheckRow(ui, c, "foveated", Tr("vr.foveated"), s.gazeFoveation,
@@ -814,9 +816,9 @@ bool PageDesktop(Ui& ui, const Rect& body) {
         changed = true;
     }
     c.y += 8;
-    changed |= CheckRow(ui, c, "sharp", Tr("desktop.sharpText"), s.sharpLayers, Tr("desktop.sharpHint"));
+    changed |= CheckRow(ui, c, "sharp", Tr("desktop.sharpText"), s.sharpLayers);
     c.y += 8;
-    changed |= CheckRow(ui, c, "desktop-input", Tr("desktop.input"), s.desktopInput, Tr("desktop.inputHint"));
+    changed |= CheckRow(ui, c, "desktop-input", Tr("desktop.input"), s.desktopInput);
     l.y = c.y = std::max(l.y, c.y);
     KeyboardSettings(ui, l, c);
     contentBottom = std::max(l.y, c.y) + scroll;
@@ -968,6 +970,8 @@ bool PageGeneral(Ui& ui, const Rect& body) {
         app.ToggleWindow("stats", s.showStats && app.CurrentMode() != Mode::Home);
         changed = true;
     }
+    changed |= CheckRow(ui, c, "compat-plain-xr", Tr("general.compatPlainXr"), s.compatPlainOpenXr,
+                        Tr("general.compatPlainXrHint"));
     c.y += 4;
     // The language, named in its own words so it's findable in any UI. What's selected is
     // the stored choice: with "auto", the radio stays on "auto" even though the resolved
@@ -1225,20 +1229,17 @@ void BuildDock(Ui& ui, const Rect& r) {
 
 // ---- Stats ---------------------------------------------------------------------------
 
-// TASK-OPLOGIC-FIX-HMD-2026-11-22 §1.1: the stats panel's "frame generation" line, three
-// states: off (the setting), half rate while the pace policy is in HalfWithGeneration -
-// the game rate it replaces → the panel refresh, plus the quota suffix while armed - and
-// full rate otherwise. The policy state freezes outside VR (its 1 Hz tick only runs there),
-// so with generation on but no VR picture the row shows "–" instead of a stale answer.
-std::string FrameGenStatus(const App& app) {
-    if (!app.Settings().frameGeneration) return Tr("stat.frameGen.off");
-    if (app.CurrentMode() != Mode::Vr) return "–";
-    const rc::LinkPolicyState policy = app.LinkPolicy();
-    if (policy.mode != rc::PaceMode::HalfWithGeneration) return Tr("stat.frameGen.full");
-    std::string v = Trf("stat.frameGen.half", {{"game", FormatMs(policy.smoothedGameFps)},
-                                               {"hmd", FormatMs(app.Settings().refreshRate)}});
-    if (app.GenCreditArmed()) v += Tr("stat.frameGen.armed");
-    return v;
+// The row reports actual output in the last stats window, not the pace policy's intent.
+std::string FrameGenStatus(const App::Stats& s) {
+    if (s.generatedFps > 0) {
+        std::string v = Trf("stat.frameGen.active", {{"fps", FormatMs(s.generatedFps)}});
+        if (s.generatedRejectedFps > 0)
+            v += Trf("stat.frameGen.rejected", {{"fps", FormatMs(s.generatedRejectedFps)}});
+        return v;
+    }
+    if (s.generatedRejectedFps > 0)
+        return Trf("stat.frameGen.rejectedOnly", {{"fps", FormatMs(s.generatedRejectedFps)}});
+    return Tr("stat.frameGen.standby");
 }
 
 void BuildStats(Ui& ui, const Rect& r) {
@@ -1252,11 +1253,16 @@ void BuildStats(Ui& ui, const Rect& r) {
         std::string value;
     };
     std::string fps = s.fps > 0 ? FormatMs(s.fps) + " fps" : "–";
-    if (s.fps > 0 && app.CurrentMode() == Mode::Vr && app.Settings().frameGeneration)
-        fps += " (" + FormatMs(s.fps + s.generatedFps) + " fps)";
+    std::string frameGen = Tr("stat.frameGen.off");
+    if (app.Settings().frameGeneration) {
+        frameGen = app.CurrentMode() == Mode::Vr ? FrameGenStatus(s) : "–";
+        if (app.CurrentMode() == Mode::Vr && (s.fps > 0 || s.generatedFps > 0))
+            fps = Trf("stat.fpsBreakdown", {{"source", FormatMs(s.fps)},
+                                            {"total", FormatMs(s.fps + s.generatedFps)}});
+    }
     const Item items[] = {{Tr("stat.latency.total"), latencyEma >= 0 ? FormatMs(latencyEma) + " ms" : "–"},
                           {Tr("stat.fps"), fps},
-                          {Tr("stat.frameGen"), FrameGenStatus(app)},
+                          {Tr("stat.frameGen"), frameGen},
                           {Tr("stat.bitrate"), s.mbps > 0 ? FormatMs(s.mbps) + " Mbps" : "–"},
                           {Tr("stat.decoding"), s.decodeMs > 0 ? FormatMs(s.decodeMs) + " ms" : "–"},
                           {Tr("stat.network"), s.rttMs > 0 ? FormatMs(s.rttMs) + " ms" : "–"},
@@ -1264,7 +1270,8 @@ void BuildStats(Ui& ui, const Rect& r) {
     for (int i = 0; i < 7; i++) {
         const float y = r.y + 16 + i * 38;
         R.Text(items[i].label, r.x + 22, y, 20, kMuted);
-        const bool poor = (i == 0 && PoorLatency(latencyEma)) || (i == 2 && app.CurrentMode() == Mode::Vr && PoorFrameRate(s, app.Settings().refreshRate));
+        const bool poor = (i == 0 && PoorLatency(latencyEma)) ||
+                          (i == 1 && app.CurrentMode() == Mode::Vr && PoorFrameRate(s, app.Settings().refreshRate));
         R.Text(items[i].value, r.Right() - 22, y, 20, poor ? kWarn : kText, Face::SemiBold, Align::Right);
     }
     // The latency, stage by stage. Bars are shares of the whole; the biggest stands out.

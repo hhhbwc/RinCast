@@ -389,39 +389,39 @@ def main():
     assert "RINCAST_CADENCE_FILL" not in config_header
     motion_header = (REPO / "pc/streamer/src/stream/motion_estimator.h").read_text(encoding="utf-8")
     motion_cpp = (REPO / "pc/streamer/src/stream/motion_estimator.cpp").read_text(encoding="utf-8")
-    assert "Microsoft::WRL::ComPtr<ID3D11Texture2D> m_staging[2];" in motion_header
-    assert "m_readPending[0] = m_readPending[1] = false;" in motion_header
-    assert "void QueueRead(ID3D11DeviceContext* ctx);" in motion_header
-    assert "bool TryRead(ID3D11DeviceContext* ctx, std::vector<float>& out);" in motion_header
-    queue_read = block(motion_cpp, "void MotionEstimator::QueueRead(")
-    assert "if (m_readPending[0] && m_readPending[1]) return;" in queue_read
-    assert "if (m_readPending[slot]) slot ^= 1;" in queue_read
+    assert "static constexpr int kReadbackSlots = 4;" in motion_header
+    assert "Microsoft::WRL::ComPtr<ID3D11Texture2D> m_staging[kReadbackSlots];" in motion_header
+    assert "Microsoft::WRL::ComPtr<ID3D11Query> m_readQuery[kReadbackSlots];" in motion_header
+    assert "bool m_readPending[kReadbackSlots]{};" in motion_header
+    assert "bool HasPendingRead() const" in motion_header
+    assert "void ResetPrevious()" in motion_header
+    assert "bool QueueRead(ID3D11DeviceContext* ctx, const rc::MotionReadbackTiming& timing);" in motion_header
+    assert "bool TryRead(ID3D11DeviceContext* ctx, std::vector<float>& out, rc::MotionReadbackTiming& timing, bool& slotConsumed);" in motion_header
+    queue_read = block(motion_cpp, "bool MotionEstimator::QueueRead(")
     assert "ctx->CopyResource(m_staging[slot].Get(), m_field.tex.Get());" in queue_read
+    assert "ctx->End(m_readQuery[slot].Get());" in queue_read
     assert "m_readPending[slot] = true;" in queue_read
-    assert "m_readWrite ^= 1;" in queue_read
     try_read = block(motion_cpp, "bool MotionEstimator::TryRead(")
-    assert "if (!m_readPending[slot])" in try_read
-    assert "D3D11_MAP_READ | D3D11_MAP_FLAG_DO_NOT_WAIT" in try_read
-    assert "DXGI_ERROR_WAS_STILL_DRAWING" in try_read
-    assert try_read.index("DXGI_ERROR_WAS_STILL_DRAWING") < try_read.index("m_readPending[slot] = false;")
-    assert "m_readNext ^= 1;" in try_read
+    assert "D3D11_ASYNC_GETDATA_DONOTFLUSH" in try_read
+    assert "if (!done) return false;" in try_read
+    assert try_read.index("if (!done) return false;") < try_read.index("D3D11_MAP_READ, 0, &map")
+    assert try_read.index("D3D11_MAP_READ, 0, &map") < try_read.rindex("m_readPending[slot] = false;")
     sync_read = block(motion_cpp, "bool MotionEstimator::Read(")
     assert "D3D11_MAP_READ, 0, &map" in sync_read
     assert "D3D11_MAP_FLAG_DO_NOT_WAIT" not in sync_read
     assert 'GetEnvironmentVariableA("RINCAST_ASYNC_MOTION", text, sizeof(text)) == 1' in vr
-    assert "text[0] == '1'" in vr
+    assert "text[0] == '0'" in vr
     run = block(vr, "void VrStream::Run(")
-    assert "const bool asyncMotion = AsyncMotionExperiment();" in run
-    assert "fs.frameIndex != lastMotionFrameIndex + 1" in run
-    assert "lastMotionFrameIndex = fs.frameIndex;" in run
-    assert "if (motionValid && asyncMotion) motion.QueueRead(ctx.Get());" in run
-    assert "motionRead = motion.TryRead(ctx.Get(), motionField);" in run
-    assert "motionRead = motion.Read(ctx.Get(), motionField);" in run
-    assert run.index("motion.TryRead(") < run.index("motion.Read(")
-    assert "++m_diagMotionPending;" in run
-    assert "motionField.assign(size_t(motion.GridWidth()) * motion.GridHeight() * 2, 0.0f);" in run
-    assert run.index("motionField.assign(size_t(motion.GridWidth()) * motion.GridHeight() * 2, 0.0f);") < run.index("AppendMotion(")
-    assert "if (motionRead || asyncMotion)" in run
+    motion_policy = (REPO / "shared/include/rc/motion_field.h").read_text(encoding="utf-8")
+    assert "const bool asyncMotion = AsyncMotionReadback();" in run
+    assert "rc::ShouldResetMotionPrevious(fs.frameIndex, lastMotionFrameIndex, motionSkipPending)" in run
+    assert "if (!previousFrameIndex) return false;" in motion_policy
+    assert "currentFrameIndex - previousFrameIndex != 1 &&" in motion_policy
+    assert "!(deliberateSkipPending && currentFrameIndex - previousFrameIndex == 2)" in motion_policy
+    assert "motion.ResetPrevious();" in run
+    assert "if (motionValid && asyncMotion)" in run
+    assert "motion.QueueRead(ctx.Get(), timing)" in run
+    assert "WaitForMotionField(" in vr
     flow = block(vr, "void VrStream::LogFrameFlow(")
     assert flow.index("overruns1s %u") < flow.index("motionPending %u")
     assert "m_diagMotionPending = 0;" in flow
@@ -441,7 +441,10 @@ def main():
     source += TESTS
     cpp = args.out / "settings-harness.cpp"
     cpp.write_text(source, encoding="utf-8")
-    cache = (REPO / "build/pc/CMakeCache.txt").read_text(encoding="utf-8")
+    cache_candidates = [REPO / "build/pc/CMakeCache.txt", REPO / "build/CMakeCache.txt"]
+    cache_path = next((p for p in cache_candidates if p.exists()), None)
+    assert cache_path is not None, "CMakeCache.txt not found under build/pc or build"
+    cache = cache_path.read_text(encoding="utf-8")
     compiler_bin = Path(re.search(r"^CMAKE_AR:FILEPATH=(.*)$", cache, re.M)[1]).parent
     msvc = compiler_bin.parents[2]
     sdk = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Windows Kits/10"

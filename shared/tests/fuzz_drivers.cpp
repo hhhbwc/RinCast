@@ -27,8 +27,12 @@
 #endif
 
 #include "nlohmann/json.hpp"
+#include "rc/audio_codec.h"
 #include "rc/connection.h"
+#include "rc/crypto.h"
+#include "rc/frame_generation.h"
 #include "rc/handshake.h"
+#include "rc/motion_field.h"
 #include "rc/socket.h"
 #include "rc/protocol.h"
 #include "rc/queue_guard.h"
@@ -332,8 +336,122 @@ int FuzzChunk(uint64_t n) {
         }
         CHECK(deliveredTotal <= fed);
     }
-    std::printf("fuzz chunk: %llu iterations, chunks fed %llu, messages delivered %llu, failures %d",
+    std::printf("fuzz chunk: %llu iterations, chunks fed %llu, messages delivered %llu, failures %d\n",
                 (unsigned long long)n, (unsigned long long)fed, (unsigned long long)deliveredTotal, g_failures);
+    return g_failures ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// mode conn: encrypted Connection::HandleDatagram (AEAD auth, version gate,
+// replay window, control/ack/ping/pong dispatch) under adversarial mutation.
+// ---------------------------------------------------------------------------
+
+int FuzzConn(uint64_t n) {
+    std::mt19937_64 rng(0xAEAD5EEDCAFE0001ULL);
+    rc::UdpSocket sock;  // closed socket: replies drop quickly without kernel blocking
+    const auto clientKeys = rc::crypto::KeyPair::Generate();
+    const auto serverKeys = rc::crypto::KeyPair::Generate();
+    const auto keys = rc::crypto::DeriveSessionKeys(
+        serverKeys.secretKey, clientKeys.publicKey, clientKeys.publicKey, serverKeys.publicKey, "fuzz-conn");
+    rc::Connection server(&sock, rc::NetAddress{0x7F000001, 40001}, 0x99887766u, keys, true, rc::kMaxDatagramLan);
+    uint64_t accepted = 0, rejectedBefore = 0;
+    server.SetControlHandler([&](const std::string& msg) { CHECK(msg.size() <= (4u * 1024u * 1024u)); });
+    server.SetPacketHandler([&](rc::PacketType, const uint8_t*, size_t sz) { CHECK(sz <= rc::kMaxDatagramLan); });
+
+    std::vector<uint8_t> datagram(rc::kMaxDatagramLan);
+    uint64_t seq = 1;
+    for (g_i = 0; g_i < n; g_i++) {
+        progress("conn");
+        const unsigned cls = unsigned(rng() % 10);
+        if (cls < 4) {
+            // Authentic client-to-server encrypted datagram (possibly replayed or bit-flipped).
+            rc::PacketHeader h{};
+            h.version = cls == 0 ? uint8_t(rng() & 0xFF) : uint8_t(rc::kProtocolVersion);
+            h.type = uint8_t(rng() % 16);
+            h.flags = rc::kFlagEncrypted;
+            h.sessionId = cls == 1 ? uint32_t(rng()) : 0x99887766u;
+            h.sequence = (rng() % 5 == 0 && seq > 5) ? (seq - (rng() % 5)) : seq++;
+            const size_t plainLen = rng() % 128;
+            std::vector<uint8_t> plain(plainLen);
+            for (size_t i = 0; i < plainLen; i++) plain[i] = uint8_t(rng() & 0xFF);
+            std::memcpy(datagram.data(), &h, sizeof(h));
+            rc::crypto::Seal(keys.clientToServer, h.sequence, 0x43, datagram.data(), sizeof(h), plain.data(),
+                             plainLen, datagram.data() + sizeof(h));
+            if (cls == 2) datagram[sizeof(h) + (rng() % (plainLen + rc::kMacSize))] ^= 0x55;
+            const size_t total = sizeof(h) + plainLen + rc::kMacSize;
+            if (server.HandleDatagram(datagram.data(), total, rc::NetAddress{0x7F000001, 40001})) accepted++;
+        } else {
+            // Arbitrary truncated or oversized garbage datagrams.
+            const size_t len = rng() % (rc::kMaxDatagramLan + 64);
+            std::vector<uint8_t> junk(len);
+            for (size_t i = 0; i < len; i++) junk[i] = uint8_t(rng() & 0xFF);
+            CHECK(!server.HandleDatagram(junk.data(), junk.size(), rc::NetAddress{0x7F000002, 40002}) ||
+                  len >= sizeof(rc::PacketHeader) + rc::kMacSize);
+        }
+        if (g_i % 500 == 0) server.Tick(int64_t(g_i) * 1'000'000LL);
+        const auto stats = server.Stats();
+        CHECK(stats.packetsRejected >= rejectedBefore);
+        rejectedBefore = stats.packetsRejected;
+    }
+    std::printf("fuzz conn: %llu iterations, accepted %llu, rejected %llu, failures %d\n",
+                (unsigned long long)n, (unsigned long long)accepted, (unsigned long long)rejectedBefore, g_failures);
+    return g_failures ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// mode motion: DecodeMotionRle / DecodeVrMotionMetadata & Opus PLC bounds.
+// ---------------------------------------------------------------------------
+
+int FuzzMotion(uint64_t n) {
+    std::mt19937_64 rng(0xF00D5EEDFACE1234ULL);
+    rc::AudioDecoder audioDec;
+    CHECK(audioDec.Init(48000, 2));
+    rc::HeadsetMotionState state;
+    uint64_t decodedOk = 0, failuresReset = 0;
+    for (g_i = 0; g_i < n; g_i++) {
+        progress("motion");
+        if ((g_i % 5) != 0) {
+            // Adversarial VrFrameMetadata + trailing RLE payload (valid/hostile dims & RLE).
+            const size_t size = rng() % 512;
+            std::vector<uint8_t> meta(size);
+            for (size_t i = 0; i < size; i++) meta[i] = uint8_t(rng() & 0xFF);
+            const bool foveated = (rng() % 4) == 0;
+            const uint64_t trackingTs = 1'000'000'000ULL + (rng() % 100'000ULL);
+            const size_t at = sizeof(rc::VrFrameMetadata) + (foveated ? sizeof(rc::VrFoveationMetadata) : 0);
+            if (size >= at + sizeof(rc::MotionHeader) && (rng() % 3 != 0)) {
+                rc::VrFrameMetadata vm{};
+                vm.trackingTimestampNs = trackingTs;
+                vm.eyeWidth = 2560;
+                vm.eyeHeight = 1440;
+                std::memcpy(meta.data(), &vm, sizeof(vm));
+                rc::MotionHeader mh{};
+                mh.gridWidth = uint16_t(rng() % 200);
+                mh.gridHeight = uint16_t(rng() % 200);
+                mh.blockSize = uint16_t(rng() % 33);
+                mh.previousTimestampNs =
+                    (rng() % 8 == 0) ? (trackingTs + 1000) : (trackingTs - 1'000'000ULL - (rng() % 30'000'000ULL));
+                std::memcpy(meta.data() + at, &mh, sizeof(mh));
+            }
+            const auto res = rc::DecodeVrMotionMetadata(true, foveated, trackingTs, meta, state);
+            if (res.decoded) {
+                CHECK(state.width > 0 && state.height > 0 && state.block > 0 && state.frameNs > 0);
+                CHECK(state.grid.size() == size_t(state.width) * size_t(state.height) * 2);
+                decodedOk++;
+            } else {
+                CHECK(!state.moves && !state.consistent && state.frameNs == 0);
+                failuresReset++;
+            }
+        } else {
+            // Hostile AudioDecoder::Decode PLC sizes never overrun stack buffer.
+            std::vector<int16_t> pcm(5760 * 2 + 16, 0x1111);
+            const int req = int(rng() % 70000) - 50;
+            const int r = audioDec.Decode(nullptr, 0, pcm.data(), req);
+            CHECK(r <= 5760);
+            for (size_t i = size_t(5760) * 2; i < pcm.size(); i++) CHECK(pcm[i] == 0x1111);
+        }
+    }
+    std::printf("fuzz motion: %llu iterations, ready %llu, clean-reset %llu, failures %d\n",
+                (unsigned long long)n, (unsigned long long)decodedOk, (unsigned long long)failuresReset, g_failures);
     return g_failures ? 1 : 0;
 }
 
@@ -348,7 +466,7 @@ int main(int argc, char** argv) {
     _set_error_mode(_OUT_TO_STDERR);
 #endif
     if (argc < 2) {
-        std::printf("usage: rincast-fuzz <msg|fec|pacing|chunk> [iterations]\n");
+        std::printf("usage: rincast-fuzz <msg|fec|pacing|chunk|conn|motion> [iterations]\n");
         return 2;
     }
     const std::string mode = argv[1];
@@ -359,6 +477,8 @@ int main(int argc, char** argv) {
     else if (mode == "fec") rc = FuzzFec(g_iterations);
     else if (mode == "pacing") rc = FuzzPacing(g_iterations);
     else if (mode == "chunk") rc = FuzzChunk(g_iterations);
+    else if (mode == "conn") rc = FuzzConn(g_iterations);
+    else if (mode == "motion") rc = FuzzMotion(g_iterations);
     else {
         std::printf("unknown mode %s\n", mode.c_str());
         return 2;

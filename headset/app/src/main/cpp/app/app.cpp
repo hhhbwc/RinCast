@@ -137,6 +137,8 @@ void App::Init() {
     Platform::Init(m_android);
     m_settingsPath = Platform::FilesDir() + "/settings.json";
     m_settings = HeadsetSettings::Load(m_settingsPath);
+    m_xr.SetCompatPlainOpenXr(m_settings.compatPlainOpenXr);
+    VideoDecoder::SetCompatPlain(m_settings.compatPlainOpenXr);
     SetLanguage(m_settings.language, Platform::SystemLocale());
     {
         rc::crypto::IdentitySeed seed{};
@@ -233,6 +235,7 @@ void App::Shutdown() {
     m_cloud.Stop();
     m_audio.Stop();
     m_mic.Stop();
+    m_scene.ClearExternal();
     m_decoders.clear();
     for (auto& [id, sc] : m_monitorLayers) m_xr.DestroySwapchain(sc);
     for (auto& [id, sc] : m_uiLayers) m_xr.DestroySwapchain(sc);
@@ -260,6 +263,7 @@ void App::ApplyPcSettings(const json& info) {
 
 void App::ApplyStreamSettings() {
     SaveSettings();
+    VideoDecoder::SetCompatPlain(m_settings.compatPlainOpenXr);
     m_xr.SetRefreshRate(m_settings.refreshRate);
     // ROUND18 L8-TELEM: the rate the display actually runs at with this config (0: could not read).
     RC_LOGI("Stream config: %.0f Hz asked, %.0f Hz on the display", m_settings.refreshRate, m_xr.RefreshRate());
@@ -377,8 +381,13 @@ void App::ConnectLan(const DiscoveredPc& pc) {
 
 void App::SetUsbCable(bool on) {
     m_settings.usbCable = on;
-    SaveSettings();
     Platform::SetUsbNetwork(on);
+    const Platform::UsbNetwork u = Platform::GetUsbNetwork();
+    if (on && u.state == Platform::UsbNetwork::NotAllowed) {
+        RC_LOGW("USB network rejected; not persisting usbCable=true");
+        m_settings.usbCable = false;
+    }
+    SaveSettings();
     m_usbCheckedNs = 0;
 }
 
@@ -388,6 +397,11 @@ void App::UpdateUsbNetwork() {
     if (!m_usbCheckedNs && m_settings.usbCable) Platform::SetUsbNetwork(true);  // asked for at start
     m_usbCheckedNs = now;
     const Platform::UsbNetwork u = Platform::GetUsbNetwork();
+    if (u.state == Platform::UsbNetwork::NotAllowed && m_settings.usbCable) {
+        RC_LOGW("USB network not allowed; reverting usbCable setting");
+        m_settings.usbCable = false;
+        SaveSettings();
+    }
     const bool changed = u.state != m_usbNetwork.state || u.handle != m_usbNetwork.handle || u.interface != m_usbNetwork.interface;
     m_usbNetwork = u;
     if (!changed) return;
@@ -445,10 +459,13 @@ void App::DisconnectNow() {
         std::lock_guard lock(m_decoderMutex);
         m_decoders.clear();
     }
+    m_scene.ClearExternal();
     for (auto& [id, ds] : m_desktopStreams) m_windows.Remove("monitor-" + std::to_string(id));
     m_desktopStreams.clear();
-    for (auto& [id, sc] : m_monitorLayers) m_xr.DestroySwapchain(sc);
-    m_monitorLayers.clear();
+    std::erase_if(m_monitorLayers, [&](auto& entry) {
+        m_monitorFresh[entry.first] = false;
+        return m_xr.DestroySwapchain(entry.second);
+    });
     m_xr.DestroySwapchain(m_vrSwapchain);
     m_vrHasFrame = false;
     m_vrState = "idle";
@@ -460,6 +477,11 @@ void App::DisconnectNow() {
     m_client.SetDiagnosis("");
     m_games.clear();
     m_monitorsLaidOut = false;
+    m_decoderRetryNs.clear();
+    m_motionFrameNs = 0;
+    m_motionIntervalSmoothNs = 0;
+    m_motionConsistent = false;
+    m_vrLatchedDisplayNs = 0;
     EnterMode(Mode::Home);
 }
 
@@ -858,7 +880,7 @@ void App::UpdateMode(float dt) {
                 const std::string status = m_client.StatusText();
                 DisconnectNow();
                 // Anything but the PC ending it on purpose is worth another try.
-                if (status != "The PC ended the session." && !status.empty() && m_haveLast) {
+                if (status != "The PC ended the session." && status != Tr("notice.pcEndedSession") && !status.empty() && m_haveLast) {
                     m_problem = status;
                     m_retryUntil = m_time + 20.f;
                     m_retryAttempt = 0;
@@ -871,6 +893,8 @@ void App::UpdateMode(float dt) {
             }
             break;
     }
+
+    if (m_mode == Mode::Desktop || m_mode == Mode::LaunchingVr || m_mode == Mode::Vr) RecoverFailedDecoders();
 
     // Hyperspace choreography.
     if (m_mode == Mode::LaunchingVr) {
@@ -1001,7 +1025,19 @@ void App::HandleControl(const json& m) {
         m_vrState = m.value("state", "idle");
         m_vrProducer = m.value("producer", "");
         m_vrApp = m.value("app", "");
-        if (m.contains("error")) PostNotice(m.value("error", ""), "error");
+        if (m.contains("error")) {
+            std::string err = m.value("error", "");
+            if (m.contains("errorKey")) {
+                const std::string ek = m.value("errorKey", "");
+                const char* tr = Tr(ek.c_str());
+                if (tr != ek) err = tr;
+            } else if (err == "SteamVR did not start. Check SteamVR on your PC.") {
+                err = Tr("notice.steamVrDidNotStart");
+            } else if (err == "SteamVR is not installed on this PC.") {
+                err = Tr("notice.steamVrNotInstalled");
+            }
+            PostNotice(err, "error");
+        }
         const bool vrActive = m_vrState == "launching" || m_vrState == "running";
         // A VR app started from the PC: jump in. Only one that starts after VR has been
         // inactive for a while is new; the PC restarts the VR stream whenever a video setting
@@ -1041,7 +1077,33 @@ void App::HandleControl(const json& m) {
     } else if (type == rc::msg::kVrPoseWait) {
         OnPoseWait(m);
     } else if (type == rc::msg::kNotice) {
-        PostNotice(m.value("text", ""), m.value("level", "info"), m.value("action", ""));
+        std::string text = m.value("text", "");
+        const std::string action = m.value("action", "");
+        if (m.contains("key")) {
+            const std::string key = m.value("key", "");
+            const char* tr = Tr(key.c_str());
+            if (tr != key) text = tr;
+        } else if (action == "vr.restartSteamVR" || text == "Restart SteamVR to use the new resolution.") {
+            text = Tr("notice.restartSteamVR");
+        } else if (text == "H.264 does not support this picture size; the stream switched to HEVC.") {
+            text = Tr("notice.h264FallbackHevc");
+        } else if (text == "SteamVR did not start. Check SteamVR on your PC.") {
+            text = Tr("notice.steamVrDidNotStart");
+        } else if (text == "SteamVR is not installed on this PC.") {
+            text = Tr("notice.steamVrNotInstalled");
+        } else if (text == "Launching game…") {
+            text = Tr("notice.launchingGame");
+        } else if (text == "Could not launch the game") {
+            text = Tr("notice.couldNotLaunchGame");
+        } else if (text == "This PC allowed the headset to connect.") {
+            text = Tr("notice.pcAllowedConnect");
+        } else if (text == "This PC now lets the headset use its mouse and keyboard.") {
+            text = Tr("notice.inputAllowed");
+        } else if (text == "This PC turned off the headset's mouse and keyboard. You can still watch." ||
+                   text == "This PC has the headset's mouse and keyboard turned off. You can still watch.") {
+            text = Tr("notice.inputDisabled");
+        }
+        PostNotice(text, m.value("level", "info"), action);
     }
 }
 
@@ -1049,6 +1111,10 @@ void App::OnVideoFrame(rc::ReceivedFrame&& f) {
     std::lock_guard lock(m_decoderMutex);
     auto it = m_decoders.find(f.streamId);
     if (it == m_decoders.end() || !it->second) return;
+    if (it->second->Failed()) {
+        m_refChainBroken[f.streamId] = true;
+        return;
+    }
     if (it->second->Codec() != f.codec) return;
     // A23 (queue bound) + A46 (TASK-RECOVERY-GUARD): judge the queue age at the decode
     // submission point (the Submit call below). A frame that queued longer than
@@ -1093,6 +1159,63 @@ void App::OnVideoFrame(rc::ReceivedFrame&& f) {
         m_client.RequestKeyframe(f.streamId);
 }
 
+void App::RecoverFailedDecoders() {
+    struct FailedDecoder {
+        uint8_t id;
+        std::shared_ptr<VideoDecoder> decoder;
+    };
+    std::vector<FailedDecoder> failed;
+    const int64_t now = rc::NowNs();
+    {
+        std::lock_guard lock(m_decoderMutex);
+        for (const auto& [id, decoder] : m_decoders) {
+            if (!decoder || !decoder->Failed()) continue;
+            auto& retryAt = m_decoderRetryNs[id];
+            if (retryAt && now < retryAt) continue;
+            retryAt = now + 5'000'000'000LL;
+            failed.push_back({id, decoder});
+        }
+    }
+    for (const auto& entry : failed) {
+        const uint8_t id = entry.id;
+        RC_LOGW("Decoder stream %u failed; rebuilding it and requesting a keyframe", id);
+        auto replacement = std::make_unique<VideoDecoder>();
+        if (id == rc::kVrStreamId) {
+            replacement->SetDecodeSampleSink([this](double ms) {
+                m_decSamples.Push(float(ms));
+                m_client.FeedDecodeSample(ms);
+            });
+        }
+        if (!replacement->Init(entry.decoder->Codec(), entry.decoder->Width(), entry.decoder->Height(), entry.decoder->Fps())) {
+            RC_LOGE("Decoder stream %u recovery init failed; retrying in 5 s", id);
+            continue;
+        }
+        std::shared_ptr<VideoDecoder> decoder = std::move(replacement);
+        {
+            std::lock_guard lock(m_decoderMutex);
+            auto it = m_decoders.find(id);
+            if (it == m_decoders.end() || it->second != entry.decoder) continue;
+            m_decoders[id] = decoder;
+            m_refChainBroken[id] = true;
+        }
+        m_client.ResetStream(id);
+        m_client.RequestKeyframe(id);
+        if (id == rc::kVrStreamId) {
+            m_scene.ClearExternal();
+            m_vrHasFrame = m_vrLatched = m_motionMoves = m_motionConsistent = false;
+            m_vrLatchNs = 0;
+            m_vrLatchedDisplayNs = 0;
+            m_vrNoPicture = 0;
+            m_genQuota = {};
+            m_decSamples.Reset();
+        } else {
+            m_monitorFresh[id] = false;
+            if (Window* w = m_windows.Find("monitor-" + std::to_string(id))) w->videoReady = false;
+        }
+        RC_LOGI("Decoder stream %u recovered; waiting for a keyframe", id);
+    }
+}
+
 void App::ConfigureDesktopStreams(const json& streams) {
     std::map<uint8_t, DesktopStreamInfo> next;
     for (const auto& s : streams) {
@@ -1114,10 +1237,13 @@ void App::ConfigureDesktopStreams(const json& streams) {
         {
             std::lock_guard lock(m_decoderMutex);
             m_decoders[id] = std::move(dec);
+            m_decoderRetryNs.erase(id);
         }
         m_client.ResetStream(id);
-        if (m_monitorLayers.count(id)) m_xr.DestroySwapchain(m_monitorLayers[id]);
-        m_monitorLayers.erase(id);
+        if (m_monitorLayers.count(id)) {
+            m_monitorFresh[id] = false;
+            if (m_xr.DestroySwapchain(m_monitorLayers[id])) m_monitorLayers.erase(id);
+        }
         Window* w = m_windows.Create("monitor-" + std::to_string(id), WindowKind::Video);
         w->title = d.name;
         w->aspect = float(d.height) / float(d.width);
@@ -1130,8 +1256,10 @@ void App::ConfigureDesktopStreams(const json& streams) {
             m_windows.Remove("monitor-" + std::to_string(id));
             std::lock_guard lock(m_decoderMutex);
             m_decoders.erase(id);
-            if (m_monitorLayers.count(id)) m_xr.DestroySwapchain(m_monitorLayers[id]);
-            m_monitorLayers.erase(id);
+            if (m_monitorLayers.count(id)) {
+                m_monitorFresh[id] = false;
+                if (m_xr.DestroySwapchain(m_monitorLayers[id])) m_monitorLayers.erase(id);
+            }
         }
     }
     m_desktopStreams = next;
@@ -1149,6 +1277,8 @@ void App::ConfigureVrStream(const json& s) {
     m_vrCodec = codec;
     m_linkPolicy = {};      // VD-OBSERVE: a fresh stream starts judging from scratch
     m_linkPolicyTicks = 0;
+    m_genQuota = {};
+    m_genQuotaAnnounced = false;
     // Foveated: the frames come smaller, and are stretched back to eyeWidth x eyeHeight.
     int codedW = eyeW, codedH = eyeH;
     const json f = s.value("foveation", json());
@@ -1191,11 +1321,17 @@ void App::ConfigureVrStream(const json& s) {
     {
         std::lock_guard lock(m_decoderMutex);
         m_decoders[rc::kVrStreamId] = std::move(dec);
+        m_decoderRetryNs.erase(rc::kVrStreamId);
     }
+    m_scene.ClearExternal();
     m_client.ResetStream(rc::kVrStreamId);
     CreateVrSwapchain();
     m_vrHasFrame = false;
+    m_vrLatchedDisplayNs = 0;
     m_motionMoves = false;
+    m_motionConsistent = false;
+    m_motionFrameNs = 0;
+    m_motionIntervalSmoothNs = 0;
     // A new stream starts with nothing waiting and nothing known about its timing.
     m_behindSinceNs = m_slipUntilNs = m_slipRetryNs = m_queueKeptUntilNs = m_queuePolicyLogNs = 0;
     m_slips.clear();
@@ -1205,12 +1341,18 @@ void App::ConfigureVrStream(const json& s) {
 
 void App::CreateVrSwapchain() {
     // Upscaling only has a job while the stream is below the headset's own resolution.
-    const float scale = std::min(2.f, float(m_xr.RecommendedWidth()) / float(std::max(1, m_vrEyeWidth)));
+    const float resolvedScale = rc::ResolveVrUpscale(m_settings.upscaling, m_xr.RecommendedWidth(), m_vrEyeWidth,
+                                                    m_scene.UpscalerReady());
+    if (m_vrSwapchain.handle && !m_xr.DestroySwapchain(m_vrSwapchain)) return;
+    const float s = resolvedScale;
+    if (!m_xr.CreateSwapchain(int(m_vrEyeWidth * s + 0.5f) * 2, int(m_vrEyeHeight * s + 0.5f), GL_SRGB8_ALPHA8, 1,
+                              false, m_vrSwapchain, 1, "vr")) {
+        m_vrHasFrame = false;
+        RC_LOGE("VR swapchain creation failed; a decoded frame will retry it");
+        return;
+    }
     m_vrUpscaleSetting = m_settings.upscaling;
-    m_vrUpscaled = m_settings.upscaling && scale > 1.05f && m_scene.UpscalerReady();
-    const float s = m_vrUpscaled ? scale : 1.f;
-    m_xr.DestroySwapchain(m_vrSwapchain);
-    m_xr.CreateSwapchain(int(m_vrEyeWidth * s + 0.5f) * 2, int(m_vrEyeHeight * s + 0.5f), GL_SRGB8_ALPHA8, 1, false, m_vrSwapchain);
+    m_vrUpscaled = resolvedScale > 1.f;
     // ROUND18 L8-TELEM: the queue depth the runtime gave the stream's swapchain; read it
     // against the submit->lit time in the diag line.
     RC_LOGI("VR swapchain: %u images, %dx%d", m_xr.SwapchainImages(), m_vrSwapchain.width, m_vrSwapchain.height);
@@ -1281,6 +1423,8 @@ void App::Frame() {
         m_micReleased = false;
         if (m_settings.micPassthrough && m_client.GetState() == StreamClient::State::Connected)
             m_mic.Start([this](const uint8_t* d, size_t n) { m_client.SendAudio(d, n); });
+    } else if (m_settings.micPassthrough && m_client.GetState() == StreamClient::State::Connected) {
+        m_mic.PollRestart();
     }
     const float dt = std::clamp(float(now - m_lastFrameNs) / 1e9f, 0.001f, 0.1f);
     m_lastFrameNs = now;
@@ -1319,6 +1463,15 @@ void App::Frame() {
         // Neither is any use without a PC, and hand tracking runs slower with simultaneous on.
         m_headset->StopBody();
         m_input.SetSimultaneous(false);
+    }
+    // xrEndFrame discards every layer on these frames; drawing into them only burns CPU/GPU time.
+    if (!frame.shouldRender) {
+        m_vrLatched = false;
+        m_vrLatchNs = 0;
+        m_displayDeltaApplied = 0;
+        m_xr.EndFrame(frame, m_underlays, false, m_overlays, false, 0);
+        m_submitNs = rc::NowNs();
+        return;
     }
     // The monitors' pictures, for what is drawn with them below. The game's picture waits for
     // the late latch: nothing drawn in between needs it.
@@ -1374,11 +1527,9 @@ void App::Frame() {
         const double lead = double(m_xr.ToMonotonicNs(frame.predictedDisplayTime) - m_lateLatchNs);
         if (lead > 0 && lead < 1e8) m_latchLeadNs = m_latchLeadNs > 0 ? m_latchLeadNs * 0.95 + lead * 0.05 : lead;
     }
-    // TASK-QUOTA-GEN-2026-11-20 §1: slot-driven "fill every empty display" became a
-    // 1:1 quota: only a slot whose decoded frame hasn't spent its generated one yet
-    // may draw one. The second empty slot in a row repeats plainly, so the
-    // extrapolation amount stays near 1 instead of rocking between 1 and 2.
-    if (m_mode == Mode::Vr && m_settings.frameGeneration && !m_vrLatched && m_genCredit) GenerateFrame(frame);
+    // A decoded frame earns a fresh budget for the empty display slots that follow it.
+    // DecideFrameGeneration spends that budget only when a moved frame can actually be drawn.
+    if (m_mode == Mode::Vr && m_settings.frameGeneration && !m_vrLatched) GenerateFrame(frame);
     BuildLayers(frame);
     const bool alpha = m_xr.PassthroughActive() || !m_underlays.empty();
     // ROUND19 E1 probe: only VR frames may ask for an earlier display slot; every other commit
@@ -1438,10 +1589,24 @@ void App::LogVrTiming(const FrameState& frame, int64_t wokeNs) {
         m_submitLitSumMs = 0;
         m_submitLitFrames = 0;
         m_flowDisplays = m_flowShown = m_flowLate = 0;
+        m_diagFlowDisplays = m_diagFlowShown = m_diagFlowLate = 0;
         m_flowGenerated = 0;
+        m_generatedFramesWindow = 0;
         m_genFramesPrevSlot = m_generatedFrames;
         m_flowDecodedStart = 0;
         m_flowDecodeMaxMs = 0;
+        m_generationWindow.Reset();
+        m_generationDiag.ResetWindow();
+        m_generationDiag.last = {};
+        m_latchDiag.ResetWindow();
+        m_zeroSampleCount = 0;
+        m_motionPackets = m_motionPacketFailures = 0;
+        m_motionFailureCounts[0] = m_motionFailureCounts[1] = m_motionFailureCounts[2] = m_motionFailureCounts[3] = 0;
+        for (uint32_t& count : m_motionHeaderFailures) count = 0;
+        m_motionFailure = 0;
+        m_vrMetadataBytes = m_motionMetadataBytes = 0;
+        m_lastMotionHeader = {};
+        m_generatedLogNs = now;
         m_decSamples.Reset();  // TASK-DEC-PERCENTILE-2026-11-20 §1.3: same boundary as the flow window
         m_flowSlackMs.clear();
         m_flowWaiting[0] = m_flowWaiting[1] = m_flowWaiting[2] = 0;
@@ -1465,7 +1630,11 @@ void App::LogVrTiming(const FrameState& frame, int64_t wokeNs) {
         }
     }
     m_flowDisplays++;
-    if (m_vrLatched) m_flowShown++;
+    m_diagFlowDisplays++;
+    if (m_vrLatched) {
+        m_flowShown++;
+        m_diagFlowShown++;
+    }
     // TASK-POLICY-FIX-TESTS-2026-11-20 §B: a slot with no new picture where
     // GenerateFrame still drew is an extrapolated one. m_generatedFrames moves
     // at most once per slot and only in GenerateFrame, so a change since the
@@ -1474,8 +1643,97 @@ void App::LogVrTiming(const FrameState& frame, int64_t wokeNs) {
     // (5 s, separately clocked) reset inside GenerateFrame.
     else if (m_generatedFrames != m_genFramesPrevSlot) m_flowGenerated++;
     m_genFramesPrevSlot = m_generatedFrames;
-    if (now - m_timingLogNs < 5'000'000'000LL) return;
+    const int64_t flowWindowStartNs = m_timingLogNs;
+    if (now - flowWindowStartNs < 5'000'000'000LL) return;
     m_timingLogNs = now;
+    if (now - m_generatedLogNs >= 5'000'000'000LL) {
+        const double secs = double(now - m_generatedLogNs) / 1e9;
+        const double flowSecs = double(now - flowWindowStartNs) / 1e9;
+        const double shownFps = flowSecs > 0 ? double(m_flowShown) / flowSecs : 0.0;
+        double streamFps = 0;
+        if (m_serverStats.contains("vr")) streamFps = m_serverStats["vr"].value("fps", 0.0);
+        const auto& stats = m_generationWindow;
+        const uint32_t rejected = stats.attempts - stats.generated;
+        const auto reason = [&](rc::GenerationRejectReason r) { return stats.rejected[size_t(r)]; };
+        RC_LOGI("Frame generation: %.0f/s generated, %.0f/s shown of %.0f Hz, stream %.0f fps, %.0f%% skipped "
+                "(cap %.1f, field: %d moving, mean %d, spread %d, far %d, coherent %d, global %d); "
+                "attempts %u, quota-blocked %u, rejected %u, reasons inconsistent %u no-motion %u missing-frame %u "
+                "missing-swapchain %u invalid-timing %u invalid-field %u amount-small %u amount-cap %u texture %u draw %u; "
+                "motion packets %u, failures %u, last-failure %d",
+                stats.GeneratedFps(secs), shownFps, m_xr.RefreshRate(), streamFps,
+                stats.attempts ? 100.0 * rejected / double(stats.attempts) : 0.0,
+                m_lastGenCap, m_motionGateMoving, m_motionGateMean, m_motionGateSpread, m_motionGateFar,
+                m_motionGateCoherent, m_motionGateGlobal, stats.attempts, stats.quotaBlocked, rejected,
+                reason(rc::GenerationRejectReason::InconsistentMotion), reason(rc::GenerationRejectReason::NoMotion),
+                reason(rc::GenerationRejectReason::MissingFrame), reason(rc::GenerationRejectReason::MissingSwapchain),
+                reason(rc::GenerationRejectReason::InvalidMotionTiming), reason(rc::GenerationRejectReason::InvalidField),
+                reason(rc::GenerationRejectReason::AmountTooSmall), reason(rc::GenerationRejectReason::AmountAboveCap),
+                reason(rc::GenerationRejectReason::TextureUnavailable), reason(rc::GenerationRejectReason::DrawFailed),
+                m_motionPackets, m_motionPacketFailures, m_motionFailure);
+        const auto& diag = m_generationDiag;
+        const auto& latchDiag = m_latchDiag;
+        const char* lastPath = diag.last.path == rc::GenerationPath::Kept ? "kept"
+                                 : diag.last.path == rc::GenerationPath::External ? "external" : "none";
+        const double motionAgeMs = m_vrMeta.trackingTimestampNs
+                                        ? double(now - int64_t(m_vrMeta.trackingTimestampNs)) / 1e6
+                                        : 0.0;
+        RC_LOGI("VR generation diagnostics: calls %u, attempts %u, quota-blocked %u, generated %u, acquire-failed %u, "
+                "draw-failed %u, release-failed %u; state enabled %d, latched %d, hasFrame %d, swapchain %d, "
+                "outstanding %d, output %dx%d, field %dx%d block %d, metadata %zu bytes, motionMetadata %zu bytes, "
+                "motionGrid %ux%u block %u previous %llu, motionAge %.1f ms, "
+                "moves %d, consistent %d, externalReady %d, upscaled %d; last reason %s, path %s, amount %.3f, cap %.2f; "
+                "latch no-image %u, metadata-missing %u, swapchain-missing %u, acquire-failed %u, release-failed %u; "
+                "motion failures short-header %u, invalid-header %u, invalid-runs %u; "
+                "header width-zero %u, height-zero %u, block-zero %u, timestamp-nonadvancing %u, unknown %u; "
+                "last-header-failure track %llu prev %llu grid %ux%u block %u",
+                diag.calls, diag.attempts, diag.quotaBlocked, diag.generated, diag.acquireFailed, diag.drawFailed,
+                diag.releaseFailed, int(m_settings.frameGeneration), int(m_vrLatched), int(m_vrHasFrame),
+                int(m_vrSwapchain.handle != 0), int(m_vrSwapchain.imageAcquired), m_vrSwapchain.width, m_vrSwapchain.height,
+                m_motionWidth, m_motionHeight, m_motionBlock, m_vrMetadataBytes, m_motionMetadataBytes,
+                m_lastMotionHeader.gridWidth, m_lastMotionHeader.gridHeight, m_lastMotionHeader.blockSize,
+                static_cast<unsigned long long>(m_lastMotionHeader.previousTimestampNs), motionAgeMs, int(m_motionMoves),
+                int(m_motionConsistent), int(m_scene.ExternalGenerationReady()), int(m_vrUpscaled),
+                rc::GenerationRejectReasonName(diag.last.reason), lastPath, diag.last.amount, diag.last.cap,
+                latchDiag.noImage, latchDiag.metadataMissing, latchDiag.swapchainMissing, latchDiag.acquireFailed,
+                latchDiag.releaseFailed, m_motionFailureCounts[1], m_motionFailureCounts[2], m_motionFailureCounts[3],
+                m_motionHeaderFailures[0], m_motionHeaderFailures[1], m_motionHeaderFailures[2],
+                m_motionHeaderFailures[3], m_motionHeaderFailures[4],
+                static_cast<unsigned long long>(m_lastMotionFailureTrackingNs),
+                static_cast<unsigned long long>(m_lastMotionFailureHeader.previousTimestampNs),
+                m_lastMotionFailureHeader.gridWidth, m_lastMotionFailureHeader.gridHeight,
+                m_lastMotionFailureHeader.blockSize);
+        // Separate line: fields/order of the two lines above are untouched.  Only in a
+        // zero-generation window.  mB=0 means "no motion field" and ALONE cannot separate
+        // mailbox miss / PC oversize rollback / PC motion disabled — correlate ts (the
+        // headsetTargetNs the PC wrote into VrFrameMetadata) with the PC's own frame records.
+        // f is the wire sequence only: it is NOT the PC producer's counter.
+        // Worth=false, timing/field, consistency and clock/quota gating are unambiguous
+        // from reason+flags alone.  seq orders the samples inside this window.
+        if (stats.attempts > 0 && stats.generated == 0 && m_zeroSampleCount > 0) {
+            char line[1024] = "VR gen zero-window trace:";
+            size_t used = std::strlen(line);
+            for (uint8_t i = 0; i < m_zeroSampleCount; ++i) {
+                const ZeroGenSample& s = m_zeroSamples[i];
+                int n = std::snprintf(line + used, sizeof(line) - used,
+                        " [f=%u seq=%u ts=%llu r=%s fl=0x%x mB=%u since=%.1f sm=%.1f amt=%.2f cap=%.2f]",
+                        s.frameIndex, s.localSeq, static_cast<unsigned long long>(s.trackingTimestampNs),
+                        rc::GenerationRejectReasonName(rc::GenerationRejectReason(s.reason)),
+                        unsigned(s.flags), unsigned(s.motionBytes), s.sinceMs, s.smoothMs, s.amount, s.cap);
+                if (n <= 0 || size_t(n) >= sizeof(line) - used) break;
+                used += size_t(n);
+            }
+            RC_LOGI("%s", line);
+        }
+        m_generationWindow.Reset();
+        m_generationDiag.ResetWindow();
+        m_latchDiag.ResetWindow();
+        m_zeroSampleCount = 0;
+        m_motionPackets = m_motionPacketFailures = 0;
+        m_motionFailureCounts[0] = m_motionFailureCounts[1] = m_motionFailureCounts[2] = m_motionFailureCounts[3] = 0;
+        for (uint32_t& count : m_motionHeaderFailures) count = 0;
+        m_motionFailure = 0;
+        m_generatedLogNs = now;
+    }
     uint32_t decoded = 0;
     {
         std::lock_guard lock(m_decoderMutex);
@@ -1974,85 +2232,150 @@ void App::UpdateFace(const FrameState& frame) {
 
 void App::ReadMotion(const std::vector<uint8_t>& metadata) {
     m_motionMoves = false;
-    // After the frame's metadata, and its foveation's.
-    const size_t at = sizeof(rc::VrFrameMetadata) + (m_vrFoveated ? sizeof(rc::VrFoveationMetadata) : 0);
-    if (!m_settings.frameGeneration || metadata.size() < at + sizeof(rc::MotionHeader)) return;
-    rc::MotionHeader h;
-    std::memcpy(&h, metadata.data() + at, sizeof(h));
-    const size_t head = at + sizeof(h);
-    if (!h.gridWidth || !h.gridHeight || !h.blockSize || m_vrMeta.trackingTimestampNs <= h.previousTimestampNs) return;
-    if (!rc::DecodeMotionRuns(metadata.data() + head, metadata.size() - head, size_t(h.gridWidth) * h.gridHeight, m_motionGrid)) return;
-    m_motionWidth = h.gridWidth;
-    m_motionHeight = h.gridHeight;
-    m_motionBlock = h.blockSize;
-    m_motionFrameNs = int64_t(m_vrMeta.trackingTimestampNs - h.previousTimestampNs);
-    // Smoothed, for how far a generated frame may reach: the interval jitters, and the cap
-    // should follow what the stream does, not each frame's noise.
-    m_motionIntervalSmoothNs = m_motionIntervalSmoothNs > 0 ? m_motionIntervalSmoothNs * 0.8 + double(m_motionFrameNs) * 0.2
-                                                           : double(m_motionFrameNs);
-    // Before anything is counted or uploaded: far matches dropped, so the picture is warped by
-    // motion only.
-    const rc::MotionGate gate = rc::JudgeMotionField(m_motionGrid, m_motionWidth, m_motionHeight);
-    m_motionConsistent = gate.worth;
-    m_motionGateMoving = gate.moving;
-    m_motionGateMean = gate.mean;
-    m_motionGateSpread = gate.spread;
-    m_motionGateFar = gate.farRejected;
-    m_motionGateCoherent = gate.coherent;
-    m_motionGateGlobal = gate.global;
-    m_motionMoves = std::any_of(m_motionGrid.begin(), m_motionGrid.end(), [](int8_t v) { return v != 0; });
-    if (m_motionMoves) m_scene.UploadMotion(m_motionGrid.data(), m_motionWidth, m_motionHeight);
+    m_motionConsistent = false;
+    m_motionFrameNs = 0;
+    m_motionFailure = 0;
+    m_motionMetadataBytes = metadata.size();
+    m_motionGateMoving = m_motionGateMean = m_motionGateSpread = m_motionGateFar = 0;
+    m_motionGateCoherent = m_motionGateGlobal = 0;
+    if (!m_settings.frameGeneration) return;
+    ++m_motionPackets;
+    rc::HeadsetMotionState state{m_motionMoves, m_motionConsistent, m_motionWidth, m_motionHeight,
+                                 m_motionBlock, m_motionFrameNs, m_motionIntervalSmoothNs,
+                                 std::move(m_motionGrid)};
+    const rc::MotionDecodeResult res =
+        rc::DecodeVrMotionMetadata(true, m_vrFoveated, m_vrMeta.trackingTimestampNs, metadata, state);
+    m_motionGrid = std::move(state.grid);
+    if (res.failureStage != 1) {
+        const rc::MotionHeader h = res.header;
+        m_lastMotionHeader = h;
+    }
+    if (res.failureStage != 0) {
+        ++m_motionPacketFailures;
+        if (res.failureStage == 1) ++m_motionFailureCounts[1];
+        if (res.failureStage == 2) {
+            ++m_motionFailureCounts[2];
+            m_lastMotionFailureHeader = res.header;
+            m_lastMotionFailureTrackingNs = m_vrMeta.trackingTimestampNs;
+            if (res.headerFailure & rc::kMotionHeaderZeroWidth) ++m_motionHeaderFailures[0];
+            if (res.headerFailure & rc::kMotionHeaderZeroHeight) ++m_motionHeaderFailures[1];
+            if (res.headerFailure & rc::kMotionHeaderZeroBlock) ++m_motionHeaderFailures[2];
+            if (res.headerFailure & rc::kMotionHeaderNonAdvancingTimestamp) ++m_motionHeaderFailures[3];
+            if (res.headerFailure & uint8_t(~rc::kMotionHeaderFailureMask)) ++m_motionHeaderFailures[4];
+        }
+        else if (res.failureStage == 3) ++m_motionFailureCounts[3];
+        m_motionFailure = res.failureStage;
+        return;
+    }
+    m_motionWidth = state.width;
+    m_motionHeight = state.height;
+    m_motionBlock = state.block;
+    m_motionFrameNs = state.frameNs;
+    m_motionIntervalSmoothNs = state.intervalSmoothNs;
+    m_motionConsistent = state.consistent;
+    m_motionMoves = state.moves;
+    m_motionGateMoving = res.gate.moving;
+    m_motionGateMean = res.gate.mean;
+    m_motionGateSpread = res.gate.spread;
+    m_motionGateFar = res.gate.farRejected;
+    m_motionGateCoherent = res.gate.coherent;
+    m_motionGateGlobal = res.gate.global;
+    if (res.uploadMotion) m_scene.UploadMotion(m_motionGrid.data(), m_motionWidth, m_motionHeight);
 }
 
 // No new frame for this display: move the moving things on from the last picture. The layer
 // keeps the last frame's pose, so the compositor still turns it with the head.
 void App::GenerateFrame(const FrameState& frame) {
-    // TASK-QUOTA-GEN-2026-11-20 §1: this call spends the slot's credit whatever the
-    // outcome - a drawn frame, a front gate or the cap refusing - so an empty slot
-    // never hands a second try to the next one (better one filler missing than two).
-    m_genCredit = false;
-    if (!m_motionMoves || !m_motionConsistent || !m_vrHasFrame || !m_vrSwapchain.handle || m_motionFrameNs <= 0) {
-        if (m_motionMoves && !m_motionConsistent) m_generatedSkipped++;
+    ++m_generationDiag.calls;
+    rc::GenerationInput in;
+    in.enabled = m_settings.frameGeneration;
+    in.vr = m_mode == Mode::Vr;
+    in.latched = m_vrLatched;
+    in.hasFrame = m_vrHasFrame;
+    in.swapchain = m_vrSwapchain.handle != 0;
+    in.motionMoves = m_motionMoves;
+    in.motionConsistent = m_motionConsistent;
+    in.motionFrameNs = m_motionFrameNs;
+    in.sinceFrameNs = rc::ElapsedSinceLatchedFrameNs(m_xr.ToMonotonicNs(frame.predictedDisplayTime), m_vrLatchedDisplayNs,
+                                                     int64_t(m_vrMeta.trackingTimestampNs));
+    in.displayNs = frame.period > 0 ? double(frame.period) : 1e9 / 90.0;
+    in.motionIntervalSmoothNs = m_motionIntervalSmoothNs;
+    in.upscaled = m_vrUpscaled;
+    in.externalReady = m_scene.ExternalGenerationReady();
+    const float fieldW = rc::MotionFieldExtent(m_motionWidth, m_motionBlock);
+    const float fieldH = rc::MotionFieldExtent(m_motionHeight, m_motionBlock);
+    in.fieldWidth = fieldW;
+    in.fieldHeight = fieldH;
+    // Forced cadence only below ~60 fps at 72 Hz: above that the real frames already cover the
+    // display slots, and a forced frame would just take quota from a healthy stream.
+    in.force = rc::ShouldForceFrameGeneration(m_motionIntervalSmoothNs, m_motionFrameNs, in.displayNs);
+    // Both DrawKeptMoved (un-upscaled m_gsrTexture) and DrawExternalMoved sample the
+    // source-resolution VR picture, not the upscaled swapchain target.
+    const uint32_t pictureW = m_vrEyeWidth > 0 ? uint32_t(m_vrEyeWidth) * 2u : uint32_t(m_vrSwapchain.width);
+    const uint32_t pictureH = m_vrEyeHeight > 0 ? uint32_t(m_vrEyeHeight) : uint32_t(m_vrSwapchain.height);
+    const float fieldU = rc::MotionFieldUvScale(m_motionWidth, m_motionBlock, pictureW);
+    const float fieldV = rc::MotionFieldUvScale(m_motionHeight, m_motionBlock, pictureH);
+    const rc::GenerationDecision decision = rc::DecideFrameGeneration(m_genQuota, in);
+    if (decision.attempt || decision.quotaBlocked) {
+        m_generationDiag.last = decision;
+        m_lastGenCap = decision.cap;
+    }
+    if (decision.attempt) ++m_generationDiag.attempts;
+    if (decision.quotaBlocked) ++m_generationDiag.quotaBlocked;
+    if (decision.attempt) m_genStats.Attempt();
+    if (!decision.draw) {
+        // Zero-generation causal sample (fixed size, in place — no per-frame allocation).
+        if (m_zeroSampleCount < sizeof(m_zeroSamples) / sizeof(m_zeroSamples[0])) {
+            ZeroGenSample& s = m_zeroSamples[m_zeroSampleCount++];
+            // Correlate with the PC by trackingTimestampNs, the one value both ends copy
+            // verbatim (PC meta.trackingTimestampNs = job.headsetTargetNs).  The wire seq is
+            // NOT the PC's producer counter: VideoSender::Send assigns ++m_frameIndex and
+            // ignores SendJob::frameIndex, so every stale/oversize drop drifts the two
+            // permanently.  Keep the seq for ordering, use ts for cross-end alignment.
+            s.frameIndex = m_vrFrameIndex;
+            s.trackingTimestampNs = m_vrMeta.trackingTimestampNs;
+            s.localSeq = ++m_zeroGenFrameIndex;
+            s.reason = uint8_t(decision.reason);
+            s.flags = uint8_t((in.motionMoves ? 1 : 0) | (in.motionConsistent ? 2 : 0) |
+                              (m_motionMetadataBytes > 0 ? 4 : 0) | (!decision.quotaBlocked ? 8 : 0));
+            s.motionBytes = uint16_t(std::min<size_t>(m_motionMetadataBytes, 65535u));
+            s.sinceMs = float(in.sinceFrameNs / 1e6);
+            s.smoothMs = float(in.motionIntervalSmoothNs / 1e6);
+            s.amount = decision.amount;
+            s.cap = decision.cap;
+        }
+        m_generationWindow.Record(decision);
         return;
     }
-    const int64_t sinceFrame = m_xr.ToMonotonicNs(frame.predictedDisplayTime) - int64_t(m_vrMeta.trackingTimestampNs);
-    const float amount = float(double(sinceFrame) / double(m_motionFrameNs));
-    // How many displays one stream frame has to cover decides how far a generated one may reach:
-    // at half the display rate every other display has no frame, at a third, two in three. The
-    // cap follows that ratio (smoothed), within limits: past a few frames the motion field can't
-    // say where things went, and a stall would otherwise ask for exactly that.
-    const double displayNs = frame.period > 0 ? double(frame.period) : 1e9 / 90.0;
-    const double cap = std::clamp(m_motionIntervalSmoothNs > 0 ? m_motionIntervalSmoothNs / displayNs + 0.3 : 1.2, 1.0, 2.5);
-    m_lastGenCap = float(cap);
-    if (amount <= 0.05f || amount > cap) return;
     const GLuint fbo = m_xr.AcquireImage(m_vrSwapchain);
-    // The field is in the picture's own pixels, which can be larger than what is shown
-    // (SteamVR supersampling above the stream's cap, foveated encoding): scale against the
-    // picture and sample the whole field. Pushing a little less than asked undershoots
-    // instead of overshooting, which reads as steady rather than wobbly.
-    const float fieldW = float(m_motionWidth * m_motionBlock);
-    const float fieldH = float(m_motionHeight * m_motionBlock);
-    const float perPixel = amount * 0.85f * 127.f * rc::kMotionUnitPixels;
-    m_scene.DrawKeptMoved(fbo, m_vrSwapchain.width, m_vrSwapchain.height, perPixel / fieldW, perPixel / fieldH, 1.f, 1.f);
-    m_xr.ReleaseImage(m_vrSwapchain);
+    if (!fbo) {
+        ++m_generationDiag.acquireFailed;
+        m_vrHasFrame = false;
+        m_generationWindow.Record(decision, false);
+        return;
+    }
+    bool drew = false;
+    if (decision.path == rc::GenerationPath::Kept) {
+        drew = m_scene.DrawKeptMoved(fbo, m_vrSwapchain.width, m_vrSwapchain.height, decision.scaleX, decision.scaleY, fieldU,
+                                     fieldV);
+    } else if (decision.path == rc::GenerationPath::External) {
+        drew = m_scene.DrawExternalMoved(fbo, m_vrSwapchain.width, m_vrSwapchain.height, decision.scaleX, decision.scaleY, fieldU,
+                                         fieldV);
+    }
+    const bool released = m_xr.ReleaseImage(m_vrSwapchain);
+    if (!released) ++m_generationDiag.releaseFailed;
+    if (!drew) ++m_generationDiag.drawFailed;
+    drew = released && drew;
+    m_generationWindow.Record(decision, drew);
+    if (!drew) {
+        m_vrHasFrame = false;
+        return;
+    }
     glFlush();  // as for a new frame: the GPU starts now
     m_generatedFrames++;
-    m_statsGenerated++;
-    const int64_t now = rc::NowNs();
-    if (now - m_generatedLogNs > 5'000'000'000LL) {
-        const double secs = double(now - m_generatedLogNs) / 1e9;
-        double streamFps = 0;
-        if (m_serverStats.contains("vr")) streamFps = m_serverStats["vr"].value("fps", 0.0);
-        RC_LOGI("Frame generation: %.0f/s generated, %.0f/s shown of %.0f Hz, stream %.0f fps, %.0f%% skipped "
-                "(cap %.1f, field: %d moving, mean %d, spread %d, far %d, coherent %d, global %d)",
-                m_generatedFrames / secs, m_stats.fps, m_xr.RefreshRate(), streamFps,
-                m_generatedFrames + m_generatedSkipped ? 100.0 * m_generatedSkipped / double(m_generatedFrames + m_generatedSkipped) : 0.0,
-                m_lastGenCap, m_motionGateMoving, m_motionGateMean, m_motionGateSpread, m_motionGateFar,
-                m_motionGateCoherent, m_motionGateGlobal);
-        m_generatedFrames = 0;
-        m_generatedSkipped = 0;
-        m_generatedLogNs = now;
-    }
+    m_generatedFramesWindow++;
+    ++m_generationDiag.generated;
+    m_genStats.Generated();
 }
 
 void App::LatchVideo(const FrameState& frame, bool late) {
@@ -2070,55 +2393,91 @@ void App::LatchVideo(const FrameState& frame, bool late) {
         if (id == rc::kVrStreamId && !late) continue;
         DecodedFrameInfo info;
         if (!dec->Latch(info)) {
-            if (id == rc::kVrStreamId) m_behindSinceNs = 0;  // no picture to take: none waited behind one either
+            if (id == rc::kVrStreamId) {
+                ++m_latchDiag.noImage;
+                m_behindSinceNs = 0;  // no picture to take: none waited behind one either
+            }
             continue;
         }
         const int64_t latchNs = rc::NowNs();
+        const auto texture = dec->Geometry();
         if (id == rc::kVrStreamId) {
+            m_vrMetadataBytes = info.metadata.size();
             m_vrLatchNs = latchNs;
             const bool haveMeta = info.metadata.size() >= sizeof(rc::VrFrameMetadata);
-            if (haveMeta) std::memcpy(&m_vrMeta, info.metadata.data(), sizeof(m_vrMeta));
-            if (m_vrFoveated && info.metadata.size() >= sizeof(rc::VrFrameMetadata) + sizeof(rc::VrFoveationMetadata)) {
-                rc::VrFoveationMetadata fm;
-                std::memcpy(&fm, info.metadata.data() + sizeof(rc::VrFrameMetadata), sizeof(fm));
-                std::memcpy(m_vrFoveation.start, fm.foveaStart, sizeof(fm.foveaStart));
-            }
-            const VideoFoveation* foveation = m_vrFoveated ? &m_vrFoveation : nullptr;
-            if (m_settings.upscaling != m_vrUpscaleSetting && m_vrSwapchain.handle) CreateVrSwapchain();
-            if (m_vrSwapchain.handle) {
-                const GLuint fbo = m_xr.AcquireImage(m_vrSwapchain);
-                TimeVrDraw(true);
-                // Generating a frame needs the last picture afterwards, too.
-                const bool keep = m_settings.frameGeneration && m_scene.UpscalerReady();
-                if (m_vrUpscaled || keep) {
-                    m_scene.KeepVideo(dec->Texture(), dec->Crop(), m_vrEyeWidth * 2, m_vrEyeHeight, foveation);
-                    if (m_vrUpscaled) m_scene.DrawKeptUpscaled(fbo, m_vrSwapchain.width, m_vrSwapchain.height);
-                    else m_scene.DrawKept(fbo, m_vrSwapchain.width, m_vrSwapchain.height);
-                } else {
-                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-                    m_scene.BlitExternal(dec->Texture(), m_vrSwapchain.width, m_vrSwapchain.height, dec->Crop(), 0, 0, 1, 1,
-                                         foveation);
+            const bool haveFoveation = !m_vrFoveated || info.metadata.size() >= sizeof(rc::VrFrameMetadata) + sizeof(rc::VrFoveationMetadata);
+            if (!haveMeta || !haveFoveation) {
+                ++m_latchDiag.metadataMissing;
+                m_vrHasFrame = m_vrLatched = m_motionMoves = m_motionConsistent = false;
+                m_vrLatchNs = m_vrLatchedDisplayNs = 0;
+                if (m_settings.frameGeneration) {
+                    ++m_motionPackets;
+                    ++m_motionPacketFailures;
+                    ++m_motionFailureCounts[1];
+                    m_motionFailure = 1;
                 }
-                TimeVrDraw(false);
-                m_xr.ReleaseImage(m_vrSwapchain);
-                // The GPU starts on the picture now, while the rest of the frame is put
-                // together, not when the frame is handed in.
-                glFlush();
+                continue;
             }
+            rc::VrFrameMetadata nextMeta;
+            std::memcpy(&nextMeta, info.metadata.data(), sizeof(nextMeta));
+            rc::VrFoveationMetadata nextFoveation{};
+            if (m_vrFoveated)
+                std::memcpy(&nextFoveation, info.metadata.data() + sizeof(rc::VrFrameMetadata), sizeof(nextFoveation));
+            if (!m_vrSwapchain.handle || m_settings.upscaling != m_vrUpscaleSetting) CreateVrSwapchain();
+            if (!m_vrSwapchain.handle) {
+                ++m_latchDiag.swapchainMissing;
+                m_vrHasFrame = m_vrLatched = false;
+                m_vrLatchNs = m_vrLatchedDisplayNs = 0;
+                continue;
+            }
+            const GLuint fbo = m_xr.AcquireImage(m_vrSwapchain);
+            if (!fbo) {
+                ++m_latchDiag.acquireFailed;
+                m_vrHasFrame = m_vrLatched = false;
+                m_vrLatchNs = m_vrLatchedDisplayNs = 0;
+                continue;
+            }
+            m_vrMeta = nextMeta;
+            if (m_vrFoveated) std::memcpy(m_vrFoveation.start, nextFoveation.foveaStart, sizeof(nextFoveation.foveaStart));
+            const VideoFoveation* foveation = m_vrFoveated ? &m_vrFoveation : nullptr;
+            TimeVrDraw(true);
+            if (m_vrUpscaled) {
+                m_scene.KeepVideo(texture.texture, texture.crop, m_vrEyeWidth * 2, m_vrEyeHeight, foveation);
+                m_scene.DrawKeptUpscaled(fbo, m_vrSwapchain.width, m_vrSwapchain.height);
+            } else {
+                m_scene.BlitExternal(fbo, texture.texture, m_vrSwapchain.width, m_vrSwapchain.height, texture.crop, 0, 0,
+                                     1, 1, foveation);
+            }
+            TimeVrDraw(false);
+            if (!m_xr.ReleaseImage(m_vrSwapchain)) {
+                ++m_latchDiag.releaseFailed;
+                m_vrHasFrame = m_vrLatched = false;
+                m_vrLatchNs = m_vrLatchedDisplayNs = 0;
+                continue;
+            }
+            if (!m_vrUpscaled && m_settings.frameGeneration)
+                m_scene.RememberExternal(texture.texture, texture.width, texture.height, texture.crop, foveation);
+            // The GPU starts on the picture now, while the rest of the frame is put
+            // together, not when the frame is handed in.
+            glFlush();
+            const int64_t displayNs = m_xr.ToMonotonicNs(frame.predictedDisplayTime);
             m_vrHasFrame = true;
             m_vrLatched = true;
-            // TASK-QUOTA-GEN-2026-11-20 §1: the decoded frame arms the quota, but only
-            // while the pace policy is at half rate with generation - a full-rate game
-            // needs no fillers, so Full never arms it. The user's master switch stays
-            // the overall gate; the policy only decides whether the gate has a quota.
-            if (m_settings.frameGeneration && m_linkPolicy.mode == rc::PaceMode::HalfWithGeneration) {
-                m_genCredit = true;
-                if (!m_genQuotaAnnounced) {
-                    m_genQuotaAnnounced = true;
-                    RC_LOGI("Frame generation quota armed: one generated frame per decoded frame");
-                }
-            }
+            m_vrFrameIndex = info.frameIndex;
+            m_vrLatchedDisplayNs = displayNs;
+            // Each decoded frame owns a fresh budget for the empty display slots that follow it.
+            // A sudden drop from 72 to 30 fps must land on the wide budget immediately: the 0.8/0.2
+            // EMA would otherwise keep the old, short interval for another 4-5 frames and starve
+            // exactly the slots this change exists to fill.
             ReadMotion(info.metadata);
+            const double slotIntervalNs =
+                std::max(m_motionIntervalSmoothNs, double(m_motionFrameNs > 0 ? m_motionFrameNs : 0));
+            const int generationSlots = rc::FrameGenerationSlots(slotIntervalNs, double(frame.period));
+            m_genQuota.Arm(m_settings.frameGeneration, generationSlots);
+            if (m_settings.frameGeneration && !m_genQuotaAnnounced) {
+                m_genQuotaAnnounced = true;
+                RC_LOGI("Frame generation quota armed: %d slots per decoded frame", generationSlots);
+            }
             m_vrFrames++;
             // ROUND20 T4: the decoded-frame seq range this diag window covers (telemetry
             // only; the PC logs its producer's own seq so logpair can pair the ends).
@@ -2126,7 +2485,6 @@ void App::LatchVideo(const FrameState& frame, bool late) {
             m_seqWindowMax = m_vrFrames;
             // Latency feedback: the frame was rendered for `trackingTimestampNs` and will be
             // shown at this frame's display time; steer our prediction toward reality.
-            const int64_t displayNs = m_xr.ToMonotonicNs(frame.predictedDisplayTime);
             const double errorMs = double(displayNs - int64_t(m_vrMeta.trackingTimestampNs)) / 1e6;
             if (std::fabs(errorMs) < 200) m_pipelineLatencyMs = std::clamp(m_pipelineLatencyMs + errorMs * 0.05, 15.0, 120.0);
             int64_t sampledNs = 0;
@@ -2174,7 +2532,10 @@ void App::LatchVideo(const FrameState& frame, bool late) {
                 if (e >= period / 2) e -= period;
                 if (e < -period / 2) e += period;
                 m_phaseErrors.push_back(e);
-                if (e > m_phaseMarginNs) m_flowLate++;
+                if (e > m_phaseMarginNs) {
+                    m_flowLate++;
+                    m_diagFlowLate++;
+                }
                 // For the log, folded the way SteerVrTiming folds lateness (frames run late far
                 // more than early): up to 80% of a period late, up to 20% early.
                 const double late = std::fmod(e + 1.2 * period, period) - 0.2 * period;
@@ -2184,19 +2545,27 @@ void App::LatchVideo(const FrameState& frame, bool late) {
         } else {
             Window* w = m_windows.Find("monitor-" + std::to_string(id));
             if (!w) continue;
-            w->videoTexture = dec->Texture();
-            std::memcpy(w->videoCrop, dec->Crop(), sizeof(w->videoCrop));
-            w->videoReady = true;
+            w->videoTexture = texture.texture;
+            std::memcpy(w->videoCrop, texture.crop, sizeof(w->videoCrop));
             if (w->layerBacked) {
                 auto& sc = m_monitorLayers[id];
-                if (!sc.handle) m_xr.CreateSwapchain(dec->Width(), dec->Height(), GL_SRGB8_ALPHA8, 1, false, sc);
+                if (!sc.handle)
+                    m_xr.CreateSwapchain(dec->Width(), dec->Height(), GL_SRGB8_ALPHA8, 1, false, sc, 1,
+                                         ("monitor-" + std::to_string(id)).c_str());
                 if (sc.handle) {
+                    m_monitorFresh[id] = false;
+                    w->videoReady = false;
                     const GLuint fbo = m_xr.AcquireImage(sc);
-                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-                    m_scene.BlitExternal(dec->Texture(), sc.width, sc.height, dec->Crop());
-                    m_xr.ReleaseImage(sc);
-                    m_monitorFresh[id] = true;
+                    if (fbo) {
+                        m_scene.BlitExternal(fbo, texture.texture, sc.width, sc.height, texture.crop);
+                        if (m_xr.ReleaseImage(sc)) {
+                            m_monitorFresh[id] = true;
+                            w->videoReady = true;
+                        }
+                    }
                 }
+            } else {
+                w->videoReady = true;
             }
             if (info.receivedNs) {
                 const int64_t displayNs = m_xr.ToMonotonicNs(frame.predictedDisplayTime);
@@ -2224,7 +2593,7 @@ void App::LatchVideo(const FrameState& frame, bool late) {
                 m_latencyCount++;
             }
         }
-        m_statsFrames += id == rc::kVrStreamId || m_mode != Mode::Vr ? 1 : 0;
+        m_genStats.source += id == rc::kVrStreamId || m_mode != Mode::Vr ? 1 : 0;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -2270,7 +2639,7 @@ void App::LatchVideo(const FrameState& frame, bool late) {
         // is re-asserted every second because KeepRefreshRate re-asks for the setting's
         // own rate every two.
         {
-            auto readSwitch = [this](const char* name) -> long {
+            auto readSwitch = [](const char* name) -> long {
                 std::FILE* f = std::fopen((Platform::FilesDir() + ("/" + std::string(name))).c_str(), "rb");
                 if (!f) return -1;  // missing file: caller decides the default
                 char buf[32] = {};
@@ -2320,8 +2689,9 @@ void App::LatchVideo(const FrameState& frame, bool late) {
             }
         }
         const bool vr = m_mode == Mode::Vr || m_mode == Mode::LaunchingVr;
-        m_stats.fps = m_statsFrames / secs / std::max<size_t>(1, vr ? 1 : m_desktopStreams.size());
-        m_stats.generatedFps = m_statsGenerated / secs;
+        m_stats.fps = m_genStats.source / secs / std::max<size_t>(1, vr ? 1 : m_desktopStreams.size());
+        m_stats.generatedFps = m_genStats.GeneratedFps(secs);
+        m_stats.generatedRejectedFps = m_genStats.RejectedFps(secs);
         // VD-OBSERVE (TASK 2026-11-20 §2.1): the pace policy, ticked at 1 Hz here rather than in
         // GenerateFrame(): that one only runs with frame generation on, which is off by default,
         // so its log would never be seen - exactly the state we want to judge first.
@@ -2335,14 +2705,6 @@ void App::LatchVideo(const FrameState& frame, bool late) {
             policyIn.recvFps = float(m_stats.fps);
             policyIn.aer = false;  // reserved: no AER source on this build
             const rc::PaceMode pace = rc::UpdateLinkPolicy(m_linkPolicy, policyIn, now);
-            // TASK-QUOTA-GEN-2026-11-20 §1: the quota only exists at half rate with
-            // generation. A pace switch to Full empties it (and re-arms the one-shot
-            // announcement for the next half-rate period); this reads the policy's
-            // verdict, it doesn't drive it.
-            if (pace != rc::PaceMode::HalfWithGeneration) {
-                m_genCredit = false;
-                m_genQuotaAnnounced = false;
-            }
             if (++m_linkPolicyTicks % 5 == 0) {
                 double encFps = 0, dropped = 0;
                 if (m_serverStats.contains("vr")) {
@@ -2357,8 +2719,7 @@ void App::LatchVideo(const FrameState& frame, bool late) {
             }
         }
         m_stats.latencyMs = m_latencyCount ? m_latencySum / m_latencyCount : 0;
-        m_statsFrames = 0;
-        m_statsGenerated = 0;
+        m_genStats.Reset();
         m_latencySum = 0;
         m_latencyCount = 0;
         json stages = json::object();
@@ -2420,12 +2781,16 @@ void App::LatchVideo(const FrameState& frame, bool late) {
                     "%u stale dropped; "
                     "latency %.1f ms, pipeline %.1f ms, decode %.1f ms, rtt %.1f ms, stages %s, submit->lit %.1f ms, "
                     "dt-probe %d%s, fes %d, ffov %d, fref %d, dec p50/p95 %.1f/%.1f",
-                    m_flowShown, m_flowDisplays - m_flowShown, m_flowLate, m_flowDisplays, uint32_t(m_generatedFrames),
+                    m_diagFlowShown,
+                    std::max(0, m_diagFlowDisplays - m_diagFlowShown - int(m_generatedFramesWindow)),
+                    m_diagFlowLate, m_diagFlowDisplays, m_generatedFramesWindow,
                     m_statsDropStale,
                     m_stats.latencyMs, m_pipelineLatencyMs, m_stats.decodeMs, m_stats.rttMs,
                     stages.empty() ? "NA" : stages.dump().c_str(), submitLitMs, m_displayDeltaApplied, seqPart,
                     m_forceEncodeScale, m_forceFoveation, m_forceRefresh, m_decSamples.Percentile(50.f),
                     m_decSamples.Percentile(95.f));
+            m_diagFlowDisplays = m_diagFlowShown = m_diagFlowLate = 0;
+            m_generatedFramesWindow = 0;
             // TASK-DEC-PERCENTILE-2026-11-20 §1.3.4: the APK-forensics grep anchor and device
             // cross-check line - the same decode_stats switch as the panel above gates it, so
             // the default log volume is unchanged.
@@ -2668,7 +3033,7 @@ void App::RenderEyes(const FrameState& frame, float dt) {
     m_sky.Prepare(inVr ? Environment::Passthrough : env, m_time);
     m_windows.SortForDrawing(frame.head.position);
     for (int eye = 0; eye < 2; eye++) {
-        m_xr.BindEye(eye);
+        if (!m_xr.BindEye(eye)) continue;
         glClearColor(0, 0, 0, 0);
         glClearDepthf(1.f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -2715,14 +3080,30 @@ void App::UpdateStatsLayer(Window* stats, bool active, float dt) {
         return;
     }
     const int w = int(stats->canvasW * stats->rtScale), h = int(stats->canvasH * stats->rtScale);
-    if (m_statsLayer.handle && (m_statsLayer.width != w || m_statsLayer.height != h)) m_xr.DestroySwapchain(m_statsLayer);
-    if (!m_statsLayer.handle && !m_xr.CreateSwapchain(w, h, GL_SRGB8_ALPHA8, 1, false, m_statsLayer)) return;
+    if (m_statsLayer.handle && (m_statsLayer.width != w || m_statsLayer.height != h)) {
+        if (!m_xr.DestroySwapchain(m_statsLayer)) {
+            stats->canvasLayer = false;
+            m_statsLayerActive = false;
+            return;
+        }
+    }
+    if (!m_statsLayer.handle && !m_xr.CreateSwapchain(w, h, GL_SRGB8_ALPHA8, 1, false, m_statsLayer, 1, "stats")) return;
     stats->canvasLayer = true;
     // Its numbers change once a second.
     const int64_t now = rc::NowNs();
     if (m_statsDrawnNs && now - m_statsDrawnNs < 250'000'000LL) return;
-    m_windows.RenderCanvasTo(*stats, m_xr.AcquireImage(m_statsLayer), w, h, dt, m_time);
-    m_xr.ReleaseImage(m_statsLayer);
+    const GLuint fbo = m_xr.AcquireImage(m_statsLayer);
+    if (!fbo) {
+        stats->canvasLayer = false;
+        m_statsLayerActive = false;
+        return;
+    }
+    m_windows.RenderCanvasTo(*stats, fbo, w, h, dt, m_time);
+    if (!m_xr.ReleaseImage(m_statsLayer)) {
+        stats->canvasLayer = false;
+        m_statsLayerActive = false;
+        return;
+    }
     m_statsDrawnNs = now;
     m_statsLayerActive = true;
 }
@@ -2747,14 +3128,22 @@ void App::UpdateUiLayers() {
         }
         XrSwapchainGl& sc = m_uiLayers[w.id];
         const int width = w.rt.color.width, height = w.rt.color.height;
-        if (sc.handle && (sc.width != width || sc.height != height)) m_xr.DestroySwapchain(sc);
+        if (sc.handle && (sc.width != width || sc.height != height)) {
+            if (!m_xr.DestroySwapchain(sc)) continue;
+        }
         if (!sc.handle) {
             w.layerCurrent = false;
-            if (!m_xr.CreateSwapchain(width, height, GL_SRGB8_ALPHA8, 1, false, sc)) continue;
+            if (!m_xr.CreateSwapchain(width, height, GL_SRGB8_ALPHA8, 1, false, sc, 1, w.id.c_str())) continue;
+        }
+        // A failed release leaves the runtime image acquired. Retry that ownership hand-back
+        // before drawing or reusing this layer; never submit it while it is still acquired.
+        if (sc.imageAcquired && !m_xr.ReleaseImage(sc)) {
+            w.layerCurrent = false;
+            continue;
         }
         // A layer shows the image last released into it: an unchanged canvas needn't be copied
         // again every frame.
-        if (w.layerCurrent && !w.canvasRedrawn) {
+        if (w.layerCurrent && !w.canvasRedrawn && !sc.imageAcquired) {
             w.layerBacked = true;
             used++;
             continue;
@@ -2762,6 +3151,10 @@ void App::UpdateUiLayers() {
         // Pixel for pixel: the canvas was just drawn at this size. While it fades in or out, the
         // canvas goes in at that opacity instead, so the window is sharp from its first frame.
         const GLuint fbo = m_xr.AcquireImage(sc);
+        if (!fbo) {
+            w.layerCurrent = false;
+            continue;
+        }
         if (w.appear < 0.995f) {
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
             m_scene.Blit2DAlpha(w.rt.color.id, width, height, w.appear);
@@ -2772,7 +3165,10 @@ void App::UpdateUiLayers() {
             glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
-        m_xr.ReleaseImage(sc);
+        if (!m_xr.ReleaseImage(sc)) {
+            w.layerCurrent = false;
+            continue;
+        }
         w.layerBacked = true;
         w.layerCurrent = w.appear >= 0.995f;
         used++;
@@ -2781,7 +3177,10 @@ void App::UpdateUiLayers() {
     for (auto it = m_uiLayers.begin(); it != m_uiLayers.end();) {
         const Window* w = m_windows.Find(it->first);
         if (!w || w->removed || (!w->visible && w->appear < 0.01f)) {
-            m_xr.DestroySwapchain(it->second);
+            if (!m_xr.DestroySwapchain(it->second)) {
+                ++it;
+                continue;
+            }
             it = m_uiLayers.erase(it);
         } else {
             ++it;
@@ -2802,7 +3201,7 @@ void App::BuildLayers(const FrameState& frame) {
 
     // VR stream: the PC frame with the exact pose it was rendered for; the Quest
     // compositor reprojects it to the current head pose.
-    if (m_mode == Mode::Vr && m_vrHasFrame && m_vrSwapchain.handle) {
+    if (m_mode == Mode::Vr && m_vrHasFrame && m_vrSwapchain.handle && !m_vrSwapchain.imageAcquired) {
         const Pose head{{m_vrMeta.renderPose.orientation[0], m_vrMeta.renderPose.orientation[1],
                          m_vrMeta.renderPose.orientation[2], m_vrMeta.renderPose.orientation[3]},
                         {m_vrMeta.renderPose.position[0], m_vrMeta.renderPose.position[1], m_vrMeta.renderPose.position[2]}};
@@ -2862,7 +3261,7 @@ void App::BuildLayers(const FrameState& frame) {
     for (Window* w : m_windows.DrawOrder()) {
         if (w->kind == WindowKind::Ui) {
             const auto it = m_uiLayers.find(w->id);
-            if (!w->layerBacked || it == m_uiLayers.end() || !it->second.handle) continue;
+            if (!w->layerBacked || it == m_uiLayers.end() || !it->second.handle || it->second.imageAcquired) continue;
             const void* next = nullptr;
             if (m_xr.LayerSettings()) {
                 XrCompositionLayerSettingsFB s{XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB};
@@ -2890,7 +3289,7 @@ void App::BuildLayers(const FrameState& frame) {
             if (it == m_monitorLayers.end()) continue;
             const uint8_t id = it->first;
             XrSwapchainGl& sc = it->second;
-            if (!sc.handle || !w->layerBacked || !w->visible || w->appear < 0.98f || !m_monitorFresh[id]) continue;
+            if (!sc.handle || sc.imageAcquired || !w->layerBacked || !w->visible || w->appear < 0.98f || !m_monitorFresh[id]) continue;
             const void* next = nullptr;
             if (m_xr.LayerSettings()) {
                 XrCompositionLayerSettingsFB s{XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB};

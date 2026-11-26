@@ -42,6 +42,7 @@
 // feeds slowSamples for that same naming. The deviation records above are kept
 // as history of the pre-revision behaviour.
 
+#include <algorithm>
 #include <cstdint>
 
 #include "rc/fps_ladder.h"  // kFpsLadder (SuggestStartFps lands on a rung)
@@ -59,6 +60,24 @@ enum class PaceMode : uint8_t { Full = 0, HalfWithGeneration = 1 };
 
 // 给日志用，不影响行为。
 enum class PaceReason : uint8_t { Ok, GameSlow, LinkSlow, Recovered, AppRefusesGeneration, Dwelling };
+
+inline int FrameGenerationSlots(double motionIntervalNs, double displayNs) {
+    if (!(motionIntervalNs > 0) || !(displayNs > 0)) return 1;
+    return int(std::clamp(motionIntervalNs / displayNs + 0.5, 1.0, 3.0));
+}
+
+// Each decoded frame owns a fresh budget for the empty display slots that follow it.
+struct FrameGenerationQuota {
+    int credit = 0;
+
+    void Arm(bool enabled, int count = 1) { credit = enabled ? std::clamp(count, 0, 4) : 0; }
+    bool HasCredit() const { return credit > 0; }
+    bool Spend() {
+        if (credit <= 0) return false;
+        --credit;
+        return true;
+    }
+};
 
 struct LinkPolicyInput {
     float targetFps = 0;   // 头显当前显示刷新率

@@ -18,6 +18,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -47,10 +48,14 @@ struct DecodedFrameInfo {
     int waiting = 0;                 // pictures decoded after this one, still waiting when it was taken
 };
 
+bool IsValidDecodedCrop(uint32_t width, uint32_t height, int32_t left, int32_t top, int32_t right,
+                        int32_t bottom);
+
 class VideoDecoder {
    public:
     ~VideoDecoder();
     static DecoderCaps Capabilities();
+    static void SetCompatPlain(bool b) { s_compatPlain = b; }
 
     // fps: the stream's frame rate, which the decoder books its share of the hardware for.
     bool Init(rc::VideoCodec codec, int width, int height, float fps);
@@ -67,9 +72,20 @@ class VideoDecoder {
     // GL thread: latches the newest decoded image into the external texture.
     // Returns true when a new frame was latched; `info` describes it.
     bool Latch(DecodedFrameInfo& info);
-    GLuint Texture() const { return m_texture; }
-    // Visible part of the texture: {offsetU, offsetV, scaleU, scaleV} (texture space, row 0 at v = 0).
-    const float* Crop() const { return m_crop; }
+    struct TextureGeometry {
+        GLuint texture;
+        int width;
+        int height;
+        float crop[4];
+    };
+    TextureGeometry Geometry() const {
+        std::lock_guard lock(m_geometryMutex);
+        return {m_texture, m_textureWidth, m_textureHeight, {m_crop[0], m_crop[1], m_crop[2], m_crop[3]}};
+    }
+    GLuint Texture() const {
+        std::lock_guard lock(m_geometryMutex);
+        return m_texture;
+    }
 #ifdef __ANDROID__
     bool HasFrame() const { return m_image != nullptr; }
 #else
@@ -77,6 +93,15 @@ class VideoDecoder {
 #endif
     int Width() const { return m_width; }
     int Height() const { return m_height; }
+    int TextureWidth() const {
+        std::lock_guard lock(m_geometryMutex);
+        return m_textureWidth;
+    }
+    int TextureHeight() const {
+        std::lock_guard lock(m_geometryMutex);
+        return m_textureHeight;
+    }
+    float Fps() const { return m_fps; }
     rc::VideoCodec Codec() const { return m_codec; }
 
     // Statistics (thread-safe).
@@ -108,10 +133,12 @@ class VideoDecoder {
     bool Configure(const std::vector<uint8_t>& keyframe);
     void InputLoop();
     void OutputLoop();
+    void Fail(const char* what, const char* detail = nullptr);
     static const char* CodecName(rc::VideoCodec c);
 
     rc::VideoCodec m_codec = rc::VideoCodec::HEVC;
     int m_width = 0, m_height = 0;
+    int m_textureWidth = 0, m_textureHeight = 0;
     float m_fps = 72;  // ROUND18 L4 default (was 90)
 #ifdef __ANDROID__
     void ReleaseImage(AImage* image, EGLImageKHR egl);
@@ -130,15 +157,25 @@ class VideoDecoder {
         int fd = -1;  // dmabuf
         EGLImageKHR image = EGL_NO_IMAGE_KHR;
         uint32_t frameIndex = 0;
+        uint64_t generation = 0;  // capture batch this buffer belongs to
     };
     bool SetUpCapture();
     void QueuePicture(int index);
+    // EGLImageKHR can only be destroyed on a thread with a current EGL context (the GL
+    // thread).  Retired images from a rebuilt/failed capture batch are queued here under
+    // m_pictureMutex and destroyed by Latch()/Shutdown(), never by the output thread.
+    void DestroyRetiredImagesLocked();
+    std::vector<EGLImageKHR> m_retiredImages;
+    uint64_t m_batchGeneration = 0;  // monotonic; guards against fd-reuse ABA on rebuild
     int m_device = -1;
     std::vector<Plane> m_bitstream;  // OUTPUT buffers, mmap'd
     std::vector<bool> m_bitstreamFree;
     std::vector<Picture> m_pictures;  // CAPTURE buffers
     uint32_t m_captureFormat = 0, m_captureWidth = 0, m_captureHeight = 0, m_captureStride = 0;
     uint32_t m_captureUvOffset = 0;
+    // Crop for the CURRENT capture batch, published to GL only from Latch() after the
+    // EGLImage is bound (guarded by m_pictureMutex).  Geometry and picture stay in sync.
+    float m_pendingCrop[4] = {0, 0, 1, 1};
     std::atomic<bool> m_captureReady{false};
     std::mutex m_pictureMutex;
     std::deque<int> m_ready;  // decoded, not latched yet (newest last)
@@ -153,7 +190,9 @@ class VideoDecoder {
     std::atomic<uint32_t> m_skipped{0};
     std::atomic<uint32_t> m_staleDropThreshold{2};  // ROUND18 L5; 2 = today's behaviour
     std::atomic<int64_t> m_catchUpHeldUntilNs{0};
-    void Warn(const char* what);  // at most every 5 s per reason
+    void Warn(const char* what, const char* detail = nullptr);  // at most every 5 s per reason
+    std::mutex m_warnMutex;
+    std::map<std::string, std::pair<int64_t, uint32_t>> m_warnSeen;  // reason -> {last logged, count since}
 
     struct Pending {
         uint32_t frameIndex;
@@ -175,6 +214,9 @@ class VideoDecoder {
     // GL side
     GLuint m_texture = 0;
     float m_crop[4] = {0, 0, 1, 1};
+    mutable std::mutex m_geometryMutex;
+    void PublishTextureGeometry(GLuint texture, int width, int height, const float crop[4]);
+    void ResetTextureGeometry();
 #ifdef __ANDROID__
     AImage* m_image = nullptr;
     EGLImageKHR m_eglImage = EGL_NO_IMAGE_KHR;
@@ -192,6 +234,7 @@ class VideoDecoder {
     int m_decodeCount = 0;
     std::function<void(double)> m_decodeSampleSink;  // R3: set before Init, read by the output thread
     std::map<int64_t, int64_t> m_inputTimes;  // pts -> queued time
+    inline static bool s_compatPlain = false;
 };
 
 }  // namespace rv

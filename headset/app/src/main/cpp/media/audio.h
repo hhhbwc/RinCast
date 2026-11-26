@@ -27,6 +27,8 @@ class AudioPlayer {
     int BufferedMs();
 
    private:
+    bool StartLocked();
+    void StopLocked();
 #ifdef __ANDROID__
     static aaudio_data_callback_result_t Callback(AAudioStream*, void* user, void* audio, int32_t frames);
     static void ErrorCallback(AAudioStream*, void* user, aaudio_result_t error);
@@ -52,6 +54,8 @@ class MicCapture {
     bool Start(PacketSink sink);
     void Stop();
     bool Running() const { return m_stream != nullptr; }
+    void PollRestart();
+    void ScheduleRestart() { m_restart.store(true); }
     void SetMuted(bool m) { m_muted = m; }
     void SetGain(float g) { m_gain = g; }  // the microphone volume setting, 0 .. 2
 
@@ -60,6 +64,7 @@ class MicCapture {
     void OnSamples(const void* audio, int32_t frames);
 #ifdef __ANDROID__
     static aaudio_data_callback_result_t Callback(AAudioStream*, void* user, void* audio, int32_t frames);
+    static void ErrorCallback(AAudioStream*, void* user, aaudio_result_t error);
     AAudioStream* m_stream = nullptr;
 #else
     void Run();
@@ -78,6 +83,8 @@ class MicCapture {
     bool m_float = false;
     double m_resamplePos = 0;
     int16_t m_prevSample = 0;
+    std::atomic<bool> m_restart{false};
+    int64_t m_lastRestartNs = 0;
     std::atomic<bool> m_muted{false};
     std::atomic<float> m_gain{1.f};
 };

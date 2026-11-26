@@ -151,8 +151,13 @@ void Connection::SendControl(const std::string& json) {
 }
 
 void Connection::SendDisconnect() {
-    // Unreliable; send a few times for good measure.
+    // Unreliable; send a few times for good measure, then let Tick repeat for a short
+    // window. The immediate burst alone loses to a full receive queue behind 100 KB of
+    // control chunks; retrying from Tick spreads the attempts over the next 600 ms.
     for (int i = 0; i < 3; i++) Send(PacketType::Disconnect, nullptr, 0);
+    const int64_t now = NowNs();
+    m_disconnectLastNs.store(now, std::memory_order_relaxed);
+    m_disconnectUntilNs.store(now + MsToNs(600), std::memory_order_relaxed);
 }
 
 bool Connection::CheckReplay(uint64_t seq) {
@@ -407,6 +412,14 @@ void Connection::Tick(int64_t nowNs) {
         m_stats.controlRetransmits += resend.size();
     }
     for (const auto& p : resend) SendRaw(PacketType::Control, p.data(), p.size(), nullptr, 0);
+
+    // Disconnect retry window (see SendDisconnect): one packet every 40 ms until it ends.
+    const int64_t disconnectUntil = m_disconnectUntilNs.load(std::memory_order_relaxed);
+    if (disconnectUntil > nowNs &&
+        nowNs - m_disconnectLastNs.load(std::memory_order_relaxed) >= MsToNs(40)) {
+        m_disconnectLastNs.store(nowNs, std::memory_order_relaxed);
+        Send(PacketType::Disconnect, nullptr, 0);
+    }
 }
 
 }  // namespace rc

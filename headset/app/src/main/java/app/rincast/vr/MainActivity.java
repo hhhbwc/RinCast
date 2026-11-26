@@ -8,6 +8,8 @@ import android.content.pm.PackageManager;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
 import android.net.ConnectivityManager;
 import android.net.LinkProperties;
 import android.net.Network;
@@ -55,6 +57,17 @@ public class MainActivity extends NativeActivity {
     protected void onDestroy() {
         setStreamingLocks(false);
         setUsbNetwork(false);
+        for (int i = 0; i < uiSounds.length; i++) {
+            if (uiSounds[i] != null) {
+                try { uiSounds[i].release(); } catch (Throwable ignored) {}
+                uiSounds[i] = null;
+            }
+        }
+        if (tts != null) {
+            try { tts.shutdown(); } catch (Throwable ignored) {}
+            tts = null;
+            ttsReady = false;
+        }
         super.onDestroy();
     }
 
@@ -74,7 +87,7 @@ public class MainActivity extends NativeActivity {
         if (cm == null) return;
         if (!on) {
             if (usbCallback != null) {
-                try { cm.unregisterNetworkCallback(usbCallback); } catch (RuntimeException ignored) { }
+                try { cm.unregisterNetworkCallback(usbCallback); } catch (Throwable ignored) { }
                 usbCallback = null;
             }
             usbState = 0;
@@ -83,40 +96,48 @@ public class MainActivity extends NativeActivity {
             return;
         }
         if (usbCallback != null) return;
-        final NetworkRequest request = new NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_USB)
-            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .removeCapability(NetworkCapabilities.NET_CAPABILITY_TRUSTED)
-            .build();
-        usbCallback = new ConnectivityManager.NetworkCallback() {
-            @Override public void onAvailable(Network network) {
-                usbHandle = network.getNetworkHandle();
-                LinkProperties lp = cm.getLinkProperties(network);
-                if (lp != null && lp.getInterfaceName() != null) usbInterface = lp.getInterfaceName();
-                usbState = 2;
-            }
-            @Override public void onLinkPropertiesChanged(Network network, LinkProperties lp) {
-                if (lp.getInterfaceName() != null) usbInterface = lp.getInterfaceName();
-            }
-            @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
-                usbKbps = caps.getLinkDownstreamBandwidthKbps();
-            }
-            @Override public void onLost(Network network) {
-                usbHandle = 0;
-                usbState = 1;
-            }
-            @Override public void onUnavailable() {
-                // Declined, or asked while in the background: the request is gone.
-                synchronized (MainActivity.this) { usbCallback = null; }
-                usbHandle = 0;
-                usbState = 3;
-            }
-        };
-        usbState = 1;
         try {
+            final NetworkRequest.Builder builder = new NetworkRequest.Builder();
+            // NetworkCapabilities.TRANSPORT_USB was introduced in Android 12 (API 31).
+            // On Android 10/11 (such as PICO OS based on Android 10), TRANSPORT_USB throws IllegalArgumentException: Invalid TransportType 8.
+            if (Build.VERSION.SDK_INT >= 31) {
+                builder.addTransportType(NetworkCapabilities.TRANSPORT_USB);
+            } else {
+                builder.addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET);
+            }
+            builder.removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+            builder.removeCapability(NetworkCapabilities.NET_CAPABILITY_TRUSTED);
+            final NetworkRequest request = builder.build();
+            usbCallback = new ConnectivityManager.NetworkCallback() {
+                @Override public void onAvailable(Network network) {
+                    usbHandle = network.getNetworkHandle();
+                    LinkProperties lp = cm.getLinkProperties(network);
+                    if (lp != null && lp.getInterfaceName() != null) usbInterface = lp.getInterfaceName();
+                    usbState = 2;
+                }
+                @Override public void onLinkPropertiesChanged(Network network, LinkProperties lp) {
+                    if (lp.getInterfaceName() != null) usbInterface = lp.getInterfaceName();
+                }
+                @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+                    usbKbps = caps.getLinkDownstreamBandwidthKbps();
+                }
+                @Override public void onLost(Network network) {
+                    usbHandle = 0;
+                    usbState = 1;
+                }
+                @Override public void onUnavailable() {
+                    // Declined, or asked while in the background: the request is gone.
+                    synchronized (MainActivity.this) { usbCallback = null; }
+                    usbHandle = 0;
+                    usbState = 3;
+                }
+            };
+            usbState = 1;
             cm.requestNetwork(request, usbCallback);
-        } catch (RuntimeException e) {
+        } catch (Throwable e) {
             usbCallback = null;
+            usbHandle = 0;
+            usbInterface = "";
             usbState = 3;
         }
     }
@@ -124,6 +145,102 @@ public class MainActivity extends NativeActivity {
     /** "state,handle,kbps,interface". */
     public String usbNetworkState() {
         return usbState + "," + usbHandle + "," + usbKbps + "," + usbInterface;
+    }
+
+    /**
+     * Dynamically queries hardware decoder capabilities:
+     * returns int[] of [h264, hevc, hevc10, av1, av110, maxWidth, maxHeight].
+     */
+    public int[] queryVideoDecoderCaps() {
+        final int[] result = new int[]{1, 1, 0, 0, 0, 4096, 4096};
+        try {
+            int maxW = 0, maxH = 0;
+            boolean anyHw = false;
+            boolean hasH264 = false, hasHevc = false, hasHevc10 = false, hasAv1 = false, hasAv110 = false;
+            MediaCodecList list = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
+            MediaCodecInfo[] codecInfos = list.getCodecInfos();
+            if (codecInfos != null) {
+                for (MediaCodecInfo info : codecInfos) {
+                    if (info == null || info.isEncoder()) continue;
+                    if (Build.VERSION.SDK_INT >= 29) {
+                        try {
+                            if (info.isSoftwareOnly()) continue;
+                        } catch (Throwable ignored) {}
+                    }
+                    String name = info.getName().toLowerCase(java.util.Locale.ROOT);
+                    if (name.contains(".secure") || name.startsWith("c2.android.") || name.startsWith("omx.google.") ||
+                        name.startsWith("omx.ffmpeg.") || name.startsWith("c2.google.")) {
+                        continue;
+                    }
+                    String[] types = info.getSupportedTypes();
+                    if (types == null) continue;
+                    for (String type : types) {
+                        if (type.equalsIgnoreCase("video/avc")) {
+                            anyHw = true;
+                            hasH264 = true;
+                            try {
+                                MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(type);
+                                if (caps != null && caps.getVideoCapabilities() != null) {
+                                    maxW = Math.max(maxW, caps.getVideoCapabilities().getSupportedWidths().getUpper());
+                                    maxH = Math.max(maxH, caps.getVideoCapabilities().getSupportedHeights().getUpper());
+                                }
+                            } catch (Throwable ignored) {}
+                        } else if (type.equalsIgnoreCase("video/hevc")) {
+                            anyHw = true;
+                            hasHevc = true;
+                            try {
+                                MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(type);
+                                if (caps != null) {
+                                    if (caps.profileLevels != null) {
+                                        for (MediaCodecInfo.CodecProfileLevel pl : caps.profileLevels) {
+                                            if (pl.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10 ||
+                                                pl.profile == 0x1000 || pl.profile == 0x2000) {
+                                                hasHevc10 = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (caps.getVideoCapabilities() != null) {
+                                        maxW = Math.max(maxW, caps.getVideoCapabilities().getSupportedWidths().getUpper());
+                                        maxH = Math.max(maxH, caps.getVideoCapabilities().getSupportedHeights().getUpper());
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        } else if (type.equalsIgnoreCase("video/av01")) {
+                            anyHw = true;
+                            hasAv1 = true;
+                            try {
+                                MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(type);
+                                if (caps != null) {
+                                    if (caps.profileLevels != null) {
+                                        for (MediaCodecInfo.CodecProfileLevel pl : caps.profileLevels) {
+                                            if (pl.profile == 0x2 /* AV1ProfileMain10 */) {
+                                                hasAv110 = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (caps.getVideoCapabilities() != null) {
+                                        maxW = Math.max(maxW, caps.getVideoCapabilities().getSupportedWidths().getUpper());
+                                        maxH = Math.max(maxH, caps.getVideoCapabilities().getSupportedHeights().getUpper());
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                }
+            }
+            if (anyHw) {
+                result[0] = hasH264 ? 1 : 0;
+                result[1] = hasHevc ? 1 : 0;
+            }
+            if (hasHevc10) result[2] = 1;
+            if (hasAv1) result[3] = 1;
+            if (hasAv110) result[4] = 1;
+            if (maxW > 0) result[5] = maxW;
+            if (maxH > 0) result[6] = maxH;
+        } catch (Throwable ignored) {}
+        return result;
     }
 
     /** Stable random id for this installation (used to recognize the headset). */
@@ -159,35 +276,45 @@ public class MainActivity extends NativeActivity {
      * the multicast lock lets us receive LAN discovery broadcasts.
      */
     public synchronized void setStreamingLocks(boolean enable) {
-        WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        WifiManager wifi = null;
+        try {
+            wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        } catch (Throwable ignored) {}
         if (enable) {
             if (wifiLock == null && wifi != null) {
-                int mode = Build.VERSION.SDK_INT >= 29 ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                                                       : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
-                wifiLock = wifi.createWifiLock(mode, "rincast:stream");
-                wifiLock.acquire();
+                try {
+                    int mode = Build.VERSION.SDK_INT >= 29 ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                                                           : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                    wifiLock = wifi.createWifiLock(mode, "rincast:stream");
+                    wifiLock.acquire();
+                } catch (Throwable ignored) { wifiLock = null; }
             }
-            // The low-latency lock only counts while Android sees the app in the foreground
-            // with the screen on, which headsets don't all report while it's in VR. Holding the
-            // high-performance one as well keeps the radio out of power save there too.
             if (wifiHighPerfLock == null && wifi != null && Build.VERSION.SDK_INT >= 29) {
-                wifiHighPerfLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "rincast:stream-hp");
-                wifiHighPerfLock.acquire();
+                try {
+                    wifiHighPerfLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "rincast:stream-hp");
+                    wifiHighPerfLock.acquire();
+                } catch (Throwable ignored) { wifiHighPerfLock = null; }
             }
             if (multicastLock == null && wifi != null) {
-                multicastLock = wifi.createMulticastLock("rincast:discovery");
-                multicastLock.acquire();
+                try {
+                    multicastLock = wifi.createMulticastLock("rincast:discovery");
+                    multicastLock.acquire();
+                } catch (Throwable ignored) { multicastLock = null; }
             }
             if (wakeLock == null) {
-                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "rincast:stream");
-                wakeLock.acquire();
+                try {
+                    PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                    if (pm != null) {
+                        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "rincast:stream");
+                        wakeLock.acquire();
+                    }
+                } catch (Throwable ignored) { wakeLock = null; }
             }
         } else {
-            if (wifiLock != null) { wifiLock.release(); wifiLock = null; }
-            if (wifiHighPerfLock != null) { wifiHighPerfLock.release(); wifiHighPerfLock = null; }
-            if (multicastLock != null) { multicastLock.release(); multicastLock = null; }
-            if (wakeLock != null) { wakeLock.release(); wakeLock = null; }
+            if (wifiLock != null) { try { wifiLock.release(); } catch (Throwable ignored) {} wifiLock = null; }
+            if (wifiHighPerfLock != null) { try { wifiHighPerfLock.release(); } catch (Throwable ignored) {} wifiHighPerfLock = null; }
+            if (multicastLock != null) { try { multicastLock.release(); } catch (Throwable ignored) {} multicastLock = null; }
+            if (wakeLock != null) { try { wakeLock.release(); } catch (Throwable ignored) {} wakeLock = null; }
         }
     }
 
@@ -247,18 +374,25 @@ public class MainActivity extends NativeActivity {
     }
 
     public void speak(String text) {
-        if (ttsReady) {
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "rincast-ui");
-            return;
-        }
-        // The engine takes a moment to start: say the latest thing once it's there.
-        pendingSpeech = text;
-        if (tts == null) {
-            tts = new TextToSpeech(this, status -> {
-                ttsReady = status == TextToSpeech.SUCCESS;
-                if (ttsReady && pendingSpeech != null) tts.speak(pendingSpeech, TextToSpeech.QUEUE_FLUSH, null, "rincast-ui");
-            });
-        }
+        runOnUiThread(() -> {
+            try {
+                if (ttsReady && tts != null) {
+                    tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "rincast-ui");
+                    return;
+                }
+                pendingSpeech = text;
+                if (tts == null) {
+                    tts = new TextToSpeech(MainActivity.this, status -> {
+                        ttsReady = status == TextToSpeech.SUCCESS;
+                        if (ttsReady && tts != null && pendingSpeech != null) {
+                            try { tts.speak(pendingSpeech, TextToSpeech.QUEUE_FLUSH, null, "rincast-ui"); } catch (Throwable ignored) {}
+                        }
+                    });
+                }
+            } catch (Throwable ignored) {
+                ttsReady = false;
+            }
+        });
     }
 
     private static boolean isLocalHost(String host) {

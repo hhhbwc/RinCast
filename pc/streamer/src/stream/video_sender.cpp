@@ -1,6 +1,7 @@
 #include "video_sender.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 #include "rc/platform.h"
@@ -113,28 +114,23 @@ void VideoSender::Send(const EncodedFrame& frame, const void* metadata, uint16_t
             m_packetizer.SetPacingFrameBudgetNs(budgetNs);
         }
     }
-    // R4.2: 1 s sliding-window wire-byte ceiling (burst mode only). The window counts wire
-    // bytes (headers + FEC parity), exactly what the packetizer puts on the path.
+    // R4.2 & T-59: 1 s sliding-window wire-byte ceiling (burst mode only). The window
+    // counts wire bytes (headers + FEC parity), returned directly from SendFrame under the
+    // same single fecPct snapshot used to emit datagrams on the path.
     const int paceMode = m_pacingMode.load(std::memory_order_relaxed);
     const uint32_t capKbps = m_maxKbps.load();
     size_t frameWireBytes = 0;
-    if (paceMode == 3 && capKbps > 0) {
-        const size_t fragPayload = m_connection->MaxPayload() - sizeof(rc::VideoFragmentHeader);
-        const size_t total = 2 + metadataSize + frame.data.size();
-        int fecPct = m_dynamicFec.load(std::memory_order_relaxed);
-        if (fecPct < 0) fecPct = m_baseFecPercent;
-        // The one wire-byte formula, shared with the offline sweep (video_sender.h).
-        frameWireBytes = FrameWireBytes(fragPayload, total, fecPct);
-    }
     m_packetizer.SendFrame(m_streamId, m_codec, flags, index, metadata, metadataSize, frame.data.data(),
-                           frame.data.size());
+                           frame.data.size(), &frameWireBytes);
     // R4.2 (D-026): the ceiling acts on the ENCODER TARGET, never on already-encoded
     // frames. An earlier revision delayed a frame whose wire bytes would push the
     // trailing second over the ceiling: that held the wire ceiling but walked bench
     // submit->sent 5.88 -> 8.25 ms avg / 11.4 -> 49.0 ms p99 (G4.3 FAIL). The target
     // route keeps the latency untouched: the encoder is simply told what the wire
     // ceiling means in encoded bytes, and the NEXT frames are smaller.
-    if (paceMode == 3 && capKbps > 0) {
+    // T-59: skip WireCeiling accounting when SendFrame rejected early (frameWireBytes == 0)
+    // so oversized (>2048 fragments) frames never pollute the overhead window with 0/enc.
+    if (paceMode == 3 && capKbps > 0 && frameWireBytes > 0) {
         rc::WireCeiling::Snapshot snap;
         if (m_wireCeiling.OnFrame(rc::NowNs(), frameWireBytes, frame.data.size(), capKbps, snap))
             m_wireCapKbps.store(snap.encoderTargetKbps, std::memory_order_relaxed);
@@ -246,7 +242,13 @@ bool VideoSender::BeginFrame(VideoEncoder& encoder) {
     return true;
 }
 
-void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
+void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& rawFb) {
+    rc::VideoFeedbackPayload fb = rawFb;
+    if (!std::isfinite(fb.queueDelayMs)) fb.queueDelayMs = -1.0f;
+    if (!std::isfinite(fb.decodeMs) || fb.decodeMs < 0.0f) fb.decodeMs = 0.0f;
+    if (!std::isfinite(fb.networkMs) || fb.networkMs < 0.0f) fb.networkMs = 0.0f;
+    if (!std::isfinite(fb.totalLatencyMs) || fb.totalLatencyMs < 0.0f) fb.totalLatencyMs = 0.0f;
+
     // Only a request that actually starts a recovery is a new loss episode. Passing every
     // repetition straight to the guard bypassed the in-flight de-dup below and made one
     // lost frame look like sustained congestion (the 34 <-> 40 Mbps sawtooth, S3).
@@ -277,12 +279,12 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     // before anything drops - loss alone is a late signal). Loss and the arrival rate
     // back it up (headsets that don't measure the delay have only lost frames).
     const int64_t now = rc::NowNs();
-    const uint32_t total = fb.fragmentsReceived + fb.fragmentsLost;
-    const double lossRate = total ? double(fb.fragmentsLost) / total : 0;
+    const uint64_t total = uint64_t(fb.fragmentsReceived) + uint64_t(fb.fragmentsLost);
+    const double lossRate = total ? std::clamp(double(fb.fragmentsLost) / double(total), 0.0, 1.0) : 0.0;
     const bool measured = fb.queueDelayMs >= 0;
     if (measured) {
         const double prev = m_queueMs.load(std::memory_order_relaxed);
-        m_queueMs.store(prev < 0 ? fb.queueDelayMs : prev * 0.6 + fb.queueDelayMs * 0.4,
+        m_queueMs.store((prev < 0 || !std::isfinite(prev)) ? fb.queueDelayMs : prev * 0.6 + fb.queueDelayMs * 0.4,
                         std::memory_order_relaxed);
     }
     // Without frames in this report (a still desktop) there is nothing to judge by.
@@ -306,7 +308,9 @@ void VideoSender::OnFeedback(const rc::VideoFeedbackPayload& fb) {
     }
     // Wi-Fi and mobile links lose the odd packet without being full: only sustained or
     // heavy loss counts. (Headsets that measure no delay have nothing better than lost frames.)
-    const double lossAvg = m_lossAvg.load(std::memory_order_relaxed) * 0.8 + lossRate * 0.2;
+    const double prevLoss = m_lossAvg.load(std::memory_order_relaxed);
+    const double safePrevLoss = std::isfinite(prevLoss) ? std::clamp(prevLoss, 0.0, 1.0) : 0.0;
+    const double lossAvg = safePrevLoss * 0.8 + lossRate * 0.2;
     m_lossAvg.store(lossAvg, std::memory_order_relaxed);
     // Loss-coupled parity: at the edge of a real link the steady state includes small
     // losses. The recovery frames cover single-frame gaps; a little more parity covers

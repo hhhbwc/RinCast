@@ -20,6 +20,15 @@ namespace rv {
 
 using json = nlohmann::json;
 
+struct DecoderCaps {
+    int maxFpsAtMaxRes = 0;
+};
+
+class VideoDecoder {
+   public:
+    static DecoderCaps Capabilities() { return {}; }
+};
+
 enum class Mode { Home, Connecting, Desktop, LaunchingVr, Vr };
 
 struct GameInfo {
@@ -143,16 +152,29 @@ class App {
     std::deque<Notice> notices;
     std::string vrState = "Half-Life: Alyx";
     struct Stats {
-        double fps = 0, latencyMs = 0, decodeMs = 0, mbps = 0, rttMs = 0;
+        double fps = 0, generatedFps = 0, generatedRejectedFps = 0,
+               latencyMs = 0, decodeMs = 0, mbps = 0, rttMs = 0;
         std::string codec;
         int width = 0, height = 0;
         double stageMs[kStageCount] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
     } stats;
     std::vector<std::string> open;
 
+    int savedSettingsCount = 0;
+    int appliedStreamSettingsCount = 0;
+    HeadsetSettings savedSettings;
+    HeadsetSettings appliedStreamSettings;
+
     HeadsetSettings& Settings() { return settings; }
-    void SaveSettings() {}
-    void ApplyStreamSettings() {}
+    void SaveSettings() {
+        savedSettings = settings;
+        ++savedSettingsCount;
+    }
+    void ApplyStreamSettings() {
+        SaveSettings();
+        appliedStreamSettings = settings;
+        ++appliedStreamSettingsCount;
+    }
     Mode CurrentMode() const { return mode; }
     Discovery& Lan() { return lan; }
     Cloud& Account() { return account; }
@@ -208,6 +230,7 @@ class App {
     void SetUsbCable(bool on) { settings.usbCable = on; }
     const std::deque<Notice>& Notices() const { return notices; }
     Stats CurrentStats() const { return stats; }
+    double LatencyDisplayMs() const { return stats.latencyMs; }
 };
 
 }  // namespace rv

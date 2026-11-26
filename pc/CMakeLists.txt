@@ -90,7 +90,13 @@ target_link_libraries(capture-test PRIVATE rincast-core)
 add_executable(motion-bench ../tools/motion-bench/main.cpp streamer/src/stream/motion_estimator.cpp)
 target_include_directories(motion-bench PRIVATE ../third_party ../shared/include)
 target_compile_definitions(motion-bench PRIVATE UNICODE _UNICODE)
-target_link_libraries(motion-bench PRIVATE d3d11 dxgi d3dcompiler)
+target_link_libraries(motion-bench PRIVATE rincast-core d3d11 dxgi d3dcompiler)
+
+# Offline D3D11 multi-threaded GPU readback + VrStream synchronization test.
+add_executable(vr-motion-test ../tools/vr-motion-test/main.cpp streamer/src/stream/motion_estimator.cpp)
+target_include_directories(vr-motion-test PRIVATE ../third_party ../shared/include)
+target_compile_definitions(vr-motion-test PRIVATE UNICODE _UNICODE RINCAST_TEST_EXPOSE_MOTION_STAGES)
+target_link_libraries(vr-motion-test PRIVATE rincast-core d3d11 dxgi d3dcompiler)
 
 # Developer tool: encoder speed / frame size / loss recovery on this GPU.
 add_executable(encode-bench ../tools/encode-bench/main.cpp
@@ -166,3 +172,26 @@ add_executable(remote-e2e ../tools/remote-e2e/main.cpp ../headset/app/src/main/c
 target_include_directories(remote-e2e PRIVATE streamer/src ../headset/app/src/main/cpp ../third_party)
 target_compile_definitions(remote-e2e PRIVATE UNICODE _UNICODE)
 target_link_libraries(remote-e2e PRIVATE rincast-core winhttp crypt32)
+
+# Offline tests compiling real headset C++ files (StreamClient, VideoDecoder::Submit, HeadsetSettings, strings).
+add_executable(rincast-headset-tests ../tools/headset-tests/main.cpp
+  ../headset/app/src/main/cpp/net/stream_client.cpp
+  ../headset/app/src/main/cpp/media/video_decoder_common.cpp
+  ../headset/app/src/main/cpp/app/settings.cpp
+  ../headset/app/src/main/cpp/app/strings.cpp)
+target_include_directories(rincast-headset-tests PRIVATE ../tools/headset-tests/shim ../headset/app/src/main/cpp ../third_party ../shared/include)
+target_compile_definitions(rincast-headset-tests PRIVATE UNICODE _UNICODE)
+target_link_libraries(rincast-headset-tests PRIVATE rincast-core)
+
+# Offline tests compiling real PC streamer files (Settings, VrBridgeHost+BridgeClient, Foveator, ColorConverter, VideoSender).
+add_executable(rincast-streamer-tests ../tools/streamer-tests/main.cpp
+  streamer/src/settings.cpp
+  streamer/src/util.cpp
+  streamer/src/vr/vr_bridge_host.cpp
+  streamer/src/gpu.cpp
+  streamer/src/encode/color_convert.cpp
+  streamer/src/stream/foveator.cpp
+  streamer/src/stream/video_sender.cpp)
+target_include_directories(rincast-streamer-tests PRIVATE common streamer/src driver-openvr/src ../third_party ../shared/include)
+target_compile_definitions(rincast-streamer-tests PRIVATE UNICODE _UNICODE)
+target_link_libraries(rincast-streamer-tests PRIVATE rincast-core d3d11 dxgi d3dcompiler)

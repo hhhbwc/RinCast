@@ -205,8 +205,10 @@ class AmfEncoder final : public VideoEncoder {
             res = m_encoder->QueryOutput(&data);
             if (res == AMF_OK && data) {
                 amf::AMFBufferPtr buffer(data);
+                if (!buffer || !buffer->GetNative()) return false;
                 const auto* p = static_cast<const uint8_t*>(buffer->GetNative());
                 out.data.assign(p, p + buffer->GetSize());
+                out.timestamp = m_frames - 1;
                 int64_t type = -1;
                 switch (m_config.codec) {
                     case rc::VideoCodec::H264: {

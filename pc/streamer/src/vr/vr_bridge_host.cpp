@@ -11,27 +11,44 @@
 
 namespace rcs {
 
-bool VrBridgeHost::Start() {
+namespace {
+
+void AddClampedAtomic(std::atomic<double>& target, double delta, double minVal, double maxVal) {
+    double cur = target.load(std::memory_order_relaxed);
+    while (!target.compare_exchange_weak(cur, std::clamp(cur + delta, minVal, maxVal),
+                                         std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    }
+}
+
+}  // namespace
+
+bool VrBridgeHost::Start(const rcvr::BridgeNames& names) {
     ClearTrackingCache();
     m_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(rcvr::Shared),
-                                   rcvr::kSharedMemoryName);
+                                   names.sharedMemory);
     if (!m_mapping) {
         RC_LOGE("VR bridge: CreateFileMapping failed (%lu)", GetLastError());
         return false;
     }
     m_shared = static_cast<rcvr::Shared*>(MapViewOfFile(m_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(rcvr::Shared)));
-    if (!m_shared) return false;
+    if (!m_shared) {
+        Stop();
+        return false;
+    }
     std::memset(m_shared, 0, sizeof(rcvr::Shared));
     m_shared->magic = rcvr::kMagic;
     m_shared->version = rcvr::kVersion;
     m_shared->latestReadySlot = -1;
-    m_frameEvent = CreateEventW(nullptr, FALSE, FALSE, rcvr::kFrameReadyEventName);
-    m_trackingEvent = CreateEventW(nullptr, FALSE, FALSE, rcvr::kTrackingEventName);
+    m_frameEvent = CreateEventW(nullptr, FALSE, FALSE, names.frameReady);
+    m_trackingEvent = CreateEventW(nullptr, FALSE, FALSE, names.trackingEvent);
 
     auto adapter = PreferredAdapter();
     m_gpu = DescribeAdapter(adapter.Get());
     m_device = CreateDevice(adapter.Get());
-    if (!m_device) return false;
+    if (!m_device) {
+        Stop();
+        return false;
+    }
     m_shared->config.adapterLuid = m_gpu.luid;
 
     // Restore the last headset configuration so SteamVR can start before a
@@ -56,6 +73,10 @@ bool VrBridgeHost::Start() {
         }
     }
 
+    m_hapticsRead = 0;
+    m_hapticsWaitTicks = 0;
+    m_hapticsWaitStartNs = 0;
+    InterlockedExchange64(&m_shared->streamerHeartbeatNs, rcvr::QpcNowNs());
     m_running = true;
     m_thread = std::thread([this] { HeartbeatLoop(); });
     RC_LOGI("VR bridge ready on %s", m_gpu.name.c_str());
@@ -65,6 +86,9 @@ bool VrBridgeHost::Start() {
 void VrBridgeHost::Stop() {
     m_running = false;
     if (m_thread.joinable()) m_thread.join();
+    m_hapticsRead = 0;
+    m_hapticsWaitTicks = 0;
+    m_hapticsWaitStartNs = 0;
     for (auto& h : m_textureHandles)
         if (h) CloseHandle(h), h = nullptr;
     for (auto& t : m_textures) t.Reset();
@@ -205,13 +229,13 @@ void VrBridgeHost::ShiftVsync(int64_t shiftNs) {
     const double s = std::clamp(double(shiftNs), -10e6, 10e6);
     // Proportional for the offset, integral for the drift; settles in a few seconds.
     m_pendingShiftNs.fetch_add(0.5 * s);
-    m_driftNsPerS = std::clamp(m_driftNsPerS.load() + 0.2 * s, -2e6, 2e6);
+    AddClampedAtomic(m_driftNsPerS, 0.2 * s, -2e6, 2e6);
 }
 
 void VrBridgeHost::SlipVsync(int64_t slipNs) {
     if (slipNs <= 0) return;
     // A few frames at most: more than that waiting is no longer a matter of timing.
-    m_pendingSlipNs = std::min(m_pendingSlipNs.load() + double(slipNs), 50e6);
+    AddClampedAtomic(m_pendingSlipNs, double(slipNs), 0.0, 50e6);
 }
 
 bool VrBridgeHost::PoseWaitNs(int64_t atNs, int64_t& waitNs, int64_t& periodNs) const {
@@ -255,6 +279,8 @@ void VrBridgeHost::RecoverFromDeadProducer() {
     m_shared->producerPid = 0;
     m_shared->producerKind = LONG(rcvr::ProducerKind::None);
     m_shared->renderedEyeWidth = m_shared->renderedEyeHeight = 0;
+    m_hapticsWaitTicks = 0;
+    m_hapticsWaitStartNs = 0;
     if (w && h) CreateTextures(w, h);
     InterlockedIncrement(&m_shared->configGeneration);
 }
@@ -292,19 +318,70 @@ void VrBridgeHost::HeartbeatLoop() {
                 if (!alive) RecoverFromDeadProducer();
             }
         }
-        const LONG write = m_shared->hapticsWrite;
-        if (write - m_hapticsRead > rcvr::kHapticsRing) m_hapticsRead = write - rcvr::kHapticsRing;
-        while (m_hapticsRead < write) {
-            const rcvr::HapticEvent& e = m_shared->haptics[m_hapticsRead % rcvr::kHapticsRing];
-            if (e.sequence == uint32_t(m_hapticsRead + 1)) {
-                HapticHandler handler;
-                {
-                    std::lock_guard lock(m_mutex);
-                    handler = m_onHaptic;
+        static constexpr uint32_t kMaxHapticsWaitTicks = 50;
+        static constexpr int64_t kMaxHapticsWaitNs = 50'000'000LL;
+        LONG write = m_shared->hapticsWrite;
+        if (int32_t(uint32_t(write) - uint32_t(m_hapticsRead)) > rcvr::kHapticsRing) {
+            m_hapticsRead = LONG(uint32_t(write) - uint32_t(rcvr::kHapticsRing));
+            m_hapticsWaitTicks = 0;
+            m_hapticsWaitStartNs = 0;
+        }
+        while (int32_t(uint32_t(write) - uint32_t(m_hapticsRead)) > 0) {
+            const uint32_t expectedSeq = uint32_t(m_hapticsRead) + 1u;
+            const volatile rcvr::HapticEvent& slot =
+                m_shared->haptics[uint32_t(m_hapticsRead) % uint32_t(rcvr::kHapticsRing)];
+            const uint32_t seq1 = slot.sequence;
+            if (seq1 != expectedSeq) {
+                const LONG writeNow = m_shared->hapticsWrite;
+                if (int32_t(uint32_t(writeNow) - uint32_t(m_hapticsRead)) > rcvr::kHapticsRing) {
+                    m_hapticsRead = LONG(uint32_t(writeNow) - uint32_t(rcvr::kHapticsRing));
+                    m_hapticsWaitTicks = 0;
+                    m_hapticsWaitStartNs = 0;
+                    write = writeNow;
+                    continue;
                 }
-                if (handler) handler(e);
+                const int64_t waitNow = rcvr::QpcNowNs();
+                if (m_hapticsWaitTicks == 0) m_hapticsWaitStartNs = waitNow;
+                m_hapticsWaitTicks++;
+                if (m_hapticsWaitTicks <= kMaxHapticsWaitTicks &&
+                    (waitNow - m_hapticsWaitStartNs) < kMaxHapticsWaitNs) {
+                    break;
+                }
+                m_hapticsRead++;
+                m_hapticsWaitTicks = 0;
+                m_hapticsWaitStartNs = 0;
+                continue;
+            }
+            MemoryBarrier();
+            rcvr::HapticEvent copy{};
+            copy.sequence = seq1;
+            copy.hand = slot.hand;
+            copy.durationS = slot.durationS;
+            copy.frequency = slot.frequency;
+            copy.amplitude = slot.amplitude;
+            MemoryBarrier();
+            const LONG writeAfter = m_shared->hapticsWrite;
+            if (slot.sequence != expectedSeq ||
+                int32_t(uint32_t(writeAfter) - uint32_t(m_hapticsRead)) > rcvr::kHapticsRing) {
+                if (int32_t(uint32_t(writeAfter) - uint32_t(m_hapticsRead)) > rcvr::kHapticsRing) {
+                    m_hapticsRead = LONG(uint32_t(writeAfter) - uint32_t(rcvr::kHapticsRing));
+                    write = writeAfter;
+                } else {
+                    m_hapticsRead++;
+                }
+                m_hapticsWaitTicks = 0;
+                m_hapticsWaitStartNs = 0;
+                continue;
             }
             m_hapticsRead++;
+            m_hapticsWaitTicks = 0;
+            m_hapticsWaitStartNs = 0;
+            HapticHandler handler;
+            {
+                std::lock_guard lock(m_mutex);
+                handler = m_onHaptic;
+            }
+            if (handler) handler(copy);
         }
         Sleep(1);
     }

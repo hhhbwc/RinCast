@@ -3,7 +3,7 @@
 //   node tools/ui-preview/build.mjs [out dir] [scene]
 // Needs Visual Studio's C++ tools, the Android NDK (for the GLES headers) and ANGLE's libEGL.dll
 // and libGLESv2.dll: every Electron app has them. Point ANGLE_DIR at that app's folder.
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync, execSync, spawnSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,7 +67,7 @@ const includes = [join(gen, "app"), gen, cpp, join(cpp, "app"), join(repo, "shar
 const sources = [join(repo, "tools/ui-preview/main.cpp"), join(gen, "app/screens.cpp"), join(cpp, "app/strings.cpp"), join(cpp, "ui/ui.cpp"), join(cpp, "ui/window.cpp"), join(cpp, "keyboard/keyboard.cpp"), join(cpp, "keyboard/kb_layout.cpp"), join(cpp, "keyboard/kb_swipe.cpp"), join(cpp, "keyboard/kb_sound.cpp"), join(cpp, "gfx/ui_renderer.cpp"), join(gen, "gfx/gl.cpp"), join(cpp, "stb_impl.cpp")].map(q).join(" ");
 // The headset app gets its version from VERSION through CMake; the preview needs it too.
 const version = readFileSync(join(repo, "VERSION"), "utf8").trim();
-lines.push(`cl /nologo /std:c++17 /EHsc /O1 /utf-8 /W0 /DNOMINMAX /DGL_GLEXT_PROTOTYPES /DRINCAST_VERSION_STRING=\\"${version}\\" /Fo:obj\\ ${includes} ${sources} /Fe:ui-preview.exe /link libEGL.lib libGLESv2.lib`);
+lines.push(`cl /nologo /std:c++20 /EHsc /O1 /utf-8 /W0 /DNOMINMAX /DGL_GLEXT_PROTOTYPES /DRINCAST_VERSION_STRING=\\"${version}\\" /Fo:obj\\ ${includes} ${sources} /Fe:ui-preview.exe /link libEGL.lib libGLESv2.lib`);
 mkdirSync(join(b, "obj"), { recursive: true });
 writeFileSync(join(b, "build.cmd"), lines.join("\r\n") + "\r\n");
 try {
@@ -76,4 +76,8 @@ try {
   console.log(String(e.stdout).split("\n").filter((l) => /error|unresolved|fatal/i.test(l)).slice(0, 40).join("\n"));
   process.exit(1);
 }
-console.log(execFileSync(join(b, "ui-preview.exe"), [join(repo, "headset/app/src/main/assets"), out, ...(scene ? [scene] : [])], { encoding: "utf8", cwd: b, stdio: ["ignore", "pipe", "inherit"] }));
+const preview = spawnSync(join(b, "ui-preview.exe"), [join(repo, "headset/app/src/main/assets"), out, ...(scene ? [scene] : [])], { encoding: "utf8", cwd: b });
+process.stdout.write(preview.stdout || "");
+process.stderr.write(preview.stderr || "");
+if (preview.error) throw preview.error;
+process.exit(preview.status ?? 1);
