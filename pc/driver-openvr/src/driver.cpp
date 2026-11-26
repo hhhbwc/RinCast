@@ -1069,8 +1069,13 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
         srvd.Texture2D.MipLevels = 1;
         ComPtr<ID3D11ShaderResourceView> srv;
         if (FAILED(m_device->CreateShaderResourceView(src, &srvd, &srv))) return;
+        D3D11_TEXTURE2D_DESC ddesc{};
+        dst->GetDesc(&ddesc);
+        const bool dst10Bit = ddesc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
+                              ddesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM;
         D3D11_RENDER_TARGET_VIEW_DESC rtvd{};
-        rtvd.Format = srgbOut ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        rtvd.Format = dst10Bit ? DXGI_FORMAT_R10G10B10A2_UNORM
+                               : (srgbOut ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM);
         rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
         ComPtr<ID3D11RenderTargetView> rtv;
         if (FAILED(m_device->CreateRenderTargetView(dst, &rtvd, &rtv))) return;
@@ -1096,7 +1101,7 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
             lc.reproj2[0] = reproj[6];
             lc.reproj2[1] = reproj[7];
             lc.reproj2[2] = reproj[8];
-            lc.reproj2[3] = 0.0f;
+            lc.reproj2[3] = (dst10Bit && srgbOut) ? 1.0f : 0.0f;
         } else {
             lc.reproj0[0] = 1.0f;
             lc.reproj0[1] = 0.0f;
@@ -1111,7 +1116,7 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
             lc.reproj2[0] = 0.0f;
             lc.reproj2[1] = 0.0f;
             lc.reproj2[2] = 1.0f;
-            lc.reproj2[3] = 0.0f;
+            lc.reproj2[3] = (dst10Bit && srgbOut) ? 1.0f : 0.0f;
         }
         m_ctx->UpdateSubresource(m_rectBuffer.Get(), 0, nullptr, &lc, 0, 0);
         m_ctx->RSSetViewports(1, &vp);

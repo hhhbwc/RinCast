@@ -587,9 +587,11 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
                s.matchSteamVr ? std::string(Tr("vr.sameAsSteamVr")) : Percent(scale) + ", " + pixels, !s.matchSteamVr, 1.f))
         dragScale = scale;
     if (dragScale >= 0 && !ui.IsHeld("resolution")) {
+        const bool resChanged = std::fabs(s.vrScale - dragScale) > 0.001f;
         s.SetVrScale(dragScale);
         dragScale = -1;
         changed = true;
+        if (resChanged && app.VrRunning()) app.PostNotice(Tr("notice.restartSteamVrForRes"));
     }
     changed |= CheckRow(ui, l, "match-steamvr", Tr("vr.matchSteamVr"), s.matchSteamVr, Tr("vr.matchSteamVrHint"));
     l.y += 14;
@@ -640,10 +642,22 @@ bool PageVrQuality(Ui& ui, const Rect& body) {
     changed |= CheckRow(ui, l, "10bit", Tr("vr.tenBit"), s.tenBit, ci == 3 ? Tr("vr.needsHevcAv1") : "", ci != 3);
     Section(ui, l, Tr("vr.enhancements"));
     changed |= CheckRow(ui, l, "upscaling", Tr("vr.upscaling"), s.upscaling, Tr("vr.upscalingHint"));
-    float sharpenPct = s.sharpening * 100.0f;
-    const std::string sharpenText = s.sharpening <= 0.001f ? Tr("stat.frameGen.off") : std::to_string(int(sharpenPct)) + "%";
-    if (BarRow(ui, l, "sharpening", Tr("vr.sharpening"), sharpenPct, 0, 100, 10, sharpenText, !s.upscaling)) {
-        s.sharpening = sharpenPct / 100.0f;
+    float sharpenPct = std::round(s.vrSharpen * 100.0f);
+    const std::string sharpenText = s.vrSharpen <= 0.001f ? Tr("stat.frameGen.off") : std::to_string(int(sharpenPct)) + "%";
+    if (BarRow(ui, l, "vr-sharpen", Tr("vr.sharpen"), sharpenPct, 0, 100, 5, sharpenText, !s.upscaling)) {
+        s.vrSharpen = std::clamp(sharpenPct / 100.0f, 0.0f, 1.0f);
+        changed = true;
+    }
+    float vibrancePct = std::round((s.vrVibrance / 0.45f) * 100.0f);
+    const std::string vibranceText = vibrancePct <= 0.5f ? Tr("stat.frameGen.off") : std::to_string(int(vibrancePct)) + "%";
+    if (BarRow(ui, l, "vr-vibrance", Tr("vr.vibrance"), vibrancePct, 0, 100, 5, vibranceText)) {
+        s.vrVibrance = std::clamp((vibrancePct / 100.0f) * 0.45f, 0.0f, 0.5f);
+        changed = true;
+    }
+    float darkPct = std::round((s.vrDarkGamma / 0.30f) * 100.0f);
+    const std::string darkText = darkPct <= 0.5f ? Tr("stat.frameGen.off") : std::to_string(int(darkPct)) + "%";
+    if (BarRow(ui, l, "vr-dark-gamma", Tr("vr.darkGamma"), darkPct, 0, 100, 5, darkText)) {
+        s.vrDarkGamma = std::clamp((darkPct / 100.0f) * 0.30f, 0.0f, 0.35f);
         changed = true;
     }
     changed |= CheckRow(ui, l, "framegen", Tr("vr.frameGen"), s.frameGeneration, Tr("vr.frameGenHint"));
@@ -825,6 +839,8 @@ bool PageDesktop(Ui& ui, const Rect& body) {
     changed |= CheckRow(ui, c, "sharp", Tr("desktop.sharpText"), s.sharpLayers);
     c.y += 8;
     changed |= CheckRow(ui, c, "desktop-input", Tr("desktop.input"), s.desktopInput);
+    c.y += 8;
+    changed |= CheckRow(ui, c, "use-pc-keyboard", Tr("desktop.usePcKeyboard"), s.usePcKeyboard);
     l.y = c.y = std::max(l.y, c.y);
     KeyboardSettings(ui, l, c);
     contentBottom = std::max(l.y, c.y) + scroll;
@@ -976,8 +992,11 @@ bool PageGeneral(Ui& ui, const Rect& body) {
         app.ToggleWindow("stats", s.showStats && app.CurrentMode() != Mode::Home);
         changed = true;
     }
-    changed |= CheckRow(ui, c, "compat-plain-xr", Tr("general.compatPlainXr"), s.compatPlainOpenXr,
-                        Tr("general.compatPlainXrHint"));
+    if (CheckRow(ui, c, "compat-plain-xr", Tr("general.compatPlainXr"), s.compatPlainOpenXr,
+                 Tr("general.compatPlainXrHint"))) {
+        changed = true;
+        if (app.VrRunning()) app.PostNotice(Tr("notice.restartSteamVrForRes"));
+    }
     c.y += 4;
     // The language, named in its own words so it's findable in any UI. What's selected is
     // the stored choice: with "auto", the radio stays on "auto" even though the resolved
@@ -1216,7 +1235,10 @@ void BuildDock(Ui& ui, const Rect& r) {
                 }
             }
             if (id == "steamvr") app.LaunchSteamVr();
-            if (id == "keyboard") app.ToggleWindow("keyboard");
+            if (id == "keyboard") {
+                if (app.Settings().usePcKeyboard && app.Client().GetState() == StreamClient::State::Connected) app.TogglePcKeyboard();
+                else app.ToggleWindow("keyboard");
+            }
             if (id == "recenter") app.Recenter();
             // Back to wherever you were.
             if (id == "menu") {

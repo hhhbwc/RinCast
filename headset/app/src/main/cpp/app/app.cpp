@@ -572,6 +572,8 @@ void App::ApplyAccessibility() {
 
 void App::SendKey(uint16_t vk, bool down) { m_client.SendControl({{"type", rc::msg::kKey}, {"vk", vk}, {"down", down}}); }
 
+void App::TogglePcKeyboard() { m_client.SendControl({{"type", rc::msg::kPcKeyboard}}); }
+
 void App::SendText(const std::string& text) { m_client.SendControl({{"type", rc::msg::kText}, {"text", text}}); }
 
 void App::PostNotice(const std::string& text, const std::string& level, const std::string& action) {
@@ -1498,6 +1500,7 @@ void App::Frame() {
     UpdateStatsLayer(stats, statsLayer, dt);
     const bool uiLayer = !(vrClear && (!statsShown || statsLayer));
     m_keyboard.SetVisible(IsVisible("keyboard"));
+    m_keyboard.SetDirectVk(m_client.GetState() == StreamClient::State::Connected && m_mode == Mode::Desktop);
     if (Window* kbw = m_windows.Find("keyboard"); kbw && kbw->visible) m_keyboard.Size(*kbw);
     m_windows.RenderCanvases(dt, m_time);
     UpdateUiLayers();
@@ -1825,26 +1828,38 @@ void App::UpdateInput(const FrameState& frame, float dt) {
         r.scroll = std::fabs(in.thumbstick.y) > 0.15f ? in.thumbstick.y * m_settings.scrollSpeed : 0.f;
         r.push = in.thumbstick.y;
 
-        // Left menu: toggle the dock (desktop) / double-press opens the VR overlay. On the
-        // desktop while SteamVR runs, a double-press opens the same small menu, with "Back to
-        // VR" where it has "Back to desktop" in VR: one gesture and one menu both ways.
-        if (in.menu && !m_handState[h].menu) {
-            int64_t now = rc::NowNs();
-            const bool twice = now - m_lastMenuPressNs < 450'000'000LL;
-            if (m_mode == Mode::Vr) {
-                if (twice) ToggleWindow("vr-overlay", !m_vrOverlay);
-            } else if (m_mode == Mode::Desktop) {
-                if (twice && VrRunning()) {
-                    ToggleWindow("dock");  // undo the first press
-                    ToggleWindow("vr-overlay", !IsVisible("vr-overlay"));
-                    now = 0;  // a third press starts over
-                } else {
-                    ToggleWindow("dock");
+        // Left menu: in VR mode, long-press (0.6 s) opens RinCast's overlay so short/double
+        // presses pass cleanly to SteamVR without hijacking SteamVR's menu button.
+        if (m_mode == Mode::Vr) {
+            if (in.menu) {
+                m_handState[h].menuHeld += dt;
+                if (!m_handState[h].menuLongFired && m_handState[h].menuHeld >= 0.6f) {
+                    m_handState[h].menuLongFired = true;
+                    ToggleWindow("vr-overlay", !m_vrOverlay);
                 }
             } else {
-                screens::ToggleMenu(*this);
+                m_handState[h].menuHeld = 0;
+                m_handState[h].menuLongFired = false;
             }
-            m_lastMenuPressNs = now;
+        } else {
+            m_handState[h].menuHeld = 0;
+            m_handState[h].menuLongFired = false;
+            if (in.menu && !m_handState[h].menu) {
+                int64_t now = rc::NowNs();
+                const bool twice = now - m_lastMenuPressNs < 450'000'000LL;
+                if (m_mode == Mode::Desktop) {
+                    if (twice && VrRunning()) {
+                        ToggleWindow("dock");  // undo the first press
+                        ToggleWindow("vr-overlay", !IsVisible("vr-overlay"));
+                        now = 0;  // a third press starts over
+                    } else {
+                        ToggleWindow("dock");
+                    }
+                } else {
+                    screens::ToggleMenu(*this);
+                }
+                m_lastMenuPressNs = now;
+            }
         }
         m_handState[h].menu = in.menu;
     }
@@ -1855,7 +1870,25 @@ void App::UpdateInput(const FrameState& frame, float dt) {
         const bool both = left.active && right.active && left.squeeze > 0.7f && right.squeeze > 0.7f;
         const float before = m_gripsHeld;
         m_gripsHeld = both ? m_gripsHeld + dt : 0.f;
-        if (before < 0.5f && m_gripsHeld >= 0.5f && m_mode == Mode::Desktop) ToggleWindow("keyboard", !IsVisible("keyboard"));
+        if (before < 0.5f && m_gripsHeld >= 0.5f && m_mode == Mode::Desktop) {
+            if (m_settings.usePcKeyboard && m_client.GetState() == StreamClient::State::Connected) TogglePcKeyboard();
+            else ToggleWindow("keyboard", !IsVisible("keyboard"));
+        }
+        // L3 + R3 held 0.15 s: toggle performance stats overlay in VR or Desktop.
+        const bool bothSticks = left.active && right.active && left.thumbstickClick && right.thumbstickClick;
+        const float prevSticks = m_sticksHeld;
+        m_sticksHeld = bothSticks ? m_sticksHeld + dt : 0.f;
+        if (prevSticks < 0.15f && m_sticksHeld >= 0.15f && (m_mode == Mode::Vr || m_mode == Mode::Desktop)) {
+            m_settings.showStats = !m_settings.showStats;
+            ToggleWindow("stats", m_settings.showStats);
+            SaveSettings();
+        }
+        // Desktop mode: long-press R3 (0.6 s) to recenter screens.
+        const bool r3Only = m_mode == Mode::Desktop && right.active && right.thumbstickClick &&
+                            !(left.active && left.thumbstickClick);
+        const float prevR3 = m_r3Held;
+        m_r3Held = r3Only ? m_r3Held + dt : 0.f;
+        if (prevR3 < 0.6f && m_r3Held >= 0.6f) Recenter();
     }
     // One-handed route to the same menu for the right hand: hold A and B.
     {
@@ -1887,33 +1920,70 @@ void App::UpdateInput(const FrameState& frame, float dt) {
     if (m_mode != Mode::Desktop || m_windows.Dragging()) return;
     int mouseHand = -1;
     if (m_settings.desktopInput) {
-        for (int h = 1; h >= 0; h--) {
+        const auto hitsVideo = [&](int h) {
             const WindowHit& hit = m_hits[h];
-            if (hit.window && hit.window->kind == WindowKind::Video && hit.zone == HitZone::Content) {
-                if (mouseHand < 0 || m_rays[h].triggerDown) mouseHand = h;
+            return hit.window && hit.window->kind == WindowKind::Video && hit.zone == HitZone::Content;
+        };
+        const int prev = std::clamp(m_lastMouseHand, 0, 1);
+        const int other = 1 - prev;
+        const HandInput& otherIn = m_input.Hand(other);
+        const bool otherActing = m_rays[other].triggerDown || otherIn.primary || otherIn.secondary;
+        if (hitsVideo(prev) && (!otherActing || !hitsVideo(other))) {
+            mouseHand = prev;
+        } else {
+            for (int h = 1; h >= 0; h--) {
+                if (hitsVideo(h) && (mouseHand < 0 || m_rays[h].triggerDown)) mouseHand = h;
             }
         }
+        if (mouseHand >= 0) m_lastMouseHand = mouseHand;
     }
     if (mouseHand < 0) {
-        // Release anything held when the ray leaves the monitors or input is disabled.
+        // Release all held mouse buttons when the ray leaves the monitors or input is disabled.
         for (int h = 0; h < 2; h++) {
             if (m_handState[h].trigger) m_client.SendControl({{"type", rc::msg::kMouseButton}, {"button", 0}, {"down", false}});
+            if (m_handState[h].secondary) m_client.SendControl({{"type", rc::msg::kMouseButton}, {"button", 1}, {"down", false}});
+            if (m_handState[h].stickClick) m_client.SendControl({{"type", rc::msg::kMouseButton}, {"button", 2}, {"down", false}});
             m_handState[h].trigger = false;
+            m_handState[h].secondary = false;
+            m_handState[h].stickClick = false;
+            m_handState[h].clickLocked = false;
         }
         return;
     }
     const WindowHit& hit = m_hits[mouseHand];
     const int streamId = std::stoi(hit.window->id.substr(8));
+    const HandInput& in = m_input.Hand(mouseHand);
+    auto& st = m_handState[mouseHand];
+    float sendU = hit.uv.x;
+    float sendV = hit.uv.y;
+    if (!in.isHand) {
+        if (m_rays[mouseHand].triggerPressed) {
+            st.clickLocked = true;
+            st.clickLockTime = 0.f;
+            st.downU = sendU;
+            st.downV = sendV;
+        }
+        if (st.clickLocked && m_rays[mouseHand].triggerDown) {
+            st.clickLockTime += dt;
+            const float du = sendU - st.downU;
+            const float dv = sendV - st.downV;
+            if (st.clickLockTime < 0.12f && (du * du + dv * dv) < (0.008f * 0.008f)) {
+                sendU = st.downU;
+                sendV = st.downV;
+            } else {
+                st.clickLocked = false;
+            }
+        } else if (!m_rays[mouseHand].triggerDown) {
+            st.clickLocked = false;
+        }
+    }
     rc::PointerPayload p{};
     p.monitorStreamId = uint8_t(streamId);
     p.visible = 1;
-    p.u = hit.uv.x;
-    p.v = hit.uv.y;
+    p.u = sendU;
+    p.v = sendV;
     p.inputSeq = ++m_pointerSeq;
     m_client.SendPointer(p);
-
-    const HandInput& in = m_input.Hand(mouseHand);
-    auto& st = m_handState[mouseHand];
     auto button = [&](bool now, bool& prev, int index) {
         if (now != prev) {
             m_client.SendControl({{"type", rc::msg::kMouseButton}, {"button", index}, {"down", now}});
@@ -2441,22 +2511,19 @@ void App::LatchVideo(const FrameState& frame, bool late) {
             if (m_vrFoveated) std::memcpy(m_vrFoveation.start, nextFoveation.foveaStart, sizeof(nextFoveation.foveaStart));
             const VideoFoveation* foveation = m_vrFoveated ? &m_vrFoveation : nullptr;
             TimeVrDraw(true);
+            const float effectiveSharpen = (!m_vrUpscaled && !m_xr.LayerSettings() && (m_stats.mbps == 0 || m_stats.mbps >= 35))
+                                               ? std::clamp(m_settings.vrSharpen, 0.0f, 1.0f)
+                                               : 0.0f;
+            const float effectiveVibrance = std::clamp(m_settings.vrVibrance, 0.0f, 0.5f);
+            const float effectiveDarkGamma = std::clamp(m_settings.vrDarkGamma, 0.0f, 0.35f);
+            m_scene.SetVrImageAdjust(effectiveSharpen, effectiveVibrance, effectiveDarkGamma);
             if (m_vrUpscaled) {
                 m_scene.KeepVideo(texture.texture, texture.crop, m_vrEyeWidth * 2, m_vrEyeHeight, foveation);
                 m_scene.DrawKeptUpscaled(fbo, m_vrSwapchain.width, m_vrSwapchain.height);
             } else {
-                float vrSharpen = 0.0f;
-                float vrVibrance = 0.0f;
-                const bool isPico = m_headset && !std::strcmp(m_headset->Family(), "PICO");
-                const bool allowSharpen = (m_stats.mbps == 0 || m_stats.mbps >= 35);
-                if (!m_xr.LayerSettings() && allowSharpen && m_settings.sharpening > 0.001f) {
-                    vrSharpen = std::clamp(m_settings.sharpening, 0.0f, 1.0f);
-                }
-                if (isPico && m_settings.sharpening > 0.001f) {
-                    vrVibrance = 0.15f;
-                }
                 m_scene.BlitExternal(fbo, texture.texture, m_vrSwapchain.width, m_vrSwapchain.height, texture.crop, 0, 0,
-                                     1, 1, foveation, vrSharpen, vrVibrance, texture.width, texture.height);
+                                     1, 1, foveation, effectiveSharpen, effectiveVibrance, effectiveDarkGamma,
+                                     texture.width, texture.height);
             }
             TimeVrDraw(false);
             if (!m_xr.ReleaseImage(m_vrSwapchain)) {
@@ -3232,7 +3299,7 @@ void App::BuildLayers(const FrameState& frame) {
         m_vrLayer.viewCount = 2;
         m_vrLayer.views = m_vrViews;
         // Sharpening shows up compression artifacts, so only with bits to spare.
-        if (m_xr.LayerSettings() && m_stats.mbps >= 40 && m_settings.sharpening > 0.001f) {
+        if (m_xr.LayerSettings() && m_stats.mbps >= 40 && m_settings.vrSharpen > 0.001f) {
             XrCompositionLayerSettingsFB s{XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB};
             s.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB;
             m_layerSettings.push_back(s);

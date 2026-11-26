@@ -8,6 +8,7 @@ namespace rcs {
 // BT.709 limited range. Chroma is sampled at the centre of each 2x2 block
 // (bilinear tap at the shared corner averages the four source pixels).
 static const char* kShader = R"(
+cbuffer Params : register(b0) { float2 invSize; float ditherAmp; float isStereo; };
 Texture2D src : register(t0);
 SamplerState samp : register(s0);
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -19,33 +20,31 @@ static const float3 kY = float3(0.2126, 0.7152, 0.0722);
 static const float3 kU = float3(-0.1146, -0.3854, 0.5);
 static const float3 kV = float3(0.5, -0.4542, -0.0458);
 
-// Interleaved Gradient Noise for 1-LSB dithering to prevent color banding in dark scenes
-float InterleavedGradientNoise(float2 screenPos) {
-    return frac(52.9829189 * frac(dot(screenPos, float2(0.06711056, 0.00583715))));
+float Ign(float2 pos) {
+    return frac(52.9829189 * frac(dot(pos, float2(0.06711056, 0.00583715))));
 }
 
 float psY(V i) : SV_Target {
     float3 rgb = saturate(src.Sample(samp, i.uv).rgb);
     float y = dot(rgb, kY) * (219.0 / 255.0) + 16.0 / 255.0;
-#if !TEN_BIT
-    float dither = (InterleavedGradientNoise(i.pos.xy) - 0.5) * (1.0 / 255.0);
-    y = saturate(y + dither);
-#endif
+    if (ditherAmp > 0.0) {
+        float n = (Ign(i.pos.xy) + Ign(i.pos.xy + float2(17.0, 31.0)) - 1.0) * 0.5;
+        y = saturate(y + n * ditherAmp);
+    }
     return y;
 }
 float2 psUV(V i) : SV_Target {
-    float3 rgb = saturate(src.Sample(samp, i.uv).rgb);
-    float2 uv = float2(dot(rgb, kU), dot(rgb, kV)) * (224.0 / 255.0) + 128.0 / 255.0;
-#if !TEN_BIT
-    float ditherU = (InterleavedGradientNoise(i.pos.xy) - 0.5) * (1.0 / 255.0);
-    float ditherV = (InterleavedGradientNoise(i.pos.xy + float2(13.0, 7.0)) - 0.5) * (1.0 / 255.0);
-    uv = saturate(uv + float2(ditherU, ditherV));
-#endif
-    return uv;
+    float2 uv = i.uv;
+    if (isStereo > 0.5) {
+        float eye = step(0.5, uv.x);
+        uv.x = clamp(uv.x, eye * 0.5 + 0.5 * invSize.x, eye * 0.5 + 0.5 - 0.5 * invSize.x);
+    }
+    float3 rgb = saturate(src.Sample(samp, uv).rgb);
+    return float2(dot(rgb, kU), dot(rgb, kV)) * (224.0 / 255.0) + 128.0 / 255.0;
 }
 )";
 
-bool ColorConverter::Init(ID3D11Device* device, UINT width, UINT height, bool tenBit) {
+bool ColorConverter::Init(ID3D11Device* device, UINT width, UINT height, bool tenBit, bool isStereo) {
     // A47: a failed re-Init (resolution change / device loss) must not leave half
     // of the old object graph alive beside freshly created objects. Reset every
     // member up front so any FAILED return below leaves a single clean state.
@@ -61,6 +60,7 @@ bool ColorConverter::Init(ID3D11Device* device, UINT width, UINT height, bool te
     m_psUV.Reset();
     m_sampler.Reset();
     m_raster.Reset();
+    m_params.Reset();
     m_inputSrv.Reset();
     m_lastInput = nullptr;
 
@@ -84,10 +84,9 @@ bool ColorConverter::Init(ID3D11Device* device, UINT width, UINT height, bool te
     rd.Format = tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;
     if (FAILED(device->CreateRenderTargetView(m_yuv.Get(), &rd, &m_rtvUV))) return false;
 
-    const std::string shader = std::string("#define TEN_BIT ") + (tenBit ? "1" : "0") + "\n" + kShader;
-    auto vs = CompileShader(shader.c_str(), "vs", "vs_5_0");
-    auto psY = CompileShader(shader.c_str(), "psY", "ps_5_0");
-    auto psUV = CompileShader(shader.c_str(), "psUV", "ps_5_0");
+    auto vs = CompileShader(kShader, "vs", "vs_5_0");
+    auto psY = CompileShader(kShader, "psY", "ps_5_0");
+    auto psUV = CompileShader(kShader, "psUV", "ps_5_0");
     if (!vs || !psY || !psUV) return false;
     // A47: device loss / OOM makes these Create* fail; ignoring the HRESULT let
     // Init() report success and Convert() bind null objects. Check all of them.
@@ -104,6 +103,19 @@ bool ColorConverter::Init(ID3D11Device* device, UINT width, UINT height, bool te
     rs.CullMode = D3D11_CULL_NONE;
     rs.DepthClipEnable = TRUE;
     if (FAILED(device->CreateRasterizerState(&rs, &m_raster))) return false;
+
+    const float paramsData[4] = {
+        width ? 1.0f / float(width) : 0.0f,
+        height ? 1.0f / float(height) : 0.0f,
+        tenBit ? 0.0f : (1.0f / 255.0f),
+        isStereo ? 1.0f : 0.0f,
+    };
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = sizeof(paramsData);
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA initData{paramsData, 0, 0};
+    if (FAILED(device->CreateBuffer(&bd, &initData, &m_params))) return false;
     return true;
 }
 
@@ -147,6 +159,7 @@ bool ColorConverter::Convert(ID3D11DeviceContext* ctx, ID3D11Texture2D* rgb) {
     ctx->VSSetShader(m_vs.Get(), nullptr, 0);
     ctx->PSSetShaderResources(0, 1, m_inputSrv.GetAddressOf());
     ctx->PSSetSamplers(0, 1, m_sampler.GetAddressOf());
+    ctx->PSSetConstantBuffers(0, 1, m_params.GetAddressOf());
     ctx->RSSetState(m_raster.Get());
     ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     ctx->OMSetDepthStencilState(nullptr, 0);

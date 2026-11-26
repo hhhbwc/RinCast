@@ -1546,6 +1546,158 @@ void TestLayerReprojection() {
     std::printf("layer reprojection (single passthrough, multi latest, drop history, rotation signs, asymmetric fov/gl, D3DCompile): ok\n");
 }
 
+void Test10BitPipelineDitherStereoAndSrgb() {
+    ComPtr<ID3D11DeviceContext> ctx;
+    auto dev = CreateHardwareOrWarpDevice(ctx);
+    CHECK(dev != nullptr);
+    if (!dev) return;
+
+    // 1. Foveator 10-bit (R10G10B10A2_UNORM) -> ColorConverter P010
+    constexpr uint32_t eyeW = 128, eyeH = 64, fullW = eyeW * 2;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = fullW;
+    td.Height = eyeH;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    auto pack10 = [](uint32_t r, uint32_t g, uint32_t b, uint32_t a) -> uint32_t {
+        return (a << 30) | (b << 20) | (g << 10) | r;
+    };
+    std::vector<uint32_t> px10(size_t(fullW) * eyeH);
+    for (uint32_t y = 0; y < eyeH; y++) {
+        for (uint32_t x = 0; x < fullW; x++) {
+            px10[size_t(y) * fullW + x] = (x < eyeW) ? pack10(512, 512, 512, 3) : pack10(0, 1023, 0, 3);
+        }
+    }
+    D3D11_SUBRESOURCE_DATA init10{px10.data(), fullW * 4, 0};
+    ComPtr<ID3D11Texture2D> src10;
+    CHECK(SUCCEEDED(dev->CreateTexture2D(&td, &init10, &src10)));
+
+    rcs::Foveator fov10;
+    const uint32_t fovEyeW = rcs::Foveator::EncodedSize(eyeW, 0.45f);
+    const uint32_t fovEyeH = rcs::Foveator::EncodedSize(eyeH, 0.45f);
+    CHECK(fov10.Init(dev.Get(), eyeW, eyeH, fovEyeW, fovEyeH, 0.45f, true));
+    D3D11_TEXTURE2D_DESC fovDesc{};
+    fov10.Output()->GetDesc(&fovDesc);
+    CHECK(fovDesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+    const float starts[2][2] = {{0.275f, 0.275f}, {0.275f, 0.275f}};
+    CHECK(fov10.Squeeze(ctx.Get(), src10.Get(), starts));
+
+    rcs::ColorConverter conv10;
+    CHECK(conv10.Init(dev.Get(), fovEyeW * 2, fovEyeH, true, true));
+    CHECK(conv10.Convert(ctx.Get(), fov10.Output()));
+    D3D11_TEXTURE2D_DESC p010Desc{};
+    conv10.Output()->GetDesc(&p010Desc);
+    CHECK(p010Desc.Format == DXGI_FORMAT_P010);
+
+    // 2. ColorConverter 8-bit + dithering + stereo UV eye-seam clamp
+    rcs::ColorConverter conv8;
+    CHECK(conv8.Init(dev.Get(), fullW, eyeH, false, true));
+    CHECK(conv8.Convert(ctx.Get(), src10.Get()));
+    D3D11_TEXTURE2D_DESC nv12Desc{};
+    conv8.Output()->GetDesc(&nv12Desc);
+    nv12Desc.Usage = D3D11_USAGE_STAGING;
+    nv12Desc.BindFlags = 0;
+    nv12Desc.MiscFlags = 0;
+    nv12Desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> staging8;
+    CHECK(SUCCEEDED(dev->CreateTexture2D(&nv12Desc, nullptr, &staging8)));
+    ctx->CopyResource(staging8.Get(), conv8.Output());
+    ctx->Flush();
+    D3D11_MAPPED_SUBRESOURCE map8{};
+    CHECK(SUCCEEDED(ctx->Map(staging8.Get(), 0, D3D11_MAP_READ, 0, &map8)));
+    const uint8_t* uvRow = static_cast<const uint8_t*>(map8.pData) + size_t(eyeH + eyeH / 4) * map8.RowPitch;
+    // Last chroma pair of left eye (must stay neutral gray ~128, not bled by right eye green)
+    const int leftEdgeU = uvRow[(eyeW - 2)];
+    const int leftEdgeV = uvRow[(eyeW - 2) + 1];
+    // First chroma pair of right eye (must stay green < 60, not bled by left eye gray)
+    const int rightEdgeU = uvRow[eyeW];
+    const int rightEdgeV = uvRow[eyeW + 1];
+    ctx->Unmap(staging8.Get(), 0);
+    if (!(leftEdgeU >= 124 && leftEdgeU <= 132 && leftEdgeV >= 124 && leftEdgeV <= 132 &&
+          rightEdgeU < 60 && rightEdgeV < 60)) {
+        std::printf("DEBUG UV seam: left=(%d,%d) right=(%d,%d)\n", leftEdgeU, leftEdgeV, rightEdgeU, rightEdgeV);
+    }
+    CHECK(leftEdgeU >= 124 && leftEdgeU <= 132 && leftEdgeV >= 124 && leftEdgeV <= 132);
+    CHECK(rightEdgeU < 60 && rightEdgeV < 60);
+
+    // 3. kBlitShader on R10G10B10A2_UNORM with reproj2.w = 1.0 (LinearToSrgb)
+    ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
+    CHECK(SUCCEEDED(D3DCompile(rcvr::kBlitShader, std::strlen(rcvr::kBlitShader), "kBlitShader", nullptr, nullptr,
+                               "vs", "vs_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_WARNINGS_ARE_ERRORS, 0, &vsBlob, &errBlob)));
+    CHECK(SUCCEEDED(D3DCompile(rcvr::kBlitShader, std::strlen(rcvr::kBlitShader), "kBlitShader", nullptr, nullptr,
+                               "ps", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_WARNINGS_ARE_ERRORS, 0, &psBlob, &errBlob)));
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    CHECK(SUCCEEDED(dev->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &vs)));
+    CHECK(SUCCEEDED(dev->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps)));
+
+    D3D11_TEXTURE2D_DESC ftd{};
+    ftd.Width = 4; ftd.Height = 4; ftd.MipLevels = ftd.ArraySize = 1;
+    ftd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    ftd.SampleDesc.Count = 1;
+    ftd.Usage = D3D11_USAGE_DEFAULT;
+    ftd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    // Float16(0.2) = 0x3266
+    std::vector<uint16_t> f16(4 * 4 * 4, 0x3266);
+    D3D11_SUBRESOURCE_DATA fInit{f16.data(), 4 * 8, 0};
+    ComPtr<ID3D11Texture2D> fSrc;
+    CHECK(SUCCEEDED(dev->CreateTexture2D(&ftd, &fInit, &fSrc)));
+    ComPtr<ID3D11ShaderResourceView> fSrv;
+    CHECK(SUCCEEDED(dev->CreateShaderResourceView(fSrc.Get(), nullptr, &fSrv)));
+
+    D3D11_TEXTURE2D_DESC otd{};
+    otd.Width = 4; otd.Height = 4; otd.MipLevels = otd.ArraySize = 1;
+    otd.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    otd.SampleDesc.Count = 1;
+    otd.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ComPtr<ID3D11Texture2D> oDst;
+    CHECK(SUCCEEDED(dev->CreateTexture2D(&otd, nullptr, &oDst)));
+    ComPtr<ID3D11RenderTargetView> oRtv;
+    CHECK(SUCCEEDED(dev->CreateRenderTargetView(oDst.Get(), nullptr, &oRtv)));
+
+    rcvr::LayerConstants lc{};
+    lc.rect[2] = 1.0f; lc.rect[3] = 1.0f;
+    lc.reproj0[0] = 1.0f; lc.reproj1[1] = 1.0f; lc.reproj2[2] = 1.0f; lc.reproj2[3] = 1.0f;
+    D3D11_BUFFER_DESC cbd{sizeof(lc), D3D11_USAGE_IMMUTABLE, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+    D3D11_SUBRESOURCE_DATA cInit{&lc, 0, 0};
+    ComPtr<ID3D11Buffer> cb;
+    CHECK(SUCCEEDED(dev->CreateBuffer(&cbd, &cInit, &cb)));
+    D3D11_SAMPLER_DESC sd{};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    ComPtr<ID3D11SamplerState> samp;
+    CHECK(SUCCEEDED(dev->CreateSamplerState(&sd, &samp)));
+
+    D3D11_VIEWPORT vp{0, 0, 4, 4, 0, 1};
+    ctx->RSSetViewports(1, &vp);
+    ctx->OMSetRenderTargets(1, oRtv.GetAddressOf(), nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(vs.Get(), nullptr, 0);
+    ctx->PSSetShader(ps.Get(), nullptr, 0);
+    ctx->PSSetConstantBuffers(0, 1, cb.GetAddressOf());
+    ctx->PSSetShaderResources(0, 1, fSrv.GetAddressOf());
+    ctx->PSSetSamplers(0, 1, samp.GetAddressOf());
+    ctx->Draw(3, 0);
+
+    otd.Usage = D3D11_USAGE_STAGING;
+    otd.BindFlags = 0;
+    otd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> oStg;
+    CHECK(SUCCEEDED(dev->CreateTexture2D(&otd, nullptr, &oStg)));
+    ctx->CopyResource(oStg.Get(), oDst.Get());
+    D3D11_MAPPED_SUBRESOURCE oMap{};
+    CHECK(SUCCEEDED(ctx->Map(oStg.Get(), 0, D3D11_MAP_READ, 0, &oMap)));
+    const uint32_t outPx = *static_cast<const uint32_t*>(oMap.pData);
+    ctx->Unmap(oStg.Get(), 0);
+    const float outR = float(outPx & 0x3FFu) / 1023.0f;
+    const float expectedSrgb = 1.055f * std::pow(0.2f, 1.0f / 2.4f) - 0.055f;
+    CHECK(std::fabs(outR - expectedSrgb) < 2e-3f);
+    std::printf("streamer D3D11 10-bit pipeline, stereo UV clamp, LinearToSrgb (< 2e-3): ok\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1560,6 +1712,7 @@ int main() {
     TestVrDiagMath();
     TestVideoSenderLiveAndFeedback();
     TestLayerReprojection();
+    Test10BitPipelineDitherStereoAndSrgb();
     CoUninitialize();
 
     std::error_code ec;

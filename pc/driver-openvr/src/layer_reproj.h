@@ -229,6 +229,18 @@ V vs(uint id : SV_VertexID) {
     o.eyeUv = c;
     return o;
 }
+float Lanczos2(float x) {
+    x = abs(x);
+    if (x < 1e-4) return 1.0;
+    if (x >= 2.0) return 0.0;
+    const float pi = 3.14159265;
+    float px = pi * x;
+    return (sin(px) / px) * (sin(px * 0.5) / (px * 0.5));
+}
+float3 LinearToSrgb(float3 c) {
+    c = saturate(c);
+    return lerp(c * 12.92, 1.055 * pow(max(c, 1e-6), 1.0 / 2.4) - 0.055, step(0.0031308, c));
+}
 float4 ps(V i) : SV_Target {
     float2 srcEyeUv = i.eyeUv;
     bool inBounds = true;
@@ -256,13 +268,36 @@ float4 ps(V i) : SV_Target {
     if (!inBounds) {
         return float4(0, 0, 0, reproj1.w > 0.5 ? 0.0 : 1.0);
     }
-    if (covered.x <= 1.05 && covered.y <= 1.05) return tex.Sample(samp, uv);
-    const float2 step = max(covered, 1.0) / (4.0 * float2(w, h));
-    float4 sum = 0;
-    [unroll] for (int y = 0; y < 4; y++)
-        [unroll] for (int x = 0; x < 4; x++)
-            sum += tex.SampleLevel(samp, uv + (float2(x, y) - 1.5) * step, 0);
-    return sum / 16;
+    float4 res;
+    if (covered.x <= 1.05 && covered.y <= 1.05) {
+        res = tex.Sample(samp, uv);
+    } else {
+        const float2 stepUv = max(covered, 1.0) / (4.0 * float2(w, h));
+        float4 sum = 0;
+        float wSum = 0;
+        float3 mn = float3(1e9, 1e9, 1e9);
+        float3 mx = float3(-1e9, -1e9, -1e9);
+        [unroll] for (int y = 0; y < 4; y++) {
+            float dy = (float(y) - 1.5) * 0.5;
+            float wy = Lanczos2(dy * 1.6);
+            [unroll] for (int x = 0; x < 4; x++) {
+                float dx = (float(x) - 1.5) * 0.5;
+                float wt = Lanczos2(dx * 1.6) * wy;
+                float4 s = tex.SampleLevel(samp, uv + (float2(x, y) - 1.5) * stepUv, 0);
+                sum += s * wt;
+                wSum += wt;
+                if (x >= 1 && x <= 2 && y >= 1 && y <= 2) {
+                    mn = min(mn, s.rgb);
+                    mx = max(mx, s.rgb);
+                }
+            }
+        }
+        res = sum / max(wSum, 1e-5);
+        float3 margin = (mx - mn) * 0.12;
+        res.rgb = clamp(res.rgb, max(0.0, mn - margin), min(1.0, mx + margin));
+    }
+    if (reproj2.w > 0.5) res.rgb = LinearToSrgb(res.rgb);
+    return res;
 }
 )";
 

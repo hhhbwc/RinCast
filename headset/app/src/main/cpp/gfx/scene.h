@@ -51,7 +51,13 @@ class SceneRenderer {
     // crop: VideoDecoder::Crop() (null = whole texture).
     void BlitExternal(GLuint dstFbo, GLuint texture, int width, int height, const float* crop = nullptr, float u0 = 0,
                       float v0 = 0, float u1 = 1, float v1 = 1, const VideoFoveation* foveation = nullptr,
-                      float sharpen = 0.0f, float vibrance = 0.0f, int srcWidth = 0, int srcHeight = 0);
+                      float sharpen = 0.0f, float vibrance = 0.0f, float darkGamma = 0.0f,
+                      int srcWidth = 0, int srcHeight = 0);
+    void SetVrImageAdjust(float sharpen, float vibrance, float darkGamma) {
+        m_vrSharpen = sharpen;
+        m_vrVibrance = vibrance;
+        m_vrDarkGamma = darkGamma;
+    }
     bool UpscalerReady() const { return m_upscalerReady; }
     // Keeps a width x height video frame as a normal texture, gamma-encoded, then draws it to dstFbo:
     void KeepVideo(GLuint texture, const float* crop, int width, int height, const VideoFoveation* foveation = nullptr);
@@ -80,6 +86,9 @@ class SceneRenderer {
     float m_externalCrop[4] = {0, 0, 1, 1};
     VideoFoveation m_externalFoveation;
     bool m_externalFoveated = false;
+    float m_vrSharpen = 0.0f;
+    float m_vrVibrance = 0.0f;
+    float m_vrDarkGamma = 0.0f;
     bool m_rawSrgbWrites = false;  // GL_EXT_sRGB_write_control: video goes into sRGB images as it is
     GLuint m_gsrTexture = 0, m_gsrFbo = 0;
     int m_gsrWidth = 0, m_gsrHeight = 0;

@@ -55,6 +55,7 @@ class Keyboard {
     // What a canvas point is: a key (Content), a handle, or nothing (the ray goes through).
     HitZone ZoneAt(Vec2 px) const;
     void SetVisible(bool visible);
+    void SetDirectVk(bool on) { m_directVk = on; }
     // Where it opens: BetterFrame's spot, in front, below the eyes, leaning back like a laptop.
     Pose PlaceInFront(const Pose& head) const;
     static const std::vector<std::string>& ThemeNames();
@@ -201,6 +202,7 @@ class Keyboard {
     std::string m_lastChar, m_msg;
     float m_msgUntil = 0;
     bool m_visible = false;
+    bool m_directVk = true;
     float m_now = 0;
 
     // romaji, Korean, Vietnamese

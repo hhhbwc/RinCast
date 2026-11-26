@@ -31,7 +31,7 @@ class Foveator {
 
     // eyeWidth x eyeHeight per eye in, encodedEyeWidth x encodedEyeHeight per eye out.
     bool Init(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight, uint32_t encodedEyeWidth,
-              uint32_t encodedEyeHeight, float fovea);
+              uint32_t encodedEyeHeight, float fovea, bool tenBit = false);
     // foveaStart: per eye, where the full-density square starts (x, y from the top, 0..1).
     bool Squeeze(ID3D11DeviceContext* ctx, ID3D11Texture2D* frame, const float foveaStart[2][2]);
     ID3D11Texture2D* Output() const { return m_output.Get(); }

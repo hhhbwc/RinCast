@@ -166,49 +166,88 @@ vec2 Foveate(vec2 uv, float eye) {
     return vec2((x + eye) * 0.5, FoveaAxis(uv.y, a.y, uFoveaLayout.z));
 }
 )";
+static const char* kColorGradeFs = R"(
+uniform float uVibrance;
+uniform float uDarkGamma;
+vec3 ColorGrade(vec3 g) {
+    if (uDarkGamma > 0.001) {
+        float luma = dot(g, vec3(0.2126, 0.7152, 0.0722));
+        float shadowWeight = (1.0 - luma) * (1.0 - luma);
+        float gamma = 1.0 + uDarkGamma * shadowWeight;
+        g = pow(max(g, vec3(0.0)), vec3(gamma));
+    }
+    if (uVibrance > 0.001) {
+        float mx = max(g.r, max(g.g, g.b));
+        float mn = min(g.r, min(g.g, g.b));
+        float sat = mx - mn;
+        float luma = dot(g, vec3(0.2126, 0.7152, 0.0722));
+        float boost = 1.0 + uVibrance * (1.0 - sat);
+        g = clamp(mix(vec3(luma), g, boost), 0.0, 1.0);
+    }
+    return g;
+}
+)";
+static const char* kCasExtFs = R"(
+uniform float uSharpen;
+uniform vec2 uInvTexSize;
+vec3 ApplyCasExtAt(samplerExternalOES tex, vec2 tc, vec2 lo, vec2 hi, vec2 stepUv, float strength) {
+    vec3 e = texture(tex, tc).rgb;
+    if (strength <= 0.001 || stepUv.x <= 0.0 || stepUv.y <= 0.0) return e;
+    vec3 b = texture(tex, clamp(tc + vec2(0.0, -stepUv.y), lo, hi)).rgb;
+    vec3 d = texture(tex, clamp(tc + vec2(-stepUv.x, 0.0), lo, hi)).rgb;
+    vec3 f = texture(tex, clamp(tc + vec2(stepUv.x, 0.0), lo, hi)).rgb;
+    vec3 h = texture(tex, clamp(tc + vec2(0.0, stepUv.y), lo, hi)).rgb;
+    vec3 mn = min(min(min(d, e), min(f, b)), h);
+    vec3 mx = max(max(max(d, e), max(f, b)), h);
+    vec3 amp = clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0);
+    amp = sqrt(amp);
+    float peak = -1.0 / mix(8.0, 5.0, strength);
+    vec3 w = amp * peak;
+    vec3 outCol = (e + (b + d + f + h) * w) / (1.0 + 4.0 * w);
+    return clamp(outCol, 0.0, 1.0);
+}
+vec3 ApplyCasExt(samplerExternalOES tex, vec2 uv, vec4 crop, vec2 invSize, float strength) {
+    float eye = step(0.5, uv.x);
+    vec2 lo = crop.xy + vec2(eye * 0.5 + 0.5 * invSize.x, 0.5 * invSize.y) * crop.zw;
+    vec2 hi = crop.xy + vec2(eye * 0.5 + 0.5 - 0.5 * invSize.x, 1.0 - 0.5 * invSize.y) * crop.zw;
+    return ApplyCasExtAt(tex, crop.xy + uv * crop.zw, lo, hi, invSize * crop.zw, strength);
+}
+)";
+static const char* kCas2DFs = R"(
+uniform float uSharpen;
+uniform vec2 uInvTexSize;
+vec3 ApplyCas2D(sampler2D tex, vec2 uv, vec2 invSize, float strength) {
+    vec3 e = texture(tex, uv).rgb;
+    if (strength <= 0.001 || invSize.x <= 0.0 || invSize.y <= 0.0) return e;
+    float eye = step(0.5, uv.x);
+    vec2 lo = vec2(eye * 0.5 + 0.5 * invSize.x, 0.5 * invSize.y);
+    vec2 hi = vec2(eye * 0.5 + 0.5 - 0.5 * invSize.x, 1.0 - 0.5 * invSize.y);
+    vec3 b = texture(tex, clamp(uv + vec2(0.0, -invSize.y), lo, hi)).rgb;
+    vec3 d = texture(tex, clamp(uv + vec2(-invSize.x, 0.0), lo, hi)).rgb;
+    vec3 f = texture(tex, clamp(uv + vec2(invSize.x, 0.0), lo, hi)).rgb;
+    vec3 h = texture(tex, clamp(uv + vec2(0.0, invSize.y), lo, hi)).rgb;
+    vec3 mn = min(min(min(d, e), min(f, b)), h);
+    vec3 mx = max(max(max(d, e), max(f, b)), h);
+    vec3 amp = clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0);
+    amp = sqrt(amp);
+    float peak = -1.0 / mix(8.0, 5.0, strength);
+    vec3 w = amp * peak;
+    vec3 outCol = (e + (b + d + f + h) * w) / (1.0 + 4.0 * w);
+    return clamp(outCol, 0.0, 1.0);
+}
+)";
 static const char* kBlitExtFs = R"(
 uniform samplerExternalOES uTex;
 uniform vec4 uCrop;  // visible part of the decoder buffer: offset.xy, scale.zw
-uniform vec2 uTexel;
-uniform float uSharpen;
-uniform float uVibrance;
 in vec2 vUv;
 out vec4 oColor;
-
-vec3 CasFilter(vec2 uv) {
-    vec2 tc = uCrop.xy + uv * uCrop.zw;
-    vec3 c = texture(uTex, tc).rgb;
-    if (uSharpen <= 0.001) return c;
-    vec2 step = uTexel * uCrop.zw;
-    vec3 a = texture(uTex, tc + vec2(0.0, -step.y)).rgb;
-    vec3 b = texture(uTex, tc + vec2(-step.x, 0.0)).rgb;
-    vec3 d = texture(uTex, tc + vec2(step.x, 0.0)).rgb;
-    vec3 e = texture(uTex, tc + vec2(0.0, step.y)).rgb;
-    vec3 minRgb = min(min(min(a, b), min(d, e)), c);
-    vec3 maxRgb = max(max(max(a, b), max(d, e)), c);
-    vec3 amp = clamp(min(minRgb, 2.0 - maxRgb) / max(maxRgb, vec3(1e-5)), 0.0, 1.0);
-    vec3 w = -sqrt(amp) * (uSharpen * 0.22);
-    vec3 result = (w * (a + b + d + e) + c) / (4.0 * w + vec3(1.0));
-    return clamp(result, minRgb, maxRgb);
-}
-
-vec3 EnhanceColor(vec3 col) {
-    if (uVibrance > 0.001) {
-        float luma = dot(col, vec3(0.299, 0.587, 0.114));
-        float sat = max(col.r, max(col.g, col.b)) - min(col.r, min(col.g, col.b));
-        float boost = (1.0 - sat) * uVibrance;
-        col = clamp(mix(vec3(luma), col, 1.0 + boost), 0.0, 1.0);
-        col = pow(col, vec3(1.0 + 0.06 * uVibrance));
-    }
-    return col;
-}
 
 // Layer swapchains are sRGB: ToLayer() linearizes the gamma-encoded video, or with sRGB writes
 // off leaves it as it is.
 void main() {
     vec2 uv = Foveate(vec2(vUv.x, 1.0 - vUv.y), step(0.5, vUv.x));
-    vec3 g = CasFilter(uv);
-    g = EnhanceColor(g);
+    vec3 g = ApplyCasExt(uTex, uv, uCrop, uInvTexSize, uSharpen);
+    g = ColorGrade(g);
     oColor = vec4(ToLayer(g), 1.0);
 }
 )";
@@ -305,7 +344,7 @@ void main() {
         float deltaY = clamp(finalY - color.w, -23.0 / 255.0, 23.0 / 255.0);
         color.xyz = clamp(color.xyz + deltaY, 0.0, 1.0);
     }
-    highp vec3 g = color.xyz;
+    highp vec3 g = ColorGrade(color.xyz);
     oColor = vec4(ToLayer(g), 1.0);
 }
 )";
@@ -314,7 +353,8 @@ uniform sampler2D uTex;
 in vec2 vUv;
 out vec4 oColor;
 void main() {
-    vec3 g = texture(uTex, vUv).rgb;
+    vec3 g = ApplyCas2D(uTex, vUv, uInvTexSize, uSharpen);
+    g = ColorGrade(g);
     oColor = vec4(ToLayer(g), 1.0);
 }
 )";
@@ -340,7 +380,10 @@ void main() {
     uv.y = clamp(uv.y, 0.0, 1.0);
     uv.x = clamp(uv.x, eye * 0.5 + uHalfTexel.x, 0.5 + eye * 0.5 - uHalfTexel.x);
     uv.y = clamp(uv.y, uHalfTexel.y, 1.0 - uHalfTexel.y);
-    vec3 g = texture(uTex, vec2(uv.x, 1.0 - uv.y)).rgb;
+    vec3 g = uSharpen > 0.001
+        ? ApplyCas2D(uTex, vec2(uv.x, 1.0 - uv.y), uInvTexSize, uSharpen)
+        : texture(uTex, vec2(uv.x, 1.0 - uv.y)).rgb;
+    g = ColorGrade(g);
     oColor = vec4(ToLayer(g), 1.0);
 }
 )";
@@ -376,7 +419,12 @@ void main() {
     float eyeMid = 0.5 * (cropMin.x + cropMax.x);
     sampleUv.x = clamp(sampleUv.x, min(eyeMin, eyeMid), max(eyeMax, eyeMid));
     sampleUv.y = clamp(sampleUv.y, uCrop.y, uCrop.y + uCrop.w);
-    vec3 g = texture(uTex, sampleUv).rgb;
+    vec2 casLo = vec2(min(eyeMin, eyeMid), uCrop.y);
+    vec2 casHi = vec2(max(eyeMax, eyeMid), uCrop.y + uCrop.w);
+    vec3 g = uSharpen > 0.001
+        ? ApplyCasExtAt(uTex, sampleUv, casLo, casHi, uInvTexSize * uCrop.zw, uSharpen)
+        : texture(uTex, sampleUv).rgb;
+    g = ColorGrade(g);
     oColor = vec4(ToLayer(g), 1.0);
 }
 )";
@@ -432,14 +480,14 @@ bool SceneRenderer::Init() {
         ? "vec3 ToLayer(vec3 g) { return g; }\n"
         : "vec3 ToLayer(vec3 g) { return mix(g / 12.92, pow((g + 0.055) / 1.055, vec3(2.4)), step(0.04045, g)); }\n";
     const std::string ext = "#extension GL_OES_EGL_image_external_essl3 : require\n";
-    const std::string blitExt = ext + toLayer + kFoveateFs + kBlitExtFs;
+    const std::string blitExt = ext + toLayer + kColorGradeFs + kCasExtFs + kFoveateFs + kBlitExtFs;
     const std::string blitExtGamma = ext + kFoveateFs + kBlitExtGammaFs;
     // Optional: without it, upscaling just stays off.
     m_upscalerReady = m_blitExtGamma.Build(kBlitVs, blitExtGamma.c_str(), "blitExtGamma");
-    m_upscalerReady = m_gsr.Build(kBlitVs, (toLayer + kGsrFs).c_str(), "gsr") && m_upscalerReady;
-    m_upscalerReady = m_kept.Build(kBlitVs, (toLayer + kKeptFs).c_str(), "kept") && m_upscalerReady;
-    m_upscalerReady = m_keptMoved.Build(kBlitVs, (toLayer + kKeptMovedFs).c_str(), "keptMoved") && m_upscalerReady;
-    m_externalMovedReady = m_externalMoved.Build(kBlitVs, (ext + toLayer + kFoveateFs + kExternalMovedFs).c_str(), "externalMoved");
+    m_upscalerReady = m_gsr.Build(kBlitVs, (toLayer + kColorGradeFs + kGsrFs).c_str(), "gsr") && m_upscalerReady;
+    m_upscalerReady = m_kept.Build(kBlitVs, (toLayer + kColorGradeFs + kCas2DFs + kKeptFs).c_str(), "kept") && m_upscalerReady;
+    m_upscalerReady = m_keptMoved.Build(kBlitVs, (toLayer + kColorGradeFs + kCas2DFs + kKeptMovedFs).c_str(), "keptMoved") && m_upscalerReady;
+    m_externalMovedReady = m_externalMoved.Build(kBlitVs, (ext + toLayer + kColorGradeFs + kCasExtFs + kFoveateFs + kExternalMovedFs).c_str(), "externalMoved");
     ok &= m_externalMovedReady;
     ok &= m_blitExt.Build(kBlitVs, blitExt.c_str(), "blitExt");
     ok &= m_blit2D.Build(kBlitVs, kBlit2DFs, "blit2d");
@@ -566,7 +614,7 @@ static void SetFoveation(const Program& p, const VideoFoveation* f) {
 
 void SceneRenderer::BlitExternal(GLuint dstFbo, GLuint texture, int width, int height, const float* crop, float u0, float v0,
                                  float u1, float v1, const VideoFoveation* foveation,
-                                 float sharpen, float vibrance, int srcWidth, int srcHeight) {
+                                 float sharpen, float vibrance, float darkGamma, int srcWidth, int srcHeight) {
     static const float kFull[4] = {0, 0, 1, 1};
     glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
     glViewport(0, 0, width, height);
@@ -580,9 +628,10 @@ void SceneRenderer::BlitExternal(GLuint dstFbo, GLuint texture, int width, int h
     SetFoveation(m_blitExt, foveation);
     const float tw = srcWidth > 0 ? float(srcWidth) : float(width);
     const float th = srcHeight > 0 ? float(srcHeight) : float(height);
-    glUniform2f(m_blitExt.Uniform("uTexel"), 1.0f / tw, 1.0f / th);
+    glUniform2f(m_blitExt.Uniform("uInvTexSize"), tw > 0 ? 1.0f / tw : 0.0f, th > 0 ? 1.0f / th : 0.0f);
     glUniform1f(m_blitExt.Uniform("uSharpen"), sharpen);
     glUniform1f(m_blitExt.Uniform("uVibrance"), vibrance);
+    glUniform1f(m_blitExt.Uniform("uDarkGamma"), darkGamma);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
     glUniform1i(m_blitExt.Uniform("uTex"), 0);
@@ -634,6 +683,8 @@ void SceneRenderer::DrawKeptUpscaled(GLuint dstFbo, int dstW, int dstH) {
     m_gsr.Use();
     glUniform4f(m_gsr.Uniform("uRect"), 0, 0, 1, 1);
     glUniform4f(m_gsr.Uniform("uViewport"), 1.f / m_gsrWidth, 1.f / m_gsrHeight, float(m_gsrWidth), float(m_gsrHeight));
+    glUniform1f(m_gsr.Uniform("uVibrance"), m_vrVibrance);
+    glUniform1f(m_gsr.Uniform("uDarkGamma"), m_vrDarkGamma);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, m_gsrTexture);
     glUniform1i(m_gsr.Uniform("uTex"), 0);
@@ -650,6 +701,10 @@ void SceneRenderer::DrawKept(GLuint dstFbo, int dstW, int dstH) {
     RawSrgbWrites raw(m_rawSrgbWrites);
     m_kept.Use();
     glUniform4f(m_kept.Uniform("uRect"), 0, 0, 1, 1);
+    glUniform2f(m_kept.Uniform("uInvTexSize"), m_gsrWidth > 0 ? 1.f / m_gsrWidth : 0.f, m_gsrHeight > 0 ? 1.f / m_gsrHeight : 0.f);
+    glUniform1f(m_kept.Uniform("uSharpen"), m_vrSharpen);
+    glUniform1f(m_kept.Uniform("uVibrance"), m_vrVibrance);
+    glUniform1f(m_kept.Uniform("uDarkGamma"), m_vrDarkGamma);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, m_gsrTexture);
     glUniform1i(m_kept.Uniform("uTex"), 0);
@@ -667,6 +722,10 @@ bool SceneRenderer::DrawKeptMoved(GLuint dstFbo, int dstW, int dstH, float scale
     glDisable(GL_DEPTH_TEST);
     m_keptMoved.Use();
     glUniform4f(m_keptMoved.Uniform("uRect"), 0, 0, 1, 1);
+    glUniform2f(m_keptMoved.Uniform("uInvTexSize"), m_gsrWidth > 0 ? 1.f / m_gsrWidth : 0.f, m_gsrHeight > 0 ? 1.f / m_gsrHeight : 0.f);
+    glUniform1f(m_keptMoved.Uniform("uSharpen"), m_vrSharpen);
+    glUniform1f(m_keptMoved.Uniform("uVibrance"), m_vrVibrance);
+    glUniform1f(m_keptMoved.Uniform("uDarkGamma"), m_vrDarkGamma);
     glUniform2f(m_keptMoved.Uniform("uScale"), scaleX, scaleY);
     glUniform2f(m_keptMoved.Uniform("uField"), fieldU, fieldV);
     glUniform2f(m_keptMoved.Uniform("uMotionHalfTexel"),
@@ -715,6 +774,11 @@ bool SceneRenderer::DrawExternalMoved(GLuint dstFbo, int dstW, int dstH, float s
     glUniform4f(m_externalMoved.Uniform("uRect"), 0, 0, 1, 1);
     glUniform4fv(m_externalMoved.Uniform("uCrop"), 1, m_externalCrop);
     SetFoveation(m_externalMoved, m_externalFoveated ? &m_externalFoveation : nullptr);
+    glUniform2f(m_externalMoved.Uniform("uInvTexSize"), m_externalWidth > 0 ? 1.f / m_externalWidth : 0.f,
+                m_externalHeight > 0 ? 1.f / m_externalHeight : 0.f);
+    glUniform1f(m_externalMoved.Uniform("uSharpen"), m_vrSharpen);
+    glUniform1f(m_externalMoved.Uniform("uVibrance"), m_vrVibrance);
+    glUniform1f(m_externalMoved.Uniform("uDarkGamma"), m_vrDarkGamma);
     glUniform2f(m_externalMoved.Uniform("uScale"), scaleX, scaleY);
     glUniform2f(m_externalMoved.Uniform("uField"), fieldU, fieldV);
     glUniform2f(m_externalMoved.Uniform("uMotionHalfTexel"),

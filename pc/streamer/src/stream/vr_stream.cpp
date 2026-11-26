@@ -689,13 +689,13 @@ void VrStream::Run() {
             m_statSrcW.store(srcWidth, std::memory_order_relaxed);
             m_statSrcH.store(srcHeight, std::memory_order_relaxed);
             convertersReady = false;
-            if (foveated && !foveator.Init(device, srcWidth / 2, srcHeight, encWidth / 2, encHeight, m_config.foveaSize)) {
+            if (foveated && !foveator.Init(device, srcWidth / 2, srcHeight, encWidth / 2, encHeight, m_config.foveaSize, m_config.tenBit)) {
                 WarnEvery5s("VR frame dropped: foveated encoding didn't start");
                 InterlockedExchange(&fs.state, rcvr::kSlotFree);
                 continue;
             }
             bool ok = true;
-            for (auto& c : converters) ok = ok && c.Init(device, encWidth, encHeight, m_config.tenBit);
+            for (auto& c : converters) ok = ok && c.Init(device, encWidth, encHeight, m_config.tenBit, true);
             if (!ok) {
                 WarnEvery5s("VR frame dropped: the colour converter didn't start");
                 InterlockedExchange(&fs.state, rcvr::kSlotFree);

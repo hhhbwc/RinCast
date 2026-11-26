@@ -18,6 +18,8 @@ void MouseWheel(float dx, float dy);
 // Windows virtual key code. Extended keys (arrows, etc.) are detected automatically.
 void Key(unsigned short vk, bool down);
 void Text(const std::wstring& text);
+// Toggles the Windows touch keyboard (TabTip / ITipInvocation, fallback osk.exe).
+void TogglePcKeyboard();
 // Releases every button/key we may have left pressed (on disconnect).
 void ReleaseAll();
 // True when the last SendInput was refused (UIPI: higher-privilege window in front).

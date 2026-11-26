@@ -12,7 +12,7 @@ namespace rcs {
 class ColorConverter {
    public:
     // Creates the YUV target (NV12 or P010) of the given size.
-    bool Init(ID3D11Device* device, UINT width, UINT height, bool tenBit);
+    bool Init(ID3D11Device* device, UINT width, UINT height, bool tenBit, bool isStereo = false);
     // Converts `rgb` (any size; scaled to fit) into the YUV target.
     bool Convert(ID3D11DeviceContext* ctx, ID3D11Texture2D* rgb);
     ID3D11Texture2D* Output() const { return m_yuv.Get(); }
@@ -28,6 +28,7 @@ class ColorConverter {
     ComPtr<ID3D11PixelShader> m_psUV;
     ComPtr<ID3D11SamplerState> m_sampler;
     ComPtr<ID3D11RasterizerState> m_raster;
+    ComPtr<ID3D11Buffer> m_params;
     // SRV cache for the most recent input texture.
     ID3D11Texture2D* m_lastInput = nullptr;
     ComPtr<ID3D11ShaderResourceView> m_inputSrv;

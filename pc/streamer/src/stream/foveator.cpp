@@ -67,7 +67,7 @@ struct Params {
 // the pure config builders and the offline sweep need it without the D3D side.
 
 bool Foveator::Init(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight, uint32_t encodedEyeWidth,
-                    uint32_t encodedEyeHeight, float fovea) {
+                    uint32_t encodedEyeHeight, float fovea, bool tenBit) {
     m_device = device;
     m_fovea = fovea;
     m_eyeWidth = eyeWidth;
@@ -80,7 +80,7 @@ bool Foveator::Init(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight,
     td.Width = encodedEyeWidth * 2;
     td.Height = encodedEyeHeight;
     td.MipLevels = td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.Format = tenBit ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     HRESULT hr = device->CreateTexture2D(&td, nullptr, &m_output);

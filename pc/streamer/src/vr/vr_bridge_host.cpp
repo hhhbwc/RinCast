@@ -101,9 +101,10 @@ void VrBridgeHost::Stop() {
     ClearTrackingCache();
 }
 
-bool VrBridgeHost::CreateTextures(uint32_t width, uint32_t height) {
+bool VrBridgeHost::CreateTextures(uint32_t width, uint32_t height, bool tenBit) {
     ComPtr<ID3D11Device1> device1;
     m_device.As(&device1);
+    const DXGI_FORMAT format = tenBit ? DXGI_FORMAT_R10G10B10A2_TYPELESS : DXGI_FORMAT_R8G8B8A8_TYPELESS;
     const uint32_t generation = m_generation.fetch_add(1, std::memory_order_relaxed) + 1;
     for (int i = 0; i < rcvr::kFrameSlots; i++) {
         if (m_textureHandles[i]) CloseHandle(m_textureHandles[i]);
@@ -116,7 +117,7 @@ bool VrBridgeHost::CreateTextures(uint32_t width, uint32_t height) {
         td.ArraySize = 1;
         // Typeless so producers can render through an sRGB or UNORM view to
         // match their source, while we always read gamma-encoded UNORM.
-        td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        td.Format = format;
         td.SampleDesc.Count = 1;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
@@ -140,18 +141,20 @@ bool VrBridgeHost::CreateTextures(uint32_t width, uint32_t height) {
     }
     m_shared->textureWidth = width;
     m_shared->textureHeight = height;
-    m_shared->textureFormat = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    m_shared->textureFormat = format;
     m_shared->latestReadySlot = -1;
     return true;
 }
 
-bool VrBridgeHost::Configure(const rcvr::DisplayConfig& config) {
+bool VrBridgeHost::Configure(const rcvr::DisplayConfig& config, bool tenBit) {
     std::lock_guard lock(m_mutex);
     m_driftNsPerS = 0;  // another session, maybe another headset: learn its drift afresh
     rcvr::DisplayConfig c = config;
     c.adapterLuid = m_gpu.luid;
     const auto& old = m_shared->config;
+    const DXGI_FORMAT desiredFormat = tenBit ? DXGI_FORMAT_R10G10B10A2_TYPELESS : DXGI_FORMAT_R8G8B8A8_TYPELESS;
     const bool resolutionChanged = !m_hasConfig || old.eyeWidth != c.eyeWidth || old.eyeHeight != c.eyeHeight;
+    const bool formatChanged = !m_hasConfig || m_shared->textureFormat != desiredFormat;
     // What SteamVR renders at, which it only takes on when it starts.
     const auto renderSize = [](const rcvr::DisplayConfig& d) {
         return std::make_pair(d.renderEyeWidth ? d.renderEyeWidth : d.eyeWidth, d.renderEyeHeight ? d.renderEyeHeight : d.eyeHeight);
@@ -159,7 +162,7 @@ bool VrBridgeHost::Configure(const rcvr::DisplayConfig& config) {
     const bool renderSizeChanged = !m_hasConfig || renderSize(old) != renderSize(c);
     const bool displayChanged = resolutionChanged || old.refreshRate != c.refreshRate ||
                                 std::memcmp(old.fovTan, c.fovTan, sizeof(c.fovTan)) != 0;
-    if (resolutionChanged && !CreateTextures(c.eyeWidth * 2, c.eyeHeight)) return false;
+    if ((resolutionChanged || formatChanged) && !CreateTextures(c.eyeWidth * 2, c.eyeHeight, tenBit)) return false;
     m_shared->config = c;
     MemoryBarrier();
     if (displayChanged) InterlockedIncrement(&m_shared->configGeneration);
@@ -281,7 +284,7 @@ void VrBridgeHost::RecoverFromDeadProducer() {
     m_shared->renderedEyeWidth = m_shared->renderedEyeHeight = 0;
     m_hapticsWaitTicks = 0;
     m_hapticsWaitStartNs = 0;
-    if (w && h) CreateTextures(w, h);
+    if (w && h) CreateTextures(w, h, m_shared->textureFormat == DXGI_FORMAT_R10G10B10A2_TYPELESS);
     InterlockedIncrement(&m_shared->configGeneration);
 }
 

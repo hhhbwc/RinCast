@@ -1,5 +1,7 @@
 #include "input_injector.h"
 
+#include <objbase.h>
+#include <shellapi.h>
 #include <windows.h>
 
 #include <atomic>
@@ -135,6 +137,33 @@ void Text(const std::wstring& text) {
         ins.push_back(up);
     }
     if (!ins.empty()) Send(ins.data(), UINT(ins.size()));
+}
+
+void TogglePcKeyboard() {
+    const HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    const bool needUninit = SUCCEEDED(hrInit);
+    bool toggled = false;
+    static constexpr GUID kClsidUiHostNoLaunch = {
+        0x4CE576FA, 0x83DC, 0x4F88, {0x95, 0x1C, 0x9D, 0x07, 0x82, 0xB4, 0xE3, 0x76}};
+    static constexpr GUID kIidITipInvocation = {
+        0x37C994E7, 0x432B, 0x4834, {0xA2, 0xF7, 0xDC, 0xE1, 0xF1, 0x3B, 0x83, 0x4B}};
+    struct ITipInvocation : public IUnknown {
+        virtual HRESULT STDMETHODCALLTYPE Toggle(HWND hwnd) = 0;
+    };
+    ITipInvocation* tip = nullptr;
+    if (SUCCEEDED(CoCreateInstance(kClsidUiHostNoLaunch, nullptr, CLSCTX_INPROC_HANDLER | CLSCTX_LOCAL_SERVER,
+                                   kIidITipInvocation, reinterpret_cast<void**>(&tip))) &&
+        tip) {
+        toggled = SUCCEEDED(tip->Toggle(GetDesktopWindow()));
+        tip->Release();
+    }
+    if (needUninit) CoUninitialize();
+    if (toggled) return;
+    const HINSTANCE r1 = ShellExecuteW(
+        nullptr, L"open", L"C:\\Program Files\\Common Files\\microsoft shared\\ink\\TabTip.exe",
+        nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(r1) > 32) return;
+    ShellExecuteW(nullptr, L"open", L"osk.exe", nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void ReleaseAll() {

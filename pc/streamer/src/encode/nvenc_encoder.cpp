@@ -116,10 +116,7 @@ class NvencEncoder final : public VideoEncoder {
             SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) &&
             SUCCEEDED(adapter->GetDesc(&desc))) {
             const wchar_t* name = desc.Description;
-            if (wcsstr(name, L"RTX 40") || wcsstr(name, L"RTX 30") || wcsstr(name, L"RTX 50") ||
-                wcsstr(name, L"RTX A") || wcsstr(name, L"Ada") || wcsstr(name, L"RTX 6000") ||
-                wcsstr(name, L"RTX 5000") || wcsstr(name, L"RTX 4500") || wcsstr(name, L"RTX 4000") ||
-                wcsstr(name, L"RTX 3500") || wcsstr(name, L"RTX 3000")) {
+            if (wcsstr(name, L"RTX") != nullptr) {
                 isModernRtx = true;
             }
         }

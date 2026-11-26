@@ -324,7 +324,7 @@ void ClientSession::OnControl(const std::string& text) {
     const std::string type = StrField(m, "type");
     if (type.empty()) return;
     if (!m_inputAllowed && (type == rc::msg::kMouseButton || type == rc::msg::kMouseWheel ||
-                            type == rc::msg::kKey || type == rc::msg::kText))
+                            type == rc::msg::kKey || type == rc::msg::kText || type == rc::msg::kPcKeyboard))
         return;
     if (type == rc::msg::kMouseButton) {
         input::MouseButton(IntField(m, "button", 0), BoolField(m, "down", false));
@@ -340,6 +340,10 @@ void ClientSession::OnControl(const std::string& text) {
     }
     if (type == rc::msg::kText) {
         input::Text(Widen(StrField(m, "text")));
+        return;
+    }
+    if (type == rc::msg::kPcKeyboard) {
+        input::TogglePcKeyboard();
         return;
     }
     if (type.front() == '_') return;
@@ -1475,25 +1479,17 @@ void ClientSession::StartVr() {
                 dc.ipd, dc.headsetModel, dc.headsetSerial, match ? 1 : 0, dc.renderEyeWidth, dc.renderEyeHeight);
     }
 
-    const bool needsRestart = bridge.Configure(dc);
-    bridge.SetHeadsetConnected(true);
-
     int autoscalePct = 100;
     if (pc.l7Autoscale) {
         std::lock_guard lock(m_mutex);
         autoscalePct = m_autoscale.Pct();
     }
-    // The settings -> config synthesis is a pure function now (stream_config.h,
-    // TASK-COMBO-SWEEP-2026-11-21); this method keeps the bridge, the logs and the
-    // wire messages. The block below was moved there VERBATIM. The guarded wrapper
-    // (TASK-CAPS-GUARD) moves an H264 stream whose full frame exceeds NVENC's 4096 px
-    // width onto HEVC instead of an encoder that could never open; the session owns
-    // the log line, the header stays log-free.
-    // A84: built from the effective-rung snapshot (see StartDesktop) - the floor stays
-    // in pc for every other reader of the settings.
     const Settings eff = EffectiveSettings(pc);
     const VrStreamBuild vrBuild = BuildVrStreamConfigGuarded(eff, st, codec, m_slowPath, match, autoscalePct,
                                                             dc.eyeWidth, dc.eyeHeight, rate, App::Get().Caps(), caps);
+
+    const bool needsRestart = bridge.Configure(dc, vrBuild.cfg.tenBit);
+    bridge.SetHeadsetConnected(true);
     if (vrBuild.h264WidthFallback) {
         RC_LOGW("H264 unsupported at %upx, falling back to HEVC", vrBuild.h264RejectedWidth);
         // A19 audit #4: the headset saw the codec change in its stats but never the

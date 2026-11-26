@@ -395,6 +395,7 @@ inline constexpr const char* kMouseButton = "input.mouseButton";
 inline constexpr const char* kMouseWheel = "input.mouseWheel";
 inline constexpr const char* kKey = "input.key";
 inline constexpr const char* kText = "input.text";
+inline constexpr const char* kPcKeyboard = "input.pcKeyboard";
 inline constexpr const char* kGamepad = "input.gamepad";
 inline constexpr const char* kRecenter = "vr.recenter";
 inline constexpr const char* kStats = "stats.client";

@@ -1090,6 +1090,41 @@ void Keyboard::Press(const Key& k, bool quiet) {
             }
         } else if (mods && c.size() == 1 && isalnum(static_cast<unsigned char>(c[0]))) {
             Tap(uint16_t(toupper(static_cast<unsigned char>(c[0]))), true, true);  // Ctrl + letter: a shortcut
+        } else if (m_directVk && !lang.romaji && lang.ime.empty() && c.size() == 1) {
+            uint16_t vk = 0;
+            bool needShift = false;
+            const char ch = c[0];
+            if (ch >= 'a' && ch <= 'z') {
+                vk = uint16_t('A' + (ch - 'a'));
+            } else if (ch >= 'A' && ch <= 'Z') {
+                vk = uint16_t(ch);
+                needShift = true;
+            } else if (ch >= '0' && ch <= '9') {
+                vk = uint16_t(ch);
+            } else if (ch == ' ') {
+                vk = VK_SPACE;
+            } else {
+                static const struct { char ch; uint16_t vk; bool shift; } kPunct[] = {
+                    {',', 0xBC, false}, {'<', 0xBC, true},  {'.', 0xBE, false}, {'>', 0xBE, true},
+                    {'/', 0xBF, false}, {'?', 0xBF, true},  {';', 0xBA, false}, {':', 0xBA, true},
+                    {'\'', 0xDE, false},{'"', 0xDE, true},  {'[', 0xDB, false}, {'{', 0xDB, true},
+                    {']', 0xDD, false}, {'}', 0xDD, true},  {'\\', 0xDC, false},{'|', 0xDC, true},
+                    {'-', 0xBD, false}, {'_', 0xBD, true},  {'=', 0xBB, false}, {'+', 0xBB, true},
+                    {'`', 0xC0, false}, {'~', 0xC0, true},  {'!', '1', true},   {'@', '2', true},
+                    {'#', '3', true},   {'$', '4', true},   {'%', '5', true},   {'^', '6', true},
+                    {'&', '7', true},   {'*', '8', true},   {'(', '9', true},   {')', '0', true},
+                };
+                for (const auto& p : kPunct) {
+                    if (p.ch == ch) { vk = p.vk; needShift = p.shift; break; }
+                }
+            }
+            if (vk) {
+                if (needShift && !m_st.shift) m_out.key(VK_SHIFT, true);
+                Tap(vk, true, false);
+                if (needShift && !m_st.shift) m_out.key(VK_SHIFT, false);
+            } else {
+                TypeText(c);
+            }
         } else {
             TypeText(c);
         }

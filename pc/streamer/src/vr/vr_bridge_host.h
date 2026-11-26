@@ -21,8 +21,8 @@ class VrBridgeHost {
     void Stop();
 
     // Applies a headset display configuration. Recreates textures when the
-    // resolution changes. Returns true if SteamVR needs a restart to apply.
-    bool Configure(const rcvr::DisplayConfig& config);
+    // resolution or pixel format changes. Returns true if SteamVR needs a restart to apply.
+    bool Configure(const rcvr::DisplayConfig& config, bool tenBit = false);
     void SetHeadsetConnected(bool connected);
     void PublishTracking(const rcvr::TrackingSnapshot& snapshot, bool clockValid);
     bool LookupTracking(uint64_t sequence, int64_t& targetDisplayPcNs, bool& clockValid) const;
@@ -62,7 +62,7 @@ class VrBridgeHost {
 
    private:
     void HeartbeatLoop();
-    bool CreateTextures(uint32_t width, uint32_t height);
+    bool CreateTextures(uint32_t width, uint32_t height, bool tenBit);
     void RecoverFromDeadProducer();
     void ClearTrackingCache();
 

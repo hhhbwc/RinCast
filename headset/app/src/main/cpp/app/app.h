@@ -128,6 +128,7 @@ class App {
     void ShowMonitors(bool show);
     bool MonitorsVisible() const { return m_monitorsVisible; }
     void SendKey(uint16_t vk, bool down);
+    void TogglePcKeyboard();
     void SendText(const std::string& text);
     void PostNotice(const std::string& text, const std::string& level = "info", const std::string& action = {});
     void DismissNotice();
@@ -266,6 +267,9 @@ class App {
     float m_noPcsSince = -1;
     float m_abHeld = 0;
     float m_gripsHeld = 0;  // both grips, for the keyboard
+    float m_sticksHeld = 0; // L3 + R3, for stats overlay
+    float m_r3Held = 0;     // R3 long-press in desktop mode, for recenter
+    int m_lastMouseHand = 1;
     std::string m_spokenProblem;
     Vec3 m_smoothDir[2];
     void ReconnectTick();
@@ -495,8 +499,12 @@ class App {
     struct HandState {
         bool trigger = false, secondary = false, stickClick = false;
         bool menu = false;
+        float menuHeld = 0;
+        bool menuLongFired = false;
         float secondaryHeld = 0;  // B or Y, to tell a press from the A+B chord
         bool chord = false;
+        bool clickLocked = false;
+        float clickLockTime = 0, downU = 0, downV = 0;
         // A pinch on a screen: release soon = click, move = scroll, hold still = right-click.
         enum class Pinch { Undecided, Scrolling, Done } pinch = Pinch::Undecided;
         float pinchTime = 0, pinchStartV = 0, pinchLastV = 0;

@@ -36,8 +36,11 @@ json HeadsetSettings::ToJson() const {
             {"curvature", curvature},
             {"sharpLayers", sharpLayers},
             {"desktopInput", desktopInput},
+            {"usePcKeyboard", usePcKeyboard},
             {"upscaling", upscaling},
-            {"sharpening", sharpening},
+            {"vrSharpen", vrSharpen},
+            {"vrVibrance", vrVibrance},
+            {"vrDarkGamma", vrDarkGamma},
             {"frameGeneration", frameGeneration},
             {"bodyTracking", bodyTracking},
             {"faceTracking", faceTracking},
@@ -107,8 +110,14 @@ void HeadsetSettings::FromJson(const json& j) {
     get("curvature", curvature);
     get("sharpLayers", sharpLayers);
     get("desktopInput", desktopInput);
+    get("usePcKeyboard", usePcKeyboard);
     get("upscaling", upscaling);
-    get("sharpening", sharpening);
+    get("vrSharpen", vrSharpen);
+    vrSharpen = std::clamp(vrSharpen, 0.f, 1.f);
+    get("vrVibrance", vrVibrance);
+    vrVibrance = std::clamp(vrVibrance, 0.f, 0.5f);
+    get("vrDarkGamma", vrDarkGamma);
+    vrDarkGamma = std::clamp(vrDarkGamma, 0.f, 0.35f);
     get("frameGeneration", frameGeneration);
     get("bodyTracking", bodyTracking);
     get("faceTracking", faceTracking);

@@ -37,7 +37,9 @@ struct HeadsetSettings {
     // tuner's own state now - this headset neither shows it nor sends it. An old
     // settings.json keeps the key; Load simply ignores it.
     bool upscaling = false;             // Snapdragon GSR on the VR picture
-    float sharpening = 0.5f;            // 0..1 CAS / layer sharpening (0 = off)
+    float vrSharpen = 0.45f;            // 0..1 AMD CAS adaptive sharpening (0 = off)
+    float vrVibrance = 0.0f;            // 0..0.5 color vibrance boost
+    float vrDarkGamma = 0.0f;           // 0..0.35 smooth shadow gamma boost
     bool frameGeneration = false;       // make a frame from motion when the next is late
     bool bodyTracking = false;          // send the body to SteamVR as trackers
     bool faceTracking = false;          // send the face (and eyes) to the PC, for VRCFaceTracking
@@ -50,6 +52,7 @@ struct HeadsetSettings {
     bool sharpLayers = true;            // monitors as compositor layers
     float screenDistance = 1.35f;
     bool desktopInput = true;           // send pointer and click events to PC monitors
+    bool usePcKeyboard = true;          // prefer Windows touch keyboard over built-in 3D keyboard
 
     // Audio
     bool streamAudio = true;
