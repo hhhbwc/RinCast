@@ -76,11 +76,6 @@ bool App::Init() {
     SettingsStore::Get().Load();
     const Settings settings = SettingsStore::Get().Snapshot();
     SetStartWithWindows(settings.startWithWindows);
-    m_oscEye.SetCallback([this](const rc::GazePayload& g) {
-        if (auto session = m_server.ActiveSession()) session->OnExternalGaze(g);
-    });
-    m_oscEye.Configure(settings.externalEyeTracking, static_cast<uint16_t>(settings.externalEyeOscPort),
-                       settings.externalEyeInvertX, settings.externalEyeInvertY);
     // Default devices a killed streamer left switched to the headset's.
     RunAsync([] { audio::RestoreDefaults(); });
 
@@ -120,6 +115,11 @@ bool App::Init() {
         RC_LOGE("Could not open the stream socket");
         return false;
     }
+    m_oscEye.SetCallback([this](const rc::GazePayload& g) {
+        if (auto session = m_server.ActiveSession()) session->OnExternalGaze(g);
+    });
+    m_oscEye.Configure(settings.externalEyeTracking, static_cast<uint16_t>(settings.externalEyeOscPort),
+                       settings.externalEyeInvertX, settings.externalEyeInvertY);
     m_cloud.Start(&m_server);
     steamvr::WatchForcedDriver();
 

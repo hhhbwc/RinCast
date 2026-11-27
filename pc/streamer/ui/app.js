@@ -828,7 +828,9 @@ function renderOscEyeStatus() {
   const port = osc.port || state.settings.externalEyeOscPort || 9945;
   if (osc.bindError) {
     el.style.color = "#e05252";
-    el.textContent = t("video.externalEyePortBusy", { port });
+    el.textContent = osc.bindError === 10048
+      ? t("video.externalEyePortBusy", { port })
+      : `${t("video.externalEyePortBusy", { port })} (WSA ${osc.bindError})`;
   } else if (osc.active) {
     el.style.color = "#3fb950";
     const nx = Number(osc.lastNormX || 0);

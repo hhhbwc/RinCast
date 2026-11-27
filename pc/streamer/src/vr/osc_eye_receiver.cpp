@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include "rc/platform.h"
+#include "rc/socket.h"
 
 namespace rcs {
 
@@ -411,6 +412,7 @@ bool OscEyeReceiver::ParsePacket(const uint8_t* data, size_t len, bool invertX, 
 }
 
 void OscEyeReceiver::WorkerLoop(uint16_t port) {
+    rc::NetInit();
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) {
         const int err = WSAGetLastError();
