@@ -1949,6 +1949,45 @@ void TestOscEyeReceiverAndSettings() {
         auto nanMsg = BuildOscMsg("/tracking/eye/CenterPitchYaw", ",ff", {std::numeric_limits<float>::quiet_NaN(), 0.0f});
         CHECK(!rcs::OscEyeReceiver::ParsePacket(nanMsg.data(), nanMsg.size(), false, false, state, g, lastAddr, nx, ny, updated));
     }
+
+    // 4. PaperTracker native 72-byte /papertracker/gaze/v1 (,iiiffffff)
+    {
+        auto buildPtV1 = [](uint32_t seq, uint32_t flags, int32_t ageUs, float ly, float lp, float ry, float rp, float fy, float fp) {
+            std::vector<uint8_t> p = {'/', 'p', 'a', 'p', 'e', 'r', 't', 'r', 'a', 'c', 'k', 'e', 'r', '/', 'g', 'a', 'z', 'e',
+                                      '/', 'v', '1', 0, 0, 0, ',', 'i', 'i', 'i', 'f', 'f', 'f', 'f', 'f', 'f', 0, 0};
+            auto pushBe32 = [&](uint32_t v) {
+                p.push_back(uint8_t((v >> 24) & 0xFF));
+                p.push_back(uint8_t((v >> 16) & 0xFF));
+                p.push_back(uint8_t((v >> 8) & 0xFF));
+                p.push_back(uint8_t(v & 0xFF));
+            };
+            auto pushF = [&](float f) {
+                uint32_t b = 0;
+                std::memcpy(&b, &f, 4);
+                pushBe32(b);
+            };
+            pushBe32(seq);
+            pushBe32(flags);
+            pushBe32(uint32_t(ageUs));
+            pushF(ly); pushF(lp); pushF(ry); pushF(rp); pushF(fy); pushF(fp);
+            return p;
+        };
+        rcs::OscEyeParserState state;
+        rc::GazePayload g{};
+        std::string lastAddr;
+        float nx = 0.0f, ny = 0.0f;
+        bool updated = false;
+        auto pt1 = buildPtV1(1, 0x3u, 500, 30.0f, 20.0f, 30.0f, 20.0f, 30.0f, 20.0f);
+        CHECK(pt1.size() == 72);
+        CHECK(rcs::OscEyeReceiver::ParsePacket(pt1.data(), pt1.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated && lastAddr == "/papertracker/gaze/v1");
+        CHECK(g.gaze[0][0] > 0.4f && g.gaze[0][1] > 0.25f && g.gaze[0][2] < -0.5f);  // yaw right (+x), pitch up (+y)
+
+        // Fused-only fallback when left/right valid bits are 0
+        auto pt2 = buildPtV1(2, 0x4u, 500, 0.0f, 0.0f, 0.0f, 0.0f, -25.0f, -15.0f);
+        CHECK(rcs::OscEyeReceiver::ParsePacket(pt2.data(), pt2.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated && g.gaze[0][0] < -0.3f && g.gaze[0][1] < -0.2f);
+    }
     std::printf("streamer OSC eye receiver (OSC 1.0, #bundle, blink hold, malformed guards, port clamp): ok\n");
 }
 

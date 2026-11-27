@@ -23,6 +23,16 @@ constexpr int kMaxBundleDepth = 4;
 constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
 constexpr float kBlinkHoldThreshold = 0.85f;
 constexpr int64_t kActiveTimeoutNs = 500'000'000LL;
+constexpr int64_t kSubscribeRenewNs = 1'000'000'000LL;
+
+// PaperTracker gaze export v1: argument-free OSC messages sent to 127.0.0.1:<port>
+constexpr uint8_t kSubscribeMsg[36] = {
+    '/', 'p', 'a', 'p', 'e', 'r', 't', 'r', 'a', 'c', 'k', 'e', 'r', '/', 'g', 'a', 'z', 'e',
+    '/', 'v', '1', '/', 's', 'u', 'b', 's', 'c', 'r', 'i', 'b', 'e', '\0', ',', '\0', '\0', '\0'};
+constexpr uint8_t kUnsubscribeMsg[40] = {
+    '/', 'p', 'a', 'p', 'e', 'r', 't', 'r', 'a', 'c', 'k', 'e', 'r', '/', 'g', 'a', 'z', 'e',
+    '/', 'v', '1', '/', 'u', 'n', 's', 'u', 'b', 's', 'c', 'r', 'i', 'b', 'e', '\0', '\0', '\0',
+    ',', '\0', '\0', '\0'};
 
 uint32_t ReadBe32(const uint8_t* p) {
     uint32_t v = 0;
@@ -100,6 +110,17 @@ bool NormalizeGazeVec(float x, float y, float z, bool invertX, bool invertY, flo
     return true;
 }
 
+// PaperTracker gaze export v1: tangent-plane angles (tan(yaw), tan(pitch), -1), yaw right, pitch up.
+bool TangentAnglesToVec(float yawDeg, float pitchDeg, bool invertX, bool invertY, float out[3]) {
+    if (!std::isfinite(yawDeg) || !std::isfinite(pitchDeg) || std::fabs(yawDeg) >= 89.0f ||
+        std::fabs(pitchDeg) >= 89.0f) {
+        return false;
+    }
+    const float yd = std::clamp(invertX ? -yawDeg : yawDeg, -55.0f, 55.0f) * kDegToRad;
+    const float pd = std::clamp(invertY ? -pitchDeg : pitchDeg, -45.0f, 45.0f) * kDegToRad;
+    return NormalizeGazeVec(std::tan(yd), std::tan(pd), -1.0f, false, false, out);
+}
+
 void UpdateNormFromGaze(const rc::GazePayload& g, float& outNormX, float& outNormY) {
     float sx = 0.0f, sy = 0.0f;
     int n = 0;
@@ -134,27 +155,27 @@ bool HandleOscMessage(const uint8_t* data, size_t len, bool invertX, bool invert
     if (!ReadOscString(data, len, offset, typeTag)) return false;
     if (typeTag.empty() || typeTag[0] != ',') return false;
 
-    float args[8] = {};
+    float args[10] = {};
     int argCount = 0;
     for (size_t i = 1; i < typeTag.size(); ++i) {
         const char tag = typeTag[i];
         if (tag == 'f') {
             if (offset + 4 > len) return false;
-            if (argCount < 8) args[argCount++] = ReadBeFloat(data + offset);
+            if (argCount < 10) args[argCount++] = ReadBeFloat(data + offset);
             offset += 4;
         } else if (tag == 'd') {
             if (offset + 8 > len) return false;
-            if (argCount < 8) args[argCount++] = static_cast<float>(ReadBeDouble(data + offset));
+            if (argCount < 10) args[argCount++] = static_cast<float>(ReadBeDouble(data + offset));
             offset += 8;
         } else if (tag == 'i') {
             if (offset + 4 > len) return false;
             const int32_t iv = static_cast<int32_t>(ReadBe32(data + offset));
-            if (argCount < 8) args[argCount++] = static_cast<float>(iv);
+            if (argCount < 10) args[argCount++] = static_cast<float>(iv);
             offset += 4;
         } else if (tag == 'T') {
-            if (argCount < 8) args[argCount++] = 1.0f;
+            if (argCount < 10) args[argCount++] = 1.0f;
         } else if (tag == 'F') {
-            if (argCount < 8) args[argCount++] = 0.0f;
+            if (argCount < 10) args[argCount++] = 0.0f;
         } else {
             // Unsupported type tag: safely ignore this message.
             return false;
@@ -162,6 +183,32 @@ bool HandleOscMessage(const uint8_t* data, size_t len, bool invertX, bool invert
     }
 
     outLastAddress = address;
+
+    // PaperTracker native gaze export v1: /papertracker/gaze/v1 ,iiiffffff
+    if (address == "/papertracker/gaze/v1" && typeTag == ",iiiffffff" && len == 72) {
+        const uint32_t ptFlags = ReadBe32(data + 36 + 4);
+        const bool leftValid = (ptFlags & 1u) != 0;
+        const bool rightValid = (ptFlags & 2u) != 0;
+        const bool fusedValid = (ptFlags & 4u) != 0;
+        rc::GazePayload g{};
+        if (leftValid && TangentAnglesToVec(args[3], args[4], invertX, invertY, g.gaze[0])) {
+            g.flags |= rc::kGazeLeftValid;
+        } else if (fusedValid && TangentAnglesToVec(args[7], args[8], invertX, invertY, g.gaze[0])) {
+            g.flags |= rc::kGazeLeftValid;
+        }
+        if (rightValid && TangentAnglesToVec(args[5], args[6], invertX, invertY, g.gaze[1])) {
+            g.flags |= rc::kGazeRightValid;
+        } else if (fusedValid && TangentAnglesToVec(args[7], args[8], invertX, invertY, g.gaze[1])) {
+            g.flags |= rc::kGazeRightValid;
+        }
+        if (g.flags == 0) return false;
+        state.lastValidGaze = g;
+        state.hasValidGaze = true;
+        outGaze = g;
+        UpdateNormFromGaze(g, outNormX, outNormY);
+        outUpdatedGaze = true;
+        return true;
+    }
 
     // Blink protection updates
     if (address == "/tracking/eye/EyesClosedAmount" && argCount >= 1) {
@@ -377,19 +424,25 @@ void OscEyeReceiver::WorkerLoop(uint16_t port) {
     DWORD timeoutMs = 200;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port);
-    if (bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+    // Bind an ephemeral loopback port so we can subscribe to PaperTracker (which owns 127.0.0.1:port).
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local.sin_port = 0;
+    if (bind(s, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR) {
         const int err = WSAGetLastError();
-        RC_LOGW("OSC eye receiver: bind 127.0.0.1:%u failed (%d)", unsigned(port), err);
+        RC_LOGW("OSC eye receiver: bind loopback failed (%d)", err);
         closesocket(s);
         std::lock_guard lock(m_statusMutex);
         m_status.listening = false;
         m_status.bindError = err;
         return;
     }
+
+    sockaddr_in target{};
+    target.sin_family = AF_INET;
+    target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    target.sin_port = htons(port);
 
     {
         std::lock_guard lock(m_sockMutex);
@@ -400,15 +453,23 @@ void OscEyeReceiver::WorkerLoop(uint16_t port) {
         m_status.listening = true;
         m_status.bindError = 0;
     }
-    RC_LOGI("OSC eye receiver listening on 127.0.0.1:%u", unsigned(port));
+    RC_LOGI("OSC eye receiver subscribing to PaperTracker at 127.0.0.1:%u", unsigned(port));
 
     OscEyeParserState parserState;
     uint8_t buf[4096];
     int64_t rateWindowStartNs = rc::NowNs();
+    int64_t nextSubscribeNs = 0;
     uint32_t ratePackets = 0;
     float currentRateHz = 0.0f;
 
     while (m_running.load(std::memory_order_acquire)) {
+        const int64_t nowBefore = rc::NowNs();
+        if (nowBefore >= nextSubscribeNs) {
+            sendto(s, reinterpret_cast<const char*>(kSubscribeMsg), sizeof(kSubscribeMsg), 0,
+                   reinterpret_cast<const sockaddr*>(&target), sizeof(target));
+            nextSubscribeNs = nowBefore + kSubscribeRenewNs;
+        }
+
         const int n = recvfrom(s, reinterpret_cast<char*>(buf), sizeof(buf), 0, nullptr, nullptr);
         const int64_t nowNs = rc::NowNs();
         if (nowNs - rateWindowStartNs >= 1'000'000'000LL) {
@@ -418,6 +479,15 @@ void OscEyeReceiver::WorkerLoop(uint16_t port) {
             rateWindowStartNs = nowNs;
             std::lock_guard lock(m_statusMutex);
             m_status.rateHz = currentRateHz;
+        }
+        if (n == SOCKET_ERROR) {
+            const int err = WSAGetLastError();
+            if (err == WSAECONNRESET) {
+                std::lock_guard lock(m_statusMutex);
+                m_status.active = false;
+                m_status.rateHz = 0.0f;
+            }
+            continue;
         }
         if (n <= 0) continue;
 
@@ -450,6 +520,8 @@ void OscEyeReceiver::WorkerLoop(uint16_t port) {
         }
     }
 
+    sendto(s, reinterpret_cast<const char*>(kUnsubscribeMsg), sizeof(kUnsubscribeMsg), 0,
+           reinterpret_cast<const sockaddr*>(&target), sizeof(target));
     CloseSocket();
     RC_LOGI("OSC eye receiver stopped");
 }
