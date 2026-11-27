@@ -38,6 +38,7 @@
 
 #include "encode/color_convert.h"
 #include "encode/encoder.h"
+#include "vr/osc_eye_receiver.h"
 #include "gpu.h"
 #include "nlohmann/json.hpp"
 #include "rc/connection.h"
@@ -1827,6 +1828,130 @@ void TestSlicedEncodingConfigAndNvencIdr() {
     std::printf("streamer sliced encoding (config + NVENC 4-slice HEVC IDR NAL & <40M single-slice fallback): ok\n");
 }
 
+static std::vector<uint8_t> BuildOscMsg(const std::string& addr, const std::string& tags, const std::vector<float>& floats) {
+    auto pushStr = [](std::vector<uint8_t>& out, const std::string& s) {
+        out.insert(out.end(), s.begin(), s.end());
+        out.push_back(0);
+        while (out.size() % 4 != 0) out.push_back(0);
+    };
+    auto pushBe32 = [](std::vector<uint8_t>& out, uint32_t v) {
+        out.push_back(uint8_t((v >> 24) & 0xFF));
+        out.push_back(uint8_t((v >> 16) & 0xFF));
+        out.push_back(uint8_t((v >> 8) & 0xFF));
+        out.push_back(uint8_t(v & 0xFF));
+    };
+    std::vector<uint8_t> msg;
+    pushStr(msg, addr);
+    pushStr(msg, tags);
+    for (float f : floats) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &f, 4);
+        pushBe32(msg, bits);
+    }
+    return msg;
+}
+
+static std::vector<uint8_t> BuildOscBundle(const std::vector<std::vector<uint8_t>>& elems) {
+    std::vector<uint8_t> b = {'#', 'b', 'u', 'n', 'd', 'l', 'e', 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    for (const auto& e : elems) {
+        const uint32_t sz = uint32_t(e.size());
+        b.push_back(uint8_t((sz >> 24) & 0xFF));
+        b.push_back(uint8_t((sz >> 16) & 0xFF));
+        b.push_back(uint8_t((sz >> 8) & 0xFF));
+        b.push_back(uint8_t(sz & 0xFF));
+        b.insert(b.end(), e.begin(), e.end());
+    }
+    return b;
+}
+
+void TestOscEyeReceiverAndSettings() {
+    // 1. Settings persistence & port clamp
+    {
+        rcs::Settings def;
+        CHECK(!def.externalEyeTracking);
+        CHECK(def.externalEyeOscPort == 9945);
+        CHECK(!def.externalEyeInvertX);
+        CHECK(!def.externalEyeInvertY);
+
+        rcs::Settings s;
+        s.FromJson(rcs::json{{"externalEyeTracking", true},
+                             {"externalEyeOscPort", 0},
+                             {"externalEyeInvertX", true},
+                             {"externalEyeInvertY", true}});
+        CHECK(s.externalEyeTracking);
+        CHECK(s.externalEyeOscPort == 1024);
+        CHECK(s.externalEyeInvertX);
+        CHECK(s.externalEyeInvertY);
+
+        s.FromJson(rcs::json{{"externalEyeOscPort", 99999}});
+        CHECK(s.externalEyeOscPort == 65535);
+    }
+
+    // 2. OSC 1.0 coordinate conversion + invertX/Y
+    {
+        rcs::OscEyeParserState state;
+        rc::GazePayload g{};
+        std::string lastAddr;
+        float nx = 0.0f, ny = 0.0f;
+        bool updated = false;
+
+        auto msg0 = BuildOscMsg("/tracking/eye/CenterPitchYaw", ",ff", {0.0f, 0.0f});
+        CHECK(rcs::OscEyeReceiver::ParsePacket(msg0.data(), msg0.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated);
+        CHECK(std::fabs(g.gaze[0][0]) < 1e-5f && std::fabs(g.gaze[0][1]) < 1e-5f && std::fabs(g.gaze[0][2] + 1.0f) < 1e-5f);
+
+        auto msgYaw = BuildOscMsg("/tracking/eye/LeftRightPitchYaw", ",ffff", {0.0f, 30.0f, 0.0f, 30.0f});
+        CHECK(rcs::OscEyeReceiver::ParsePacket(msgYaw.data(), msgYaw.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated && g.gaze[0][0] > 0.4f && g.gaze[0][2] < -0.5f);
+        CHECK(rcs::OscEyeReceiver::ParsePacket(msgYaw.data(), msgYaw.size(), true, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated && g.gaze[0][0] < -0.4f);
+
+        auto msgPitch = BuildOscMsg("/tracking/eye/CenterPitchYaw", ",ff", {20.0f, 0.0f});
+        CHECK(rcs::OscEyeReceiver::ParsePacket(msgPitch.data(), msgPitch.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated && g.gaze[0][1] < -0.3f);
+        CHECK(rcs::OscEyeReceiver::ParsePacket(msgPitch.data(), msgPitch.size(), false, true, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated && g.gaze[0][1] > 0.3f);
+    }
+
+    // 3. LeftRightVec (+z flip), FT/v2 params, #bundle, blink hold, and malformed/NaN guards
+    {
+        rcs::OscEyeParserState state;
+        rc::GazePayload g{};
+        std::string lastAddr;
+        float nx = 0.0f, ny = 0.0f;
+        bool updated = false;
+
+        auto vecMsg = BuildOscMsg("/tracking/eye/LeftRightVec", ",ffffff", {0.0f, 0.0f, 1.0f, 0.1f, 0.0f, 0.99f});
+        CHECK(rcs::OscEyeReceiver::ParsePacket(vecMsg.data(), vecMsg.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated && g.gaze[0][2] < -0.9f && g.gaze[1][2] < -0.9f);
+
+        auto blinkOn = BuildOscMsg("/tracking/eye/EyesClosedAmount", ",f", {0.95f});
+        CHECK(rcs::OscEyeReceiver::ParsePacket(blinkOn.data(), blinkOn.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(!updated);
+        auto heldGaze = BuildOscMsg("/tracking/eye/CenterPitchYaw", ",ff", {-30.0f, -30.0f});
+        CHECK(rcs::OscEyeReceiver::ParsePacket(heldGaze.data(), heldGaze.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(!updated);  // held during blink
+        CHECK(g.gaze[0][2] < -0.9f);
+
+        auto blinkOff = BuildOscMsg("/tracking/eye/EyesClosedAmount", ",f", {0.0f});
+        CHECK(rcs::OscEyeReceiver::ParsePacket(blinkOff.data(), blinkOff.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        auto b = BuildOscBundle({
+            BuildOscMsg("/avatar/parameters/FT/v2/EyeLeftX", ",f", {0.5f}),
+            BuildOscMsg("/avatar/parameters/FT/v2/EyeLeftY", ",f", {0.5f}),
+        });
+        CHECK(rcs::OscEyeReceiver::ParsePacket(b.data(), b.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated && g.gaze[0][0] > 0.2f && g.gaze[0][1] > 0.1f);
+
+        // Malformed / truncated / NaN
+        CHECK(!rcs::OscEyeReceiver::ParsePacket(nullptr, 0, false, false, state, g, lastAddr, nx, ny, updated));
+        const uint8_t noNul[] = {'/', 't', 'e', 's', 't', 'a', 'b', 'c'};
+        CHECK(!rcs::OscEyeReceiver::ParsePacket(noNul, sizeof(noNul), false, false, state, g, lastAddr, nx, ny, updated));
+        auto nanMsg = BuildOscMsg("/tracking/eye/CenterPitchYaw", ",ff", {std::numeric_limits<float>::quiet_NaN(), 0.0f});
+        CHECK(!rcs::OscEyeReceiver::ParsePacket(nanMsg.data(), nanMsg.size(), false, false, state, g, lastAddr, nx, ny, updated));
+    }
+    std::printf("streamer OSC eye receiver (OSC 1.0, #bundle, blink hold, malformed guards, port clamp): ok\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1843,6 +1968,7 @@ int main() {
     TestLayerReprojection();
     Test10BitPipelineDitherStereoAndSrgb();
     TestSlicedEncodingConfigAndNvencIdr();
+    TestOscEyeReceiverAndSettings();
     CoUninitialize();
 
     std::error_code ec;

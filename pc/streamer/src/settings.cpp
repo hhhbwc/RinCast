@@ -45,6 +45,7 @@ json Settings::ToJson(bool forUi) const {
         {"pcBitrateWins", pcBitrateWins},
         {"fecPercent", fecPercent},
         {"foveatedEncoding", foveatedEncoding},
+        {"externalEyeTracking", externalEyeTracking},
         {"adaptiveQuantization", adaptiveQuantization},
         {"twoPassEncoding", twoPassEncoding},
         {"vrSlicedEncoding", vrSlicedEncoding},
@@ -57,6 +58,9 @@ json Settings::ToJson(bool forUi) const {
         {"audioDevices", audioDevices},
         {"openxrRuntime", openxrRuntime},
         {"autoRegisterSteamVrDriver", autoRegisterSteamVrDriver},
+        {"externalEyeOscPort", externalEyeOscPort},
+        {"externalEyeInvertX", externalEyeInvertX},
+        {"externalEyeInvertY", externalEyeInvertY},
         {"cloudUrl", cloudUrl},
         {"allowRemote", allowRemote},
         {"cloudUserName", cloudUserName},
@@ -106,6 +110,7 @@ void Settings::FromJson(const json& j) {
     get("pcBitrateWins", pcBitrateWins);
     get("fecPercent", fecPercent);
     get("foveatedEncoding", foveatedEncoding);
+    get("externalEyeTracking", externalEyeTracking);
     get("adaptiveQuantization", adaptiveQuantization);
     get("twoPassEncoding", twoPassEncoding);
     get("desktopMaxHeight", desktopMaxHeight);
@@ -117,6 +122,9 @@ void Settings::FromJson(const json& j) {
     get("audioDevices", audioDevices);
     get("openxrRuntime", openxrRuntime);
     get("autoRegisterSteamVrDriver", autoRegisterSteamVrDriver);
+    get("externalEyeOscPort", externalEyeOscPort);
+    get("externalEyeInvertX", externalEyeInvertX);
+    get("externalEyeInvertY", externalEyeInvertY);
     get("cloudUrl", cloudUrl);
     get("allowRemote", allowRemote);
     get("cloudRefreshTokenProtected", cloudRefreshTokenProtected);
@@ -161,6 +169,7 @@ void Settings::FromJson(const json& j) {
     vrBitrateMbps = std::clamp(vrBitrateMbps, 10, 500);
     desktopBitrateMbps = std::clamp(desktopBitrateMbps, 5, 200);
     fecPercent = std::clamp(fecPercent, 0, 25);
+    externalEyeOscPort = std::clamp(externalEyeOscPort, 1024, 65535);
     streamProfile = std::clamp(streamProfile, 0, 2);
     // 0 = follow the profile; otherwise clamp to the supported range.
     encodeScalePct = encodeScalePct > 0 ? std::clamp(encodeScalePct, 50, 100) : 0;

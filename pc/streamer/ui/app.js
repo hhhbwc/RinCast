@@ -142,6 +142,12 @@ listeners.push((msg) => {
       renderHome();
       renderStatus();
       break;
+    case "oscEye":
+      if (state) {
+        state.oscEye = msg.oscEye;
+        renderOscEyeStatus();
+      }
+      break;
   }
 });
 
@@ -211,7 +217,12 @@ function settingError(el, text) {
 function commitSetting(el) {
   const key = el.dataset.setting;
   let value = el.type === "checkbox" ? el.checked : el.value;
-  if (el.type === "range" || (el.type === "radio" && /^\d+$/.test(value))) value = Number(value);
+  if (el.type === "range" || el.type === "number" || (el.type === "radio" && /^\d+$/.test(value))) value = Number(value);
+  if (key === "externalEyeOscPort") {
+    if (!Number.isFinite(value) || value < 1024 || value > 65535) value = 9945;
+    value = Math.round(value);
+    el.value = value;
+  }
   if (key === "pcName" && !String(value).trim()) {
     settingError(el, t("err.pcName"));
     el.value = state.settings.pcName;
@@ -785,6 +796,7 @@ function renderDependents() {
   const squeeze = !!state.session?.headsetGazeFoveation;
   $("#foveatedRow input").checked = !!state.settings.foveatedEncoding;
   setOff($("#foveatedRow"), !nvenc || squeeze);
+  renderOscEyeStatus();
   // Two-pass is the user's own switch. A profile no longer forces it on (the old
   // Best-picture behaviour surprised users who had left it off), so the checkbox
   // simply mirrors the setting and is only greyed when the encoder can't do it.
@@ -799,6 +811,35 @@ function renderDependents() {
   setOff($("#cbrRow"), cbrBlockedByLink);
   setOff($("#playOnPcRow"), !state.settings.streamAudio);
   setOff($("#micRow"), state.settings.audioDevices === "system");
+}
+
+function renderOscEyeStatus() {
+  if (!state) return;
+  const on = !!state.settings.externalEyeTracking;
+  const opts = $("#externalEyeOpts");
+  if (opts) opts.hidden = !on;
+  const el = $("#externalEyeStatus");
+  if (!el) return;
+  if (!on) {
+    el.textContent = "";
+    return;
+  }
+  const osc = state.oscEye || {};
+  const port = osc.port || state.settings.externalEyeOscPort || 9945;
+  if (osc.bindError) {
+    el.style.color = "#e05252";
+    el.textContent = t("video.externalEyePortBusy", { port });
+  } else if (osc.active) {
+    el.style.color = "#3fb950";
+    const nx = Number(osc.lastNormX || 0);
+    const ny = Number(osc.lastNormY || 0);
+    const sx = `${nx >= 0 ? "+" : ""}${nx.toFixed(2)}`;
+    const sy = `${ny >= 0 ? "+" : ""}${ny.toFixed(2)}`;
+    el.textContent = `${t("video.externalEyeConnected", { hz: Math.round(osc.rateHz || 0), addr: osc.lastAddress || "" })} (X: ${sx}, Y: ${sy})`;
+  } else {
+    el.style.color = "";
+    el.textContent = t("video.externalEyeWaiting", { port });
+  }
 }
 
 function renderAudio() {
@@ -1078,7 +1119,7 @@ function mock(msg) {
   const audio = { speaker: false, microphone: false, microphoneFeed: false, steam: { speaker: !(demo === "problem"), microphone: !(demo === "problem") }, active: demo === "problem" ? {} : { speaker: "steam", microphone: "steam" } };
   const base = mock.base ||= {
     type: "state", version: "1.0.0", downloadUrl: "https://rincast.com/#download", downloadSite: "rincast.com",
-    settings: { pcName: "Studio PC", codec: "auto", tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, autoTune: false, streamProfile: 1, profileControlsVideo: false, qualityProfileCbr: false, fillMode: false, encodeScalePct: 0, pcBitrateWins: false, fecPercent: 5, foveatedEncoding: false, adaptiveQuantization: true, twoPassEncoding: false, vrSlicedEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: "auto", autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: true, preventSleep: true, cloudUrl: "https://rincast.com", allowRemote: true,
+    settings: { pcName: "Studio PC", codec: "auto", tenBit: false, vrBitrateMbps: 200, desktopBitrateMbps: 40, adaptiveBitrate: true, autoTune: false, streamProfile: 1, profileControlsVideo: false, qualityProfileCbr: false, fillMode: false, encodeScalePct: 0, pcBitrateWins: false, fecPercent: 5, foveatedEncoding: false, externalEyeTracking: false, externalEyeOscPort: 9945, externalEyeInvertX: false, externalEyeInvertY: false, adaptiveQuantization: true, twoPassEncoding: false, vrSlicedEncoding: false, desktopMaxHeight: 0, streamAudio: true, playOnPcToo: false, micPassthrough: true, switchDefaultAudio: true, audioDevices: "auto", autoRegisterSteamVrDriver: true, requireApproval: true, desktopInput: true, startWithWindows: true, preventSleep: true, cloudUrl: "https://rincast.com", allowRemote: true,
       trustedDevices: none ? [] : [{ id: "q3", name: "Quest 3", model: "Meta Quest 3", lastSeen: Date.now() / 1000 }] },
     cloud: demo === "signedout" || demo === "firstrun" ? { signedIn: false } : { signedIn: true, userName: "Sam", email: "sam@example.com", status: demo === "problem" ? "error" : "online", error: demo === "problem" ? "The server didn't answer." : "", allowRemote: true },
     system: { gpu: demo === "problem" ? "Microsoft Basic Display Adapter" : "NVIDIA GeForce RTX 5070 Ti", port: 38711, addresses: ["192.168.1.20"], vpnAddresses: demo === "vpn" ? [{ name: "Tailscale", address: "100.101.102.103" }] : [], firewall: { otherNetworksOpen: demo !== "problem", publicInUse: demo === "public", publicAllowed: false, publicUnguarded: false }, encoder: demo === "problem" ? {} : { backend: "nvenc", h264: true, hevc: true, av1: true, hevc10: true },

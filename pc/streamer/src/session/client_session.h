@@ -92,6 +92,7 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     void OwnSyncedSettings(const json& changed, const std::function<void()>& save);
     // Rebuild streams affected by build-time settings; live picture-tier moves do not call this.
     void OnStreamProfileChanged();
+    void OnExternalGaze(const rc::GazePayload& gaze);
     void OnMonitorsChanged();
     // ROUND19 T3: the user's manual reset is the only way the autoscale ladder
     // climbs back to 100 %; the rebuilt stream picks the new level up on the hot path.
@@ -164,6 +165,7 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
     // "Let headsets use the mouse and keyboard": checked on every input event, so not a
     // settings snapshot each time.
     std::atomic<bool> m_inputAllowed{true};
+    std::atomic<int64_t> m_lastExternalGazeNs{0};
     void ApplyInputSetting(bool announce);
 
     // Control work happens off the network thread.

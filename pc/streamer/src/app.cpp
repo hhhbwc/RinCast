@@ -76,6 +76,11 @@ bool App::Init() {
     SettingsStore::Get().Load();
     const Settings settings = SettingsStore::Get().Snapshot();
     SetStartWithWindows(settings.startWithWindows);
+    m_oscEye.SetCallback([this](const rc::GazePayload& g) {
+        if (auto session = m_server.ActiveSession()) session->OnExternalGaze(g);
+    });
+    m_oscEye.Configure(settings.externalEyeTracking, static_cast<uint16_t>(settings.externalEyeOscPort),
+                       settings.externalEyeInvertX, settings.externalEyeInvertY);
     // Default devices a killed streamer left switched to the headset's.
     RunAsync([] { audio::RestoreDefaults(); });
 
@@ -125,6 +130,7 @@ bool App::Init() {
 }
 
 void App::Shutdown() {
+    m_oscEye.Stop();
     m_server.Stop();
     m_cloud.Stop();
     m_bridge.Stop();
@@ -267,6 +273,17 @@ json App::StateJson() {
     }
     std::lock_guard lock(m_uiMutex);
     state["pendingApproval"] = m_pendingApproval;
+    const OscEyeStatus osc = m_oscEye.Status();
+    state["oscEye"] = {{"enabled", osc.enabled},
+                       {"listening", osc.listening},
+                       {"active", osc.active},
+                       {"port", osc.port},
+                       {"bindError", osc.bindError},
+                       {"rateHz", osc.rateHz},
+                       {"lastNormX", osc.lastNormX},
+                       {"lastNormY", osc.lastNormY},
+                       {"lastAddress", osc.lastAddress},
+                       {"unrecognizedPackets", osc.unrecognizedPackets}};
     return state;
 }
 
@@ -327,6 +344,21 @@ void App::Tick() {
         if (SettingsStore::Get().Snapshot().preventSleep)
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
     }
+    const OscEyeStatus osc = m_oscEye.Status();
+    if (osc.enabled) {
+        PushUi({{"type", "oscEye"},
+                {"oscEye",
+                 {{"enabled", osc.enabled},
+                  {"listening", osc.listening},
+                  {"active", osc.active},
+                  {"port", osc.port},
+                  {"bindError", osc.bindError},
+                  {"rateHz", osc.rateHz},
+                  {"lastNormX", osc.lastNormX},
+                  {"lastNormY", osc.lastNormY},
+                  {"lastAddress", osc.lastAddress},
+                  {"unrecognizedPackets", osc.unrecognizedPackets}}}});
+    }
 }
 
 std::string App::ApplySettingSideEffects(const json& changed) {
@@ -336,6 +368,12 @@ std::string App::ApplySettingSideEffects(const json& changed) {
         SettingsStore::Get().Update([](Settings& s) { s.startWithWindows = !s.startWithWindows; });
     }
     if (changed.contains("pcName") || changed.contains("allowRemote") || changed.contains("cloudUrl")) m_cloud.Wake();
+    if (changed.contains("externalEyeTracking") || changed.contains("externalEyeOscPort") ||
+        changed.contains("externalEyeInvertX") || changed.contains("externalEyeInvertY")) {
+        const Settings s = SettingsStore::Get().Snapshot();
+        m_oscEye.Configure(s.externalEyeTracking, static_cast<uint16_t>(s.externalEyeOscPort),
+                           s.externalEyeInvertX, s.externalEyeInvertY);
+    }
     if (auto session = m_server.ActiveSession()) {
         session->OnSettingsChanged(changed);
         // PC 视频参数在建流时读取；复用 session worker，只重建已有流。
@@ -346,7 +384,8 @@ std::string App::ApplySettingSideEffects(const json& changed) {
             changed.contains("videoPacingMode") || changed.contains("qualityProfileCbr") ||
             changed.contains("fillMode") ||
             changed.contains("fecPercent") ||
-            changed.contains("foveatedEncoding") || changed.contains("adaptiveQuantization") ||
+            changed.contains("foveatedEncoding") || changed.contains("externalEyeTracking") ||
+            changed.contains("adaptiveQuantization") ||
             changed.contains("vrSlicedEncoding") ||
             changed.contains("twoPassEncoding") || changed.contains("encodeScalePct") ||
             changed.contains("l7Autoscale") ||

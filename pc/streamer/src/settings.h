@@ -114,6 +114,7 @@ struct Settings {
     // dead switch a reader would wonder about.
     int fecPercent = 5;
     bool foveatedEncoding = false;  // VR: fewer bits towards the lens edges
+    bool externalEyeTracking = false;  // External PC-side eye tracking (OSC / PaperTracker)
     bool adaptiveQuantization = true;
     bool twoPassEncoding = false;  // VR only; desktop streams always use two passes
     int desktopMaxHeight = 0;      // 0 = native
@@ -129,6 +130,9 @@ struct Settings {
     // VR
     std::string openxrRuntime = "steamvr";  // rincast | steamvr (what we make active while streaming)
     bool autoRegisterSteamVrDriver = true;
+    int externalEyeOscPort = 9945;
+    bool externalEyeInvertX = false;
+    bool externalEyeInvertY = false;
 
     // Cloud
     std::string cloudUrl = "https://rincast.com";

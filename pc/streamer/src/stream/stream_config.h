@@ -130,8 +130,11 @@ inline VrStreamBuild BuildVrStreamConfig(const Settings& pc, const ClientStreamS
     // Start from the plain (un-foveated) base; the foveated block overrides it.
     uint32_t codedEyeW = rc::ScaledEncodeSize(cfg.eyeWidth * 2, cfg.encodeScale) / 2;
     uint32_t codedEyeH = rc::ScaledEncodeSize(cfg.eyeHeight, cfg.encodeScale);
-    if (st.gazeFoveation && cfg.encodeScale >= 1.0f) {
-        cfg.foveaSize = st.eyesTracked ? Foveator::kFoveaSize : Foveator::kFixedFoveaSize;
+    const bool externalEyes = pc.externalEyeTracking;
+    const bool effectiveFoveate = st.gazeFoveation || externalEyes;
+    const bool effectiveEyesTracked = st.eyesTracked || externalEyes;
+    if (effectiveFoveate && cfg.encodeScale >= 1.0f) {
+        cfg.foveaSize = effectiveEyesTracked ? Foveator::kFoveaSize : Foveator::kFixedFoveaSize;
         // When the user lets the profiles drive video settings, each one floors the
         // full-density centre at its own share (latency 0.6, balanced 0.7, quality 0.8)
         // and only ever raises; matched-SteamVR sizes and the slow internet path pick
@@ -256,7 +259,7 @@ inline rc::AutoTuneInput BuildAutoTuneInput(const Settings& pc, const ClientStre
     const bool squeeze = built.foveatedEyeWidth > 0 && built.foveatedEyeHeight > 0;
     in.foveaOn = squeeze;
     // The headset's own switch; auto never writes synced keys.
-    in.foveaPossible = st.gazeFoveation;
+    in.foveaPossible = st.gazeFoveation || pc.externalEyeTracking;
     // A84b §3 above: `pc` is the EFFECTIVE snapshot (see ClientSession::RunAutoTune),
     // so this is the rung the live streams are built at - the only thing auto may move.
     in.profileId = pc.streamProfile;

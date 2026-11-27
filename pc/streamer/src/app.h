@@ -16,6 +16,7 @@
 #include "gpu.h"
 #include "net/stream_server.h"
 #include "util.h"
+#include "vr/osc_eye_receiver.h"
 #include "vr/vr_bridge_host.h"
 
 namespace rcs {
@@ -70,6 +71,7 @@ class App {
 
     StreamServer m_server;
     VrBridgeHost m_bridge;
+    OscEyeReceiver m_oscEye;
     CloudClient m_cloud;
     std::mutex m_firewallMutex;
     firewall::Status m_firewall;

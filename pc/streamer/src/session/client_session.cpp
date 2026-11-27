@@ -442,10 +442,14 @@ void ClientSession::OnPacket(rc::PacketType type, const uint8_t* payload, size_t
             MeasurePoseWait(s.receivedPcNs);
             // Where the eyes look comes after the poses, from headsets doing foveated encoding.
             if (size >= sizeof(t) + sizeof(rc::GazePayload)) {
-                rc::GazePayload g;
-                std::memcpy(&g, payload + sizeof(t), sizeof(g));
-                std::lock_guard lock(m_mutex);
-                if (m_vr) m_vr->SetGaze(g);
+                const bool externalFresh =
+                    (rc::NowNs() - m_lastExternalGazeNs.load(std::memory_order_relaxed)) < 500'000'000LL;
+                if (!externalFresh) {
+                    rc::GazePayload g;
+                    std::memcpy(&g, payload + sizeof(t), sizeof(g));
+                    std::lock_guard lock(m_mutex);
+                    if (m_vr) m_vr->SetGaze(g);
+                }
             }
             break;
         }
@@ -1045,6 +1049,12 @@ void ClientSession::OnStreamProfileChanged() {
     Enqueue(json{{"type", "_profile"}});
 }
 
+void ClientSession::OnExternalGaze(const rc::GazePayload& gaze) {
+    m_lastExternalGazeNs.store(rc::NowNs(), std::memory_order_relaxed);
+    std::lock_guard lock(m_mutex);
+    if (m_vr) m_vr->SetGaze(gaze);
+}
+
 void ClientSession::ResetAutoscale() {
     {
         std::lock_guard lock(m_mutex);
@@ -1503,11 +1513,16 @@ void ClientSession::StartVr() {
     VrStreamConfig cfg = vrBuild.cfg;
     const uint32_t codedEyeW = vrBuild.codedEyeWidth;
     const uint32_t codedEyeH = vrBuild.codedEyeHeight;
-    if (st.gazeFoveation && cfg.encodeScale >= 1.0f) {
+    const bool externalEyes = SettingsStore::Get().Snapshot().externalEyeTracking;
+    const bool effectiveFoveate = st.gazeFoveation || externalEyes;
+    if (effectiveFoveate && cfg.encodeScale >= 1.0f) {
+        const char* gazeSource = externalEyes       ? "where the eyes look (external OSC)"
+                                 : st.eyesTracked ? "where the eyes look"
+                                                  : "at the lens centre";
         RC_LOGI("VR stream: foveated %s, encoding %ux%u per eye (scaled from %ux%u)",
-                st.eyesTracked ? "where the eyes look" : "at the lens centre",
+                gazeSource,
                 codedEyeW, codedEyeH, cfg.foveatedEyeWidth, cfg.foveatedEyeHeight);
-    } else if (st.gazeFoveation) {
+    } else if (effectiveFoveate) {
         // ROUND18 L2-FIX3: the user still has foveation on, but a scaled frame
         // cannot carry it. The full-density centre needs F*eye pixels; below that
         // s = (encEye/eye - F)/(1-F) goes negative and both shaders fold back,

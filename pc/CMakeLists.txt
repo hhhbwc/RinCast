@@ -188,6 +188,7 @@ add_executable(rincast-streamer-tests ../tools/streamer-tests/main.cpp
   streamer/src/settings.cpp
   streamer/src/util.cpp
   streamer/src/vr/vr_bridge_host.cpp
+  streamer/src/vr/osc_eye_receiver.cpp
   streamer/src/gpu.cpp
   streamer/src/encode/color_convert.cpp
   streamer/src/encode/encoder.cpp
