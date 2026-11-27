@@ -736,11 +736,13 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
         if (it == m_swapSets.end()) return;
         const auto set = it->second;
         for (auto h : set->handles) m_swapSets.erase(h);
+        m_srvCacheDirty.store(true, std::memory_order_release);
     }
     void DestroyAllSwapTextureSets(uint32_t pid) override {
         std::lock_guard lock(m_layerMutex);
         for (auto it = m_swapSets.begin(); it != m_swapSets.end();)
             it = it->second->pid == pid ? m_swapSets.erase(it) : std::next(it);
+        m_srvCacheDirty.store(true, std::memory_order_release);
     }
     void GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t handles[2], uint32_t (*indices)[2]) override {
         std::lock_guard lock(m_layerMutex);
@@ -1028,6 +1030,7 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
         if (m_textureGeneration != s->configGeneration || !m_slots[slot]) {
             if (m_textureGeneration != s->configGeneration) {
                 for (auto& t : m_slots) t.Reset();
+                m_dstRtvs.clear();
                 m_textureGeneration = s->configGeneration;
             }
             if (FAILED(m_device->OpenSharedResourceByName(s->textureNames[slot], DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
@@ -1063,22 +1066,37 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
             case DXGI_FORMAT_R32G32B32A32_FLOAT: srgbOut = true; break;
             default: break;
         }
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvd{};
-        srvd.Format = srvFormat;
-        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvd.Texture2D.MipLevels = 1;
+        if (m_srvCacheDirty.exchange(false, std::memory_order_acquire)) m_srcSrvs.clear();
         ComPtr<ID3D11ShaderResourceView> srv;
-        if (FAILED(m_device->CreateShaderResourceView(src, &srvd, &srv))) return;
+        if (auto it = m_srcSrvs.find(src); it != m_srcSrvs.end() && it->second.first == srvFormat) {
+            srv = it->second.second;
+        } else {
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvd{};
+            srvd.Format = srvFormat;
+            srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvd.Texture2D.MipLevels = 1;
+            if (FAILED(m_device->CreateShaderResourceView(src, &srvd, &srv))) return;
+            if (m_srcSrvs.size() >= 64) m_srcSrvs.clear();
+            m_srcSrvs[src] = {srvFormat, srv};
+        }
         D3D11_TEXTURE2D_DESC ddesc{};
         dst->GetDesc(&ddesc);
         const bool dst10Bit = ddesc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
                               ddesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM;
-        D3D11_RENDER_TARGET_VIEW_DESC rtvd{};
-        rtvd.Format = dst10Bit ? DXGI_FORMAT_R10G10B10A2_UNORM
-                               : (srgbOut ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM);
-        rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        const DXGI_FORMAT rtvFormat = dst10Bit ? DXGI_FORMAT_R10G10B10A2_UNORM
+                                             : (srgbOut ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM);
         ComPtr<ID3D11RenderTargetView> rtv;
-        if (FAILED(m_device->CreateRenderTargetView(dst, &rtvd, &rtv))) return;
+        const std::pair<ID3D11Texture2D*, DXGI_FORMAT> rtvKey{dst, rtvFormat};
+        if (auto it = m_dstRtvs.find(rtvKey); it != m_dstRtvs.end()) {
+            rtv = it->second;
+        } else {
+            D3D11_RENDER_TARGET_VIEW_DESC rtvd{};
+            rtvd.Format = rtvFormat;
+            rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            if (FAILED(m_device->CreateRenderTargetView(dst, &rtvd, &rtv))) return;
+            if (m_dstRtvs.size() >= 16) m_dstRtvs.clear();
+            m_dstRtvs[rtvKey] = rtv;
+        }
         rcvr::LayerConstants lc{};
         lc.rect[0] = b.uMin;
         lc.rect[1] = b.vMin;
@@ -1167,6 +1185,9 @@ class Hmd : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponen
     ComPtr<ID3D11PixelShader> m_ps;
     ComPtr<ID3D11SamplerState> m_sampler;
     std::map<vr::SharedTextureHandle_t, ComPtr<ID3D11Texture2D>> m_backbuffers;
+    std::map<ID3D11Texture2D*, std::pair<DXGI_FORMAT, ComPtr<ID3D11ShaderResourceView>>> m_srcSrvs;
+    std::atomic<bool> m_srvCacheDirty{false};
+    std::map<std::pair<ID3D11Texture2D*, DXGI_FORMAT>, ComPtr<ID3D11RenderTargetView>> m_dstRtvs;
     ComPtr<ID3D11Texture2D> m_slots[rcvr::kFrameSlots];
     LONG m_textureGeneration = -1;
 

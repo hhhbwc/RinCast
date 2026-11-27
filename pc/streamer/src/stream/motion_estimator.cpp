@@ -147,6 +147,20 @@ float Sad(int2 corner, int2 o) {
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= uint(size.x / 32.0) || id.y >= uint(size.y / 32.0)) return;
     const int2 corner = int2(id.xy) * 8;
+    // Flat-area variance gate: avoid matching noise on solid walls, fog or dark skies.
+    float mean = 0.0;
+    for (int my = 0; my < 8; my++)
+        for (int mx = 0; mx < 8; mx++)
+            mean += cur.Load(int3(corner + int2(mx, my), 0));
+    mean *= (1.0 / 64.0);
+    float mad = 0.0;
+    for (int vy = 0; vy < 8; vy++)
+        for (int vx = 0; vx < 8; vx++)
+            mad += abs(cur.Load(int3(corner + int2(vx, vy), 0)) - mean);
+    if (mad < 0.012 * 64.0) {
+        dst[id.xy] = float2(0.0, 0.0);
+        return;
+    }
     const int2 base = ClampOffset(int2(id.xy) * 8, corner, int2(round(ExpectedPixels(id.xy) / 4.0)), 8, 4.0);
     const float zero = Sad(corner, base);
     float best = zero;
@@ -182,7 +196,24 @@ void main(uint3 id : SV_DispatchThreadID) {
     // More than 32 px of content motion in one frame (2880 px/s) is either a wrong match or
     // more than a held frame can be bent into: keep what the head turn alone explains.
     if (abs(bestOffset.x - base.x) > 8 || abs(bestOffset.y - base.y) > 8) bestOffset = base;
-    dst[id.xy] = float2(base - bestOffset) * 4.0;
+    float2 sub = float2(0.0, 0.0);
+    if (bestOffset.x != base.x || bestOffset.y != base.y) {
+        if (SameEye(int2(id.xy) * 8, corner, bestOffset + int2(-1, 0), 8, 4.0) &&
+            SameEye(int2(id.xy) * 8, corner, bestOffset + int2(1, 0), 8, 4.0)) {
+            const float sL = Sad(corner, bestOffset + int2(-1, 0));
+            const float sR = Sad(corner, bestOffset + int2(1, 0));
+            const float denom = sL - 2.0 * best + sR;
+            if (denom > 1e-4) sub.x = clamp(0.5 * (sL - sR) / denom, -0.5, 0.5);
+        }
+        if (SameEye(int2(id.xy) * 8, corner, bestOffset + int2(0, -1), 8, 4.0) &&
+            SameEye(int2(id.xy) * 8, corner, bestOffset + int2(0, 1), 8, 4.0)) {
+            const float sU = Sad(corner, bestOffset + int2(0, -1));
+            const float sD = Sad(corner, bestOffset + int2(0, 1));
+            const float denom = sU - 2.0 * best + sD;
+            if (denom > 1e-4) sub.y = clamp(0.5 * (sU - sD) / denom, -0.5, 0.5);
+        }
+    }
+    dst[id.xy] = (float2(base) - (float2(bestOffset) + sub)) * 4.0;
 }
 )";
 
@@ -221,10 +252,48 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
+// 3x3 edge-preserving bilateral filter on the median-cleaned motion field.
+const char* kBilateralCs = R"(
+Texture2D<float2> src : register(t0);
+RWTexture2D<float2> dst : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint dimX, dimY;
+    src.GetDimensions(dimX, dimY);
+    if (id.x >= dimX || id.y >= dimY) return;
+    const float2 c = src.Load(int3(id.xy, 0));
+    if (dot(c, c) < 1e-6) {
+        dst[id.xy] = float2(0.0, 0.0);
+        return;
+    }
+    static const float kSpatial[3][3] = {
+        {1.0, 2.0, 1.0},
+        {2.0, 4.0, 2.0},
+        {1.0, 2.0, 1.0},
+    };
+    float2 sum = float2(0.0, 0.0);
+    float wSum = 0.0;
+    for (int j = 0; j < 3; j++) {
+        for (int i = 0; i < 3; i++) {
+            int2 n = clamp(int2(id.xy) + int2(i - 1, j - 1), int2(0, 0), int2(int(dimX), int(dimY)) - 1);
+            if ((n.x < int(dimX / 2)) != (id.x < dimX / 2)) continue;
+            const float2 m = src.Load(int3(n, 0));
+            const float diff = length(m - c);
+            const float rangeW = exp(-(diff * diff) / (2.0 * 6.0 * 6.0));
+            const float w = kSpatial[j][i] * rangeW;
+            sum += m * w;
+            wSum += w;
+        }
+    }
+    dst[id.xy] = wSum > 1e-5 ? (sum / wSum) : c;
+}
+)";
+
 ComPtr<ID3D11ComputeShader> Compile(ID3D11Device* device, const char* name, const char* source) {
     ComPtr<ID3DBlob> code, errors;
-    if (FAILED(D3DCompile(source, std::strlen(source), name, nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                          &code, &errors))) {
+    if (FAILED(D3DCompile(source, std::strlen(source), name, nullptr, nullptr, "main", "cs_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_WARNINGS_ARE_ERRORS,
+                          0, &code, &errors))) {
         RC_LOGE("Motion estimator: %s shader compile failed: %s", name,
                 errors ? static_cast<const char*>(errors->GetBufferPointer()) : "no compiler diagnostic");
         return nullptr;
@@ -272,7 +341,8 @@ bool MotionEstimator::Init(ID3D11Device* device, uint32_t width, uint32_t height
     m_coarseCs = Compile(device, "motion-coarse", (std::string(kExpected) + kCoarseCs).c_str());
     m_refineCs = Compile(device, "motion-refine", (std::string(kExpected) + kRefineCs).c_str());
     m_medianCs = Compile(device, "motion-median", kMedianCs);
-    if (!m_lumaCs || !m_downCs || !m_coarseCs || !m_refineCs || !m_medianCs) {
+    m_bilateralCs = Compile(device, "motion-bilateral", kBilateralCs);
+    if (!m_lumaCs || !m_downCs || !m_coarseCs || !m_refineCs || !m_medianCs || !m_bilateralCs) {
         RC_LOGE("Motion estimator init failed at %ux%u: one or more compute shaders are unavailable", width, height);
         return false;
     }
@@ -289,6 +359,7 @@ bool MotionEstimator::Init(ID3D11Device* device, uint32_t width, uint32_t height
     }
     if (!MakeLevel(DXGI_FORMAT_R16G16_FLOAT, m_gridWidth, m_gridHeight, m_coarse) ||
         !MakeLevel(DXGI_FORMAT_R16G16_FLOAT, m_gridWidth, m_gridHeight, m_refined) ||
+        !MakeLevel(DXGI_FORMAT_R16G16_FLOAT, m_gridWidth, m_gridHeight, m_median) ||
         !MakeLevel(DXGI_FORMAT_R16G16_FLOAT, m_gridWidth, m_gridHeight, m_field))
         return false;
     D3D11_TEXTURE2D_DESC d{};
@@ -340,7 +411,9 @@ bool MotionEstimator::Process(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView
         ID3D11ShaderResourceView* refineIn[3] = {quarter.srv.Get(), m_quarter[m_current ^ 1].srv.Get(), m_coarse.srv.Get()};
         Dispatch(ctx, m_refineCs.Get(), refineIn, 3, m_refined.uav.Get(), Groups(m_gridWidth), Groups(m_gridHeight));
         ID3D11ShaderResourceView* medianIn = m_refined.srv.Get();
-        Dispatch(ctx, m_medianCs.Get(), &medianIn, 1, m_field.uav.Get(), Groups(m_gridWidth), Groups(m_gridHeight));
+        Dispatch(ctx, m_medianCs.Get(), &medianIn, 1, m_median.uav.Get(), Groups(m_gridWidth), Groups(m_gridHeight));
+        ID3D11ShaderResourceView* bilateralIn = m_median.srv.Get();
+        Dispatch(ctx, m_bilateralCs.Get(), &bilateralIn, 1, m_field.uav.Get(), Groups(m_gridWidth), Groups(m_gridHeight));
     }
     m_hasPrevious = true;
     return compared;
@@ -356,12 +429,29 @@ void MotionEstimator::Decode(const D3D11_MAPPED_SUBRESOURCE& map, std::vector<fl
     }
 }
 
+void MotionEstimator::ApplyTemporalSmoothing(std::vector<float>& field) {
+    if (m_prevField.size() == field.size()) {
+        for (size_t i = 0; i + 1 < field.size(); i += 2) {
+            const float cx = field[i], cy = field[i + 1];
+            const float px = m_prevField[i], py = m_prevField[i + 1];
+            const float dot = cx * px + cy * py;
+            const float dx = cx - px, dy = cy - py;
+            if (dot > 0.f && (dx * dx + dy * dy) < (12.0f * 12.0f)) {
+                field[i] = 0.75f * cx + 0.25f * px;
+                field[i + 1] = 0.75f * cy + 0.25f * py;
+            }
+        }
+    }
+    m_prevField = field;
+}
+
 bool MotionEstimator::Read(ID3D11DeviceContext* ctx, std::vector<float>& out) {
     ctx->CopyResource(m_staging[0].Get(), m_field.tex.Get());
     D3D11_MAPPED_SUBRESOURCE map;
     if (FAILED(ctx->Map(m_staging[0].Get(), 0, D3D11_MAP_READ, 0, &map))) return false;
     Decode(map, out);
     ctx->Unmap(m_staging[0].Get(), 0);
+    ApplyTemporalSmoothing(out);
     return true;
 }
 
@@ -468,6 +558,7 @@ bool MotionEstimator::TryRead(ID3D11DeviceContext* ctx, std::vector<float>& out,
     if (FAILED(hr)) return false;
     Decode(map, out);
     ctx->Unmap(m_staging[slot].Get(), 0);
+    ApplyTemporalSmoothing(out);
     return true;
 }
 

@@ -19,7 +19,7 @@ namespace rv {
 class AudioPlayer {
    public:
     ~AudioPlayer() { Stop(); }
-    bool Start();
+    bool Start(bool lowLatencyPath = false);
     void Stop();
     // AudioPacketHeader + Opus payload from the network thread.
     void PushPacket(const uint8_t* data, size_t size);
@@ -43,6 +43,7 @@ class AudioPlayer {
     rc::JitterBuffer m_jitter;
     std::atomic<float> m_volume{1.f};
     std::atomic<bool> m_restart{false};
+    bool m_lowLatencyPath = false;
     uint32_t m_lastSeq = 0;
     std::mutex m_mutex;
 };

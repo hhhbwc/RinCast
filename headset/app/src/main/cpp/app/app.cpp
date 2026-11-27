@@ -850,7 +850,7 @@ void App::UpdateMode(float dt) {
                 info["type"] = rc::msg::kClientInfo;
                 m_client.SendControl(info);
                 Platform::SetStreamingLocks(true);
-                if (m_settings.streamAudio) m_audio.Start();
+                if (m_settings.streamAudio) m_audio.Start(!m_client.IsRemote() && !m_client.IsVpn());
                 m_audio.SetVolume(m_settings.volume);
                 m_mic.SetGain(m_settings.micVolume);
                 if (m_settings.micPassthrough)

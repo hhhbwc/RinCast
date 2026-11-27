@@ -99,7 +99,12 @@ def extract_shaders() -> tuple[str, str, str, str]:
     for name in ("kBlitVs", "kFoveateFs", "kGsrFs", "kExternalMovedFs"):
         if name not in raw:
             raise RuntimeError(f"missing shader {name}")
-    return raw["kBlitVs"], raw["kFoveateFs"], raw["kGsrFs"], raw["kExternalMovedFs"]
+    return (
+        raw["kBlitVs"],
+        raw.get("kColorGradeFs", "") + raw.get("kCasExtFs", "") + raw["kFoveateFs"],
+        raw.get("kColorGradeFs", "") + raw["kGsrFs"],
+        raw["kExternalMovedFs"],
+    )
 
 
 def apply_mutations(gsr: str, external: str, mutations: list[str]) -> tuple[str, str]:

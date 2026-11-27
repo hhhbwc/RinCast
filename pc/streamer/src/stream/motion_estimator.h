@@ -35,6 +35,7 @@ class MotionEstimator {
     // The next frame has nothing to be compared with.
     void Reset() {
         m_hasPrevious = false;
+        m_prevField.clear();
         for (int i = 0; i < kReadbackSlots; i++) {
             m_readPending[i] = false;
             m_readTiming[i] = {};
@@ -45,7 +46,10 @@ class MotionEstimator {
     }
     // Drops only the previous-frame reference on an unexpected bridge skip while keeping
     // in-flight async GPU readbacks intact for frames already handed to the encoder.
-    void ResetPrevious() { m_hasPrevious = false; }
+    void ResetPrevious() {
+        m_hasPrevious = false;
+        m_prevField.clear();
+    }
 
     uint32_t GridWidth() const { return m_gridWidth; }
     uint32_t GridHeight() const { return m_gridHeight; }
@@ -87,11 +91,13 @@ class MotionEstimator {
     void Dispatch(ID3D11DeviceContext* ctx, ID3D11ComputeShader* cs, ID3D11ShaderResourceView* const* srvs, UINT srvCount,
                   ID3D11UnorderedAccessView* uav, UINT x, UINT y);
     void Decode(const D3D11_MAPPED_SUBRESOURCE& map, std::vector<float>& out);
+    void ApplyTemporalSmoothing(std::vector<float>& field);
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
-    Microsoft::WRL::ComPtr<ID3D11ComputeShader> m_lumaCs, m_downCs, m_coarseCs, m_refineCs, m_medianCs;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> m_lumaCs, m_downCs, m_coarseCs, m_refineCs, m_medianCs, m_bilateralCs;
     Level m_quarter[2], m_sixteenth[2];  // this frame's and the last, swapping
-    Level m_coarse, m_refined, m_field;
+    Level m_coarse, m_refined, m_median, m_field;
+    std::vector<float> m_prevField;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_staging[kReadbackSlots];
     Microsoft::WRL::ComPtr<ID3D11Query> m_readQuery[kReadbackSlots];
     bool m_readPending[kReadbackSlots]{};

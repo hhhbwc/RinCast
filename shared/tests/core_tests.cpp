@@ -2215,6 +2215,34 @@ static void TestMotionGateExternalRegressions() {
         rc::ApplyMotionHysteresis(field, grid);
         CHECK(grid == std::vector<int8_t>({0, 0, 0}));
     }
+    {
+        // CleanMotionOutliers: isolated noise cleared, coherent object preserved, opposite outlier replaced, eye seam isolated.
+        const int cw = 12, ch = 5;
+        std::vector<int8_t> g(size_t(cw) * ch * 2, 0);
+        auto set = [&](int x, int y, int8_t vx, int8_t vy) {
+            const size_t at = (size_t(y) * cw + size_t(x)) * 2;
+            g[at] = vx;
+            g[at + 1] = vy;
+        };
+        auto get = [&](int x, int y) -> std::pair<int8_t, int8_t> {
+            const size_t at = (size_t(y) * cw + size_t(x)) * 2;
+            return {g[at], g[at + 1]};
+        };
+        for (int y = 1; y <= 3; y++)
+            for (int x = 1; x <= 3; x++) set(x, y, 4, 0);
+        set(2, 2, -4, 0);
+        set(0, 4, 5, 2);
+        for (int y = 0; y <= 2; y++)
+            for (int x = 6; x <= 7; x++) set(x, y, 6, 0);
+        set(5, 1, 6, 0);
+
+        rc::CleanMotionOutliers(g, cw, ch);
+        CHECK(get(2, 2) == std::make_pair(int8_t(4), int8_t(0)));
+        CHECK(get(1, 1) == std::make_pair(int8_t(4), int8_t(0)));
+        CHECK(get(0, 4) == std::make_pair(int8_t(0), int8_t(0)));
+        CHECK(get(5, 1) == std::make_pair(int8_t(0), int8_t(0)));
+        CHECK(get(6, 1) == std::make_pair(int8_t(6), int8_t(0)));
+    }
     std::printf("ok\n");
 }
 

@@ -176,7 +176,10 @@ inline MotionDecodeResult DecodeVrMotionMetadata(bool enabled, bool foveated, ui
     state.consistent = res.gate.worth;
     // A rejected field keeps whatever scattered blocks block matching produced; no gate cleaned
     // them. Filter before anything reaches the GPU, so forcing the cadence cannot upload noise.
-    if (!state.consistent) FilterMotionFieldLocalConsensus(state.grid, state.width, state.height);
+    if (!state.consistent)
+        FilterMotionFieldLocalConsensus(state.grid, state.width, state.height);
+    else
+        CleanMotionOutliers(state.grid, state.width, state.height);
     state.moves = std::any_of(state.grid.begin(), state.grid.end(), [](int8_t v) { return v != 0; });
     // Upload whenever the field still carries motion, even if the gate calls it inconsistent:
     // cadence-forced generation needs the real field on the GPU.  Skipping is the

@@ -244,6 +244,76 @@ inline void FilterMotionFieldLocalConsensus(std::vector<int8_t>& grid, int w, in
     grid.swap(cleaned);
 }
 
+// Removes isolated noise blocks and replaces sharp local mismatches within an accepted motion field.
+// Keeps eye boundaries (w/2) strictly isolated so left and right eyes never contaminate each other.
+inline void CleanMotionOutliers(std::vector<int8_t>& grid, int w, int h) {
+    if (w < 1 || h < 1 || size_t(h) > std::numeric_limits<size_t>::max() / size_t(w)) return;
+    const size_t blocks = size_t(w) * size_t(h);
+    if (blocks > std::numeric_limits<size_t>::max() / 2) return;
+    if (grid.size() < blocks * 2) return;
+    std::vector<int8_t> out = grid;
+    const bool splitEyes = (w & 1) == 0;
+    const int mid = w / 2;
+    const auto mag = [](int v) { return v < 0 ? -v : v; };
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            const size_t at = (size_t(y) * size_t(w) + size_t(x)) * 2;
+            const int vx = grid[at], vy = grid[at + 1];
+            if (!vx && !vy) continue;
+            const int x0 = splitEyes && x >= mid ? mid : 0;
+            const int x1 = splitEyes && x < mid ? mid : w;
+            int nxList[8]{}, nyList[8]{};
+            int count = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                const int ny = y + dy;
+                if (ny < 0 || ny >= h) continue;
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (!dx && !dy) continue;
+                    const int nx = x + dx;
+                    if (nx < x0 || nx >= x1) continue;
+                    const size_t nat = (size_t(ny) * size_t(w) + size_t(nx)) * 2;
+                    const int nvx = grid[nat], nvy = grid[nat + 1];
+                    if (nvx || nvy) {
+                        nxList[count] = nvx;
+                        nyList[count] = nvy;
+                        count++;
+                    }
+                }
+            }
+            if (count < 2) {
+                out[at] = out[at + 1] = 0;
+                continue;
+            }
+            std::sort(nxList, nxList + count);
+            std::sort(nyList, nyList + count);
+            const int medX = nxList[count / 2];
+            const int medY = nyList[count / 2];
+            const int dot = vx * medX + vy * medY;
+            const int dist = mag(vx - medX) + mag(vy - medY);
+            if (dot < 0 || dist > 4) {
+                int consistent = 0;
+                for (int dy = -1; dy <= 1; dy++) {
+                    const int ny = y + dy;
+                    if (ny < 0 || ny >= h) continue;
+                    for (int dx = -1; dx <= 1; dx++) {
+                        if (!dx && !dy) continue;
+                        const int nx = x + dx;
+                        if (nx < x0 || nx >= x1) continue;
+                        const size_t nat = (size_t(ny) * size_t(w) + size_t(nx)) * 2;
+                        const int nvx = grid[nat], nvy = grid[nat + 1];
+                        if ((nvx || nvy) && mag(nvx - medX) + mag(nvy - medY) <= 2) consistent++;
+                    }
+                }
+                if (consistent >= 5) {
+                    out[at] = int8_t(medX);
+                    out[at + 1] = int8_t(medY);
+                }
+            }
+        }
+    }
+    grid.swap(out);
+}
+
 #pragma pack(push, 1)
 struct MotionHeader {
     uint16_t gridWidth;

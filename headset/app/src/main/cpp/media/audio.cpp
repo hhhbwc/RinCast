@@ -15,8 +15,9 @@ namespace rv {
 
 #ifdef __ANDROID__
 
-bool AudioPlayer::Start() {
+bool AudioPlayer::Start(bool lowLatencyPath) {
     std::lock_guard lock(m_mutex);
+    m_lowLatencyPath = lowLatencyPath;
     return StartLocked();
 }
 
@@ -28,7 +29,10 @@ void AudioPlayer::Stop() {
 bool AudioPlayer::StartLocked() {
     StopLocked();
     if (!m_decoder.Init(rc::kAudioSampleRate, 2)) return false;
-    m_jitter.Configure(2, rc::kAudioSampleRate, 30, 150);
+    if (m_lowLatencyPath)
+        m_jitter.Configure(2, rc::kAudioSampleRate, 18, 120);
+    else
+        m_jitter.Configure(2, rc::kAudioSampleRate, 30, 150);
     AAudioStreamBuilder* b = nullptr;
     AAudio_createStreamBuilder(&b);
     AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
@@ -99,8 +103,9 @@ pa_simple* OpenPulse(pa_stream_direction_t direction, int channels, const char* 
 
 }  // namespace
 
-bool AudioPlayer::Start() {
+bool AudioPlayer::Start(bool lowLatencyPath) {
     std::lock_guard lock(m_mutex);
+    m_lowLatencyPath = lowLatencyPath;
     return StartLocked();
 }
 
@@ -112,7 +117,10 @@ void AudioPlayer::Stop() {
 bool AudioPlayer::StartLocked() {
     StopLocked();
     if (!m_decoder.Init(rc::kAudioSampleRate, 2)) return false;
-    m_jitter.Configure(2, rc::kAudioSampleRate, 30, 150);
+    if (m_lowLatencyPath)
+        m_jitter.Configure(2, rc::kAudioSampleRate, 18, 120);
+    else
+        m_jitter.Configure(2, rc::kAudioSampleRate, 30, 150);
     m_stream = OpenPulse(PA_STREAM_PLAYBACK, 2, "PC audio", 20);
     if (!m_stream) return false;
     m_running = true;

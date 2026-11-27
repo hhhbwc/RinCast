@@ -65,7 +65,28 @@ class AmfEncoder final : public VideoEncoder {
         const int64_t bps = int64_t(config.bitrateKbps) * 1000;
         const int64_t vbv = Vbv(bps);
         // Optional extras: an older driver without one still encodes, just without it.
-        bool aq = config.adaptiveQuant, twoPass = config.twoPass;
+        bool isModernRdna = false;
+        {
+            ComPtr<IDXGIDevice> dxgiDev;
+            ComPtr<IDXGIAdapter> adapter;
+            DXGI_ADAPTER_DESC adesc{};
+            if (device && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgiDev))) &&
+                SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&adesc))) {
+                const wchar_t* n = adesc.Description;
+                if (wcsstr(n, L"RX 6") || wcsstr(n, L"RX 7") || wcsstr(n, L"RX 8") || wcsstr(n, L"RX 9") ||
+                    wcsstr(n, L"W6") || wcsstr(n, L"W7")) {
+                    isModernRdna = true;
+                }
+            }
+            if (!isModernRdna) {
+                amf::AMFComponentPtr av1Probe;
+                if (lib.factory->CreateComponent(m_context, ComponentId(rc::VideoCodec::AV1), &av1Probe) == AMF_OK) {
+                    isModernRdna = true;
+                }
+            }
+        }
+        const bool balancedPreset = config.desktop || isModernRdna;
+        bool aq = config.adaptiveQuant || isModernRdna, twoPass = config.twoPass;
         auto optional = [&](const wchar_t* name, auto value, bool& flag) {
             if (flag && m_encoder->SetProperty(name, value) != AMF_OK) {
                 RC_LOGW("AMF: %ls not supported by this driver", name);
@@ -91,9 +112,9 @@ class AmfEncoder final : public VideoEncoder {
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, 0);
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true);
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET,
-                                       config.desktop ? AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED
+                                       balancedPreset ? AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED
                                                       : AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
-                m_encoder->SetProperty(AMF_VIDEO_ENCODER_ENABLE_VBAQ, aq);
+                optional(AMF_VIDEO_ENCODER_ENABLE_VBAQ, true, aq);
                 optional(AMF_VIDEO_ENCODER_PREENCODE_ENABLE, int64_t(AMF_VIDEO_ENCODER_PREENCODE_ENABLED), twoPass);
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES, AMF_COLOR_PRIMARIES_BT709);
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC,
@@ -114,9 +135,9 @@ class AmfEncoder final : public VideoEncoder {
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, 0);
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_LOWLATENCY_MODE, true);
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET,
-                                       config.desktop ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED
+                                       balancedPreset ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED
                                                       : AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED);
-                m_encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, aq);
+                optional(AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, true, aq);
                 optional(AMF_VIDEO_ENCODER_HEVC_PREENCODE_ENABLE, true, twoPass);
                 if (config.tenBit) {
                     m_encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PROFILE, AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN_10);
@@ -146,7 +167,7 @@ class AmfEncoder final : public VideoEncoder {
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_AV1_ENCODING_LATENCY_MODE,
                                        AMF_VIDEO_ENCODER_AV1_ENCODING_LATENCY_MODE_LOWEST_LATENCY);
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET,
-                                       config.desktop ? AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET_BALANCED
+                                       balancedPreset ? AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET_BALANCED
                                                       : AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET_SPEED);
                 optional(AMF_VIDEO_ENCODER_AV1_AQ_MODE,
                          int64_t(aq ? AMF_VIDEO_ENCODER_AV1_AQ_MODE_CAQ : AMF_VIDEO_ENCODER_AV1_AQ_MODE_NONE), aq);
