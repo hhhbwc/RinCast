@@ -47,6 +47,7 @@ json Settings::ToJson(bool forUi) const {
         {"foveatedEncoding", foveatedEncoding},
         {"adaptiveQuantization", adaptiveQuantization},
         {"twoPassEncoding", twoPassEncoding},
+        {"vrSlicedEncoding", vrSlicedEncoding},
         {"desktopMaxHeight", desktopMaxHeight},
         {"desktopFps", desktopFps},
         {"streamAudio", streamAudio},
@@ -89,6 +90,7 @@ void Settings::FromJson(const json& j) {
     get("desktopInput", desktopInput);
     get("codec", codec);
     get("tenBit", tenBit);
+    get("vrSlicedEncoding", vrSlicedEncoding);
     get("vrBitrateMbps", vrBitrateMbps);
     get("desktopBitrateMbps", desktopBitrateMbps);
     get("adaptiveBitrate", adaptiveBitrate);

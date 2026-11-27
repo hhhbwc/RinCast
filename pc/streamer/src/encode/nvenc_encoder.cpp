@@ -184,6 +184,7 @@ class NvencEncoder final : public VideoEncoder {
         // Strips cost compression, so not when bits are scarce.
         const bool split = config.splitFrame && engines > 1 && config.bitrateKbps >= 30000 && config.codec != rc::VideoCodec::H264 &&
                            uint64_t(config.width) * config.height >= 2560ull * 1440;
+        const bool useSlices = config.sliceCount > 1 && !config.desktop && config.bitrateKbps >= 40000 && !split;
         m_blockSize = config.codec == rc::VideoCodec::H264 ? 16 : config.codec == rc::VideoCodec::HEVC ? 32 : 64;
         if (config.foveated) rc.qpMapMode = NV_ENC_QP_MAP_DELTA;
 
@@ -193,8 +194,8 @@ class NvencEncoder final : public VideoEncoder {
                 auto& h = m_encodeConfig.encodeCodecConfig.h264Config;
                 h.repeatSPSPPS = 1;
                 h.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-                h.sliceMode = 0;
-                h.sliceModeData = 0;
+                h.sliceMode = useSlices ? 3 : 0;
+                h.sliceModeData = useSlices ? uint32_t(config.sliceCount) : 0;
                 h.h264VUIParameters.videoSignalTypePresentFlag = 1;
                 h.h264VUIParameters.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
                 h.h264VUIParameters.videoFullRangeFlag = 0;
@@ -209,6 +210,8 @@ class NvencEncoder final : public VideoEncoder {
                 auto& h = m_encodeConfig.encodeCodecConfig.hevcConfig;
                 h.repeatSPSPPS = 1;
                 h.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+                h.sliceMode = useSlices ? 3 : 0;
+                h.sliceModeData = useSlices ? uint32_t(config.sliceCount) : 0;
                 h.inputBitDepth = depth;
                 h.outputBitDepth = depth;
                 if (config.foveated) h.maxCUSize = NV_ENC_HEVC_CUSIZE_32x32;  // the QP map is per 32x32 CTB
@@ -237,6 +240,10 @@ class NvencEncoder final : public VideoEncoder {
                 a.matrixCoefficients = NV_ENC_VUI_MATRIX_COEFFS_BT709;
                 a.colorRange = 0;
                 a.chromaFormatIDC = 1;
+                if (useSlices) {
+                    a.numTileRows = 2;
+                    a.numTileColumns = 1;
+                }
                 if (m_canInvalidate) {
                     a.maxNumRefFramesInDPB = kDpbFrames;
                     a.numFwdRefs = NV_ENC_NUM_REF_FRAMES_1;
@@ -270,6 +277,20 @@ class NvencEncoder final : public VideoEncoder {
             if (!m_encoder) return false;
             m_init.splitEncodeMode = NV_ENC_SPLIT_AUTO_MODE;
             m_encodeConfig.rcParams.qpMapMode = NV_ENC_QP_MAP_DISABLED;
+            st = api.nvEncInitializeEncoder(m_encoder, &m_init);
+        }
+        if (st != NV_ENC_SUCCESS && useSlices) {
+            RC_LOGW("NVENC: initialize with %d slices failed (%d): %s; retrying single-slice",
+                    config.sliceCount, int(st), api.nvEncGetLastErrorString(m_encoder));
+            api.nvEncDestroyEncoder(m_encoder);
+            m_encoder = OpenSession(device);
+            if (!m_encoder) return false;
+            m_encodeConfig.encodeCodecConfig.h264Config.sliceMode = 0;
+            m_encodeConfig.encodeCodecConfig.h264Config.sliceModeData = 0;
+            m_encodeConfig.encodeCodecConfig.hevcConfig.sliceMode = 0;
+            m_encodeConfig.encodeCodecConfig.hevcConfig.sliceModeData = 0;
+            m_encodeConfig.encodeCodecConfig.av1Config.numTileRows = 0;
+            m_encodeConfig.encodeCodecConfig.av1Config.numTileColumns = 0;
             st = api.nvEncInitializeEncoder(m_encoder, &m_init);
         }
         if (st != NV_ENC_SUCCESS && config.twoPass) {
@@ -313,7 +334,14 @@ class NvencEncoder final : public VideoEncoder {
         const char* presetName = preset == NV_ENC_PRESET_P3_GUID ? ", preset P3 (Fast)"
                                  : preset == NV_ENC_PRESET_P4_GUID ? ", preset P4"
                                  : preset == NV_ENC_PRESET_P1_GUID ? ", preset P1 (Fastest)" : "";
-        RC_LOGI("NVENC %s %ux%u @%.0f fps, ceiling %u kbps (%s, avg %u kbps, QP floor %s)%s%s%s%s%s%s%s",
+        const int activeSlices =
+            config.codec == rc::VideoCodec::H264 && m_encodeConfig.encodeCodecConfig.h264Config.sliceMode == 3
+                ? int(m_encodeConfig.encodeCodecConfig.h264Config.sliceModeData)
+            : config.codec == rc::VideoCodec::HEVC && m_encodeConfig.encodeCodecConfig.hevcConfig.sliceMode == 3
+                ? int(m_encodeConfig.encodeCodecConfig.hevcConfig.sliceModeData)
+                : 1;
+        const std::string slicesText = activeSlices > 1 ? (", " + std::to_string(activeSlices) + " slices") : "";
+        RC_LOGI("NVENC %s %ux%u @%.0f fps, ceiling %u kbps (%s, avg %u kbps, QP floor %s)%s%s%s%s%s%s%s%s",
                 CodecName(config.codec), config.width, config.height, config.fps, config.bitrateKbps,
                 m_cappedVbr ? "capped VBR" : "CBR",
                 m_cappedVbr ? budget.averageBitrate / 1000 : config.bitrateKbps, qpText.c_str(),
@@ -321,7 +349,8 @@ class NvencEncoder final : public VideoEncoder {
                 config.tenBit ? ", 10-bit" : "",
                 m_split ? ", split across engines" : "", m_foveated ? ", foveated" : "",
                 m_canInvalidate ? ", loss recovery" : "", m_encodeConfig.rcParams.enableAQ ? ", AQ" : "",
-                m_encodeConfig.rcParams.multiPass != NV_ENC_MULTI_PASS_DISABLED ? ", two-pass" : "");
+                m_encodeConfig.rcParams.multiPass != NV_ENC_MULTI_PASS_DISABLED ? ", two-pass" : "",
+                slicesText.c_str());
         return true;
     }
 

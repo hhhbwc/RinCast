@@ -1006,6 +1006,7 @@ void VrStream::RunEncoder() {
             ec.foveated = m_config.foveated && !job.foveated;
             ec.adaptiveQuant = m_config.adaptiveQuant;
             ec.twoPass = m_config.twoPass;
+            ec.sliceCount = (m_config.sliceCount > 1 && ec.bitrateKbps >= 40000) ? m_config.sliceCount : 1;
             ec.cappedVbr = m_config.cappedVbr;
             ec.fillMode = m_config.fillMode;
             encoder = CreateEncoder(device, m_bridge->VendorId(), ec);

@@ -29,6 +29,8 @@ struct EncoderConfig {
     bool foveated = false;
     // Use every NVENC engine for one frame on GPUs that have more than one (HEVC/AV1).
     bool splitFrame = true;
+    // Number of horizontal slices per frame (1 = single slice; 4 = parallel decode).
+    int sliceCount = 1;
     // More bits for flat areas (skies, walls), where blocking shows first; fewer for busy
     // detail that hides it. NVENC and AMF.
     bool adaptiveQuant = true;

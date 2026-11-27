@@ -86,6 +86,7 @@ class AmfEncoder final : public VideoEncoder {
             }
         }
         const bool balancedPreset = config.desktop || isModernRdna;
+        const int sliceCount = (!config.desktop && config.bitrateKbps >= 40000 && config.sliceCount > 1) ? config.sliceCount : 1;
         bool aq = config.adaptiveQuant || isModernRdna, twoPass = config.twoPass;
         auto optional = [&](const wchar_t* name, auto value, bool& flag) {
             if (flag && m_encoder->SetProperty(name, value) != AMF_OK) {
@@ -114,6 +115,7 @@ class AmfEncoder final : public VideoEncoder {
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET,
                                        balancedPreset ? AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED
                                                       : AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
+                if (sliceCount > 1) m_encoder->SetProperty(AMF_VIDEO_ENCODER_SLICES_PER_FRAME, int64_t(sliceCount));
                 optional(AMF_VIDEO_ENCODER_ENABLE_VBAQ, true, aq);
                 optional(AMF_VIDEO_ENCODER_PREENCODE_ENABLE, int64_t(AMF_VIDEO_ENCODER_PREENCODE_ENABLED), twoPass);
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES, AMF_COLOR_PRIMARIES_BT709);
@@ -137,6 +139,7 @@ class AmfEncoder final : public VideoEncoder {
                 m_encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET,
                                        balancedPreset ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED
                                                       : AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED);
+                if (sliceCount > 1) m_encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_SLICES_PER_FRAME, int64_t(sliceCount));
                 optional(AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, true, aq);
                 optional(AMF_VIDEO_ENCODER_HEVC_PREENCODE_ENABLE, true, twoPass);
                 if (config.tenBit) {

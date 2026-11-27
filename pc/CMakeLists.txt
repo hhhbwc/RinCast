@@ -190,8 +190,12 @@ add_executable(rincast-streamer-tests ../tools/streamer-tests/main.cpp
   streamer/src/vr/vr_bridge_host.cpp
   streamer/src/gpu.cpp
   streamer/src/encode/color_convert.cpp
+  streamer/src/encode/encoder.cpp
+  streamer/src/encode/nvenc_encoder.cpp
+  streamer/src/encode/amf_encoder.cpp
+  streamer/src/encode/mf_encoder.cpp
   streamer/src/stream/foveator.cpp
   streamer/src/stream/video_sender.cpp)
 target_include_directories(rincast-streamer-tests PRIVATE common streamer/src driver-openvr/src ../third_party ../shared/include)
 target_compile_definitions(rincast-streamer-tests PRIVATE UNICODE _UNICODE)
-target_link_libraries(rincast-streamer-tests PRIVATE rincast-core d3d11 dxgi d3dcompiler)
+target_link_libraries(rincast-streamer-tests PRIVATE rincast-core d3d11 dxgi d3dcompiler mfplat mfuuid)

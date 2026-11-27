@@ -48,6 +48,7 @@
 #include "rc/video_transport.h"
 #include "settings.h"
 #include "stream/foveator.h"
+#include "stream/stream_config.h"
 #include "stream/video_sender.h"
 #include "stream/vr_diag_math.h"
 #include "util.h"
@@ -1705,6 +1706,127 @@ void Test10BitPipelineDitherStereoAndSrgb() {
     std::printf("streamer D3D11 10-bit pipeline, stereo UV clamp, LinearToSrgb (< 2e-3): ok\n");
 }
 
+void TestSlicedEncodingConfigAndNvencIdr() {
+    // 1. Config synthesis gating: vrSlicedEncoding + >= 40 Mbps + non-AV1 => 4 slices; otherwise 1.
+    {
+        rcs::Settings pc;
+        rcs::ClientStreamSettings st;
+        pc.vrBitrateMbps = 100;
+        pc.pcBitrateWins = true;
+        pc.vrSlicedEncoding = false;
+        auto bOff = rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::HEVC, false, false, 100, 1280, 1280, 72.f);
+        CHECK(bOff.cfg.sliceCount == 1);
+
+        pc.vrSlicedEncoding = true;
+        auto bHevc = rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::HEVC, false, false, 100, 1280, 1280, 72.f);
+        CHECK(bHevc.cfg.sliceCount == 4);
+
+        auto bAv1 = rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::AV1, false, false, 100, 1280, 1280, 72.f);
+        CHECK(bAv1.cfg.sliceCount == 1);
+
+        pc.vrBitrateMbps = 30;
+        auto bLow = rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::HEVC, false, false, 100, 1280, 1280, 72.f);
+        CHECK(bLow.cfg.sliceCount == 1);
+    }
+
+    // 2. Real GPU NVENC 4-slice HEVC IDR NAL verification (if NVIDIA hardware adapter is present).
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return;
+    ComPtr<IDXGIAdapter1> nvAdapter;
+    for (UINT i = 0;; i++) {
+        ComPtr<IDXGIAdapter1> a;
+        if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+        DXGI_ADAPTER_DESC1 desc{};
+        a->GetDesc1(&desc);
+        if (desc.VendorId == 0x10DE && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            nvAdapter = a;
+            break;
+        }
+    }
+    if (!nvAdapter) {
+        std::printf("streamer sliced encoding (config ok, NVENC hardware test skipped: no NVIDIA GPU)\n");
+        return;
+    }
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    if (FAILED(D3D11CreateDevice(nvAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+                                 D3D11_SDK_VERSION, &dev, nullptr, &ctx))) {
+        return;
+    }
+
+    constexpr uint32_t kW = 1280, kH = 720;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = kW; td.Height = kH; td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    std::vector<uint8_t> rgba(size_t(kW) * kH * 4, 128);
+    D3D11_SUBRESOURCE_DATA init{rgba.data(), kW * 4, 0};
+    ComPtr<ID3D11Texture2D> srcTex;
+    CHECK(SUCCEEDED(dev->CreateTexture2D(&td, &init, &srcTex)));
+
+    rcs::ColorConverter conv;
+    CHECK(conv.Init(dev.Get(), kW, kH, false, false));
+    CHECK(conv.Convert(ctx.Get(), srcTex.Get()));
+    ctx->Flush();
+
+    auto countHevcIdrSlices = [](const std::vector<uint8_t>& bs) -> std::pair<int, int> {
+        int vclSlices = 0, paramSets = 0;
+        for (size_t i = 0; i + 4 < bs.size(); i++) {
+            size_t hdr = 0;
+            if (bs[i] == 0 && bs[i + 1] == 0 && bs[i + 2] == 1) hdr = i + 3;
+            else if (i + 5 < bs.size() && bs[i] == 0 && bs[i + 1] == 0 && bs[i + 2] == 0 && bs[i + 3] == 1) hdr = i + 4;
+            if (!hdr) continue;
+            const int nalType = (bs[hdr] >> 1) & 0x3F;
+            if (nalType >= 32 && nalType <= 34) paramSets++;
+            if (nalType == 19 || nalType == 20) vclSlices++;
+            i = hdr;
+        }
+        return {paramSets, vclSlices};
+    };
+
+    {
+        rcs::EncoderConfig ec;
+        ec.codec = rc::VideoCodec::HEVC;
+        ec.width = kW; ec.height = kH; ec.fps = 72.f;
+        ec.bitrateKbps = 80000;
+        ec.inputFormat = DXGI_FORMAT_NV12;
+        ec.sliceCount = 4;
+        ec.splitFrame = false;
+        auto enc = rcs::CreateEncoder(dev.Get(), 0x10DE, ec);
+        CHECK(enc != nullptr);
+        if (enc) {
+            rcs::EncodedFrame frame;
+            CHECK(enc->Encode(conv.Output(), true, frame));
+            CHECK(frame.keyframe);
+            const auto [paramSets, slices] = countHevcIdrSlices(frame.data);
+            CHECK(paramSets >= 3);
+            CHECK(slices == 4);
+        }
+    }
+    {
+        // < 40 Mbps must fall back to single slice even if sliceCount == 4 is passed.
+        rcs::EncoderConfig ec;
+        ec.codec = rc::VideoCodec::HEVC;
+        ec.width = kW; ec.height = kH; ec.fps = 72.f;
+        ec.bitrateKbps = 30000;
+        ec.inputFormat = DXGI_FORMAT_NV12;
+        ec.sliceCount = 4;
+        ec.splitFrame = false;
+        auto enc = rcs::CreateEncoder(dev.Get(), 0x10DE, ec);
+        CHECK(enc != nullptr);
+        if (enc) {
+            rcs::EncodedFrame frame;
+            CHECK(enc->Encode(conv.Output(), true, frame));
+            const auto [paramSets, slices] = countHevcIdrSlices(frame.data);
+            CHECK(paramSets >= 3);
+            CHECK(slices == 1);
+        }
+    }
+    std::printf("streamer sliced encoding (config + NVENC 4-slice HEVC IDR NAL & <40M single-slice fallback): ok\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1720,6 +1842,7 @@ int main() {
     TestVideoSenderLiveAndFeedback();
     TestLayerReprojection();
     Test10BitPipelineDitherStereoAndSrgb();
+    TestSlicedEncodingConfigAndNvencIdr();
     CoUninitialize();
 
     std::error_code ec;

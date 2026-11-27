@@ -40,6 +40,7 @@ struct VrStreamConfig {
     bool foveated = true;
     bool adaptiveQuant = true;
     bool twoPass = false;
+    int sliceCount = 1;
     // false = plain CBR: spend the ceiling exactly, even on still pictures. The quality
     // profile's opt-in mode; every other path leaves the encoder on capped VBR.
     bool cappedVbr = true;

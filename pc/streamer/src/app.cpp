@@ -347,6 +347,7 @@ std::string App::ApplySettingSideEffects(const json& changed) {
             changed.contains("fillMode") ||
             changed.contains("fecPercent") ||
             changed.contains("foveatedEncoding") || changed.contains("adaptiveQuantization") ||
+            changed.contains("vrSlicedEncoding") ||
             changed.contains("twoPassEncoding") || changed.contains("encodeScalePct") ||
             changed.contains("l7Autoscale") ||
             changed.contains("desktopMaxHeight") || changed.contains("desktopFps"))

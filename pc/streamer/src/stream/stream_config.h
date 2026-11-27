@@ -118,6 +118,7 @@ inline VrStreamBuild BuildVrStreamConfig(const Settings& pc, const ClientStreamS
     // profile used to turn it on by itself (and the page greyed it out), which
     // surprised users who had deliberately left it off; the user decides.
     cfg.twoPass = pc.twoPassEncoding;
+    cfg.sliceCount = (pc.vrSlicedEncoding && cfg.bitrateKbps >= 40000 && codec != rc::VideoCodec::AV1) ? 4 : 1;
     // A86b: CBR is a plain independent opt-in switch, never a side effect of the
     // tier auto happens to be on (that coupling oscillated - see settings.h).
     cfg.cappedVbr = !rcs::QualityProfileCbr(pc.qualityProfileCbr);

@@ -52,6 +52,7 @@ struct Settings {
     // Video
     std::string codec = "auto";    // auto | h264 | hevc | av1
     bool tenBit = false;
+    bool vrSlicedEncoding = false;
     int vrBitrateMbps = 150;
     // The headset sends its own bitrate choice and it wins by default: it plans its
     // decode buffers around that number, and a PC-side ceiling it didn't expect can
