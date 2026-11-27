@@ -339,6 +339,8 @@ class NvencEncoder final : public VideoEncoder {
                 ? int(m_encodeConfig.encodeCodecConfig.h264Config.sliceModeData)
             : config.codec == rc::VideoCodec::HEVC && m_encodeConfig.encodeCodecConfig.hevcConfig.sliceMode == 3
                 ? int(m_encodeConfig.encodeCodecConfig.hevcConfig.sliceModeData)
+            : config.codec == rc::VideoCodec::AV1 && m_encodeConfig.encodeCodecConfig.av1Config.numTileRows > 1
+                ? int(m_encodeConfig.encodeCodecConfig.av1Config.numTileRows)
                 : 1;
         const std::string slicesText = activeSlices > 1 ? (", " + std::to_string(activeSlices) + " slices") : "";
         RC_LOGI("NVENC %s %ux%u @%.0f fps, ceiling %u kbps (%s, avg %u kbps, QP floor %s)%s%s%s%s%s%s%s%s",

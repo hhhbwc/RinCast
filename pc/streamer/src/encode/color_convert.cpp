@@ -40,7 +40,13 @@ float2 psUV(V i) : SV_Target {
         uv.x = clamp(uv.x, eye * 0.5 + 0.5 * invSize.x, eye * 0.5 + 0.5 - 0.5 * invSize.x);
     }
     float3 rgb = saturate(src.Sample(samp, uv).rgb);
-    return float2(dot(rgb, kU), dot(rgb, kV)) * (224.0 / 255.0) + 128.0 / 255.0;
+    float2 chroma = float2(dot(rgb, kU), dot(rgb, kV)) * (224.0 / 255.0) + 128.0 / 255.0;
+    if (ditherAmp > 0.0) {
+        float nu = (Ign(i.pos.xy) + Ign(i.pos.xy + float2(17.0, 31.0)) - 1.0) * 0.5;
+        float nv = (Ign(i.pos.xy + float2(13.0, 7.0)) + Ign(i.pos.xy + float2(29.0, 41.0)) - 1.0) * 0.5;
+        chroma = saturate(chroma + float2(nu, nv) * ditherAmp);
+    }
+    return chroma;
 }
 )";
 
