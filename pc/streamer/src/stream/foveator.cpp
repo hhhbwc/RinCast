@@ -108,6 +108,7 @@ bool Foveator::Init(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight,
 bool Foveator::Squeeze(ID3D11DeviceContext* ctx, ID3D11Texture2D* frame, const float foveaStart[2][2]) {
     if (frame != m_lastInput) {
         m_inputSrv.Reset();
+        m_lastInput = nullptr;
         D3D11_TEXTURE2D_DESC desc;
         frame->GetDesc(&desc);
         D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
@@ -117,20 +118,33 @@ bool Foveator::Squeeze(ID3D11DeviceContext* ctx, ID3D11Texture2D* frame, const f
         // converter does.
         sd.Format = desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS   ? DXGI_FORMAT_R8G8B8A8_UNORM
                     : desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ? DXGI_FORMAT_B8G8R8A8_UNORM
-                                                                   : desc.Format;
-        if (FAILED(m_device->CreateShaderResourceView(frame, &sd, &m_inputSrv))) return false;
+                    : desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS
+                        ? DXGI_FORMAT_R10G10B10A2_UNORM
+                    : desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS
+                        ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                        : desc.Format;
+        const HRESULT hr = m_device->CreateShaderResourceView(frame, &sd, &m_inputSrv);
+        if (FAILED(hr)) {
+            RC_LOGE("Foveated encoding: source view creation failed: %s", HResultString(hr).c_str());
+            return false;
+        }
         m_lastInput = frame;
     }
     const float F = m_fovea;
     Params p{};
     std::memcpy(p.start, foveaStart, sizeof(float) * 4);
     p.layout[0] = F;
-    p.layout[1] = (float(m_encodedWidth) / m_eyeWidth - F) / (1 - F);
-    p.layout[2] = (float(m_encodedHeight) / m_eyeHeight - F) / (1 - F);
-    p.texel[0] = 1.f / (m_eyeWidth * 2);
-    p.texel[1] = 1.f / m_eyeHeight;
+    const float oneMinusF = std::max(1e-4f, 1.0f - F);
+    p.layout[1] = m_eyeWidth ? (float(m_encodedWidth) / m_eyeWidth - F) / oneMinusF : 1.0f;
+    p.layout[2] = m_eyeHeight ? (float(m_encodedHeight) / m_eyeHeight - F) / oneMinusF : 1.0f;
+    p.texel[0] = m_eyeWidth ? 1.f / (m_eyeWidth * 2) : 0.f;
+    p.texel[1] = m_eyeHeight ? 1.f / m_eyeHeight : 0.f;
     D3D11_MAPPED_SUBRESOURCE mapped;
-    if (FAILED(ctx->Map(m_params.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return false;
+    const HRESULT mapHr = ctx->Map(m_params.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(mapHr)) {
+        RC_LOGE("Foveated encoding: parameter map failed: %s", HResultString(mapHr).c_str());
+        return false;
+    }
     std::memcpy(mapped.pData, &p, sizeof(p));
     ctx->Unmap(m_params.Get(), 0);
 

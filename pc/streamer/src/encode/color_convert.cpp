@@ -154,7 +154,12 @@ bool ColorConverter::Convert(ID3D11DeviceContext* ctx, ID3D11Texture2D* rgb) {
                     : desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS
                         ? DXGI_FORMAT_R16G16B16A16_UNORM
                         : desc.Format;
-        if (FAILED(m_device->CreateShaderResourceView(rgb, &sd, &m_inputSrv))) return false;
+        const HRESULT hr = m_device->CreateShaderResourceView(rgb, &sd, &m_inputSrv);
+        if (FAILED(hr)) {
+            RC_LOGE("Colour conversion: source view creation failed (format %u): %s", unsigned(desc.Format),
+                    HResultString(hr).c_str());
+            return false;
+        }
         m_lastInput = rgb;
     }
     // The input may still be bound as a render target (e.g. by the capture

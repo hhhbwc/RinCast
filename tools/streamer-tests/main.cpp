@@ -725,6 +725,52 @@ void TestRealGpuFoveatorAndColorConverter() {
     std::printf("streamer D3D11 Foveator + ColorConverter (NV12 & P010): ok\n");
 }
 
+void TestRealGpuSharedTypelessVrTexture() {
+    ComPtr<ID3D11DeviceContext> ctx;
+    auto adapter = rcs::PreferredAdapter();
+    auto dev = adapter ? rcs::CreateDevice(adapter.Get(), &ctx) : ComPtr<ID3D11Device>{};
+    CHECK(dev != nullptr);
+    if (!dev) return;
+
+    constexpr UINT width = 1024, height = 512;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = width;
+    td.Height = height;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    ComPtr<ID3D11Texture2D> source;
+    CHECK(SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &source)));
+
+    ComPtr<IDXGIResource1> resource;
+    CHECK(SUCCEEDED(source.As(&resource)));
+    HANDLE handle = nullptr;
+    CHECK(SUCCEEDED(resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                                L"Local\\RinCastTestTypeless", &handle)));
+    ComPtr<ID3D11Device1> device1;
+    ComPtr<ID3D11Texture2D> opened;
+    if (SUCCEEDED(dev.As(&device1)) && handle) {
+        CHECK(SUCCEEDED(device1->OpenSharedResource1(handle, IID_PPV_ARGS(&opened))));
+    }
+    CloseHandle(handle);
+
+    ComPtr<IDXGIKeyedMutex> mutex;
+    source.As(&mutex);
+    CHECK(mutex != nullptr);
+    if (mutex) CHECK(SUCCEEDED(mutex->AcquireSync(0, 100)));
+
+    rcs::Foveator fov;
+    CHECK(fov.Init(dev.Get(), width / 2, height, width / 2, height, 0.45f, true));
+    const float starts[2][2] = {{0.275f, 0.275f}, {0.275f, 0.275f}};
+    CHECK(fov.Squeeze(ctx.Get(), source.Get(), starts));
+    rcs::ColorConverter conv;
+    CHECK(conv.Init(dev.Get(), width, height, true, true));
+    CHECK(conv.Convert(ctx.Get(), fov.Output()));
+    if (mutex) CHECK(SUCCEEDED(mutex->ReleaseSync(0)));
+}
+
 void TestRealGpuFoveatorHalfTexel() {
     ComPtr<ID3D11DeviceContext> ctx;
     auto dev = CreateHardwareOrWarpDevice(ctx);
@@ -1708,7 +1754,7 @@ void Test10BitPipelineDitherStereoAndSrgb() {
 }
 
 void TestSlicedEncodingConfigAndNvencIdr() {
-    // 1. Config synthesis gating: vrSlicedEncoding + >= 40 Mbps + non-AV1 => 4 slices; otherwise 1.
+    // 1. Config synthesis gating: >= 40 Mbps selects 4 HEVC or 2 AV1 slices; otherwise 1.
     {
         rcs::Settings pc;
         rcs::ClientStreamSettings st;
@@ -1723,7 +1769,7 @@ void TestSlicedEncodingConfigAndNvencIdr() {
         CHECK(bHevc.cfg.sliceCount == 4);
 
         auto bAv1 = rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::AV1, false, false, 100, 1280, 1280, 72.f);
-        CHECK(bAv1.cfg.sliceCount == 1);
+        CHECK(bAv1.cfg.sliceCount == 2);
 
         pc.vrBitrateMbps = 30;
         auto bLow = rcs::BuildVrStreamConfig(pc, st, rc::VideoCodec::HEVC, false, false, 100, 1280, 1280, 72.f);
@@ -1825,7 +1871,27 @@ void TestSlicedEncodingConfigAndNvencIdr() {
             CHECK(slices == 1);
         }
     }
-    std::printf("streamer sliced encoding (config + NVENC 4-slice HEVC IDR NAL & <40M single-slice fallback): ok\n");
+    {
+        if (!rcs::ProbeEncoderCaps(dev.Get(), 0x10DE).av1) {
+            std::printf("streamer sliced encoding (config + NVENC HEVC checks ok, AV1 hardware test skipped: encoder reports no AV1)\n");
+            return;
+        }
+        rcs::EncoderConfig ec;
+        ec.codec = rc::VideoCodec::AV1;
+        ec.width = kW; ec.height = kH; ec.fps = 72.f;
+        ec.bitrateKbps = 80000;
+        ec.inputFormat = DXGI_FORMAT_NV12;
+        ec.sliceCount = 2;
+        ec.splitFrame = false;
+        auto enc = rcs::CreateEncoder(dev.Get(), 0x10DE, ec);
+        CHECK(enc != nullptr);
+        if (enc) {
+            rcs::EncodedFrame frame;
+            CHECK(enc->Encode(conv.Output(), true, frame));
+            CHECK(frame.keyframe && !frame.data.empty());
+        }
+    }
+    std::printf("streamer sliced encoding (config + NVENC 4-slice HEVC IDR NAL, AV1 encode & <40M single-slice fallback): ok\n");
 }
 
 static std::vector<uint8_t> BuildOscMsg(const std::string& addr, const std::string& tags, const std::vector<float>& floats) {
@@ -1885,6 +1951,18 @@ void TestOscEyeReceiverAndSettings() {
 
         s.FromJson(rcs::json{{"externalEyeOscPort", 99999}});
         CHECK(s.externalEyeOscPort == 65535);
+
+        rcs::ClientStreamSettings st;
+        st.gazeFoveation = true;
+        rcs::Settings externalEyes;
+        externalEyes.externalEyeTracking = true;
+        auto externalInput = rcs::BuildAutoTuneInput(externalEyes, st, {});
+        CHECK(!externalInput.foveaOn);
+        CHECK(!externalInput.foveaPossible);
+
+        rcs::Settings headsetEyes;
+        auto headsetInput = rcs::BuildAutoTuneInput(headsetEyes, st, {});
+        CHECK(headsetInput.foveaPossible);
     }
 
     // 2. OSC 1.0 coordinate conversion + invertX/Y
@@ -1930,8 +2008,10 @@ void TestOscEyeReceiverAndSettings() {
         CHECK(!updated);
         auto heldGaze = BuildOscMsg("/tracking/eye/CenterPitchYaw", ",ff", {-30.0f, -30.0f});
         CHECK(rcs::OscEyeReceiver::ParsePacket(heldGaze.data(), heldGaze.size(), false, false, state, g, lastAddr, nx, ny, updated));
-        CHECK(!updated);  // held during blink
-        CHECK(g.gaze[0][2] < -0.9f);
+        CHECK(updated);  // held gaze must remain a live external signal
+        CHECK(g.gaze[0][2] < -0.9f && std::fabs(g.gaze[0][0]) < 1e-5f &&
+              std::fabs(g.gaze[1][0] - 0.1f) < 0.02f);
+        CHECK(nx > 0.0f && std::fabs(ny) < 1e-5f);
 
         auto blinkOff = BuildOscMsg("/tracking/eye/EyesClosedAmount", ",f", {0.0f});
         CHECK(rcs::OscEyeReceiver::ParsePacket(blinkOff.data(), blinkOff.size(), false, false, state, g, lastAddr, nx, ny, updated));
@@ -1983,9 +2063,36 @@ void TestOscEyeReceiverAndSettings() {
         CHECK(updated && lastAddr == "/papertracker/gaze/v1");
         CHECK(g.gaze[0][0] > 0.4f && g.gaze[0][1] > 0.25f && g.gaze[0][2] < -0.5f);  // yaw right (+x), pitch up (+y)
 
+        auto ptRepeated = buildPtV1(1, 0x3u, 500, -30.0f, -20.0f, -30.0f, -20.0f, -30.0f, -20.0f);
+        CHECK(rcs::OscEyeReceiver::ParsePacket(ptRepeated.data(), ptRepeated.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(!updated);
+        CHECK(g.gaze[0][0] > 0.4f && g.gaze[0][1] > 0.25f);
+
         // Fused-only fallback when left/right valid bits are 0
         auto pt2 = buildPtV1(2, 0x4u, 500, 0.0f, 0.0f, 0.0f, 0.0f, -25.0f, -15.0f);
         CHECK(rcs::OscEyeReceiver::ParsePacket(pt2.data(), pt2.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated && g.gaze[0][0] < -0.3f && g.gaze[0][1] < -0.2f);
+
+        auto ptBlinkOn = BuildOscMsg("/tracking/eye/EyesClosedAmount", ",f", {0.95f});
+        CHECK(rcs::OscEyeReceiver::ParsePacket(ptBlinkOn.data(), ptBlinkOn.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(!updated);
+        auto ptDuringBlink = buildPtV1(3, 0x3u, 500, 30.0f, 20.0f, 30.0f, 20.0f, 30.0f, 20.0f);
+        CHECK(rcs::OscEyeReceiver::ParsePacket(ptDuringBlink.data(), ptDuringBlink.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated);
+        CHECK(g.gaze[0][0] < -0.3f && g.gaze[0][1] < -0.2f);  // native gaze must also hold the last valid blink gaze
+
+        auto ptBlinkOff = BuildOscMsg("/tracking/eye/EyesClosedAmount", ",f", {0.0f});
+        CHECK(rcs::OscEyeReceiver::ParsePacket(ptBlinkOff.data(), ptBlinkOff.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        auto ptAfterBlink = buildPtV1(4, 0x3u, 500, 30.0f, 20.0f, 30.0f, 20.0f, 30.0f, 20.0f);
+        CHECK(rcs::OscEyeReceiver::ParsePacket(ptAfterBlink.data(), ptAfterBlink.size(), false, false, state, g, lastAddr, nx, ny, updated));
+        CHECK(updated && g.gaze[0][0] > 0.4f && g.gaze[0][1] > 0.25f);
+
+        rcs::OscEyeParserState zeroSequenceState;
+        auto ptZeroFirst = buildPtV1(0, 0x3u, 500, 30.0f, 20.0f, 30.0f, 20.0f, 30.0f, 20.0f);
+        CHECK(rcs::OscEyeReceiver::ParsePacket(ptZeroFirst.data(), ptZeroFirst.size(), false, false, zeroSequenceState, g, lastAddr, nx, ny, updated));
+        CHECK(updated);
+        auto ptZeroSecond = buildPtV1(0, 0x3u, 500, -30.0f, -20.0f, -30.0f, -20.0f, -30.0f, -20.0f);
+        CHECK(rcs::OscEyeReceiver::ParsePacket(ptZeroSecond.data(), ptZeroSecond.size(), false, false, zeroSequenceState, g, lastAddr, nx, ny, updated));
         CHECK(updated && g.gaze[0][0] < -0.3f && g.gaze[0][1] < -0.2f);
     }
     std::printf("streamer OSC eye receiver (OSC 1.0, #bundle, blink hold, malformed guards, port clamp): ok\n");
@@ -2001,6 +2108,7 @@ int main() {
     TestVrBridgeHostAndClient();
     TestVrBridgeHostHapticsRaceAndBurst();
     TestRealGpuFoveatorAndColorConverter();
+    TestRealGpuSharedTypelessVrTexture();
     TestRealGpuFoveatorHalfTexel();
     TestVrDiagMath();
     TestVideoSenderLiveAndFeedback();
