@@ -228,6 +228,13 @@ function commitSetting(el) {
     el.value = state.settings.pcName;
     return;
   }
+  if (key === "externalEyeTracking" && value && confirmedSettings) {
+    confirmedSettings.foveatedEncoding = false;
+    settingIntents.delete("foveatedEncoding");
+  } else if (key === "foveatedEncoding" && value && confirmedSettings) {
+    confirmedSettings.externalEyeTracking = false;
+    settingIntents.delete("externalEyeTracking");
+  }
   settingError(el, "");
   const intent = settingIntents.get(key);
   if (intent) {
@@ -239,7 +246,10 @@ function commitSetting(el) {
     submitSetting(key);
   }
   overlaySettings();
-  if (state) renderDependents();
+  if (state) {
+    if (key === "externalEyeTracking" || key === "foveatedEncoding") bindSettings();
+    renderDependents();
+  }
 }
 function submitSetting(key) {
   const intent = settingIntents.get(key);

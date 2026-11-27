@@ -415,7 +415,9 @@ void App::HandleUiMessage(const std::string& text) {
         s["requestId"] = requestId;
         PushUi(s);
     } else if (type == "setSettings") {
-        const json changes = m.value("settings", json::object());
+        json changes = m.value("settings", json::object());
+        if (changes.value("externalEyeTracking", false)) changes["foveatedEncoding"] = false;
+        else if (changes.value("foveatedEncoding", false)) changes["externalEyeTracking"] = false;
         auto save = [&] {
             SettingsStore::Get().Update([&](Settings& s) {
                 json merged = s.ToJson(false);

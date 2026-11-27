@@ -170,6 +170,7 @@ void Settings::FromJson(const json& j) {
     desktopBitrateMbps = std::clamp(desktopBitrateMbps, 5, 200);
     fecPercent = std::clamp(fecPercent, 0, 25);
     externalEyeOscPort = std::clamp(externalEyeOscPort, 1024, 65535);
+    if (externalEyeTracking && foveatedEncoding) foveatedEncoding = false;
     streamProfile = std::clamp(streamProfile, 0, 2);
     // 0 = follow the profile; otherwise clamp to the supported range.
     encodeScalePct = encodeScalePct > 0 ? std::clamp(encodeScalePct, 50, 100) : 0;
