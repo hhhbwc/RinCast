@@ -54,6 +54,9 @@ json HeadsetSettings::ToJson() const {
             {"micVolume", micVolume},
             {"haptics", haptics},
             {"scrollSpeed", scrollSpeed},
+            {"leftStickDeadzone", leftStickDeadzone},
+            {"rightStickDeadzone", rightStickDeadzone},
+            {"linkStickDeadzone", linkStickDeadzone},
             {"showStats", showStats},
             {"uiScale", uiScale},
             {"highContrast", highContrast},
@@ -132,6 +135,15 @@ void HeadsetSettings::FromJson(const json& j) {
     micVolume = std::clamp(micVolume, 0.f, 2.f);
     get("haptics", haptics);
     get("scrollSpeed", scrollSpeed);
+    get("leftStickDeadzone", leftStickDeadzone);
+    get("rightStickDeadzone", rightStickDeadzone);
+    get("linkStickDeadzone", linkStickDeadzone);
+    leftStickDeadzone = ClampStickDeadzone(leftStickDeadzone);
+    rightStickDeadzone = ClampStickDeadzone(rightStickDeadzone);
+    if (linkStickDeadzone) {
+        const float linked = std::max(leftStickDeadzone, rightStickDeadzone);
+        leftStickDeadzone = rightStickDeadzone = linked;
+    }
     get("showStats", showStats);
     get("uiScale", uiScale);
     get("highContrast", highContrast);

@@ -8,6 +8,7 @@
 #include <map>
 
 #include "../gfx/sky.h"
+#include "../xr/thumbstick_deadzone.h"
 #include "media/music_tracks.h"
 #include "../platform/jni_bridge.h"
 #include "app.h"
@@ -160,7 +161,7 @@ bool PoorFrameRate(const App::Stats& s, float wanted) {
 
 // ---- Pages of the main panel ----------------------------------------------------
 
-enum Page { kComputers, kGames, kVrGames, kDesktop, kEnvironment, kGeneral, kAccount, kHelp, kPageCount };
+enum Page { kComputers, kGames, kVrGames, kDesktop, kEnvironment, kControllers, kGeneral, kAccount, kHelp, kPageCount };
 
 int g_page = kComputers;
 
@@ -911,6 +912,141 @@ bool PageEnvironment(Ui& ui, const Rect& body) {
     return changed;
 }
 
+void DrawStickCard(Ui& ui, const Rect& card, const std::string& title, const HandInput& hand, float deadzone,
+                   bool calibrating = false, float progress = 0.f) {
+    UiRenderer& R = ui.R();
+    constexpr float kTwoPi = 6.2831853f;
+    R.RectBorder(card, Color::Hex(0x0E0E0E), kPanelRadius, kLine, 1.5f);
+
+    const bool connected = hand.thumbstickActive && !hand.isHand;
+    const Vec2 raw = connected && std::isfinite(hand.thumbstick.x) && std::isfinite(hand.thumbstick.y) ? hand.thumbstick : Vec2{};
+    const Vec2 out = ApplyThumbstickDeadzone(raw, deadzone);
+    const double rawMagnitude = StickMagnitude(raw);
+    const float rawMag = static_cast<float>(std::min(rawMagnitude, 1.0));
+    const float outMag = static_cast<float>(std::min(StickMagnitude(out), 1.0));
+    const bool caughtDrift = connected && rawMag > 0.005f && outMag <= 1e-5f;
+    const bool outputting = connected && outMag > 1e-5f;
+
+    R.Text(title, card.x + 22, card.y + 16, 24, kText, Face::SemiBold);
+    const std::string statusText = !connected ? Tr("ctrl.noStick") : outputting ? Tr("ctrl.active")
+                                       : caughtDrift  ? Tr("ctrl.filtered")
+                                                      : Tr("ctrl.centered");
+    const Color statusColor = !connected ? kFaint : outputting ? kGood : caughtDrift ? kWarn : kMuted;
+    R.Text(statusText, card.Right() - 22, card.y + 19, 19, statusColor, Face::SemiBold, Align::Right);
+
+    constexpr float radius = 92.f;
+    const float cx = card.x + card.w * 0.5f;
+    const float cy = card.y + 154.f;
+    R.Circle(cx, cy, radius, Color::Hex(0x161616));
+    R.Arc(cx, cy, radius, 2.5f, 0.f, kTwoPi, connected ? kEdge : kLine);
+    const Color axisColor = kLine.WithAlpha(0.55f);
+    R.RectFill({cx - radius + 6.f, cy - 0.75f, (radius - 6.f) * 2.f, 1.5f}, axisColor);
+    R.RectFill({cx - 0.75f, cy - radius + 6.f, 1.5f, (radius - 6.f) * 2.f}, axisColor);
+    R.Circle(cx, cy, 3.f, kFaint);
+
+    const float dz = ClampStickDeadzone(deadzone);
+    if (dz > 0.001f) {
+        const float dzRadius = dz * radius;
+        R.Circle(cx, cy, dzRadius, kAccent.WithAlpha(0.18f));
+        R.Arc(cx, cy, dzRadius, 2.2f, 0.f, kTwoPi, kAccent);
+    }
+
+    if (connected) {
+        const float rawScale = rawMagnitude > 1.0 ? static_cast<float>(1.0 / rawMagnitude) : 1.f;
+        const float rawX = cx + raw.x * rawScale * radius;
+        const float rawY = cy - raw.y * rawScale * radius;
+        if (outputting) {
+            R.Circle(rawX, rawY, 5.f, kFaint.WithAlpha(0.55f));
+            const float outX = cx + out.x * radius;
+            const float outY = cy - out.y * radius;
+            R.Circle(outX, outY, 8.5f, kGood);
+            R.Circle(outX, outY, 3.2f, kText);
+        } else if (caughtDrift) {
+            R.Circle(rawX, rawY, 7.5f, kWarn);
+            R.Circle(rawX, rawY, 2.8f, kPanel);
+        } else {
+            R.Circle(rawX, rawY, 5.5f, kMuted);
+        }
+    }
+
+    char rawBuf[160];
+    char outBuf[160];
+    snprintf(rawBuf, sizeof(rawBuf), "%s  %+.2f, %+.2f (%d%%)", Tr("ctrl.raw"), raw.x, raw.y,
+             int(std::round(rawMag * 100.f)));
+    if (calibrating) snprintf(outBuf, sizeof(outBuf), "%s  %.0f%%", Tr("ctrl.calibrating"), progress * 100.f);
+    else snprintf(outBuf, sizeof(outBuf), "%s  %+.2f, %+.2f", Tr("ctrl.output"), out.x, out.y);
+    const float infoY = cy + radius + 16.f;
+    R.Text(rawBuf, cx, infoY, 18, caughtDrift ? kWarn : kMuted, Face::Medium, Align::Center);
+    R.Text(outBuf, cx, infoY + 24.f, 18, calibrating ? kAccent : outputting ? kGood : kFaint, Face::Medium, Align::Center);
+}
+
+void PageControllers(Ui& ui, const Rect& body) {
+    App& app = *g_app;
+    HeadsetSettings& s = app.Settings();
+    UiRenderer& R = ui.R();
+    R.Text(Tr("ctrl.title"), body.x, body.y, 28, kText, Face::SemiBold);
+    R.WrapText(Tr("ctrl.subtitle"), {body.x, body.y + 40, body.w, 40}, 19, kMuted, Face::Medium, 26);
+
+    const float gap = 24.f;
+    const float cardW = (body.w - gap) * 0.5f;
+    const Rect card{body.x, body.y + 80, cardW, 314};
+    const HandInput& leftHand = app.Input().Hand(0);
+    const HandInput& rightHand = app.Input().Hand(1);
+    const bool calibrating = app.StickCalibrationActive();
+    DrawStickCard(ui, card, Tr("ctrl.leftStick"), leftHand, s.leftStickDeadzone, app.StickCalibrationActive(0),
+                  app.StickCalibrationProgress(0));
+    DrawStickCard(ui, {card.x + cardW + gap, card.y, cardW, card.h}, Tr("ctrl.rightStick"), rightHand,
+                  s.rightStickDeadzone, app.StickCalibrationActive(1), app.StickCalibrationProgress(1));
+
+    Column c{body.x, card.Bottom() + 16, body.w, true};
+    bool dirty = false;
+    if (CheckRow(ui, c, "ctrl-link", Tr("ctrl.linkBoth"), s.linkStickDeadzone, {}, !calibrating)) {
+        app.CancelStickCalibration();
+        if (s.linkStickDeadzone) {
+            const float linked = std::max(s.leftStickDeadzone, s.rightStickDeadzone);
+            s.leftStickDeadzone = s.rightStickDeadzone = linked;
+        }
+        dirty = true;
+    }
+    c.y += 6;
+    const bool leftAvailable = leftHand.thumbstickActive && !leftHand.isHand;
+    const bool rightAvailable = rightHand.thumbstickActive && !rightHand.isHand;
+    const bool canCalibrate = s.linkStickDeadzone ? leftAvailable && rightAvailable : leftAvailable || rightAvailable;
+    ButtonRow b{c.x, c.y};
+    if (b.Add(ui, "ctrl-auto", calibrating ? Tr("ctrl.calibrating") : Tr("ctrl.autoCalibrate"), ButtonStyle::Primary,
+              !calibrating && canCalibrate)) {
+        app.StartStickCalibration();
+    }
+    if (b.Add(ui, "ctrl-reset", Tr("ctrl.reset"), ButtonStyle::Quiet)) {
+        app.CancelStickCalibration();
+        s.leftStickDeadzone = s.rightStickDeadzone = 0.f;
+        dirty = true;
+    }
+    c.y += 62;
+
+    if (s.linkStickDeadzone) {
+        float dz = s.leftStickDeadzone;
+        if (BarRow(ui, c, "ctrl-dz-both", Tr("ctrl.deadzoneBoth"), dz, 0.f, kMaxStickDeadzone, 0.01f, Percent(dz),
+                   !calibrating)) {
+            app.CancelStickCalibration();
+            s.leftStickDeadzone = s.rightStickDeadzone = dz;
+            dirty = true;
+        }
+    } else {
+        if (BarRow(ui, c, "ctrl-dz-left", Tr("ctrl.deadzoneLeft"), s.leftStickDeadzone, 0.f, kMaxStickDeadzone, 0.01f,
+                   Percent(s.leftStickDeadzone), !calibrating)) {
+            app.CancelStickCalibration();
+            dirty = true;
+        }
+        if (BarRow(ui, c, "ctrl-dz-right", Tr("ctrl.deadzoneRight"), s.rightStickDeadzone, 0.f, kMaxStickDeadzone, 0.01f,
+                   Percent(s.rightStickDeadzone), !calibrating)) {
+            app.CancelStickCalibration();
+            dirty = true;
+        }
+    }
+    if (dirty) app.SaveSettings();
+}
+
 bool PageGeneral(Ui& ui, const Rect& body) {
     App& app = *g_app;
     HeadsetSettings& s = app.Settings();
@@ -1148,7 +1284,8 @@ void BuildMain(Ui& ui, const Rect& r) {
     Logo(ui, r.x + 44, r.y + 44, 44);
     R.Text("RinCast", r.x + 76, r.y + 28, 27, kText, Face::SemiBold);
 
-    static const char* names[kPageCount] = {"nav.pcs", "nav.games", "nav.vrQuality", "nav.desktop", "nav.environment", "nav.general", "nav.account", "nav.help"};
+    static const char* names[kPageCount] = {"nav.pcs", "nav.games", "nav.vrQuality", "nav.desktop",
+                                            "nav.environment", "nav.controllers", "nav.general", "nav.account", "nav.help"};
     float ny = r.y + 84;
     for (int i = 0; i < kPageCount; i++) {
         const Rect row{r.x + 12, ny, navW - 24, 52};
@@ -1187,6 +1324,7 @@ void BuildMain(Ui& ui, const Rect& r) {
         case kVrGames: changed = PageVrQuality(ui, body); break;
         case kDesktop: changed = PageDesktop(ui, body); break;
         case kEnvironment: changed = PageEnvironment(ui, body); break;
+        case kControllers: PageControllers(ui, body); break;
         case kGeneral: changed = PageGeneral(ui, body); break;
         case kAccount: PageAccount(ui, body); break;
         case kHelp: PageHelp(ui, body); break;

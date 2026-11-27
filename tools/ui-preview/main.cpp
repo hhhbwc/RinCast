@@ -114,6 +114,16 @@ void Live(App& a) {
     a.open = {"dock", "home"};
     a.serverInfo.update({{"pcName", "Studio PC"}, {"gpu", "NVIDIA GeForce RTX 5070 Ti"}, {"version", "1.0.0"}, {"os", "Windows 11"}});
 }
+void Controllers(App& a) {
+    Live(a);
+    a.input.hands[0].thumbstickActive = true;
+    a.input.hands[0].thumbstick = {0.06f, 0.08f};
+    a.input.hands[1].thumbstickActive = true;
+    a.input.hands[1].thumbstick = {0.35f, -0.2f};
+    a.settings.leftStickDeadzone = 0.13f;
+    a.settings.rightStickDeadzone = 0.20f;
+    a.settings.linkStickDeadzone = false;
+}
 const char* const kGameNames[] = {"Half-Life: Alyx", "Beat Saber", "Boneworks", "Pavlov", "Assetto Corsa Competizione", "VRChat", "Blade & Sorcery", "No Man's Sky", "Elite Dangerous", "Skyrim VR"};
 
 GLuint Art(int seed) {
@@ -161,24 +171,37 @@ const std::vector<Scene>& Scenes() {
         {"streaming-connected", "home", 2, [](App& a) { Live(a); a.settings.frameGeneration = true; a.settings.vrBitrateMbps = 0; }},
         {"streaming-match", "home", 2, [](App& a) { Live(a); a.settings.matchSteamVr = true; }},
         {"streaming-pico", "home", 2, [](App& a) { a.device.pico = true; a.input.simultaneous = false; }},
-        {"streaming-settings-apply", "home", 2, [](App&) {}, 300, 760, true, [](App& a) {
-             const bool snapshotsMatch = a.savedSettings.frameGeneration && a.appliedStreamSettings.frameGeneration;
-             if (!a.settings.frameGeneration || !snapshotsMatch || a.savedSettingsCount != 1 ||
-                 a.appliedStreamSettingsCount != 1 || a.settings.upscaling) {
-                 fprintf(stderr, "settings Apply click: enabled=%d saved=%d applied=%d savedSnapshot=%d appliedSnapshot=%d upscaling=%d\n",
-                         int(a.settings.frameGeneration), a.savedSettingsCount, a.appliedStreamSettingsCount,
-                         int(a.savedSettings.frameGeneration), int(a.appliedStreamSettings.frameGeneration), int(a.settings.upscaling));
+        {"streaming-settings-apply", "home", 2, [](App& a) { a.settings.upscaling = true; }, 300, 180, true, [](App& a) {
+             const bool snapshotsMatch = a.savedSettings.matchSteamVr && a.appliedStreamSettings.matchSteamVr &&
+                                         a.savedSettings.upscaling && a.appliedStreamSettings.upscaling;
+             if (!a.settings.matchSteamVr || !a.settings.upscaling || !snapshotsMatch || a.savedSettingsCount != 1 ||
+                 a.appliedStreamSettingsCount != 1) {
+                 fprintf(stderr, "settings immediate apply: match=%d saved=%d applied=%d snapshots=%d upscaling=%d\n",
+                         int(a.settings.matchSteamVr), a.savedSettingsCount, a.appliedStreamSettingsCount,
+                         int(snapshotsMatch), int(a.settings.upscaling));
                  return false;
              }
              return true;
          }},
         {"desktop", "home", 3, [](App&) {}},
         {"environment", "home", 4, [](App&) {}},
-        {"settings", "home", 5, [](App&) {}},
-        {"account-signed-out", "home", 6, [](App&) {}},
-        {"account-code", "home", 6, [](App& a) { a.account.state = Cloud::SignInState::WaitingForApproval; a.account.code = "K7QM-2XPL"; a.account.url = "https://rincast.com/link"; }},
-        {"account-signed-in", "home", 6, [](App& a) { a.account.state = Cloud::SignInState::SignedIn; a.account.user = "Sam"; }},
-        {"help", "home", 7, [](App& a) { Live(a); }},
+        {"controllers", "home", 5, Controllers},
+        {"controllers-linked", "home", 5, [](App& a) { Controllers(a); a.settings.linkStickDeadzone = true; a.settings.leftStickDeadzone = a.settings.rightStickDeadzone = 0.13f; }},
+        {"controllers-auto", "home", 5, Controllers, 360, 520, true, [](App& a) { return a.calibrationStarts == 1 && a.calibrationActive; }},
+        {"controllers-reset", "home", 5, Controllers, 550, 520, true, [](App& a) {
+             return a.settings.leftStickDeadzone == 0.f && a.settings.rightStickDeadzone == 0.f && a.savedSettingsCount == 1;
+         }},
+        {"controllers-sync", "home", 5, Controllers, 300, 455, true, [](App& a) {
+             return a.settings.linkStickDeadzone && a.settings.leftStickDeadzone == 0.20f && a.settings.rightStickDeadzone == 0.20f && a.savedSettingsCount == 1;
+         }},
+        {"controllers-slider", "home", 5, [](App& a) { Controllers(a); a.settings.linkStickDeadzone = true; }, 600, 605, true, [](App& a) {
+             return a.settings.leftStickDeadzone == a.settings.rightStickDeadzone && a.settings.leftStickDeadzone > 0.13f && a.savedSettingsCount == 1;
+         }},
+        {"settings", "home", 6, [](App&) {}},
+        {"account-signed-out", "home", 7, [](App&) {}},
+        {"account-code", "home", 7, [](App& a) { a.account.state = Cloud::SignInState::WaitingForApproval; a.account.code = "K7QM-2XPL"; a.account.url = "https://rincast.com/link"; }},
+        {"account-signed-in", "home", 7, [](App& a) { a.account.state = Cloud::SignInState::SignedIn; a.account.user = "Sam"; }},
+        {"help", "home", 8, [](App& a) { Live(a); }},
         {"computers-take-over", "home", 0, [](App& a) { a.lan.pcs = {{"b", "Living room", "", true}}; }},
         {"high-contrast", "home", 2, [](App& a) { theme::SetHighContrast(true); a.settings.highContrast = true; }},
         {"dock", "dock", 0, Live},
@@ -233,7 +256,7 @@ const std::vector<Scene>& Scenes() {
         {"computers-vpn", "home", 0, [](App& a) { a.lan.pcs = {{"a", "Studio PC", "", false, true}}; }},
         {"computers-connected-vpn", "home", 0, [](App& a) { Live(a); a.client.vpn = true; }},
         {"computers-reconnecting", "home", 0, [](App& a) { a.reconnecting = true; a.client.serverName = "Studio PC"; }},
-        {"settings-hover-check", "home", 5, [](App&) {}, 400, 120},
+        {"settings-hover-check", "home", 6, [](App&) {}, 400, 120},
         {"keyboard-symbols", "keyboard", 0, Live, 120, 520, true},
         {"computers-address", "home", 0, [](App&) {}, 380, 366, true},
     };
@@ -250,6 +273,7 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(out);
     // RINCAST_LANG=<code> previews the UI in that language, e.g. zh-CN.
     if (const char* lang = getenv("RINCAST_LANG")) SetLanguage(lang);
+    else SetLanguage("en");
 
     // The GPU if it's free, else Windows' software renderer: the pictures come out the same.
     EGLDisplay d = eglGetDisplay(EGL_DEFAULT_DISPLAY);

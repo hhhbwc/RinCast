@@ -26,6 +26,7 @@
 #include "rc/protocol.h"
 #include "rc/socket.h"
 #include "rc/video_transport.h"
+#include "xr/thumbstick_deadzone.h"
 
 namespace rv {
 
@@ -95,6 +96,10 @@ bool MatrixNearIdentity(const rv::Mat4& m) { return MatrixNear(m, rv::Mat4::Iden
 
 bool VectorNear(const rv::Vec3& a, const rv::Vec3& b) {
     return std::fabs(a.x - b.x) <= 1e-5f && std::fabs(a.y - b.y) <= 1e-5f && std::fabs(a.z - b.z) <= 1e-5f;
+}
+
+bool Vector2Near(const rv::Vec2& a, const rv::Vec2& b, float epsilon = 1e-5f) {
+    return std::fabs(a.x - b.x) <= epsilon && std::fabs(a.y - b.y) <= epsilon;
 }
 
 bool QuatIsFiniteUnit(const rv::Quat& q) {
@@ -329,6 +334,11 @@ void TestStringsAndLocales() {
         "stat.frameGen.active",
         "stat.frameGen.standby",
         "stat.frameGen.rejected",
+        "nav.controllers",
+        "ctrl.title",
+        "ctrl.calibrationDone",
+        "ctrl.calibrationFailed",
+        "ctrl.calibrationUnavailable",
     };
     size_t langCount = 0;
     const rv::LanguageChoice* choices = rv::LanguageChoices(langCount);
@@ -348,6 +358,49 @@ void TestStringsAndLocales() {
     std::printf("headset strings/locales: %zu languages and critical keys ok\n", langCount);
 }
 
+void TestThumbstickDeadzone() {
+    using namespace rv;
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({0.3f, -0.4f}, 0.f), {0.3f, -0.4f}));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({0.1f, 0.1f}, 0.15f), {}));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({0.6f, 0.f}, 0.2f), {0.5f, 0.f}));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({1.f, 0.f}, 0.2f), {1.f, 0.f}));
+    const float diagonal = 0.6f / std::sqrt(2.f);
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({diagonal, diagonal}, 0.2f), {diagonal * (5.f / 6.f), diagonal * (5.f / 6.f)}));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({std::numeric_limits<float>::quiet_NaN(), 0.f}, 0.2f), {}));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({0.f, std::numeric_limits<float>::infinity()}, 0.2f), {}));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({0.1f, 0.f}, -1.f), {0.1f, 0.f}));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({0.5f, 0.f}, 2.f), {1.f / 6.f, 0.f}));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({3.f, 4.f}, 0.f), {0.6f, 0.8f}));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({std::numeric_limits<float>::max(), std::numeric_limits<float>::max()}, 0.2f),
+                      {0.70710677f, 0.70710677f}));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({0.2f + 1e-4f, 0.f}, 0.2f), {0.000125f, 0.f}, 1e-6f));
+    CHECK(Vector2Near(ApplyThumbstickDeadzone({0.6f, 0.f}, std::numeric_limits<float>::quiet_NaN()), {0.6f, 0.f}));
+    CHECK(std::fabs(SuggestDeadzoneForDrift({0.06f, 0.08f}) - 0.13f) < 1e-6f);
+    CHECK(SuggestDeadzoneForDrift({0.001f, 0.f}) == 0.f);
+    CHECK(SuggestDeadzoneForDrift({0.5f, 0.f}) == kMaxStickDeadzone);
+
+    StickDeadzoneCalibration calibration;
+    calibration.Start();
+    for (int i = 0; i < kStickCalibrationFrames - 1; i++) CHECK(!calibration.Observe({0.06f, 0.08f}));
+    CHECK(calibration.Observe({0.06f, 0.08f}));
+    CHECK(calibration.CanApply());
+    CHECK(std::fabs(calibration.SuggestedDeadzone() - 0.13f) < 1e-6f);
+
+    calibration.Start();
+    for (int i = 0; i < kStickCalibrationFrames - 1; i++) CHECK(!calibration.Observe({}));
+    CHECK(calibration.Observe({0.3f, 0.f}));
+    CHECK(!calibration.CanApply());
+
+    calibration.Start();
+    for (int i = 0; i < kStickCalibrationFrames; i++) CHECK(!calibration.Observe({0.39f, 0.f}) || i == kStickCalibrationFrames - 1);
+    CHECK(!calibration.CanApply());
+
+    calibration.Start();
+    CHECK(!calibration.Observe({std::numeric_limits<float>::quiet_NaN(), 0.f}));
+    CHECK(!calibration.active && calibration.invalid && !calibration.CanApply());
+    std::printf("thumbstick deadzone: radial mapping, bounds, and multi-frame calibration ok\n");
+}
+
 void TestHeadsetSettings() {
     TempDir tmp("rc-hs-settings");
     const std::string path = (tmp.dir / "settings.json").string();
@@ -363,6 +416,7 @@ void TestHeadsetSettings() {
     CHECK(loaded.vrScaleOfPanel == false);
     CHECK(loaded.micVolume == 2.0f);
     CHECK(loaded.codec == "hevc");
+    CHECK(loaded.leftStickDeadzone == 0.f && loaded.rightStickDeadzone == 0.f && loaded.linkStickDeadzone);
 
     // Step quantization + clamp bounds.
     rv::HeadsetSettings s;
@@ -376,6 +430,9 @@ void TestHeadsetSettings() {
     CHECK(std::fabs(s.vrScale - 0.90f) < 1e-4f);
     CHECK(s.vrQuality == "high");
     s.frameGeneration = true;
+    s.leftStickDeadzone = 0.12f;
+    s.rightStickDeadzone = 0.23f;
+    s.linkStickDeadzone = false;
     s.keyboard.swipe = true;
     s.keyboard.recent = {"hello"};
     s.Save(path);
@@ -387,6 +444,25 @@ void TestHeadsetSettings() {
     const auto streamJson = rt.StreamSettingsJson();
     CHECK(streamJson["frameGeneration"] == true);
     CHECK(!streamJson.contains("streamProfile"));
+    CHECK(!streamJson.contains("leftStickDeadzone"));
+    CHECK(!streamJson.contains("rightStickDeadzone"));
+    CHECK(!streamJson.contains("linkStickDeadzone"));
+    CHECK(std::fabs(rt.leftStickDeadzone - 0.12f) < 1e-6f);
+    CHECK(std::fabs(rt.rightStickDeadzone - 0.23f) < 1e-6f);
+    CHECK(!rt.linkStickDeadzone && rt.StickDeadzone(0) == rt.leftStickDeadzone && rt.StickDeadzone(1) == rt.rightStickDeadzone);
+
+    {
+        std::ofstream f(path);
+        f << R"({"leftStickDeadzone":0.1,"rightStickDeadzone":0.3,"linkStickDeadzone":true})";
+    }
+    const rv::HeadsetSettings linked = rv::HeadsetSettings::Load(path);
+    CHECK(linked.leftStickDeadzone == 0.3f && linked.rightStickDeadzone == 0.3f);
+    rv::HeadsetSettings clamped;
+    clamped.FromJson(nlohmann::json{{"leftStickDeadzone", -1.f}, {"rightStickDeadzone", 2.f}, {"linkStickDeadzone", false}});
+    CHECK(clamped.leftStickDeadzone == 0.f && clamped.rightStickDeadzone == rv::kMaxStickDeadzone);
+    clamped.leftStickDeadzone = std::numeric_limits<float>::quiet_NaN();
+    clamped.FromJson(clamped.ToJson());
+    CHECK(clamped.leftStickDeadzone == 0.f);
 
     // Corrupt JSON must cleanly fall back to defaults without throwing.
     {
@@ -659,6 +735,7 @@ void TestStreamClientConcurrencyAndLoopback() {
 
 int main() {
     TestStringsAndLocales();
+    TestThumbstickDeadzone();
     TestHeadsetSettings();
     TestHeadsetMathBounds();
     TestVideoDecoderSubmitChain();

@@ -21,6 +21,7 @@ struct HandInput {
     float trigger = 0;
     float squeeze = 0;
     Vec2 thumbstick;
+    bool thumbstickActive = false;
     bool thumbstickClick = false;
     bool primary = false;       // A / X
     bool secondary = false;     // B / Y

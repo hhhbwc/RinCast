@@ -19,6 +19,7 @@
 #include <cstring>
 
 #include "../platform/jni_bridge.h"
+#include "../xr/thumbstick_deadzone.h"
 
 #include <net/if.h>
 #include "rc/frame_queue_bound.h"  // A23 (TASK-QUEUE-BOUND-2026-11-22): the decode queue bound
@@ -186,7 +187,12 @@ void App::Init() {
         SaveSettings();
     };
     if (!m_keyboard.Init(m_assets, kbOut)) RC_LOGE("Keyboard: its assets are missing");
-    m_scene.Init();
+    if (!m_scene.Init()) {
+        RC_LOGE("Scene renderer initialization failed");
+        m_exit = true;
+        m_xr.Shutdown();
+        return;
+    }
     m_windows.Init(&m_ui, &m_scene);
     m_xr.SetRefreshRate(m_settings.refreshRate);
     m_discovery.Start(Platform::DeviceId(), Platform::DeviceModel());
@@ -1802,7 +1808,102 @@ void App::LogVrTiming(const FrameState& frame, int64_t wokeNs) {
     m_timingWakeLeadNs = m_timingLatchNs = m_timingSubmitNs = m_timingGpuNs = 0;
 }
 
+void App::StartStickCalibration() {
+    const auto available = [&](int hand) {
+        const HandInput& in = m_input.Hand(hand);
+        return in.thumbstickActive && !in.isHand;
+    };
+    const bool linked = m_settings.linkStickDeadzone;
+    if ((linked && (!available(0) || !available(1))) || (!linked && !available(0) && !available(1))) {
+        PostNotice(Tr("ctrl.calibrationUnavailable"), "warning");
+        return;
+    }
+    for (int hand = 0; hand < 2; hand++) {
+        m_stickCalibration[hand] = {};
+        if (available(hand)) m_stickCalibration[hand].Start();
+    }
+}
+
+void App::CancelStickCalibration() {
+    for (auto& calibration : m_stickCalibration) calibration.active = false;
+}
+
+bool App::StickCalibrationActive() const {
+    return m_stickCalibration[0].active || m_stickCalibration[1].active;
+}
+
+bool App::StickCalibrationActive(int hand) const {
+    return hand >= 0 && hand < 2 && m_stickCalibration[hand].active;
+}
+
+float App::StickCalibrationProgress() const {
+    return std::max(StickCalibrationProgress(0), StickCalibrationProgress(1));
+}
+
+float App::StickCalibrationProgress(int hand) const {
+    return hand >= 0 && hand < 2 ? std::clamp(m_stickCalibration[hand].samples / float(kStickCalibrationFrames), 0.f, 1.f) : 0.f;
+}
+
+void App::UpdateStickCalibration() {
+    const auto available = [&](int hand) {
+        const HandInput& in = m_input.Hand(hand);
+        return in.thumbstickActive && !in.isHand;
+    };
+    bool changed = false;
+    bool failed = false;
+    bool succeeded = false;
+    const bool linked = m_settings.linkStickDeadzone;
+    for (int hand = 0; hand < 2; hand++) {
+        auto& calibration = m_stickCalibration[hand];
+        if (!calibration.active) continue;
+        if (!available(hand)) {
+            calibration = {};
+            failed = true;
+            if (linked) break;
+            continue;
+        }
+        calibration.Observe(m_input.Hand(hand).thumbstick);
+        if (calibration.active) continue;
+        if (!calibration.CanApply()) {
+            calibration = {};
+            failed = true;
+            if (linked) break;
+            continue;
+        }
+        if (linked) {
+            succeeded = true;
+            continue;
+        }
+        const float suggested = calibration.SuggestedDeadzone();
+        float& setting = hand == 0 ? m_settings.leftStickDeadzone : m_settings.rightStickDeadzone;
+        if (setting != suggested) {
+            setting = suggested;
+            changed = true;
+        }
+        calibration = {};
+        succeeded = true;
+    }
+    if (linked && failed) {
+        for (auto& calibration : m_stickCalibration) calibration = {};
+        PostNotice(Tr("ctrl.calibrationFailed"), "warning");
+        return;
+    }
+    if (linked && StickCalibrationActive()) return;
+    if (linked && succeeded) {
+        const float linkedDeadzone = std::max(m_stickCalibration[0].SuggestedDeadzone(), m_stickCalibration[1].SuggestedDeadzone());
+        if (m_settings.leftStickDeadzone != linkedDeadzone || m_settings.rightStickDeadzone != linkedDeadzone) {
+            m_settings.leftStickDeadzone = m_settings.rightStickDeadzone = linkedDeadzone;
+            changed = true;
+        }
+        for (auto& calibration : m_stickCalibration) calibration = {};
+    }
+    if (changed) SaveSettings();
+    if (failed) PostNotice(Tr("ctrl.calibrationFailed"), "warning");
+    if (succeeded) PostNotice(Tr("ctrl.calibrationDone"));
+}
+
 void App::UpdateInput(const FrameState& frame, float dt) {
+    UpdateStickCalibration();
     const bool uiActive = m_mode != Mode::Vr || m_vrOverlay;
     for (int h = 0; h < 2; h++) {
         const HandInput& in = m_input.Hand(h);
@@ -1825,8 +1926,10 @@ void App::UpdateInput(const FrameState& frame, float dt) {
         r.triggerDown = was ? in.trigger > 0.35f : in.trigger > 0.65f;
         r.triggerPressed = r.triggerDown && !was;
         r.triggerReleased = !r.triggerDown && was;
-        r.scroll = std::fabs(in.thumbstick.y) > 0.15f ? in.thumbstick.y * m_settings.scrollSpeed : 0.f;
-        r.push = in.thumbstick.y;
+        const Vec2 uiStick = ApplyThumbstickDeadzone(in.thumbstick, m_settings.StickDeadzone(h));
+        const float uiMag = static_cast<float>(StickMagnitude(uiStick));
+        r.scroll = uiStick.y * SmoothStep(0.12f, 0.20f, uiMag) * m_settings.scrollSpeed;
+        r.push = uiStick.y;
 
         // Left menu: in VR mode, long-press (0.6 s) opens RinCast's overlay so short/double
         // presses pass cleanly to SteamVR without hijacking SteamVR's menu button.
@@ -2038,8 +2141,10 @@ void App::UpdateInput(const FrameState& frame, float dt) {
     }
     button(in.thumbstickClick, st.stickClick, 2);
     // Smooth scrolling: thumbstick -> wheel notches.
-    const float sy = std::fabs(in.thumbstick.y) > 0.2f ? in.thumbstick.y : 0.f;
-    const float sx = std::fabs(in.thumbstick.x) > 0.5f ? in.thumbstick.x : 0.f;
+    const Vec2 deskStick = ApplyThumbstickDeadzone(in.thumbstick, m_settings.StickDeadzone(mouseHand));
+    const float deskMag = static_cast<float>(StickMagnitude(deskStick));
+    const float sy = deskStick.y * SmoothStep(0.15f, 0.25f, deskMag);
+    const float sx = deskStick.x * SmoothStep(0.45f, 0.55f, deskMag);
     if (sy != 0 || sx != 0)
         m_client.SendControl({{"type", rc::msg::kMouseWheel},
                               {"dx", sx * dt * 8.f * m_settings.scrollSpeed},
@@ -2213,8 +2318,9 @@ void App::UpdateTracking(const FrameState& frame) {
             c.buttons = b;
             c.trigger = in.trigger;
             c.grip = in.squeeze;
-            c.thumbstick[0] = in.thumbstick.x;
-            c.thumbstick[1] = in.thumbstick.y;
+            const Vec2 stick = ApplyThumbstickDeadzone(in.thumbstick, m_settings.StickDeadzone(h));
+            c.thumbstick[0] = stick.x;
+            c.thumbstick[1] = stick.y;
             if (playingWithHand) {
                 // A fist closes the fingers that would otherwise read as pinches.
                 c.grip = rc::HandGrip(joints);

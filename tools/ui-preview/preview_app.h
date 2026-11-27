@@ -125,10 +125,19 @@ class Headset {
     const char* FaceHint() const { return Tr("device.faceHint"); }
 };
 
+struct HandInput {
+    bool active = false;
+    bool isHand = false;
+    bool thumbstickActive = false;
+    Vec2 thumbstick;
+};
+
 class XrInput {
    public:
     bool simultaneous = true;
     bool SimultaneousSupported() const { return simultaneous; }
+    const HandInput& Hand(int hand) const { return hands[hand]; }
+    HandInput hands[2];
 };
 
 class App {
@@ -182,6 +191,15 @@ class App {
     XrContext& Xr() { return xr; }
     Headset& Device() { return device; }
     XrInput& Input() { return input; }
+    bool calibrationActive = false;
+    float calibrationProgress = 0.f;
+    int calibrationStarts = 0;
+    void StartStickCalibration() { calibrationActive = true; calibrationProgress = 0.25f; ++calibrationStarts; }
+    void CancelStickCalibration() { calibrationActive = false; calibrationProgress = 0.f; }
+    bool StickCalibrationActive() const { return calibrationActive; }
+    bool StickCalibrationActive(int) const { return calibrationActive; }
+    float StickCalibrationProgress() const { return calibrationProgress; }
+    float StickCalibrationProgress(int) const { return calibrationProgress; }
     bool GazeSupported() { return true; }
     void ConnectLan(const DiscoveredPc&) {}
     void ConnectCloud(const CloudPc&) {}
@@ -213,7 +231,11 @@ class App {
     void ShowMonitors(bool) {}
     bool MonitorsVisible() const { return monitorsVisible; }
     void SendKey(uint16_t, bool) {}
+    void TogglePcKeyboard() {}
     void SendText(const std::string&) {}
+    void PostNotice(const std::string& text, const std::string& level = "info", const std::string& action = {}) {
+        notices.push_back({text, level, action, 0.f, 6.f});
+    }
     void RunAction(const std::string&) {}
     void DismissNotice() {}
     float ModeTime() const { return 12; }

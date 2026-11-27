@@ -267,8 +267,9 @@ void XrInput::Update(XrTime time) {
         h.squeeze = GetFloat(s, m_squeeze, sub);
         XrActionStateVector2f v{XR_TYPE_ACTION_STATE_VECTOR2F};
         gi.action = m_stick;
-        xrGetActionStateVector2f(s, &gi, &v);
-        h.thumbstick = v.isActive ? Vec2{v.currentState.x, v.currentState.y} : Vec2{};
+        const XrResult stickResult = xrGetActionStateVector2f(s, &gi, &v);
+        h.thumbstickActive = XR_SUCCEEDED(stickResult) && v.isActive;
+        h.thumbstick = h.thumbstickActive ? Vec2{v.currentState.x, v.currentState.y} : Vec2{};
         h.thumbstickClick = GetBool(s, m_stickClick, sub);
         h.primary = GetBool(s, m_primary, sub);
         h.secondary = GetBool(s, m_secondary, sub);

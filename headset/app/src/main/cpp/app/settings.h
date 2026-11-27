@@ -7,6 +7,7 @@
 
 #include "keyboard/kb_config.h"
 #include "nlohmann/json.hpp"
+#include "../xr/thumbstick_deadzone.h"
 
 namespace rv {
 
@@ -64,6 +65,10 @@ struct HeadsetSettings {
     // Controls
     bool haptics = true;
     float scrollSpeed = 1.0f;
+    float leftStickDeadzone = 0.0f;
+    float rightStickDeadzone = 0.0f;
+    bool linkStickDeadzone = true;
+    float StickDeadzone(int hand) const { return hand == 0 ? leftStickDeadzone : rightStickDeadzone; }
     bool showStats = false;
     float uiScale = 1.0f;               // window size: 1, 1.25 or 1.5
     bool highContrast = false;

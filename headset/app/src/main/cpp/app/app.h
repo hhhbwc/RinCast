@@ -27,6 +27,7 @@
 #include "../keyboard/keyboard.h"
 #include "../xr/xr_context.h"
 #include "../xr/xr_input.h"
+#include "../xr/thumbstick_deadzone.h"
 #include "rc/frame_generation.h"
 #include "rc/link_policy.h"
 #include "rc/motion_field.h"
@@ -96,6 +97,12 @@ class App {
     XrContext& Xr() { return m_xr; }
     Headset& Device() { return *m_headset; }
     XrInput& Input() { return m_input; }
+    void StartStickCalibration();
+    void CancelStickCalibration();
+    bool StickCalibrationActive() const;
+    bool StickCalibrationActive(int hand) const;
+    float StickCalibrationProgress() const;
+    float StickCalibrationProgress(int hand) const;
     // Foveated encoding can follow the eyes.
     bool GazeSupported() { return m_headset->GazeSupported(m_xr) || m_input.GazeSupported(); }
 
@@ -171,6 +178,7 @@ class App {
     nlohmann::json StreamSettingsForPc();
     void FollowDisplayRate();
     void UpdateInput(const FrameState& frame, float dt);
+    void UpdateStickCalibration();
     void UpdateTracking(const FrameState& frame);
     void UpdateBody(const FrameState& frame);
     void CreateVrSwapchain();
@@ -272,6 +280,7 @@ class App {
     int m_lastMouseHand = 1;
     std::string m_spokenProblem;
     Vec3 m_smoothDir[2];
+    StickDeadzoneCalibration m_stickCalibration[2];
     void ReconnectTick();
     void RecoverFailedDecoders();
     std::mutex m_decoderMutex;
