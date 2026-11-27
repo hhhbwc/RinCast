@@ -185,8 +185,35 @@ bool HandleOscMessage(const uint8_t* data, size_t len, bool invertX, bool invert
 
     outLastAddress = address;
 
+    const bool eyesBlinking = state.eyesClosed > kBlinkHoldThreshold ||
+                              (state.closedLeft > kBlinkHoldThreshold && state.closedRight > kBlinkHoldThreshold);
+
+    auto emitGaze = [&](const rc::GazePayload& g) -> bool {
+        if (eyesBlinking && state.hasValidGaze) {
+            outGaze = state.lastValidGaze;
+            UpdateNormFromGaze(outGaze, outNormX, outNormY);
+            outUpdatedGaze = true;
+            return true;
+        }
+        state.lastValidGaze = g;
+        state.hasValidGaze = true;
+        outGaze = g;
+        UpdateNormFromGaze(g, outNormX, outNormY);
+        outUpdatedGaze = true;
+        return true;
+    };
+
     // PaperTracker native gaze export v1: /papertracker/gaze/v1 ,iiiffffff
     if (address == "/papertracker/gaze/v1" && typeTag == ",iiiffffff" && len == 72) {
+        const uint32_t sequence = ReadBe32(data + 36);
+        // Zero is also used by exporters that do not provide frame numbering.
+        if (sequence != 0) {
+            if (state.hasPaperTrackerSequence && sequence == state.lastPaperTrackerSequence) return true;
+            state.lastPaperTrackerSequence = sequence;
+            state.hasPaperTrackerSequence = true;
+        } else {
+            state.hasPaperTrackerSequence = false;
+        }
         const uint32_t ptFlags = ReadBe32(data + 36 + 4);
         const bool leftValid = (ptFlags & 1u) != 0;
         const bool rightValid = (ptFlags & 2u) != 0;
@@ -203,12 +230,7 @@ bool HandleOscMessage(const uint8_t* data, size_t len, bool invertX, bool invert
             g.flags |= rc::kGazeRightValid;
         }
         if (g.flags == 0) return false;
-        state.lastValidGaze = g;
-        state.hasValidGaze = true;
-        outGaze = g;
-        UpdateNormFromGaze(g, outNormX, outNormY);
-        outUpdatedGaze = true;
-        return true;
+        return emitGaze(g);
     }
 
     // Blink protection updates
@@ -224,22 +246,6 @@ bool HandleOscMessage(const uint8_t* data, size_t len, bool invertX, bool invert
         if (std::isfinite(args[0])) state.closedRight = std::clamp(args[0], 0.0f, 1.0f);
         return true;
     }
-
-    const bool eyesBlinking = state.eyesClosed > kBlinkHoldThreshold ||
-                              (state.closedLeft > kBlinkHoldThreshold && state.closedRight > kBlinkHoldThreshold);
-
-    auto emitGaze = [&](const rc::GazePayload& g) -> bool {
-        if (eyesBlinking && state.hasValidGaze) {
-            outGaze = state.lastValidGaze;
-            return true;
-        }
-        state.lastValidGaze = g;
-        state.hasValidGaze = true;
-        outGaze = g;
-        UpdateNormFromGaze(g, outNormX, outNormY);
-        outUpdatedGaze = true;
-        return true;
-    };
 
     if (address == "/tracking/eye/LeftRightVec" && argCount >= 6) {
         rc::GazePayload g{};
@@ -382,6 +388,19 @@ void OscEyeReceiver::CloseSocket() {
 
 void OscEyeReceiver::Stop() {
     m_running.store(false, std::memory_order_release);
+    // Unsubscribe from PaperTracker before closing the socket.
+    {
+        std::lock_guard lock(m_sockMutex);
+        const SOCKET s = static_cast<SOCKET>(m_socket);
+        if (s != INVALID_SOCKET && m_port != 0) {
+            sockaddr_in target{};
+            target.sin_family = AF_INET;
+            target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            target.sin_port = htons(m_port);
+            sendto(s, reinterpret_cast<const char*>(kUnsubscribeMsg), sizeof(kUnsubscribeMsg), 0,
+                   reinterpret_cast<const sockaddr*>(&target), sizeof(target));
+        }
+    }
     CloseSocket();
     if (m_thread.joinable()) m_thread.join();
     m_enabled = false;
@@ -522,8 +541,6 @@ void OscEyeReceiver::WorkerLoop(uint16_t port) {
         }
     }
 
-    sendto(s, reinterpret_cast<const char*>(kUnsubscribeMsg), sizeof(kUnsubscribeMsg), 0,
-           reinterpret_cast<const sockaddr*>(&target), sizeof(target));
     CloseSocket();
     RC_LOGI("OSC eye receiver stopped");
 }

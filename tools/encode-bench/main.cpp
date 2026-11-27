@@ -173,6 +173,8 @@ int main(int argc, char** argv) {
             ec.desktop = true;
         } else if (a == "--no-split") {
             ec.splitFrame = false;
+        } else if (a == "--slices") {
+            ec.sliceCount = std::stoi(next());
         } else if (a == "--no-aq") {
             ec.adaptiveQuant = false;
         } else if (a == "--two-pass") {

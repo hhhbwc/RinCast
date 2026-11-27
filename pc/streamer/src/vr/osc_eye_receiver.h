@@ -37,6 +37,8 @@ struct OscEyeParserState {
     float eyesClosed = 0.0f;
     rc::GazePayload lastValidGaze{};
     bool hasValidGaze = false;
+    uint32_t lastPaperTrackerSequence = 0;
+    bool hasPaperTrackerSequence = false;
 };
 
 class OscEyeReceiver {
