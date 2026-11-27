@@ -136,10 +136,10 @@
           <!-- 分组 1: 编码画质 -->
           <div class="group-title" data-i18n="video.groupQuality">Encoding quality</div>
           <div class="row">
-            <label class="check" id="tenBitRow"><input type="checkbox" data-setting="tenBit"><span data-i18n="video.tenBit">10-bit color</span><small id="tenBitHint" hidden data-i18n="video.tenBitHint">Needs HEVC or AV1.</small></label>
+            <label class="check" id="tenBitRow" data-i18n-title="video.tenBitHint"><input type="checkbox" data-setting="tenBit"><span data-i18n="video.tenBit">10-bit color</span><small id="tenBitHint" hidden data-i18n="video.tenBitHint">Needs HEVC or AV1.</small></label>
           </div>
           <div class="row">
-            <label class="check" id="foveatedRow"><input type="checkbox" data-setting="foveatedEncoding"><span data-i18n="video.foveated">Foveated encoding</span><small id="foveatedHint" data-i18n="video.foveatedHint">Lighter edges. NVIDIA only.</small></label>
+            <label class="check" id="foveatedRow" data-i18n-title="video.foveatedHint"><input type="checkbox" data-setting="foveatedEncoding"><span data-i18n="video.foveated">Foveated encoding</span></label>
           </div>
           <div class="row">
             <label class="check" id="externalEyeRow" data-i18n-title="video.externalEyeHint"><input type="checkbox" data-setting="externalEyeTracking"><span data-i18n="video.externalEye">External eye tracking (OSC / PaperTracker)</span></label>
@@ -175,7 +175,7 @@
             </div>
           </div>
           <div class="row">
-            <label class="check sub" id="l7Row"><input type="checkbox" data-setting="l7Autoscale"><span data-i18n="video.l7Autoscale">Auto-downscale on slow decode</span></label>
+            <label class="check sub" id="l7Row" data-i18n-title="video.l7AutoscaleHint"><input type="checkbox" data-setting="l7Autoscale"><span data-i18n="video.l7Autoscale">Auto-downscale on slow decode</span></label>
             <p class="note" id="l7LevelLine" hidden><span data-i18n="video.l7Level">Current size</span>: <b id="l7Level">—</b> <button id="l7Reset" data-i18n="video.l7Reset">Reset to 100%</button></p>
           </div>
           <div class="row">
@@ -185,7 +185,7 @@
             <label class="check" id="fillModeRow" data-i18n-title="video.fillModeHint"><input type="checkbox" data-setting="fillMode"><span data-i18n="video.fillMode">Low-FPS bitrate boost</span></label>
           </div>
           <div class="row">
-            <label class="check" id="pcBitrateRow"><input type="checkbox" data-setting="pcBitrateWins"><span data-i18n="video.pcBitrate">Use PC bitrate limit</span></label>
+            <label class="check" id="pcBitrateRow" data-i18n-title="video.pcBitrateHint"><input type="checkbox" data-setting="pcBitrateWins"><span data-i18n="video.pcBitrate">Use PC bitrate limit</span></label>
           </div>
 
           <!-- 分组 3: 网络容错 -->
