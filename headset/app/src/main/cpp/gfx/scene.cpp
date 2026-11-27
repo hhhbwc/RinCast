@@ -188,15 +188,17 @@ vec3 ColorGrade(vec3 g) {
 }
 )";
 static const char* kCasExtFs = R"(
+// Adreno's ES 3.1 compiler rejects samplerExternalOES function parameters; keep uTex global.
+uniform samplerExternalOES uTex;
 uniform float uSharpen;
 uniform vec2 uInvTexSize;
-vec3 ApplyCasExtAt(samplerExternalOES tex, vec2 tc, vec2 lo, vec2 hi, vec2 stepUv, float strength) {
-    vec3 e = texture(tex, tc).rgb;
+vec3 ApplyCasExtAt(vec2 tc, vec2 lo, vec2 hi, vec2 stepUv, float strength) {
+    vec3 e = texture(uTex, tc).rgb;
     if (strength <= 0.001 || stepUv.x <= 0.0 || stepUv.y <= 0.0) return e;
-    vec3 b = texture(tex, clamp(tc + vec2(0.0, -stepUv.y), lo, hi)).rgb;
-    vec3 d = texture(tex, clamp(tc + vec2(-stepUv.x, 0.0), lo, hi)).rgb;
-    vec3 f = texture(tex, clamp(tc + vec2(stepUv.x, 0.0), lo, hi)).rgb;
-    vec3 h = texture(tex, clamp(tc + vec2(0.0, stepUv.y), lo, hi)).rgb;
+    vec3 b = texture(uTex, clamp(tc + vec2(0.0, -stepUv.y), lo, hi)).rgb;
+    vec3 d = texture(uTex, clamp(tc + vec2(-stepUv.x, 0.0), lo, hi)).rgb;
+    vec3 f = texture(uTex, clamp(tc + vec2(stepUv.x, 0.0), lo, hi)).rgb;
+    vec3 h = texture(uTex, clamp(tc + vec2(0.0, stepUv.y), lo, hi)).rgb;
     vec3 mn = min(min(min(d, e), min(f, b)), h);
     vec3 mx = max(max(max(d, e), max(f, b)), h);
     vec3 amp = clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0);
@@ -206,11 +208,11 @@ vec3 ApplyCasExtAt(samplerExternalOES tex, vec2 tc, vec2 lo, vec2 hi, vec2 stepU
     vec3 outCol = (e + (b + d + f + h) * w) / (1.0 + 4.0 * w);
     return clamp(outCol, 0.0, 1.0);
 }
-vec3 ApplyCasExt(samplerExternalOES tex, vec2 uv, vec4 crop, vec2 invSize, float strength) {
+vec3 ApplyCasExt(vec2 uv, vec4 crop, vec2 invSize, float strength) {
     float eye = step(0.5, uv.x);
     vec2 lo = crop.xy + vec2(eye * 0.5 + 0.5 * invSize.x, 0.5 * invSize.y) * crop.zw;
     vec2 hi = crop.xy + vec2(eye * 0.5 + 0.5 - 0.5 * invSize.x, 1.0 - 0.5 * invSize.y) * crop.zw;
-    return ApplyCasExtAt(tex, crop.xy + uv * crop.zw, lo, hi, invSize * crop.zw, strength);
+    return ApplyCasExtAt(crop.xy + uv * crop.zw, lo, hi, invSize * crop.zw, strength);
 }
 )";
 static const char* kCas2DFs = R"(
@@ -237,7 +239,6 @@ vec3 ApplyCas2D(sampler2D tex, vec2 uv, vec2 invSize, float strength) {
 }
 )";
 static const char* kBlitExtFs = R"(
-uniform samplerExternalOES uTex;
 uniform vec4 uCrop;  // visible part of the decoder buffer: offset.xy, scale.zw
 in vec2 vUv;
 out vec4 oColor;
@@ -246,7 +247,7 @@ out vec4 oColor;
 // off leaves it as it is.
 void main() {
     vec2 uv = Foveate(vec2(vUv.x, 1.0 - vUv.y), step(0.5, vUv.x));
-    vec3 g = ApplyCasExt(uTex, uv, uCrop, uInvTexSize, uSharpen);
+    vec3 g = ApplyCasExt(uv, uCrop, uInvTexSize, uSharpen);
     g = ColorGrade(g);
     oColor = vec4(ToLayer(g), 1.0);
 }
@@ -401,7 +402,6 @@ void main() {
 // to reach the true first in-eye column.  eyeMid keeps clamp() well-formed when
 // uCrop.z degenerates toward 0 (eyeMin > eyeMax would be undefined).
 static const char* kExternalMovedFs = R"(
-uniform samplerExternalOES uTex;
 uniform vec4 uCrop;
 uniform mediump sampler2D uMotion;
 uniform vec2 uScale;
@@ -440,7 +440,7 @@ void main() {
     vec2 casLo = vec2(min(eyeMin, eyeMid), uCrop.y);
     vec2 casHi = vec2(max(eyeMax, eyeMid), uCrop.y + uCrop.w);
     vec3 g = uSharpen > 0.001
-        ? ApplyCasExtAt(uTex, sampleUv, casLo, casHi, uInvTexSize * uCrop.zw, uSharpen)
+        ? ApplyCasExtAt(sampleUv, casLo, casHi, uInvTexSize * uCrop.zw, uSharpen)
         : texture(uTex, sampleUv).rgb;
     g = ColorGrade(g);
     oColor = vec4(ToLayer(g), 1.0);
